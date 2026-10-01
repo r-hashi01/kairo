@@ -4,21 +4,21 @@
 
 | # | 決定 | 状態 |
 |---|---|---|
-| [0000](0000-record-decisions.md) | 設計判断を ADR として記録する | 提案（v0 実装済み） |
-| [0001](0001-pure-transition-core.md) | 状態遷移は I/O のない純粋関数とし、時刻はイベントで渡す | 提案（v0 実装済み） |
-| [0002](0002-shard-per-core-event-loop.md) | 1コア1シャードのイベントループが実行を所有し、ロックを持たない | 提案（v0 実装済み） |
-| [0003](0003-typed-effects-undeclared-is-real.md) | 作用に型を付け、宣言のないものは「実」として扱う | 提案（v0 実装済み） |
-| [0004](0004-output-commit-for-real-commands.md) | 状態は先に適用し、外に出る作用だけを耐久化まで保留する（出力コミット） | 提案（v0 実装済み） |
-| [0005](0005-per-shard-append-only-log.md) | 耐久性ログはシャード×ティアごとの追記ログとし、group commit する | 提案（v0 実装済み） |
-| [0006](0006-ir-serialization-json.md) | IR の直列化は JSON とし、計画はノード仕様と組にして凍結する | 提案（v0 実装済み） |
-| [0007](0007-no-replication-in-v0.md) | 複製は v0 に含めず、Sink の差し替えで後から足せるようにする | 提案（v0 実装済み） |
-| [0008](0008-blob-threshold-and-typed-fields.md) | 16 KiB を超える出力はブロブにし、型付きフィールドは状態に残す | 提案（v0 実装済み） |
-| [0009](0009-worker-protocol-framed-json.md) | ワーカープロトコルは長さ付きフレーム＋JSON で、pull とクレジット制にする | 提案（v0 実装済み） |
-| [0010](0010-hierarchical-timing-wheel.md) | タイマーは階層タイミングホイールで持ち、OS タイマーは1本だけ | 提案（v0 実装済み） |
-| [0011](0011-snapshot-eviction.md) | 待つだけの実行はスナップショットにしてメモリから外す（耐久化済み LSN まで） | 提案（v0 実装済み） |
-| [0012](0012-scheduler-single-owner.md) | スケジューラはトークンバケットとテナント間ラウンドロビンで、単一 goroutine が所有する | 提案（v0 実装済み） |
-| [0013](0013-branch-only-on-typed-fields.md) | 条件分岐は bool / int / number / enum の型付きフィールドに限る | 提案（v0 実装済み） |
-| [0014](0014-stdlib-only.md) | ランタイムは標準ライブラリだけで作る | 提案（v0 実装済み） |
-| [0015](0015-shape-values-with-protected-steps.md) | 値の整形は保護ステップ（pass / append）で行い、IR の構成要素を増やさない | 提案（v0 実装済み） |
+| [0000](0000-record-decisions.md) | 設計判断を ADR として記録する | 承認 |
+| [0001](0001-pure-transition-core.md) | 状態遷移は I/O のない純粋関数とし、時刻はイベントで渡す | 承認 |
+| [0002](0002-shard-per-core-event-loop.md) | 1コア1シャードのイベントループが実行を所有し、ロックを持たない | 承認 |
+| [0003](0003-typed-effects-undeclared-is-real.md) | 作用に型を付け、宣言のないものは「実」として扱う | 承認 |
+| [0004](0004-output-commit-for-real-commands.md) | 状態は先に適用し、外に出る作用だけを耐久化まで保留する（出力コミット） | 承認 |
+| [0005](0005-per-shard-append-only-log.md) | 耐久性ログはシャード×ティアごとの追記ログとし、group commit する | 承認 |
+| [0006](0006-ir-serialization-json.md) | IR の直列化は JSON とし、計画はノード仕様と組にして凍結する | 承認 |
+| [0007](0007-no-replication-in-v0.md) | 複製は v0 に含めず、Sink の差し替えで後から足せるようにする | 承認 |
+| [0008](0008-blob-threshold-and-typed-fields.md) | 16 KiB を超える出力はブロブにし、型付きフィールドは状態に残す | 承認 |
+| [0009](0009-worker-protocol-framed-json.md) | ワーカープロトコルは長さ付きフレーム＋JSON で、pull とクレジット制にする | 承認 |
+| [0010](0010-hierarchical-timing-wheel.md) | タイマーは階層タイミングホイールで持ち、OS タイマーは1本だけ | 承認 |
+| [0011](0011-snapshot-eviction.md) | 待つだけの実行はスナップショットにしてメモリから外す（耐久化済み LSN まで） | 承認 |
+| [0012](0012-scheduler-single-owner.md) | スケジューラはトークンバケットとテナント間ラウンドロビンで、単一 goroutine が所有する | 承認 |
+| [0013](0013-branch-only-on-typed-fields.md) | 条件分岐は bool / int / number / enum の型付きフィールドに限る | 承認 |
+| [0014](0014-stdlib-only.md) | ランタイムは標準ライブラリだけで作る | 承認 |
+| [0015](0015-shape-values-with-protected-steps.md) | 値の整形は保護ステップ（pass / append）で行い、IR の構成要素を増やさない | 承認 |
 
-「提案（v0 実装済み）」は、実装時に下した判断をまとめて起票したもので、まだレビューを受けていないものです。レビューを経て「承認」にします。
+0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
