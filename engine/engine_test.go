@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -129,8 +130,8 @@ func TestRealCommandWaitsForDurableIntent(t *testing.T) {
 		durableMu.Unlock()
 		found := false
 		wal.Scan(data, func(rec []byte) error {
-			kind, _, id, ev, _ := decodeRecord(rec)
-			if kind == recEvent && id == tk.RunID && ev.Kind == core.EvIntent && ev.Act == tk.Act && ev.Attempt == tk.Attempt {
+			r, _ := decodeRecord(rec)
+			if r.kind == recEvent && r.runID == tk.RunID && r.ev.Kind == core.EvIntent && r.ev.Act == tk.Act && r.ev.Attempt == tk.Attempt {
 				found = true
 			}
 			return nil
@@ -562,5 +563,172 @@ func TestEvictionBurstUsesFixedIOPool(t *testing.T) {
 	})
 	if peak > before+10 {
 		t.Fatalf("goroutines peaked at %d (from %d) during an eviction burst", peak, before)
+	}
+}
+
+func walSegments(t testing.TB, dir string) []string {
+	t.Helper()
+	segs, _ := filepath.Glob(filepath.Join(dir, "wal", "*.wal"))
+	return segs
+}
+
+// ADR 0016: finished runs' records are retired a whole segment at a time,
+// runs that live on are checkpointed so they stop pinning old segments, and
+// everything still recovers after a restart from the compacted log.
+func TestLogCompaction(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Shards: 1, DataDir: dir, NoSync: true, SegmentSize: 4 << 10, CompactEvery: 64, EvictAfter: 50 * time.Millisecond}
+	plans := []string{fiveNodes,
+		`{"name":"approve","root":{"kind":"seq","nodes":[{"kind":"wait","id":"w","signal":"go"},{"kind":"step","id":"a","action":"llm","input":{"by":"w.payload"}}]}}`,
+		`{"name":"slow","root":{"kind":"step","id":"s","action":"blocker"}}`,
+	}
+	ft := TierFile
+	release := make(chan struct{})
+	blocking := ExecutorFunc(func(ctx context.Context, tk *task.Task, _ func([]byte)) task.Result {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return task.Result{Output: json.RawMessage(`"slow done"`)}
+	})
+	reg := func() *ir.Registry {
+		r := testRegistry()
+		r.Register(ir.NodeSpec{Action: "blocker", Effect: ir.EffectUnprotected})
+		return r
+	}
+
+	e1 := newEngine(t, func() Config { c := cfg; c.Registry = reg(); return c }())
+	for _, p := range plans {
+		mustPlan(t, e1, p)
+	}
+	e1.RegisterExecutor([]string{"llm"}, 16, echoExec())
+	e1.RegisterExecutor([]string{"blocker"}, 1, blocking)
+	e1.Start()
+	// Started first, so their start records sit in the oldest segment.
+	waiting, _ := e1.Submit(SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft}) // evicted to a snapshot
+	running, _ := e1.Submit(SubmitRequest{Plan: "slow", Tenant: "t", Tier: &ft})    // stays in memory, in flight
+	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), waiting); return ri.Evicted })
+	var ids []string
+	for i := 0; i < 400; i++ {
+		id, err := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		if ri := wait(t, e1, id); ri.Status != "completed" {
+			t.Fatalf("%+v", ri)
+		}
+	}
+	// Compaction is checked only as the log grows (no timer), so keep a
+	// trickle of work going while checkpoints and snapshot deletes finish.
+	var segs []string
+	waitFor(t, func() bool {
+		id, _ := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
+		wait(t, e1, id)
+		segs = walSegments(t, dir)
+		return !strings.HasSuffix(filepath.Base(segs[0]), ".L00000000000000000001.wal")
+	})
+	t.Logf("%d segments left after ~%d records", len(segs), 450*13)
+	if len(segs) > 30 {
+		t.Fatalf("log not compacted: %d segments", len(segs))
+	}
+	// Crash without draining the blocked task.
+	for _, s := range e1.shards {
+		s.inbox.Push(msg{kind: mStop})
+	}
+	e1.wg.Wait()
+	e1.Close()
+	close(release)
+
+	e2 := newEngine(t, func() Config { c := cfg; c.Registry = reg(); return c }())
+	defer e2.Close()
+	for _, p := range plans {
+		mustPlan(t, e2, p)
+	}
+	e2.RegisterExecutor([]string{"llm"}, 4, echoExec())
+	e2.RegisterExecutor([]string{"blocker"}, 1, blocking)
+	if err := e2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if st := e2.Stats(); st.Active != 2 {
+		t.Fatalf("recovered %d active runs, want 2 (finished runs must stay finished)", st.Active)
+	}
+	if ri := wait(t, e2, running); ri.Status != "completed" || string(ri.Output) != `"slow done"` {
+		t.Fatalf("in-flight run after restart: %+v", ri)
+	}
+	e2.Signal(waiting, "go", json.RawMessage(`"bob"`))
+	if ri := wait(t, e2, waiting); ri.Status != "completed" || !strings.Contains(string(ri.Output), `"by":"bob"`) {
+		t.Fatalf("waiting run after restart: %+v", ri)
+	}
+}
+
+// Compaction must not feed itself: on an idle engine with many waiting
+// runs (more than 2*CompactEvery), the checkpoint records it writes do not
+// trigger further checks, so the shards go quiet.
+func TestCompactionDoesNotWakeIdleEngine(t *testing.T) {
+	for _, evict := range []time.Duration{20 * time.Millisecond, -1} {
+		t.Run(fmt.Sprint("evict=", evict > 0), func(t *testing.T) {
+			e := newEngine(t, Config{Shards: 1, DataDir: t.TempDir(), NoSync: true, CompactEvery: 8, EvictAfter: evict})
+			defer e.Close()
+			mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"never"}}`)
+			e.Start()
+			ft := TierFile
+			for i := 0; i < 40; i++ {
+				e.Submit(SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft})
+			}
+			waitFor(t, func() bool { st := e.Stats(); return st.InMemory+st.Evicted == 40 })
+			wakes := func() uint64 { return e.shards[0].wakeups.Load() }
+			// Let in-flight snapshot writes and checkpoints settle.
+			var w0 uint64
+			waitFor(t, func() bool {
+				a := wakes()
+				time.Sleep(100 * time.Millisecond)
+				w0 = wakes()
+				return a == w0
+			})
+			time.Sleep(300 * time.Millisecond)
+			if w1 := wakes(); w1 != w0 {
+				t.Fatalf("idle shard woke %d times in 300ms", w1-w0)
+			}
+		})
+	}
+}
+
+// Reusing the id of a finished run: the new run must survive a restart
+// (recovery must not mix in the old run's records), and the old run's
+// snapshot delete must not race the new run.
+func TestRunIDReuseSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	plans := []string{fiveNodes, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`}
+	ft := TierFile
+	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, EvictAfter: time.Millisecond})
+	for _, p := range plans {
+		mustPlan(t, e1, p)
+	}
+	e1.RegisterExecutor([]string{"llm"}, 4, echoExec())
+	e1.Start()
+	if _, err := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft, RunID: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, e1, "x")
+	e1.Submit(SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft, RunID: "x"})
+	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), "x"); return ri.Plan == "w" && ri.Evicted })
+	e1.Close()
+
+	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true})
+	defer e2.Close()
+	for _, p := range plans {
+		mustPlan(t, e2, p)
+	}
+	e2.Start()
+	ri, err := e2.Get(context.Background(), "x")
+	if err != nil || ri.Plan != "w" || ri.Status != "running" {
+		t.Fatalf("reused run after restart: %+v %v", ri, err)
+	}
+	e2.Signal("x", "go", nil)
+	if ri := wait(t, e2, "x"); ri.Status != "completed" {
+		t.Fatalf("%+v", ri)
 	}
 }

@@ -13,8 +13,9 @@ import (
 // reproduces its state exactly.
 
 const (
-	recStart byte = 1 // run metadata; followed by the EvStart event record
-	recEvent byte = 2
+	recStart      byte = 1 // run metadata; followed by the EvStart event record
+	recEvent      byte = 2
+	recCheckpoint byte = 3 // run metadata + LSN of a stored snapshot (ADR 0016)
 )
 
 var errBadRecord = errors.New("engine: bad log record")
@@ -39,6 +40,20 @@ func encodeStart(b []byte, m *startMeta) []byte {
 	b = appendStr(b, m.PlanHash)
 	b = appendStr(b, m.Tenant)
 	return append(b, byte(m.Tier))
+}
+
+// encodeCheckpoint records that the snapshot of m.RunID covering the log up
+// to snapLSN is in the snapshot store. Once it is durable the run no longer
+// needs its earlier records, including its start record: recovery finds the
+// run through this record instead.
+func encodeCheckpoint(b []byte, m *startMeta, snapLSN uint64) []byte {
+	b = append(b, recCheckpoint)
+	b = appendStr(b, m.RunID)
+	b = appendStr(b, m.Plan)
+	b = appendStr(b, m.PlanHash)
+	b = appendStr(b, m.Tenant)
+	b = append(b, byte(m.Tier))
+	return binary.AppendUvarint(b, snapLSN)
 }
 
 func encodeEvent(b []byte, runID string, ev *core.Event) []byte {
@@ -121,21 +136,38 @@ func (r *rdr) bytes() []byte {
 
 func (r *rdr) str() string { return string(r.bytes()) }
 
-// decodeRecord returns the record kind, run id, and either meta or event.
-func decodeRecord(rec []byte) (kind byte, meta *startMeta, runID string, ev *core.Event, err error) {
+type record struct {
+	kind    byte
+	runID   string
+	meta    *startMeta  // start, checkpoint
+	ev      *core.Event // event
+	snapLSN uint64      // checkpoint
+}
+
+func decodeMeta(r *rdr) *startMeta {
+	m := &startMeta{}
+	m.RunID = r.str()
+	m.Plan = r.str()
+	m.PlanHash = r.str()
+	m.Tenant = r.str()
+	m.Tier = Tier(r.byte1())
+	return m
+}
+
+// decodeRecord decodes one log record.
+func decodeRecord(rec []byte) (record, error) {
 	r := &rdr{b: rec}
-	kind = r.byte1()
-	switch kind {
+	out := record{kind: r.byte1()}
+	switch out.kind {
 	case recStart:
-		m := &startMeta{}
-		m.RunID = r.str()
-		m.Plan = r.str()
-		m.PlanHash = r.str()
-		m.Tenant = r.str()
-		m.Tier = Tier(r.byte1())
-		return kind, m, m.RunID, nil, r.err
+		out.meta = decodeMeta(r)
+		out.runID = out.meta.RunID
+	case recCheckpoint:
+		out.meta = decodeMeta(r)
+		out.runID = out.meta.RunID
+		out.snapLSN = r.u()
 	case recEvent:
-		runID = r.str()
+		out.runID = r.str()
 		e := &core.Event{}
 		e.Kind = core.EventKind(r.byte1())
 		e.At = r.i()
@@ -148,9 +180,11 @@ func decodeRecord(rec []byte) (kind byte, meta *startMeta, runID string, ev *cor
 		flags := r.byte1()
 		e.Retryable = flags&1 != 0
 		e.Unknown = flags&2 != 0
-		return kind, nil, runID, e, r.err
+		out.ev = e
+	default:
+		return out, errBadRecord
 	}
-	return kind, nil, "", nil, errBadRecord
+	return out, r.err
 }
 
 // Snapshot objects: uvarint LSN of the last event included, then the state.

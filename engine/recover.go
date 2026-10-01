@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"log"
 
 	"kairo/blob"
 	"kairo/core"
@@ -14,35 +15,63 @@ type lsnEvent struct {
 }
 
 type recovered struct {
-	meta   *startMeta
-	tier   Tier
-	events []lsnEvent
+	meta     *startMeta
+	tier     Tier
+	startLSN uint64 // 0 if the start record was retired
+	cpLSN    uint64 // snapshot LSN of the latest checkpoint record
+	cpRec    uint64 // LSN of that record
+	events   []lsnEvent
 }
 
 // recover rebuilds the shard's runs from its logs and snapshots, then
 // applies EvRecover to each unfinished run so in-flight work is re-issued
 // (or stopped for review, for real steps whose outcome is unknown).
+//
+// A run is found through its start record or, once that was retired,
+// through a checkpoint record (ADR 0016). Its state is the snapshot (if
+// any) plus its events after the snapshot's LSN, which retention keeps for
+// every live run (and for finished runs until their snapshot is deleted).
+// A run found without a start record and without a snapshot finished, and
+// is skipped.
 func (s *shard) recover() error {
 	runs := map[string]*recovered{}
 	var order []string
+	var first [tierCount]uint64 // first retained LSN per tier log
+	get := func(t Tier, m *startMeta) *recovered {
+		x := runs[m.RunID]
+		if x == nil {
+			x = &recovered{meta: m, tier: t}
+			runs[m.RunID] = x
+			order = append(order, m.RunID)
+		}
+		return x
+	}
 	for t, l := range s.logs {
 		if l == nil {
 			continue
 		}
-		var lsn uint64
-		err := l.sink.ReadAll(func(rec []byte) error {
-			lsn++
-			kind, meta, id, ev, err := decodeRecord(rec)
+		err := l.sink.ReadAll(func(lsn uint64, rec []byte) error {
+			if first[t] == 0 {
+				first[t] = lsn
+			}
+			r, err := decodeRecord(rec)
 			if err != nil {
 				return err
 			}
-			switch kind {
+			switch r.kind {
 			case recStart:
-				runs[id] = &recovered{meta: meta, tier: Tier(t)}
-				order = append(order, id)
+				// A start record begins a new run even if an earlier run
+				// used the same id: forget that run's records.
+				x := get(Tier(t), r.meta)
+				*x = recovered{meta: r.meta, tier: Tier(t), startLSN: lsn}
+			case recCheckpoint:
+				x := get(Tier(t), r.meta)
+				if r.snapLSN >= x.cpLSN {
+					x.cpLSN, x.cpRec = r.snapLSN, lsn
+				}
 			case recEvent:
-				if x := runs[id]; x != nil {
-					x.events = append(x.events, lsnEvent{lsn: lsn, ev: ev})
+				if x := runs[r.runID]; x != nil {
+					x.events = append(x.events, lsnEvent{lsn: lsn, ev: r.ev})
 				}
 			}
 			return nil
@@ -50,7 +79,11 @@ func (s *shard) recover() error {
 		if err != nil {
 			return err
 		}
-		l.lsn, l.durable = lsn, lsn
+		next := l.sink.Next()
+		if first[t] == 0 {
+			first[t] = next
+		}
+		l.lsn, l.durable, l.retired = next-1, next-1, first[t]
 	}
 	s.now = s.e.cfg.Now().UnixMilli()
 	for _, id := range order {
@@ -61,21 +94,27 @@ func (s *shard) recover() error {
 		}
 		st := core.NewState(id)
 		var from uint64
+		haveSnap := false
 		if x.tier >= TierFile {
 			if data, err := s.e.snaps.Get("snap/" + id); err == nil {
 				if lsn, snap, err := decodeSnapshot(data); err == nil {
-					st, from = snap, lsn
+					st, from, haveSnap = snap, lsn, true
 				}
 			} else if err != blob.ErrNotFound {
 				return err
 			}
 		}
-		var last uint64
+		if x.startLSN == 0 && !haveSnap {
+			// Its history is gone: it finished and its records were retired.
+			log.Printf("kairo: shard %d: run %s has no start record and no snapshot; treating it as finished", s.id, id)
+			continue
+		}
+		last := from
 		for _, le := range x.events {
-			last = le.lsn
 			if le.lsn <= from {
 				continue
 			}
+			last = le.lsn
 			core.Apply(p, st, le.ev, nil)
 		}
 		if st.Status.Done() {
@@ -84,7 +123,17 @@ func (s *shard) recover() error {
 			}
 			continue
 		}
-		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, st: st, timers: map[uint32]timerwheel.Handle{}, lastLSN: last, status: st.Status}
+		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, st: st, timers: map[uint32]timerwheel.Handle{},
+			lastLSN: last, startLSN: x.startLSN, status: st.Status}
+		if x.cpRec > 0 {
+			r.cpLSN, r.cpRec = x.cpLSN, x.cpRec
+			for _, le := range x.events {
+				if le.lsn > x.cpLSN {
+					r.postSnap = le.lsn
+					break
+				}
+			}
+		}
 		s.runs[id] = r
 		s.inMemory.Add(1)
 		if st.Status == core.StatusBlocked {

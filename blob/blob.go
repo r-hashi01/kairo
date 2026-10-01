@@ -122,7 +122,27 @@ func (s *Dir) Put(key string, data []byte) error {
 		os.Remove(tmp.Name())
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		return err
+	}
+	if s.noSync {
+		return nil
+	}
+	// Make the rename (and a newly created subdirectory) durable: callers
+	// such as log compaction rely on the object surviving a power loss.
+	if err := syncDir(filepath.Dir(p)); err != nil {
+		return err
+	}
+	return syncDir(s.root)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (s *Dir) Get(key string) ([]byte, error) {

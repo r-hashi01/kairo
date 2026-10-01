@@ -86,6 +86,13 @@ type Config struct {
 	// Default 16 KiB.
 	BlobThreshold int
 
+	// CompactEvery: every time a log's durable LSN advances by this many
+	// records, records no live run needs are retired (ADR 0016) and runs
+	// holding them back are checkpointed. Default 65536; negative disables.
+	CompactEvery int
+	// SegmentSize: file-tier log segment size (default 64 MiB).
+	SegmentSize int64
+
 	// EvictAfter: a run that has nothing in flight and will not be woken
 	// for at least this long is snapshotted and dropped from memory.
 	// Default 2s; negative disables eviction.
@@ -181,6 +188,9 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.BlobThreshold <= 0 {
 		cfg.BlobThreshold = 16 << 10
 	}
+	if cfg.CompactEvery == 0 {
+		cfg.CompactEvery = 65536
+	}
 	if cfg.EvictAfter == 0 {
 		cfg.EvictAfter = 2 * time.Second
 	}
@@ -242,7 +252,14 @@ func New(cfg Config) (*Engine, error) {
 				if cfg.DataDir == "" {
 					return nil, nil
 				}
-				return wal.OpenFile(filepath.Join(cfg.DataDir, "wal"), fmt.Sprintf("shard-%03d", shard), cfg.NoSync)
+				fs, err := wal.OpenFile(filepath.Join(cfg.DataDir, "wal"), fmt.Sprintf("shard-%03d", shard), cfg.NoSync)
+				if err != nil {
+					return nil, err // not a typed nil inside the interface
+				}
+				if cfg.SegmentSize > 0 {
+					fs.SegmentSize = cfg.SegmentSize
+				}
+				return fs, nil
 			}
 			return nil, nil
 		}
@@ -438,6 +455,11 @@ func (e *Engine) Submit(req SubmitRequest) (string, error) {
 	id := req.RunID
 	if id == "" {
 		id = newRunID()
+	} else {
+		// Reusing the id of a finished run: Get and Wait must see the new run.
+		e.waitMu.Lock()
+		delete(e.finished, id)
+		e.waitMu.Unlock()
 	}
 	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input}
 	sh := e.shardFor(id)

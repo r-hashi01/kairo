@@ -4,12 +4,18 @@
 // bytes and acknowledge once they are safe outside the current failure
 // domain. That is the Sink interface. Everything else (framing, LSNs, group
 // commit) lives here, independent of where the bytes end up.
+//
+// LSNs number the records of one log from 1. A sink knows the LSN of every
+// record it holds (segments carry their first LSN, ADR 0016), so records
+// that are no longer needed can be retired a whole segment at a time
+// without renumbering the rest.
 package wal
 
 import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"log"
 	"sync"
 
 	"kairo/mpsc"
@@ -17,14 +23,24 @@ import (
 
 // Sink is the pluggable destination of a shard's log.
 type Sink interface {
-	// Append durably appends batch. It returns once the bytes are
-	// acknowledged from outside the failure domain (fsync for a local file,
-	// quorum ack for a replicated log).
+	// Append durably appends batch (one or more framed records). It
+	// returns once the bytes are acknowledged from outside the failure
+	// domain (fsync for a local file, quorum ack for a replicated log).
 	Append(batch []byte) error
-	// ReadAll calls fn with every complete record previously appended, in
-	// order. A torn tail (partial final write) is silently ignored.
-	ReadAll(fn func(rec []byte) error) error
+	// ReadAll calls fn with every complete record still held, in order,
+	// with its LSN. A torn tail (partial final write) is ignored.
+	ReadAll(fn func(lsn uint64, rec []byte) error) error
+	// Next is the LSN the next appended record will get. It survives
+	// retirement: a log whose records were all retired keeps counting.
+	Next() uint64
 	Close() error
+}
+
+// Retirer is implemented by sinks that can drop records no longer needed.
+// Retire may discard records with LSN < lsn, and only whole segments: the
+// content of a segment is never rewritten or truncated.
+type Retirer interface {
+	Retire(lsn uint64) error
 }
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -60,45 +76,105 @@ func Scan(data []byte, fn func(rec []byte) error) (int, error) {
 	return off, nil
 }
 
+// count returns the number of complete, valid records in data (checks
+// CRCs; for reading).
+func count(data []byte) uint64 {
+	var n uint64
+	Scan(data, func([]byte) error { n++; return nil })
+	return n
+}
+
+// countFrames counts the records of a batch built with Frame, reading only
+// the length prefixes (for the append path).
+func countFrames(data []byte) uint64 {
+	var n uint64
+	for off := 0; off < len(data); n++ {
+		l, k := binary.Uvarint(data[off:])
+		if k <= 0 {
+			break
+		}
+		off += k + 4 + int(l)
+	}
+	return n
+}
+
 // MemSink keeps the log in memory. It survives the loss of a run but not of
-// the process; it backs the "shared memory" tier in tests and in embedded
-// use where the host process is the failure domain.
+// the process; it backs the "memory" tier and tests.
 type MemSink struct {
-	mu   sync.Mutex
-	data []byte
+	mu     sync.Mutex
+	chunks []memChunk
+	next   uint64 // LSN of the next record
 	// Delay, if set, is called before each Append returns (tests use it to
 	// hold acknowledgements back).
 	Delay func()
+}
+
+type memChunk struct {
+	first, n uint64
+	data     []byte
 }
 
 func (m *MemSink) Append(batch []byte) error {
 	if m.Delay != nil {
 		m.Delay()
 	}
+	n := countFrames(batch)
 	m.mu.Lock()
-	m.data = append(m.data, batch...)
+	if m.next == 0 {
+		m.next = 1
+	}
+	m.chunks = append(m.chunks, memChunk{first: m.next, n: n, data: append([]byte(nil), batch...)})
+	m.next += n
 	m.mu.Unlock()
 	return nil
 }
 
-func (m *MemSink) ReadAll(fn func([]byte) error) error {
+func (m *MemSink) ReadAll(fn func(uint64, []byte) error) error {
 	m.mu.Lock()
-	data := append([]byte(nil), m.data...)
+	chunks := append([]memChunk(nil), m.chunks...)
 	m.mu.Unlock()
-	_, err := Scan(data, fn)
-	if err == errTorn {
-		err = nil
+	for _, c := range chunks {
+		lsn := c.first
+		if _, err := Scan(c.data, func(rec []byte) error {
+			err := fn(lsn, rec)
+			lsn++
+			return err
+		}); err != nil && err != errTorn {
+			return err
+		}
 	}
-	return err
+	return nil
+}
+
+// Retire drops whole appended batches whose records are all below lsn.
+func (m *MemSink) Retire(lsn uint64) error {
+	m.mu.Lock()
+	i := 0
+	for i < len(m.chunks) && m.chunks[i].first+m.chunks[i].n <= lsn {
+		i++
+	}
+	m.chunks = append([]memChunk(nil), m.chunks[i:]...)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *MemSink) Next() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return max(m.next, 1)
 }
 
 func (m *MemSink) Close() error { return nil }
 
-// Bytes returns a copy of everything appended so far.
+// Bytes returns a copy of everything still held.
 func (m *MemSink) Bytes() []byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([]byte(nil), m.data...)
+	var b []byte
+	for _, c := range m.chunks {
+		b = append(b, c.data...)
+	}
+	return b
 }
 
 // Committer performs group commit for one shard. The shard hands over a
@@ -116,8 +192,9 @@ type Committer struct {
 }
 
 type batch struct {
-	data []byte
-	lsn  uint64
+	data   []byte
+	lsn    uint64
+	retire uint64 // if non-zero: a retire request, not data
 }
 
 // NewCommitter starts a committer. ack is called from the committer's
@@ -142,6 +219,12 @@ func (c *Committer) Submit(data []byte, lsn uint64) {
 	c.q.Push(batch{data: data, lsn: lsn})
 }
 
+// Retire asks the sink, if it is a Retirer, to drop records below lsn. It
+// runs on the committer's goroutine after the writes queued before it.
+func (c *Committer) Retire(lsn uint64) {
+	c.q.Push(batch{retire: lsn})
+}
+
 func (c *Committer) Close() {
 	close(c.close)
 	<-c.done
@@ -152,20 +235,39 @@ func (c *Committer) loop() {
 	var bufs []batch
 	var joined []byte
 	for {
+		stopping := false
 		select {
 		case <-c.q.Ready():
 		case <-c.close:
-			bufs = c.q.Drain(bufs)
-			if len(bufs) > 0 {
-				c.write(bufs, &joined)
-			}
-			return
+			stopping = true
 		}
 		bufs = c.q.Drain(bufs)
-		if len(bufs) == 0 {
+		if len(bufs) > 0 {
+			c.process(bufs, &joined)
+		}
+		if stopping {
+			return
+		}
+	}
+}
+
+func (c *Committer) process(bufs []batch, joined *[]byte) {
+	var data []batch
+	var retire uint64
+	for _, b := range bufs {
+		if b.retire != 0 {
+			retire = max(retire, b.retire)
 			continue
 		}
-		c.write(bufs, &joined)
+		data = append(data, b)
+	}
+	if len(data) > 0 {
+		c.write(data, joined)
+	}
+	if r, ok := c.sink.(Retirer); ok && retire != 0 {
+		if err := r.Retire(retire); err != nil {
+			log.Printf("kairo: wal retire below %d: %v", retire, err)
+		}
 	}
 }
 
