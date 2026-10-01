@@ -1,0 +1,6 @@
+kairo-data/
+/kairod
+*.test
+.claude/settings.local.json
+.claude/.cache/
+bin/
