@@ -4,12 +4,12 @@
 
 | # | 決定 | 状態 |
 |---|---|---|
-| [0000](0000-record-decisions.md) | 設計判断を ADR として記録する | 承認 |
+| [0000](0000-record-decisions.md) | 設計判断を ADR として記録する | 承認（0017 で補足） |
 | [0001](0001-pure-transition-core.md) | 状態遷移は I/O のない純粋関数とし、時刻はイベントで渡す | 承認 |
 | [0002](0002-shard-per-core-event-loop.md) | 1コア1シャードのイベントループが実行を所有し、ロックを持たない | 承認 |
 | [0003](0003-typed-effects-undeclared-is-real.md) | 作用に型を付け、宣言のないものは「実」として扱う | 承認 |
 | [0004](0004-output-commit-for-real-commands.md) | 状態は先に適用し、外に出る作用だけを耐久化まで保留する（出力コミット） | 承認 |
-| [0005](0005-per-shard-append-only-log.md) | 耐久性ログはシャード×ティアごとの追記ログとし、group commit する | 承認 |
+| [0005](0005-per-shard-append-only-log.md) | 耐久性ログはシャード×ティアごとの追記ログとし、group commit する | 承認（一部を 0016 で置き換え） |
 | [0006](0006-ir-serialization-json.md) | IR の直列化は JSON とし、計画はノード仕様と組にして凍結する | 承認 |
 | [0007](0007-no-replication-in-v0.md) | 複製は v0 に含めず、Sink の差し替えで後から足せるようにする | 承認 |
 | [0008](0008-blob-threshold-and-typed-fields.md) | 16 KiB を超える出力はブロブにし、型付きフィールドは状態に残す | 承認 |
@@ -20,5 +20,8 @@
 | [0013](0013-branch-only-on-typed-fields.md) | 条件分岐は bool / int / number / enum の型付きフィールドに限る | 承認 |
 | [0014](0014-stdlib-only.md) | ランタイムは標準ライブラリだけで作る | 承認 |
 | [0015](0015-shape-values-with-protected-steps.md) | 値の整形は保護ステップ（pass / append）で行い、IR の構成要素を増やさない | 承認 |
+| [0016](0016-log-compaction.md) | ログはチェックポイントとセグメント単位の退役で圧縮する | 承認 |
+| [0017](0017-approve-adr-before-implementation.md) | ADR は実装に入る前に承認を得る | 承認 |
+| [0018](0018-optional-sqlite-backend.md) | 保存先の既定はファイル形式とし、SQLite は別モジュールの任意の実装として試す | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

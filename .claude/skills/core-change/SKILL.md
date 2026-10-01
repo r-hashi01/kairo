@@ -12,7 +12,7 @@ description: Checklist for changing the pure state-transition core (core/) or it
 - IR の構成要素を増やすなら、既存の組み合わせで表せない理由は何か（要件は「5つの構成要素のみ」）。
 - 状態の符号化形式は変わるか（→ `codecVersion`）。ログの記録形式は変わるか（→ 過去のログを読めること）。
 
-- 関係する ADR（`docs/adr/README.md` の索引から）を読みます。その判断を変えることになるなら、先に `/adr` で起票します。
+- 関係する ADR（`docs/adr/README.md` の索引から）を読みます。その判断を変えることになるなら、先に `/adr` で起票し、**利用者の承認を得てから**実装に入ります（ADR 0017）。
 
 ## 実装中に守ること
 - `core/` には I/O、時計、goroutine、ロック、乱数を入れません（hook がブロックします）。
