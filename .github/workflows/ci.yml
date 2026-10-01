@@ -11,8 +11,35 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: check (fmt, vet, build, tests, invariants, race)
+      - name: check (fmt, vet, build, tests, invariants, race; all modules)
         run: scripts/check.sh --race
+
+  backends:
+    # The SQL backends against real databases in Docker (ADR 0020).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: postgres, mysql, tidb, oracle
+        run: scripts/check-backends.sh
+
+  vulncheck:
+    # Known vulnerabilities in the code paths of every module (ADR 0020).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          for m in . $(find store -name go.mod -exec dirname {} \;); do
+            echo "== $m"; (cd "$m" && "$(go env GOPATH)/bin/govulncheck" ./...)
+          done
 
   bench:
     # Shared CI runners are noisy; the budgets are reported, not enforced.

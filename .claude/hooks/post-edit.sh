@@ -9,10 +9,18 @@ file=$(jq -r '.tool_response.filePath // .tool_input.file_path // empty' <<<"$in
 root=${CLAUDE_PROJECT_DIR:-$(pwd)}
 cd "$root" || exit 0
 rel=${file#"$root"/}
-pkg=./$(dirname "$rel")
+
+# The repository has more than one Go module (e.g. store/sqlite): vet from
+# the module that contains the file.
+moddir=$(dirname "$file")
+while [ "$moddir" != "$root" ] && [ ! -f "$moddir/go.mod" ]; do
+  moddir=$(dirname "$moddir")
+done
+pkg=./${file#"$moddir"/}
+pkg=$(dirname "$pkg")
 
 gofmt -w "$file"
-if ! out=$(go vet "$pkg" 2>&1); then
+if ! out=$(cd "$moddir" && go vet "$pkg" 2>&1); then
   printf 'go vet %s failed after editing %s:\n%s\n' "$pkg" "$rel" "$out" >&2
   exit 2
 fi

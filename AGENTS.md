@@ -19,6 +19,9 @@ kairo は Go 製の LLM ワークフローランタイムです。目標は「�
 | `obs/` `live/` | 可観測性（欠落を許す）、ライブ中継（記録しない） | 非ブロッキング |
 | `protocol/` `executor/` | ワーカープロトコル（pull・クレジット制）、HTTP 実行器 | ここで I/O する |
 | `api/` `cmd/kairod/` | デーモンと HTTP API | — |
+| `seal/` | 保存データの暗号化と改ざん検知（ADR 0021）。`wal.Encrypted`、`blob.Encrypted` が使う | なし |
+| `store/sqlstore/` | SQL 保存先の共通実装と Dialect（別モジュール。ADR 0020）。`sqltest` は全製品共通のテスト一式 | ここで I/O する |
+| `store/{sqlite,postgres,mysql,oracle}/` | 製品ごとの Dialect とドライバ（それぞれ別モジュール）。TiDB は `store/mysql`。既定の保存先はファイル形式 | ここで I/O する |
 
 ## 破ってはいけない不変条件
 
@@ -65,6 +68,7 @@ scripts/check.sh           # 完了の条件：gofmt・vet・build・全テス�
 scripts/check.sh --race    # 並行処理（engine / sched / wal / protocol / live / mpsc）に触ったら必須
 scripts/check.sh --quick   # hook が使う軽量版
 scripts/bench.sh           # 性能予算（NFR）の判定。予算を超えると失敗する
+scripts/check-backends.sh  # SQL の保存先を、Docker の実データベースでテストする（postgres mysql tidb oracle）
 make check | race | bench | quick
 ```
 
@@ -84,7 +88,10 @@ make check | race | bench | quick
 
 ## コーディング規約
 
-- 標準ライブラリだけを使います。依存を足すなら利用者の了承が要ります（hook が確認を求めます）。
+- 本体モジュール（`kairo`）は標準ライブラリだけを使います。依存を足すなら利用者の了承が要ります（hook が確認を求めます）。依存のある実装は、`store/sqlite` のように別モジュールに置きます（ADR 0018）。本体から別モジュールを import してはいけません。
+- 保存先の実装（`wal.Sink`、`blob.Store`）を足したり変えたりしたら、`wal/waltest` と `blob/blobtest` の共通テストを流します。SQL の製品なら `sqltest.Run` を使い、`scripts/check-backends.sh <製品>` で実際のデータベースに対して流します（Docker が要る）。
+- `store/sqlstore` で実行する SQL は、`buildQueries` が作る `queries` のフィールドだけです。値を連結した SQL を書くと、`TestOnlyPreparedQueriesAreExecuted` が落ちます（ADR 0020）。
+- 製品の `Open` は、検証付きの TLS 以外を拒否します。テストで平文を使うときは、`AllowInsecureTransport` を明示します。
 - コメントと識別子は英語、ドキュメントは日本語です。周りのコードの密度と書き方に合わせてください。
 - gofmt に従います（編集後に hook が自動で整形します）。
 - エラーは握りつぶさず、戻り値で返すかログに残します。シャードループ内で panic してはいけません。

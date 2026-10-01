@@ -37,9 +37,10 @@ type shard struct {
 	fired []timerRef
 	now   int64
 
-	inMemory atomic.Int64
-	evicted  atomic.Int64
-	wakeups  atomic.Uint64 // loop iterations, for the no-polling test
+	inMemory   atomic.Int64
+	evicted    atomic.Int64
+	wakeups    atomic.Uint64 // loop iterations, for the no-polling test
+	failedLogs atomic.Int32
 }
 
 // shardLog is the per-tier log of a shard with its output-commit queue:
@@ -502,6 +503,9 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 	if err != nil {
 		// Durability can no longer be guaranteed for this log: keep holding
 		// everything that depends on it.
+		if l.failed == nil {
+			s.failedLogs.Add(1)
+		}
 		l.failed = err
 		log.Printf("kairo: shard %d: %s log write failed: %v", s.id, t, err)
 		return

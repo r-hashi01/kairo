@@ -260,3 +260,39 @@ func TestMemSinkRetire(t *testing.T) {
 		t.Fatalf("%v", lsns)
 	}
 }
+
+// A transient failure (nothing written) is retried by the committer; the
+// shard just sees a later acknowledgement, not an error.
+type flakySink struct {
+	MemSink
+	fails int
+}
+
+func (f *flakySink) Append(b []byte) error {
+	if f.fails > 0 {
+		f.fails--
+		return fmt.Errorf("%w: connection refused", ErrTransient)
+	}
+	return f.MemSink.Append(b)
+}
+
+func TestCommitterRetriesTransientErrors(t *testing.T) {
+	sink := &flakySink{fails: 3}
+	acks := make(chan error, 10)
+	c := NewCommitter(sink, func(lsn uint64, err error) { acks <- err })
+	defer c.Close()
+	c.Submit(Frame(c.Buffer(), []byte("r")), 1)
+	select {
+	case err := <-acks:
+		if err != nil {
+			t.Fatalf("transient errors surfaced: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("never acknowledged")
+	}
+	n := 0
+	sink.ReadAll(func(uint64, []byte) error { n++; return nil })
+	if n != 1 {
+		t.Fatalf("%d records stored", n)
+	}
+}

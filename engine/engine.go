@@ -26,6 +26,7 @@ import (
 	"kairo/mpsc"
 	"kairo/obs"
 	"kairo/sched"
+	"kairo/seal"
 	"kairo/task"
 	"kairo/wal"
 )
@@ -104,6 +105,11 @@ type Config struct {
 	EstimateTokens func(t *task.Task) int
 
 	Observe obs.Sink
+
+	// Keys, if set, encrypts and authenticates everything stored: every
+	// log, snapshots and blobs (ADR 0021). Data written with keys can only
+	// be read with them; tampering makes Start fail.
+	Keys seal.Keys
 
 	// Now is the clock (tests may override).
 	Now func() time.Time
@@ -292,6 +298,17 @@ func New(cfg Config) (*Engine, error) {
 		} else {
 			e.cfg.RealMinTier = TierMemory
 		}
+	}
+	if cfg.Keys != nil {
+		for i := range sinks {
+			for t, s := range sinks[i] {
+				if s != nil {
+					sinks[i][t] = wal.Encrypted(s, cfg.Keys, fmt.Sprintf("shard-%03d/%s", i, Tier(t)))
+				}
+			}
+		}
+		e.snaps = blob.Encrypted(e.snaps, cfg.Keys)
+		e.blobs = blob.Encrypted(e.blobs, cfg.Keys)
 	}
 	e.shards = make([]*shard, cfg.Shards)
 	for i := range e.shards {
@@ -564,6 +581,10 @@ type Stats struct {
 	DispatchQueued          int
 	InMemory, Evicted       int
 	ObsDropped              uint64
+	// FailedLogs counts shard logs whose writes failed with an unknown
+	// outcome. Their real commands and completions are held: those runs
+	// cannot make progress until the engine is restarted.
+	FailedLogs int
 }
 
 func (e *Engine) Stats() Stats {
@@ -575,6 +596,9 @@ func (e *Engine) Stats() Stats {
 		st.Evicted += int(s.evicted.Load())
 	}
 	st.ObsDropped = e.obs.Dropped()
+	for _, s := range e.shards {
+		st.FailedLogs += int(s.failedLogs.Load())
+	}
 	return st
 }
 

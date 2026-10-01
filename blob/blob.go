@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 var ErrNotFound = errors.New("blob: not found")
@@ -88,13 +89,28 @@ func NewDir(root string, noSync bool) (*Dir, error) {
 	return &Dir{root: root, noSync: noSync}, nil
 }
 
+// path is where key is stored: the SHA-256 of the name, so any name maps
+// to a valid, fixed-length file name (ADR 0022).
 func (s *Dir) path(key string) string {
+	h := sha256.Sum256([]byte(key))
+	name := hex.EncodeToString(h[:])
+	return filepath.Join(s.root, name[:2], name)
+}
+
+// legacyPath is where the previous format stored key, if that was a valid
+// path at all (it was not for, e.g., names ending in a split multi-byte
+// character). Objects there are still read, and moved on the next write.
+func (s *Dir) legacyPath(key string) (string, bool) {
 	k := strings.NewReplacer(":", "_", "/", "_").Replace(key)
 	sub := k
 	if len(k) > 2 {
 		sub = k[len(k)-2:]
 	}
-	return filepath.Join(s.root, sub, k)
+	if !utf8.ValidString(k) || !utf8.ValidString(sub) || len(k) > 255 || k == "." || k == ".." || sub == "." || sub == ".." ||
+		strings.ContainsAny(k, "\\\x00") {
+		return "", false
+	}
+	return filepath.Join(s.root, sub, k), true
 }
 
 func (s *Dir) Put(key string, data []byte) error {
@@ -125,15 +141,24 @@ func (s *Dir) Put(key string, data []byte) error {
 	if err := os.Rename(tmp.Name(), p); err != nil {
 		return err
 	}
-	if s.noSync {
-		return nil
+	if !s.noSync {
+		// Make the rename (and a newly created subdirectory) durable:
+		// callers such as log compaction rely on the object surviving a
+		// power loss.
+		if err := syncDir(filepath.Dir(p)); err != nil {
+			return err
+		}
+		if err := syncDir(s.root); err != nil {
+			return err
+		}
 	}
-	// Make the rename (and a newly created subdirectory) durable: callers
-	// such as log compaction rely on the object surviving a power loss.
-	if err := syncDir(filepath.Dir(p)); err != nil {
-		return err
+	// The new copy is in place: a copy in the previous format is stale.
+	if lp, ok := s.legacyPath(key); ok {
+		if err := os.Remove(lp); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
-	return syncDir(s.root)
+	return nil
 }
 
 func syncDir(dir string) error {
@@ -148,15 +173,24 @@ func syncDir(dir string) error {
 func (s *Dir) Get(key string) ([]byte, error) {
 	d, err := os.ReadFile(s.path(key))
 	if errors.Is(err, os.ErrNotExist) {
+		if lp, ok := s.legacyPath(key); ok {
+			d, err = os.ReadFile(lp)
+		}
+	}
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
 	}
 	return d, err
 }
 
 func (s *Dir) Delete(key string) error {
-	err := os.Remove(s.path(key))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if err := os.Remove(s.path(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	return err
+	if lp, ok := s.legacyPath(key); ok {
+		if err := os.Remove(lp); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }

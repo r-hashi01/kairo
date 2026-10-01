@@ -33,14 +33,27 @@ go vet ./...
 step "go build"
 go build ./...
 
+# Nested modules (optional backends with their own dependencies, ADR 0018).
+modules=$(find . -name go.mod -not -path ./go.mod -exec dirname {} \; | sort)
+
+for m in $modules; do
+  step "go vet ($m)"
+  (cd "$m" && go vet ./...)
+done
+
 if [ "$quick" = 1 ]; then
   step "go test -short"
   go test -short ./...
+  for m in $modules; do (cd "$m" && go test -short ./...); done
   exit 0
 fi
 
 step "go test"
 go test -count=1 ./...
+for m in $modules; do
+  step "go test ($m)"
+  (cd "$m" && go test -count=1 ./...)
+done
 
 # The invariants of the requirements (section 6), run by name so a rename or
 # deletion shows up here instead of silently dropping coverage.
@@ -52,6 +65,7 @@ go test -count=1 ./wal -run '^TestFileSinkAppendOnly$' -v 2>&1 | grep -E '^(--- 
 if [ "$race" = 1 ]; then
   step "go test -race"
   go test -race -count=1 ./...
+  for m in $modules; do (cd "$m" && go test -race -count=1 ./...); done
 fi
 
 printf '\nall checks passed\n'

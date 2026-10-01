@@ -17,6 +17,7 @@ import (
 	"hash/crc32"
 	"log"
 	"sync"
+	"time"
 
 	"kairo/mpsc"
 )
@@ -42,6 +43,13 @@ type Sink interface {
 type Retirer interface {
 	Retire(lsn uint64) error
 }
+
+// ErrTransient marks an Append error after which nothing was written (for
+// example the database refused the connection before a transaction
+// began). The committer retries such a batch with backoff instead of
+// failing the log. Any other error means the outcome is unknown, and the
+// log fails.
+var ErrTransient = errors.New("wal: transient failure, nothing written")
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -283,6 +291,17 @@ func (c *Committer) write(bufs []batch, joined *[]byte) {
 		data = *joined
 	}
 	err := c.sink.Append(data)
+	for backoff := 10 * time.Millisecond; errors.Is(err, ErrTransient); backoff = min(2*backoff, time.Second) {
+		// Nothing was written: try the same batch again. The shard keeps
+		// running; only its acknowledgements wait.
+		log.Printf("kairo: wal append failed, retrying in %v: %v", backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-c.close:
+			return // shutting down: the batch was never acknowledged
+		}
+		err = c.sink.Append(data)
+	}
 	lsn := bufs[len(bufs)-1].lsn
 	for _, b := range bufs {
 		d := b.data

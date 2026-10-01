@@ -6,6 +6,7 @@ import (
 
 	"kairo/blob"
 	"kairo/core"
+	"kairo/seal"
 	"kairo/timerwheel"
 )
 
@@ -103,6 +104,12 @@ func (s *shard) recover() error {
 			} else if err != blob.ErrNotFound {
 				return err
 			}
+		}
+		if haveSnap && from < x.cpLSN {
+			// The log says a newer snapshot was stored. Snapshot writes only
+			// ever move forward, so this one was put back: refuse to run on
+			// state older than the log.
+			return fmt.Errorf("run %s: snapshot covers LSN %d but the log checkpointed LSN %d: %w", id, from, x.cpLSN, seal.ErrTampered)
 		}
 		if x.startLSN == 0 && !haveSnap {
 			// Its history is gone: it finished and its records were retired.

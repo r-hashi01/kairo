@@ -4,3 +4,4 @@ kairo-data/
 .claude/settings.local.json
 .claude/.cache/
 bin/
+store/.certs/

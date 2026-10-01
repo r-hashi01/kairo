@@ -23,5 +23,9 @@
 | [0016](0016-log-compaction.md) | ログはチェックポイントとセグメント単位の退役で圧縮する | 承認 |
 | [0017](0017-approve-adr-before-implementation.md) | ADR は実装に入る前に承認を得る | 承認 |
 | [0018](0018-optional-sqlite-backend.md) | 保存先の既定はファイル形式とし、SQLite は別モジュールの任意の実装として試す | 承認 |
+| [0019](0019-no-atomic-storage-interface.md) | 保存先インターフェースは変えない（SQLite の第 2 段階は行わない） | 承認 |
+| [0020](0020-pluggable-sql-backends.md) | 指定があれば SQL データベース（PostgreSQL、MySQL、TiDB、Oracle、SQLite）に保存できるようにする | 承認 |
+| [0021](0021-encrypt-and-authenticate-stored-data.md) | 保存するログとスナップショットを、任意で暗号化し改ざんを検知する | 承認 |
+| [0022](0022-blob-dir-hashed-names.md) | blob.Dir は、オブジェクト名をハッシュしたファイル名で保存する | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
