@@ -27,5 +27,8 @@
 | [0020](0020-pluggable-sql-backends.md) | 指定があれば SQL データベース（PostgreSQL、MySQL、TiDB、Oracle、SQLite）に保存できるようにする | 承認 |
 | [0021](0021-encrypt-and-authenticate-stored-data.md) | 保存するログとスナップショットを、任意で暗号化し改ざんを検知する | 承認 |
 | [0022](0022-blob-dir-hashed-names.md) | blob.Dir は、オブジェクト名をハッシュしたファイル名で保存する | 承認 |
+| [0023](0023-durable-idempotent-submit.md) | Submit は開始が耐久化してから返し、RunID を冪等キーとして扱う | 承認 |
+| [0024](0024-per-run-blob-collection.md) | ブロブは実行ごとにまとめて保存し、実行の終了時に消す | 承認（SQL 側は 0025 で置き換え） |
+| [0025](0025-binary-collation-and-prefix-group-delete.md) | 名前は大文字小文字を区別してバイト順で比較し、MySQL / TiDB には VARBINARY で手当てする | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

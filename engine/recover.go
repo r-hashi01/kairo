@@ -114,6 +114,7 @@ func (s *shard) recover() error {
 		if x.startLSN == 0 && !haveSnap {
 			// Its history is gone: it finished and its records were retired.
 			log.Printf("kairo: shard %d: run %s has no start record and no snapshot; treating it as finished", s.id, id)
+			s.e.deleteBlobs(id)
 			continue
 		}
 		last := from
@@ -128,10 +129,11 @@ func (s *shard) recover() error {
 			if x.tier >= TierFile {
 				s.e.snaps.Delete("snap/" + id)
 			}
+			s.e.deleteBlobs(id)
 			continue
 		}
 		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, st: st, timers: map[uint32]timerwheel.Handle{},
-			lastLSN: last, startLSN: x.startLSN, status: st.Status}
+			lastLSN: last, startLSN: x.startLSN, status: st.Status, started: true}
 		if x.cpRec > 0 {
 			r.cpLSN, r.cpRec = x.cpLSN, x.cpRec
 			for _, le := range x.events {

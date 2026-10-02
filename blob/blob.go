@@ -25,6 +25,30 @@ type Store interface {
 	Delete(key string) error
 }
 
+// Grouper is implemented by stores that can delete a group of objects at
+// once (ADR 0024). The engine stores each run's blobs under the group
+// "run/<run id>" and deletes the group when the run is finished.
+type Grouper interface {
+	// DeleteGroup deletes every object whose key starts with group + "/".
+	DeleteGroup(group string) error
+}
+
+// RunGroup is the group of a run's blobs.
+func RunGroup(runID string) string { return "run/" + runID }
+
+// GroupOf returns the group of key: "run/<id>" for keys "run/<id>/<rest>".
+// Other keys (snapshots, blobs of the previous format) have no group.
+func GroupOf(key string) (string, bool) {
+	if !strings.HasPrefix(key, "run/") {
+		return "", false
+	}
+	i := strings.LastIndex(key, "/")
+	if i <= len("run/") {
+		return "", false
+	}
+	return key[:i], true
+}
+
 // ContentKey returns the content-addressed key for data.
 func ContentKey(data []byte) string {
 	h := sha256.Sum256(data)
@@ -34,6 +58,13 @@ func ContentKey(data []byte) string {
 // PutContent stores data under its content hash and returns the key.
 func PutContent(s Store, data []byte) (string, error) {
 	k := ContentKey(data)
+	return k, s.Put(k, data)
+}
+
+// PutRunContent stores data in the run's group under its content hash
+// (deduplicated within the run only, ADR 0024) and returns the key.
+func PutRunContent(s Store, runID string, data []byte) (string, error) {
+	k := RunGroup(runID) + "/" + ContentKey(data)
 	return k, s.Put(k, data)
 }
 
@@ -69,6 +100,17 @@ func (s *Mem) Delete(key string) error {
 	return nil
 }
 
+func (s *Mem) DeleteGroup(group string) error {
+	s.mu.Lock()
+	for k := range s.m {
+		if strings.HasPrefix(k, group+"/") {
+			delete(s.m, k)
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *Mem) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -94,13 +136,41 @@ func NewDir(root string, noSync bool) (*Dir, error) {
 func (s *Dir) path(key string) string {
 	h := sha256.Sum256([]byte(key))
 	name := hex.EncodeToString(h[:])
+	if g, ok := GroupOf(key); ok {
+		return filepath.Join(s.groupDir(g), name)
+	}
 	return filepath.Join(s.root, name[:2], name)
+}
+
+// groupDir holds a group's objects, so the group is deleted as a directory
+// (ADR 0024).
+func (s *Dir) groupDir(group string) string {
+	h := sha256.Sum256([]byte(group))
+	name := hex.EncodeToString(h[:])
+	return filepath.Join(s.root, "g", name[:2], name)
+}
+
+func (s *Dir) DeleteGroup(group string) error {
+	d := s.groupDir(group)
+	if err := os.RemoveAll(d); err != nil {
+		return err
+	}
+	if s.noSync {
+		return nil
+	}
+	if err := syncDir(filepath.Dir(d)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // legacyPath is where the previous format stored key, if that was a valid
 // path at all (it was not for, e.g., names ending in a split multi-byte
 // character). Objects there are still read, and moved on the next write.
 func (s *Dir) legacyPath(key string) (string, bool) {
+	if _, grouped := GroupOf(key); grouped {
+		return "", false // group keys only exist in the current format
+	}
 	k := strings.NewReplacer(":", "_", "/", "_").Replace(key)
 	sub := k
 	if len(k) > 2 {

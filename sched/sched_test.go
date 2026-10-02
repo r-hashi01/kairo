@@ -15,8 +15,8 @@ func TestAdmissionFairnessAndLimits(t *testing.T) {
 	a.Admit("A", start("A2"))
 	// Full: A queues 3, B queues 2, then the queue is full.
 	for _, n := range []string{"A3", "A4", "A5"} {
-		if q, err := a.Admit("A", start(n)); !q || err != nil {
-			t.Fatal(q, err)
+		if tk, err := a.Admit("A", start(n)); tk == nil || err != nil {
+			t.Fatal(tk, err)
 		}
 	}
 	a.Admit("B", start("B1"))
@@ -123,5 +123,30 @@ func TestDispatcherUnpollRequeues(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("tasks of a departed worker were not requeued")
 		}
+	}
+}
+
+func TestAdmissionCancel(t *testing.T) {
+	a := NewAdmission(AdmissionConfig{MaxActive: 1})
+	var started []string
+	run := func(n string) func() { return func() { started = append(started, n) } }
+	a.Admit("A", run("a1"))
+	tb, _ := a.Admit("B", run("b1"))
+	tc, _ := a.Admit("C", run("c1"))
+	if !tb.Cancel() {
+		t.Fatal("queued run could not be cancelled")
+	}
+	if tb.Cancel() {
+		t.Fatal("cancelled twice")
+	}
+	a.Release("A")
+	if join(started) != "a1 c1" {
+		t.Fatalf("started %q", join(started))
+	}
+	if tc.Cancel() {
+		t.Fatal("a started run was cancelled")
+	}
+	if active, queued := a.Stats(); active != 1 || queued != 0 {
+		t.Fatalf("active %d queued %d", active, queued)
 	}
 }

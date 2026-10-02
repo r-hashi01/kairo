@@ -22,7 +22,7 @@ import (
 // Dialect is the PostgreSQL dialect.
 var Dialect = sqlstore.Dialect{
 	Name: "postgres", Placeholder: sqlstore.Dollar,
-	IDType: "VARCHAR(512)", BigInt: "BIGINT", BytesType: "BYTEA",
+	IDType: `VARCHAR(512) COLLATE "C"`, BigInt: "BIGINT", BytesType: "BYTEA", // byte order, for prefix ranges (ADR 0025)
 	ForUpdate: " FOR UPDATE", MultiRowInsert: true,
 	DeleteLimited: func(t, w string, n int) string {
 		return fmt.Sprintf("DELETE FROM %s WHERE ctid IN (SELECT ctid FROM %s WHERE %s LIMIT %d)", t, t, w, n)

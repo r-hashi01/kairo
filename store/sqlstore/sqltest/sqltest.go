@@ -120,10 +120,10 @@ func engineScenario(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 	o := sqlstore.Options{Namespace: namespace(t.Name() + time.Now().String())}
 	ft := engine.TierFile
 	e1 := Engine(t, db, d, o, engine.Config{Shards: 2, CompactEvery: 64, EvictAfter: 50 * time.Millisecond})
-	waiting, _ := e1.Submit(engine.SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft})
+	waiting, _ := submit(e1, engine.SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft})
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), waiting); return ri.Evicted })
 	for i := 0; i < 200; i++ {
-		id, _ := e1.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+		id, _ := submit(e1, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
 		wait(t, e1, id)
 	}
 	rows := func() (n int) {
@@ -136,7 +136,7 @@ func engineScenario(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 		return
 	}
 	waitFor(t, func() bool {
-		id, _ := e1.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
+		id, _ := submit(e1, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
 		wait(t, e1, id)
 		return rows() < 600
 	})
@@ -152,4 +152,11 @@ func engineScenario(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 	if ri := wait(t, e2, waiting); ri.Status != "completed" || !strings.Contains(string(ri.Output), `"by":"bob"`) {
 		t.Fatalf("%+v", ri)
 	}
+}
+
+// submit starts a run and returns its id (Submit waits until the start is
+// durable, ADR 0023).
+func submit(e *engine.Engine, req engine.SubmitRequest) (string, error) {
+	r, err := e.Submit(context.Background(), req)
+	return r.RunID, err
 }

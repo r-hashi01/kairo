@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 
 	"kairo/core"
 	"kairo/ir"
+	"kairo/sched"
 	"kairo/task"
 	"kairo/wal"
 )
@@ -88,7 +90,7 @@ func TestFiveNodeRun(t *testing.T) {
 				t.Fatal(err)
 			}
 			tr := tier
-			id, err := e.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"hi"}`), Tenant: "t1", Tier: &tr})
+			id, err := submit(e, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"hi"}`), Tenant: "t1", Tier: &tr})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -147,7 +149,7 @@ func TestRealCommandWaitsForDurableIntent(t *testing.T) {
 	}
 	var ids []string
 	for i := 0; i < 50; i++ {
-		id, err := e.Submit(SubmitRequest{Plan: "r", Tenant: "t"})
+		id, err := submit(e, SubmitRequest{Plan: "r", Tenant: "t"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,7 +197,7 @@ func TestRecoveryAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	ft := TierFile
-	id, err := e1.Submit(SubmitRequest{Plan: "rec", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+	id, err := submit(e1, SubmitRequest{Plan: "rec", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +241,7 @@ func TestRecoveryRealStepNeedsReview(t *testing.T) {
 	mustPlan(t, e1, plan)
 	e1.RegisterExecutor([]string{"llm", "send"}, 4, hang)
 	e1.Start()
-	id, _ := e1.Submit(SubmitRequest{Plan: "crash", Tenant: "t"})
+	id, _ := submit(e1, SubmitRequest{Plan: "crash", Tenant: "t"})
 	waitFor(t, func() bool { return sendCalls.Load() == 1 })
 	// Simulate a crash: stop without letting results reach the shard.
 	for _, s := range e1.shards {
@@ -287,7 +289,7 @@ func TestEvictionAndTimers(t *testing.T) {
 	mem := TierMemory
 	var ids []string
 	for i := 0; i < 100; i++ {
-		id, _ := e.Submit(SubmitRequest{Plan: "sleep", Tenant: "t", Tier: &mem})
+		id, _ := submit(e, SubmitRequest{Plan: "sleep", Tenant: "t", Tier: &mem})
 		ids = append(ids, id)
 	}
 	waitFor(t, func() bool { return e.Stats().Evicted == 100 })
@@ -315,7 +317,7 @@ func TestLargeOutputsBecomeBlobs(t *testing.T) {
 		return task.Result{Output: json.RawMessage(`"ok"`)}
 	}))
 	e.Start()
-	id, _ := e.Submit(SubmitRequest{Plan: "blob", Tenant: "t"})
+	id, _ := submit(e, SubmitRequest{Plan: "blob", Tenant: "t"})
 	if ri := wait(t, e, id); ri.Status != "completed" {
 		t.Fatalf("%+v", ri)
 	}
@@ -336,7 +338,7 @@ func TestLiveStream(t *testing.T) {
 		return task.Result{Output: json.RawMessage(`"done"`)}
 	}))
 	e.Start()
-	id, _ := e.Submit(SubmitRequest{Plan: "s", Tenant: "t"})
+	id, _ := submit(e, SubmitRequest{Plan: "s", Tenant: "t"})
 	sub := e.Live().Subscribe(id, 64)
 	e.Signal(id, "go", nil)
 	var got []string
@@ -377,7 +379,7 @@ func TestNoGoroutinePerRun(t *testing.T) {
 	e.Start()
 	before := runtime.NumGoroutine()
 	for i := 0; i < 20000; i++ {
-		if _, err := e.Submit(SubmitRequest{Plan: "w", Tenant: "t"}); err != nil {
+		if _, err := submit(e, SubmitRequest{Plan: "w", Tenant: "t"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -396,7 +398,7 @@ func TestIdleEngineDoesNotWake(t *testing.T) {
 	  {"kind":"wait","id":"a","signal":"never"},{"kind":"wait","id":"b","duration":"1h"}]}}`)
 	e.Start()
 	for i := 0; i < 1000; i++ {
-		e.Submit(SubmitRequest{Plan: "w", Tenant: "t"})
+		submit(e, SubmitRequest{Plan: "w", Tenant: "t"})
 	}
 	waitFor(t, func() bool { return e.Stats().InMemory == 1000 })
 	time.Sleep(20 * time.Millisecond)
@@ -433,7 +435,7 @@ func TestWaitingRunMemory(t *testing.T) {
 			var m0, m1 runtime.MemStats
 			runtime.ReadMemStats(&m0)
 			for i := 0; i < n; i++ {
-				e.Submit(SubmitRequest{Plan: "w", Tenant: "t", Input: json.RawMessage(`{"q":"hello"}`)})
+				submit(e, SubmitRequest{Plan: "w", Tenant: "t", Input: json.RawMessage(`{"q":"hello"}`)})
 			}
 			waitFor(t, func() bool {
 				st := e.Stats()
@@ -476,7 +478,7 @@ func BenchmarkFiveNodeRun(b *testing.B) {
 			var wg sync.WaitGroup
 			for i := 0; i < b.N; i++ {
 				sem <- struct{}{}
-				id, err := e.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &tr})
+				id, err := submit(e, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &tr})
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -524,7 +526,7 @@ func TestHandoffLatency(t *testing.T) {
 	mem := TierMemory
 	var ids []string
 	for i := 0; i < 2000; i++ {
-		id, _ := e.Submit(SubmitRequest{Plan: "five", Tenant: fmt.Sprint(i % 4), Input: json.RawMessage(`{"q":"x"}`), Tier: &mem})
+		id, _ := submit(e, SubmitRequest{Plan: "five", Tenant: fmt.Sprint(i % 4), Input: json.RawMessage(`{"q":"x"}`), Tier: &mem})
 		ids = append(ids, id)
 		if i%100 == 99 {
 			time.Sleep(5 * time.Millisecond)
@@ -552,7 +554,7 @@ func TestEvictionBurstUsesFixedIOPool(t *testing.T) {
 	file := TierFile
 	peak := before
 	for i := 0; i < 10000; i++ {
-		e.Submit(SubmitRequest{Plan: "w", Tenant: "t", Tier: &file})
+		submit(e, SubmitRequest{Plan: "w", Tenant: "t", Tier: &file})
 		if i%500 == 0 {
 			peak = max(peak, runtime.NumGoroutine())
 		}
@@ -605,12 +607,12 @@ func TestLogCompaction(t *testing.T) {
 	e1.RegisterExecutor([]string{"blocker"}, 1, blocking)
 	e1.Start()
 	// Started first, so their start records sit in the oldest segment.
-	waiting, _ := e1.Submit(SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft}) // evicted to a snapshot
-	running, _ := e1.Submit(SubmitRequest{Plan: "slow", Tenant: "t", Tier: &ft})    // stays in memory, in flight
+	waiting, _ := submit(e1, SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft}) // evicted to a snapshot
+	running, _ := submit(e1, SubmitRequest{Plan: "slow", Tenant: "t", Tier: &ft})    // stays in memory, in flight
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), waiting); return ri.Evicted })
 	var ids []string
 	for i := 0; i < 400; i++ {
-		id, err := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+		id, err := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -625,7 +627,7 @@ func TestLogCompaction(t *testing.T) {
 	// trickle of work going while checkpoints and snapshot deletes finish.
 	var segs []string
 	waitFor(t, func() bool {
-		id, _ := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
+		id, _ := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
 		wait(t, e1, id)
 		segs = walSegments(t, dir)
 		return !strings.HasSuffix(filepath.Base(segs[0]), ".L00000000000000000001.wal")
@@ -676,7 +678,7 @@ func TestCompactionDoesNotWakeIdleEngine(t *testing.T) {
 			e.Start()
 			ft := TierFile
 			for i := 0; i < 40; i++ {
-				e.Submit(SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft})
+				submit(e, SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft})
 			}
 			waitFor(t, func() bool { st := e.Stats(); return st.InMemory+st.Evicted == 40 })
 			wakes := func() uint64 { return e.shards[0].wakeups.Load() }
@@ -703,17 +705,23 @@ func TestRunIDReuseSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	plans := []string{fiveNodes, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`}
 	ft := TierFile
-	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, EvictAfter: time.Millisecond})
+	// RecentRuns: 1, so finishing another run moves "x" out of the
+	// idempotency window and the id can be reused (ADR 0023).
+	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, EvictAfter: time.Millisecond, RecentRuns: 1})
 	for _, p := range plans {
 		mustPlan(t, e1, p)
 	}
 	e1.RegisterExecutor([]string{"llm"}, 4, echoExec())
 	e1.Start()
-	if _, err := e1.Submit(SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft, RunID: "x"}); err != nil {
+	if _, err := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft, RunID: "x"}); err != nil {
 		t.Fatal(err)
 	}
 	wait(t, e1, "x")
-	e1.Submit(SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft, RunID: "x"})
+	other, _ := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
+	wait(t, e1, other)
+	if r, err := e1.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft, RunID: "x"}); err != nil || r.Existing {
+		t.Fatalf("reuse after the window: %+v %v", r, err)
+	}
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), "x"); return ri.Plan == "w" && ri.Evicted })
 	e1.Close()
 
@@ -730,5 +738,117 @@ func TestRunIDReuseSurvivesRestart(t *testing.T) {
 	e2.Signal("x", "go", nil)
 	if ri := wait(t, e2, "x"); ri.Status != "completed" {
 		t.Fatalf("%+v", ri)
+	}
+}
+
+// submit is Submit for tests that only need the run id.
+func submit(e *Engine, req SubmitRequest) (string, error) {
+	r, err := e.Submit(context.Background(), req)
+	return r.RunID, err
+}
+
+// --- ADR 0023: durable, idempotent Submit ---------------------------------
+
+// Submit returns only once the start record is durable: here the sink
+// acknowledges after 100ms, and the start is in the acknowledged bytes by
+// the time Submit returns.
+func TestSubmitWaitsForDurableStart(t *testing.T) {
+	var mu sync.Mutex
+	acked := map[int][]byte{}
+	cfg := Config{Shards: 1, DefaultTier: TierMemory, Sinks: func(tier Tier, shard int) (wal.Sink, error) {
+		if tier != TierMemory {
+			return nil, nil
+		}
+		m := &wal.MemSink{Delay: func() { time.Sleep(100 * time.Millisecond) }}
+		return durableSink{m, shard, &mu, acked}, nil
+	}}
+	e := newEngine(t, cfg)
+	defer e.Close()
+	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"never"}}`)
+	e.Start()
+	t0 := time.Now()
+	r, err := e.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "t", RunID: "durable-1"})
+	if err != nil || r.Existing {
+		t.Fatalf("%+v %v", r, err)
+	}
+	if el := time.Since(t0); el < 90*time.Millisecond {
+		t.Fatalf("Submit returned after %v, before the start could be durable", el)
+	}
+	mu.Lock()
+	data := append([]byte(nil), acked[0]...)
+	mu.Unlock()
+	found := false
+	wal.Scan(data, func(rec []byte) error {
+		if r, _ := decodeRecord(rec); r.kind == recStart && r.runID == "durable-1" {
+			found = true
+		}
+		return nil
+	})
+	if !found {
+		t.Fatal("Submit returned but the start record was not acknowledged")
+	}
+	// A context shorter than the acknowledgement: started, not confirmed.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := e.Submit(ctx, SubmitRequest{Plan: "w", Tenant: "t", RunID: "durable-2"}); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("got %v, want ErrUnconfirmed", err)
+	}
+	// Retrying with the same id answers for the same run once durable.
+	if r, err := e.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "t", RunID: "durable-2"}); err != nil || !r.Existing {
+		t.Fatalf("retry: %+v %v", r, err)
+	}
+	if st := e.Stats(); st.Active != 2 {
+		t.Fatalf("%d active runs, want 2 (no duplicate)", st.Active)
+	}
+}
+
+func TestSubmitIsIdempotent(t *testing.T) {
+	e := newEngine(t, Config{Shards: 2})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	e.Start()
+	ctx := context.Background()
+	r1, err := e.Submit(ctx, SubmitRequest{Plan: "w", Tenant: "t", RunID: "same"})
+	if err != nil || r1.Existing {
+		t.Fatalf("%+v %v", r1, err)
+	}
+	r2, err := e.Submit(ctx, SubmitRequest{Plan: "w", Tenant: "t", RunID: "same"})
+	if err != nil || !r2.Existing {
+		t.Fatalf("duplicate while running: %+v %v", r2, err)
+	}
+	e.Signal("same", "go", nil)
+	wait(t, e, "same")
+	r3, err := e.Submit(ctx, SubmitRequest{Plan: "w", Tenant: "t", RunID: "same"})
+	if err != nil || !r3.Existing {
+		t.Fatalf("duplicate after finishing: %+v %v", r3, err)
+	}
+	if st := e.Stats(); st.Active != 0 {
+		t.Fatalf("a duplicate started: %d active", st.Active)
+	}
+}
+
+// A run still waiting for admission when ctx ends is withdrawn: it never
+// starts.
+func TestSubmitNotAcceptedWhileQueued(t *testing.T) {
+	e := newEngine(t, Config{Shards: 1, Admission: sched.AdmissionConfig{MaxActive: 1}})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	e.Start()
+	if _, err := submit(e, SubmitRequest{Plan: "w", Tenant: "t", RunID: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := e.Submit(ctx, SubmitRequest{Plan: "w", Tenant: "t", RunID: "queued"}); !errors.Is(err, ErrNotAccepted) {
+		t.Fatalf("got %v, want ErrNotAccepted", err)
+	}
+	e.Signal("first", "go", nil)
+	wait(t, e, "first")
+	time.Sleep(50 * time.Millisecond)
+	if _, err := e.Get(context.Background(), "queued"); !errors.Is(err, ErrUnknownRun) {
+		t.Fatalf("withdrawn run exists: %v", err)
+	}
+	if active, queued := e.adm.Stats(); active != 0 || queued != 0 {
+		t.Fatalf("admission leaked: active %d queued %d", active, queued)
 	}
 }

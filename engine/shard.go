@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"log"
@@ -66,6 +67,7 @@ const (
 	hDone
 	hEvict
 	hCheckpoint // a checkpoint record became durable: advance the run's base
+	hStarted    // the start is durable: answer Submit
 )
 
 type held struct {
@@ -93,20 +95,22 @@ type run struct {
 	// needs everything from its start record. After it, only its latest
 	// checkpoint record (cpRec, so recovery can find it) and its own
 	// records after the snapshot (the first of which is postSnap).
-	startLSN   uint64
-	cpLSN      uint64      // snapshot LSN of the latest durable checkpoint
-	cpRec      uint64      // LSN of that checkpoint record
-	postSnap   uint64      // first own record after cpLSN, 0 if none yet
-	pendSnap   uint64      // LSN of a snapshot being written, not yet checkpointed
-	pendFirst  uint64      // first own record after pendSnap
-	deleteSnap bool        // finished while a snapshot write was in flight
-	compactCP  bool        // the snapshot in flight was requested by compaction
-	starts     []*startReq // runs reusing this id, started once the snapshot is deleted
-	holds      int
-	done       bool
-	status     core.RunStatus
-	reviews    []Review    // steps needing review (kept outside the state so an evicted run can report them)
-	waits      []core.Wait // steps waiting for a signal, while quiescent
+	startLSN  uint64
+	cpLSN     uint64 // snapshot LSN of the latest durable checkpoint
+	cpRec     uint64 // LSN of that checkpoint record
+	postSnap  uint64 // first own record after cpLSN, 0 if none yet
+	pendSnap  uint64 // LSN of a snapshot being written, not yet checkpointed
+	pendFirst uint64 // first own record after pendSnap
+	finishJob func() // finished while a snapshot write was in flight: run after it
+	started   bool   // the start is durable (Submit answered)
+	startWait []chan startReply
+	compactCP bool        // the snapshot in flight was requested by compaction
+	starts    []*startReq // runs reusing this id, started once the snapshot is deleted
+	holds     int
+	done      bool
+	status    core.RunStatus
+	reviews   []Review    // steps needing review (kept outside the state so an evicted run can report them)
+	waits     []core.Wait // steps waiting for a signal, while quiescent
 }
 
 type timerRef struct {
@@ -121,6 +125,11 @@ type startReq struct {
 	plan   *ir.Plan
 	tier   Tier
 	input  json.RawMessage
+	reply  chan startReply // answered once the start is durable
+}
+
+type startReply struct {
+	existing bool
 }
 
 type msgKind uint8
@@ -268,8 +277,9 @@ func (s *shard) handle(m *msg) {
 		r.writing = false
 		if r.done {
 			// Deleting only now orders the delete after the write.
-			if r.deleteSnap {
-				s.deleteSnapshot(r)
+			if r.finishJob != nil {
+				s.e.doIO(r.finishJob)
+				r.finishJob = nil
 			}
 			return
 		}
@@ -353,8 +363,14 @@ func reviews(r *run) []Review {
 }
 
 func (s *shard) startRun(sr *startReq) {
-	if _, dup := s.runs[sr.runID]; dup {
+	if r, dup := s.runs[sr.runID]; dup {
+		// The id is an idempotency key: answer for the existing run.
 		s.e.adm.Release(sr.tenant)
+		if r.started {
+			sr.reply <- startReply{existing: true}
+		} else {
+			r.startWait = append(r.startWait, sr.reply)
+		}
 		return
 	}
 	if old := s.pins[sr.runID]; old != nil {
@@ -370,7 +386,15 @@ func (s *shard) startRun(sr *startReq) {
 		r.lastLSN, r.startLSN = l.lsn, l.lsn
 	}
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "run.start", RunID: r.id, Tenant: r.tenant, Data: sr.input})
+	r.startWait = append(r.startWait, sr.reply)
 	s.event(r, core.Event{Kind: core.EvStart, Data: sr.input})
+	if l := s.logFor(r); l != nil {
+		// Durable once the start record and the EvStart event are. Held at
+		// lastLSN (at or after both) to keep the held list in LSN order.
+		s.hold(l, r, hStarted, nil)
+	} else {
+		s.release(held{kind: hStarted, run: r})
+	}
 }
 
 func (s *shard) meta(r *run) *startMeta {
@@ -521,6 +545,10 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 		}
 		h.run.holds--
 		s.release(h)
+		if h.run.holds == 0 && h.kind != hEvict {
+			// An eviction may have been skipped while this was held.
+			s.maybeEvict(h.run)
+		}
 	}
 	if i > 0 {
 		n := copy(l.held, l.held[i:])
@@ -540,6 +568,13 @@ func (s *shard) release(h held) {
 		s.finish(h.run)
 	case hEvict:
 		s.maybeEvict(h.run)
+	case hStarted:
+		r := h.run
+		r.started = true
+		for i, w := range r.startWait {
+			w <- startReply{existing: i > 0} // the first waiter submitted it
+		}
+		r.startWait = nil
 	case hCheckpoint:
 		r, snap := h.run, h.snapLSN
 		if r.done || snap < r.cpLSN {
@@ -554,7 +589,6 @@ func (s *shard) release(h held) {
 			post = r.postSnap // the same snapshot, logged again
 		}
 		r.cpLSN, r.cpRec, r.postSnap = snap, h.lsn, post
-		s.maybeEvict(r) // an eviction may have been skipped while this was held
 	}
 }
 
@@ -680,16 +714,43 @@ func (s *shard) finish(r *run) {
 	delete(s.runs, r.id)
 	s.inMemory.Add(-1)
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "run.done", RunID: r.id, Tenant: r.tenant, Data: r.st.Output, Err: r.st.Error})
-	if r.tier >= TierFile {
-		s.pins[r.id] = r
-		if r.writing {
-			r.deleteSnap = true // delete once the in-flight write completes
-		} else {
-			s.deleteSnapshot(r)
+	s.e.adm.Release(r.tenant)
+
+	// The run's blobs are deleted now (ADR 0024). If its output refers to
+	// blobs, it is inlined first, and waiters are told only after that, so
+	// nobody is handed a reference to a deleted blob.
+	inline := bytes.Contains(ri.Output, []byte(`"$blob"`))
+	if inline {
+		s.e.rememberFinished(ri) // Get still resolves it: the blobs are not gone yet
+	} else {
+		s.e.finish(ri)
+	}
+	id, tier := r.id, r.tier
+	job := func() {
+		if inline {
+			if out, err := s.e.ResolveInput(ri.Output); err == nil {
+				ri.Output = out
+			} else {
+				log.Printf("kairo: run %s: inlining its output: %v", id, err)
+			}
+			s.e.finish(ri)
+		}
+		s.e.deleteBlobs(id)
+		if tier >= TierFile {
+			s.e.snaps.Delete("snap/" + id)
+			s.inbox.Push(msg{kind: mSnapDeleted, run: r})
 		}
 	}
-	s.e.adm.Release(r.tenant)
-	s.e.finish(ri)
+	if tier >= TierFile {
+		// Keep the run's records until its snapshot and blobs are gone, so a
+		// crash in between cannot resurrect it (ADR 0016).
+		s.pins[r.id] = r
+		if r.writing {
+			r.finishJob = job // after the in-flight snapshot write
+			return
+		}
+	}
+	s.e.doIO(job)
 }
 
 // maybeEvict snapshots a run that is only waiting (timers far away,
@@ -731,15 +792,6 @@ func (s *shard) writeSnapshot(r *run) {
 	s.e.doIO(func() {
 		err := s.e.snaps.Put("snap/"+r.id, data)
 		s.inbox.Push(msg{kind: mSnapStored, run: r, lsn: lsn, err: err})
-	})
-}
-
-// deleteSnapshot removes a finished run's snapshot; until that is done the
-// run stays in s.pins and keeps its log records.
-func (s *shard) deleteSnapshot(r *run) {
-	s.e.doIO(func() {
-		s.e.snaps.Delete("snap/" + r.id)
-		s.inbox.Push(msg{kind: mSnapDeleted, run: r})
 	})
 }
 

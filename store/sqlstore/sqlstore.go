@@ -85,6 +85,7 @@ type queries struct {
 	blobDelete  string
 	blobInsert  string
 	blobGet     string
+	blobGroup   string // delete a bounded batch of names in [p1, p2)
 }
 
 func buildQueries(d *Dialect, prefix string) *queries {
@@ -117,6 +118,7 @@ func buildQueries(d *Dialect, prefix string) *queries {
 	q.blobDelete = fmt.Sprintf("DELETE FROM %s WHERE k = %s", obj, p(1))
 	q.blobInsert = fmt.Sprintf("INSERT INTO %s (k, part, data) VALUES (%s, %s, %s)", obj, p(1), p(2), p(3))
 	q.blobGet = fmt.Sprintf("SELECT data FROM %s WHERE k = %s ORDER BY part", obj, p(1))
+	q.blobGroup = d.DeleteLimited(obj, fmt.Sprintf("k >= %s AND k < %s", p(1), p(2)), d.RetireBatch)
 	return q
 }
 
@@ -395,7 +397,10 @@ type Store struct {
 	part int
 }
 
-var _ blob.Store = (*Store)(nil)
+var (
+	_ blob.Store   = (*Store)(nil)
+	_ blob.Grouper = (*Store)(nil)
+)
 
 func OpenStore(db *sql.DB, d Dialect, o Options) (*Store, error) {
 	q, err := prepare(db, &d, &o)
@@ -469,6 +474,29 @@ func (s *Store) Get(key string) ([]byte, error) {
 		out = []byte{}
 	}
 	return out, nil
+}
+
+// DeleteGroup deletes every object whose key starts with group + "/"
+// (ADR 0024), as the byte range [prefix, prefix with its final "/" bumped
+// to "0"): names compare as bytes in every dialect (ADR 0025), so the range
+// is exactly the prefix and uses the primary key. Deleted in batches.
+func (s *Store) DeleteGroup(group string) error {
+	lo, err := s.name(group + "/")
+	if err != nil {
+		return err
+	}
+	hi := lo[:len(lo)-1] + "0"
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), s.o.StatementTimeout)
+		res, err := s.db.ExecContext(ctx, s.q.blobGroup, lo, hi)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+	}
 }
 
 func (s *Store) Delete(key string) error {

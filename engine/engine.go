@@ -94,6 +94,10 @@ type Config struct {
 	// SegmentSize: file-tier log segment size (default 64 MiB).
 	SegmentSize int64
 
+	// RecentRuns is how many finished runs Get, Wait and Submit's
+	// idempotency remember (default 100,000).
+	RecentRuns int
+
 	// EvictAfter: a run that has nothing in flight and will not be woken
 	// for at least this long is snapshotted and dropped from memory.
 	// Default 2s; negative disables eviction.
@@ -193,6 +197,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.BlobThreshold <= 0 {
 		cfg.BlobThreshold = 16 << 10
+	}
+	if cfg.RecentRuns <= 0 {
+		cfg.RecentRuns = 100_000
 	}
 	if cfg.CompactEvery == 0 {
 		cfg.CompactEvery = 65536
@@ -447,17 +454,41 @@ func newRunID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Submit admits a run. It returns once the run is started or queued for
-// admission; it never waits for execution.
-func (e *Engine) Submit(req SubmitRequest) (string, error) {
+// SubmitResult describes an accepted submission.
+type SubmitResult struct {
+	RunID string `json:"run_id"`
+	// Existing: the run id was already running or recently finished; no
+	// new run was started (the id is an idempotency key, ADR 0023).
+	Existing bool `json:"existing"`
+}
+
+var (
+	// ErrNotAccepted: ctx ended while the run waited for admission; it was
+	// withdrawn and never started.
+	ErrNotAccepted = errors.New("engine: not accepted (still waiting for admission when the context ended)")
+	// ErrUnconfirmed: the run was started but ctx ended before its start was
+	// durable. It may or may not survive a crash: submit again with the
+	// same RunID to find out.
+	ErrUnconfirmed = errors.New("engine: started but not yet durable when the context ended; retry with the same RunID")
+)
+
+// Submit starts a run and returns once its start is durable (immediately
+// for TierNone): a run Submit accepted survives a crash (ADR 0023). It
+// waits for admission if the engine is at capacity, until ctx ends.
+//
+// RunID is an idempotency key: submitting an id that is running or
+// recently finished (Config.RecentRuns, in this process) starts nothing
+// and reports Existing. Without a RunID the engine assigns one and a retry
+// would start a second run.
+func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, error) {
 	select {
 	case <-e.stopped:
-		return "", ErrClosed
+		return SubmitResult{}, ErrClosed
 	default:
 	}
 	p := e.plan(req.Plan)
 	if p == nil {
-		return "", fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
+		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
 	}
 	tier := e.cfg.DefaultTier
 	if req.Tier != nil {
@@ -467,24 +498,35 @@ func (e *Engine) Submit(req SubmitRequest) (string, error) {
 		tier = e.cfg.RealMinTier
 	}
 	if tier >= tierCount || !e.tiers[tier] {
-		return "", fmt.Errorf("%w: %s", ErrTier, tier)
+		return SubmitResult{}, fmt.Errorf("%w: %s", ErrTier, tier)
 	}
 	id := req.RunID
 	if id == "" {
 		id = newRunID()
 	} else {
-		// Reusing the id of a finished run: Get and Wait must see the new run.
 		e.waitMu.Lock()
-		delete(e.finished, id)
+		_, done := e.finished[id]
 		e.waitMu.Unlock()
+		if done {
+			return SubmitResult{RunID: id, Existing: true}, nil
+		}
 	}
-	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input}
+	reply := make(chan startReply, 1)
+	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, reply: reply}
 	sh := e.shardFor(id)
-	_, err := e.adm.Admit(req.Tenant, func() { sh.inbox.Push(msg{kind: mStart, start: sr}) })
+	ticket, err := e.adm.Admit(req.Tenant, func() { sh.inbox.Push(msg{kind: mStart, start: sr}) })
 	if err != nil {
-		return "", err
+		return SubmitResult{}, err
 	}
-	return id, nil
+	select {
+	case r := <-reply:
+		return SubmitResult{RunID: id, Existing: r.existing}, nil
+	case <-ctx.Done():
+		if ticket.Cancel() {
+			return SubmitResult{}, ErrNotAccepted
+		}
+		return SubmitResult{RunID: id}, ErrUnconfirmed
+	}
 }
 
 // Signal delivers an external event (webhook, approval) to a run.
@@ -553,7 +595,13 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 	}
 }
 
-const finishedCache = 100_000
+// rememberFinished records a finished run for Get and Submit's
+// idempotency without waking waiters (they are woken by finish).
+func (e *Engine) rememberFinished(ri RunInfo) {
+	e.waitMu.Lock()
+	e.finished[ri.RunID] = ri
+	e.waitMu.Unlock()
+}
 
 func (e *Engine) finish(ri RunInfo) {
 	e.waitMu.Lock()
@@ -561,8 +609,8 @@ func (e *Engine) finish(ri RunInfo) {
 	delete(e.waiters, ri.RunID)
 	e.finished[ri.RunID] = ri
 	e.finOrder = append(e.finOrder, ri.RunID)
-	if len(e.finOrder) > finishedCache {
-		old := e.finOrder[:len(e.finOrder)-finishedCache]
+	if keep := e.cfg.RecentRuns; len(e.finOrder) > keep {
+		old := e.finOrder[:len(e.finOrder)-keep]
 		for _, id := range old {
 			delete(e.finished, id)
 		}

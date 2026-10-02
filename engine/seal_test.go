@@ -57,7 +57,7 @@ func TestEncryptedEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, _ := e1.Submit(SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, RunID: "run-visible-name", Input: json.RawMessage(`{"secret":"TOPSECRET-123"}`)})
+	id, _ := submit(e1, SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, RunID: "run-visible-name", Input: json.RawMessage(`{"secret":"TOPSECRET-123"}`)})
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), id); return ri.Evicted && len(ri.Waits) == 1 })
 	e1.Close()
 	if hits := filesContain(t, dir, "TOPSECRET-123"); len(hits) > 0 {
@@ -88,7 +88,7 @@ func TestTamperedLogRefusesToStart(t *testing.T) {
 	dir := t.TempDir()
 	ft := TierFile
 	e1, _ := startSealed(t, dir, testKeys(t, 1))
-	id, _ := e1.Submit(SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, Input: json.RawMessage(`{"secret":"x"}`)})
+	id, _ := submit(e1, SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, Input: json.RawMessage(`{"secret":"x"}`)})
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), id); return len(ri.Waits) == 1 })
 	e1.Close()
 	// Flip a payload bit and recompute nothing else: CRC catches it as a
@@ -125,7 +125,7 @@ func TestStaleSnapshotRefusesToStart(t *testing.T) {
 			}
 			ft := TierFile
 			e1, _ := startSealed(t, dir, keys)
-			id, _ := e1.Submit(SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, Input: json.RawMessage(`{"secret":"x"}`)})
+			id, _ := submit(e1, SubmitRequest{Plan: "two", Tenant: "t", Tier: &ft, Input: json.RawMessage(`{"secret":"x"}`)})
 			snapFile := func() string {
 				var f string
 				filepath.Walk(filepath.Join(dir, "snapshots"), func(p string, fi os.FileInfo, err error) error {

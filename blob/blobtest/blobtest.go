@@ -73,11 +73,44 @@ func Run(t *testing.T, s blob.Store, o Options) {
 	if o.ArbitraryNames {
 		arbitraryNames(t, s)
 	}
+	if g, ok := s.(blob.Grouper); ok {
+		groups(t, s, g)
+	}
+}
+
+// groups: DeleteGroup removes exactly the group's objects (ADR 0024).
+func groups(t *testing.T, s blob.Store, g blob.Grouper) {
+	put := func(k string) {
+		if err := s.Put(k, []byte(k)); err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+	}
+	victims := []string{"run/a/sha256:1", "run/a/sha256:2"}
+	survivors := []string{"run/a0/sha256:1", "run/ab/sha256:1", "run/A/sha256:1", "snap/a", "run/b/sha256:1"}
+	for _, k := range append(append([]string{}, victims...), survivors...) {
+		put(k)
+	}
+	if err := g.DeleteGroup(blob.RunGroup("a")); err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+	for _, k := range victims {
+		if _, err := s.Get(k); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("%s survived DeleteGroup: %v", k, err)
+		}
+	}
+	for _, k := range survivors {
+		if got, err := s.Get(k); err != nil || string(got) != k {
+			t.Errorf("%s was deleted with another group: %q %v", k, got, err)
+		}
+	}
+	if err := g.DeleteGroup(blob.RunGroup("nothing-here")); err != nil {
+		t.Fatalf("DeleteGroup of an empty group: %v", err)
+	}
 }
 
 // arbitraryNames: names are data, never SQL or paths.
 func arbitraryNames(t *testing.T, s blob.Store) {
-	odd := []string{`snap/'; DROP TABLE kairo_blob; --`, `snap/"quoted"`, "snap/日本語", "snap/a%_b", `snap/..\..\x`, "snap/../../escape"}
+	odd := []string{`snap/'; DROP TABLE kairo_blob; --`, `snap/"quoted"`, "snap/日本語", "snap/a%_b", `snap/..\..\x`, "snap/../../escape", "snap/Case", "snap/case"}
 	for _, k := range odd {
 		if err := s.Put(k, []byte(k)); err != nil {
 			t.Fatalf("Put(%q): %v", k, err)

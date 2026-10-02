@@ -169,14 +169,14 @@ func TestEngineCompactionAndRecovery(t *testing.T) {
 	dir := t.TempDir()
 	ft := engine.TierFile
 	x := start(t, dir, engine.Config{Shards: 1, CompactEvery: 64, EvictAfter: 50 * time.Millisecond})
-	waiting, _ := x.e.Submit(engine.SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft})
+	waiting, _ := submit(x.e, engine.SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft})
 	waitFor(t, func() bool { ri, _ := x.e.Get(context.Background(), waiting); return ri.Evicted })
 	for i := 0; i < 400; i++ {
-		id, _ := x.e.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+		id, _ := submit(x.e, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
 		wait(t, x.e, id)
 	}
 	waitFor(t, func() bool {
-		id, _ := x.e.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
+		id, _ := submit(x.e, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
 		wait(t, x.e, id)
 		return logRows(t, dir) < 1000
 	})
@@ -192,4 +192,10 @@ func TestEngineCompactionAndRecovery(t *testing.T) {
 	if ri := wait(t, y.e, waiting); ri.Status != "completed" || !strings.Contains(string(ri.Output), `"by":"bob"`) {
 		t.Fatalf("%+v", ri)
 	}
+}
+
+// submit is Submit for tests that only need the run id.
+func submit(e *engine.Engine, req engine.SubmitRequest) (string, error) {
+	r, err := e.Submit(context.Background(), req)
+	return r.RunID, err
 }

@@ -133,7 +133,7 @@ func throughput(t *testing.T, backend string) (runsPerSec, cpuPerRun float64, lo
 	c0, t0 := cpu(), time.Now()
 	for i := 0; i < runs; i++ {
 		sem <- struct{}{}
-		id, err := x.e.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &ft})
+		id, err := submit(x.e, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &ft})
 		if err != nil {
 			t.Fatal(err)
 		}

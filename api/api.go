@@ -130,22 +130,43 @@ func (a *API) postPlan(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]any{"name": p.Name, "hash": p.Hash, "has_real": p.HasReal, "effects": effects})
 }
 
+// postRun starts a run and answers once its start is durable (ADR 0023):
+// 201 for a new run, 200 if the Idempotency-Key (the run id) was already
+// running or recently finished. ?timeout= bounds the wait (default 30s).
 func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 	var req engine.SubmitRequest
 	if err := readJSON(r, &req); err != nil {
 		fail(w, 400, err)
 		return
 	}
-	id, err := a.E.Submit(req)
+	if k := r.Header.Get("Idempotency-Key"); k != "" {
+		req.RunID = k
+	}
+	timeout := 30 * time.Second
+	if t := r.URL.Query().Get("timeout"); t != "" {
+		if d, err := time.ParseDuration(t); err == nil {
+			timeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	res, err := a.E.Submit(ctx, req)
 	switch {
 	case errors.Is(err, sched.ErrOverloaded):
 		fail(w, 429, err)
+	case errors.Is(err, engine.ErrNotAccepted):
+		w.Header().Set("Retry-After", "1")
+		fail(w, 503, err)
+	case errors.Is(err, engine.ErrUnconfirmed):
+		reply(w, 504, map[string]string{"error": err.Error(), "run_id": res.RunID})
 	case errors.Is(err, engine.ErrUnknownPlan):
 		fail(w, 404, err)
 	case err != nil:
 		fail(w, 400, err)
+	case res.Existing:
+		reply(w, 200, res)
 	default:
-		reply(w, 202, map[string]string{"run_id": id})
+		reply(w, 201, res)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"strings"
 
 	"kairo/blob"
@@ -97,10 +99,22 @@ func (e *Engine) Complete(t *task.Task, res task.Result) {
 	e.shardFor(t.RunID).inbox.Push(msg{kind: mEvent, runID: t.RunID, ev: ev})
 }
 
+// deleteBlobs drops a finished run's blobs (ADR 0024). Stores that cannot
+// delete groups keep them.
+func (e *Engine) deleteBlobs(runID string) {
+	g, ok := e.blobs.(blob.Grouper)
+	if !ok {
+		return
+	}
+	if err := g.DeleteGroup(blob.RunGroup(runID)); err != nil && !errors.Is(err, blob.ErrNoGroups) {
+		log.Printf("kairo: deleting blobs of run %s: %v", runID, err)
+	}
+}
+
 // externalize stores out as a blob and returns the envelope that replaces
 // it in the state: the reference plus the node's declared typed fields.
 func (e *Engine) externalize(t *task.Task, out json.RawMessage) (json.RawMessage, error) {
-	key, err := blob.PutContent(e.blobs, out)
+	key, err := blob.PutRunContent(e.blobs, t.RunID, out)
 	if err != nil {
 		return nil, err
 	}

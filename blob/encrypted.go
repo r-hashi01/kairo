@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"errors"
 	"sync"
 
 	"kairo/seal"
@@ -19,10 +20,42 @@ type encStore struct {
 	openers sync.Pool
 }
 
+// ErrNoGroups: the inner store cannot delete groups.
+var ErrNoGroups = errors.New("blob: store does not support DeleteGroup")
+
 func aad(name string) []byte { return append([]byte("kairo-blob\x00"), name...) }
 
-func (s *encStore) Put(key string, data []byte) error {
+// storedName hides key; a grouped key keeps a (hidden) group, so the
+// inner store can still delete the group at once.
+func (s *encStore) storedName(key string) (string, error) {
 	name, err := seal.Name(s.keys, key)
+	if err != nil {
+		return "", err
+	}
+	if g, ok := GroupOf(key); ok {
+		hg, err := seal.Name(s.keys, g)
+		if err != nil {
+			return "", err
+		}
+		return "run/" + hg[2:] + "/" + name, nil
+	}
+	return name, nil
+}
+
+func (s *encStore) DeleteGroup(group string) error {
+	g, ok := s.inner.(Grouper)
+	if !ok {
+		return ErrNoGroups
+	}
+	hg, err := seal.Name(s.keys, group)
+	if err != nil {
+		return err
+	}
+	return g.DeleteGroup("run/" + hg[2:])
+}
+
+func (s *encStore) Put(key string, data []byte) error {
+	name, err := s.storedName(key)
 	if err != nil {
 		return err
 	}
@@ -34,7 +67,7 @@ func (s *encStore) Put(key string, data []byte) error {
 }
 
 func (s *encStore) Get(key string) ([]byte, error) {
-	name, err := seal.Name(s.keys, key)
+	name, err := s.storedName(key)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +81,7 @@ func (s *encStore) Get(key string) ([]byte, error) {
 }
 
 func (s *encStore) Delete(key string) error {
-	name, err := seal.Name(s.keys, key)
+	name, err := s.storedName(key)
 	if err != nil {
 		return err
 	}

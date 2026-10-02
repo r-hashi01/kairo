@@ -79,7 +79,7 @@ func Measure(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 	c0, t0 := cpu(), time.Now()
 	for i := 0; i < runs; i++ {
 		sem <- struct{}{}
-		id, err := e.Submit(engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &ft})
+		id, err := submit(e, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: fmt.Sprint(i % 8), Tier: &ft})
 		if err != nil {
 			t.Fatal(err)
 		}

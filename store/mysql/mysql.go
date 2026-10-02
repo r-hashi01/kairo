@@ -21,11 +21,12 @@ func limited(t, w string, n int) string {
 	return fmt.Sprintf("DELETE FROM %s WHERE %s LIMIT %d", t, w, n)
 }
 
-// MySQL is the MySQL (8.0+) dialect. IDs are VARCHAR(512) (utf8mb4: 2048
-// bytes, within the 3072-byte index limit).
+// MySQL is the MySQL (8.0+) dialect. Names are VARBINARY(512): compared
+// as bytes, case-sensitively, whatever the server's default collation
+// (the default utf8mb4_0900_ai_ci would merge "Run-A" and "run-a", ADR 0025).
 var MySQL = sqlstore.Dialect{
 	Name: "mysql", Placeholder: sqlstore.Q,
-	IDType: "VARCHAR(512)", BigInt: "BIGINT", BytesType: "LONGBLOB",
+	IDType: "VARBINARY(512)", BigInt: "BIGINT", BytesType: "LONGBLOB",
 	ForUpdate: " FOR UPDATE", MultiRowInsert: true, DeleteLimited: limited,
 	PartSize: 1 << 20, RetireBatch: 10000,
 }
@@ -34,7 +35,7 @@ var MySQL = sqlstore.Dialect{
 // under TiDB's entry and transaction size limits.
 var TiDB = sqlstore.Dialect{
 	Name: "tidb", Placeholder: sqlstore.Q,
-	IDType: "VARCHAR(512)", BigInt: "BIGINT", BytesType: "LONGBLOB",
+	IDType: "VARBINARY(512)", BigInt: "BIGINT", BytesType: "LONGBLOB",
 	ForUpdate: " FOR UPDATE", MultiRowInsert: true, DeleteLimited: limited,
 	PartSize: 512 << 10, RetireBatch: 2000,
 }

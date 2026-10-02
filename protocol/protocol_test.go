@@ -62,7 +62,7 @@ func TestRemoteWorker(t *testing.T) {
 		return task.Result{Output: out}
 	}}
 	go wk.Run(ctx, "unix", sock)
-	id, err := e.Submit(engine.SubmitRequest{Plan: "p", Tenant: "t", Input: json.RawMessage(`{"xs":[1,2,3,4,5,6,7,8,9,10]}`)})
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t", Input: json.RawMessage(`{"xs":[1,2,3,4,5,6,7,8,9,10]}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestWorkerDisconnect(t *testing.T) {
 		return task.Result{Err: "crashed", Unknown: true}
 	}}
 	go hang.Run(ctx1, "unix", sock)
-	id, _ := e.Submit(engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	id, _ := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
 	for got.Load() < 2 {
 		time.Sleep(time.Millisecond)
 	}
@@ -113,4 +113,10 @@ func TestWorkerDisconnect(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// submit is Submit for tests that only need the run id.
+func submit(e *engine.Engine, req engine.SubmitRequest) (string, error) {
+	r, err := e.Submit(context.Background(), req)
+	return r.RunID, err
 }
