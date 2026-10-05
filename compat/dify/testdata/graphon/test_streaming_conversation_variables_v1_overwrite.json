@@ -218,8 +218,9 @@
    "node": "start",
    "outputs": {
     "conversation.conv_var": "default",
-    "query": "hello",
-    "sys.query": "hello"
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "query": "hello"
    }
   },
   {

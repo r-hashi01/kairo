@@ -98,3 +98,19 @@ graphon には、次の弱点がある（調査メモの 3 節）。
   - ノードファクトリは差し替えられる。Dify では DifyNodeFactory（モデル、プラグイン、ファイル）を渡す。ここでは graphon の DSL 用のファクトリ（`slim_factory`）を使う。
   - エンドツーエンドのテスト（`TestGraphonWorkerEndToEnd`）: Dify のワークフローを変換して kairo のエンジンで実行し、ノードは Python のワーカーが graphon の実装（Jinja2 のテンプレート、ローカルの HTTP サーバへのリクエスト）で実行する。`GRAPHON_PYTHON` があるときだけ動く。
 - **リトライは、graphon と同じく llm / code / http-request / tool にだけ付ける。** graphon は、ほかのノードの `retry_config` を無視するため。
+- **差分ハーネスのデータを増やした（2026-10-05）。** 39 本がすべて一致している。新しく足したのは次のとおり。
+  - question-classifier: 3 方向の分岐と aggregator。分類先を変えたケースも足した。分類器の出力の `class_id` が、そのまま分岐のハンドルになる。
+  - list-operator: 文字列・数値・真偽値のリストに対する、絞り込み・取り出し・並べ替え・件数の制限。データを与えたケースと、空のケースも足した。
+  - human-input: 2 つの操作とタイムアウト。却下とタイムアウトのケースも足した。
+- **list-operator は Go の保護アクション `kairo.list` にした。** graphon 0.7.0 の実装を移植した。合わせた点は次のとおり。
+  - リストの要素の型で、フィルタの種類が決まる。
+  - 文字列の `in` は部分一致。
+  - `limit` の負の値は、Python のスライスと同じく末尾から数える。
+  - 並べ替えは安定。
+  - エラーの種類は graphon と同じ名前にした。
+- **human-input は、待機ノードと分岐ノードの組にした**（ADR 0036 の「human-input は signal に置き換える」の写し方）。
+  - 待機は signal `human-input:<ID>` を待ち、タイムアウトは Dify のノードの `timeout` と `timeout_unit` から決める。
+  - 直後の `<ID>__route`（`kairo.switch`）が、選ばれた操作の ID で分岐する。タイムアウトなら `__timeout`（Dify の TIMEOUT_HANDLE）で分岐する。
+  - フォームが送信されたら、ホストは `{"handle": 操作の ID, "outputs": {...}}` を `SignalStep` で送る。`[ID, 名前]` の参照は、signal の中身の `outputs` を読む。
+- **失敗する実行の比較。** 状態だけを比べる。並列の枝が失敗の時点でどこまで進んでいたかは、graphon でもスレッドの順序次第で決まらないため。
+- **まだ比べていないもの。** knowledge-retrieval、agent、document-extractor、datasource、trigger の各ノード。いずれも Dify 本体か外部のサービスに依存し、モックでは中身を比べられない。

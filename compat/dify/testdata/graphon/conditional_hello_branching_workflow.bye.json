@@ -283,8 +283,9 @@
    "event": "NodeRunSucceededEvent",
    "node": "1754154032319",
    "outputs": {
-    "query": "goodbye",
-    "sys.query": "goodbye"
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "goodbye",
+    "query": "goodbye"
    }
   },
   {

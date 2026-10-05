@@ -220,6 +220,8 @@ func (m *machine) protected(n *ir.Node, scope uint32) (json.RawMessage, error) {
 		return m.evalTemplate(n, scope)
 	case ir.ActionCoalesce:
 		return m.evalCoalesce(n, scope)
+	case ir.ActionList:
+		return m.evalList(n, scope)
 	}
 	if n.Spec.Action == ir.ActionAppend {
 		b := []byte{'['}

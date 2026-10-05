@@ -605,12 +605,13 @@
    "event": "NodeRunSucceededEvent",
    "node": "1754405559643",
    "outputs": {
-    "query": "hello",
-    "switch1": 1,
-    "switch2": 1,
+    "sys.workflow_execution_id": "harness-run",
     "sys.query": "hello",
     "sys.switch1": 1,
-    "sys.switch2": 1
+    "sys.switch2": 1,
+    "query": "hello",
+    "switch1": 1,
+    "switch2": 1
    }
   },
   {

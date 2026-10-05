@@ -154,8 +154,8 @@
  },
  "status": "succeeded",
  "outputs": {
-  "ok": "code:fb",
-  "n": 1
+  "n": 1,
+  "ok": "code:fb"
  },
  "trace": [
   {
@@ -175,8 +175,9 @@
    "event": "NodeRunSucceededEvent",
    "node": "start",
    "outputs": {
-    "query": "hello",
-    "sys.query": "hello"
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "query": "hello"
    }
   },
   {
@@ -212,17 +213,6 @@
   },
   {
    "event": "NodeRunStartedEvent",
-   "node": "ok_end"
-  },
-  {
-   "event": "NodeRunSucceededEvent",
-   "node": "ok_end",
-   "outputs": {
-    "ok": "code:fb"
-   }
-  },
-  {
-   "event": "NodeRunStartedEvent",
    "node": "dv_end"
   },
   {
@@ -230,6 +220,17 @@
    "node": "dv_end",
    "outputs": {
     "n": 1
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "ok_end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "ok_end",
+   "outputs": {
+    "ok": "code:fb"
    }
   },
   {

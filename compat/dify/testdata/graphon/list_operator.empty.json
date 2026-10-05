@@ -1,0 +1,408 @@
+{
+ "fixture": "list_operator.yml",
+ "inputs": {
+  "query": "hello",
+  "needle": "zzz"
+ },
+ "case": {
+  "inputs": {
+   "needle": "zzz"
+  },
+  "outputs": {
+   "data": {
+    "strs": [],
+    "nums": [
+     1
+    ],
+    "flags": [
+     false
+    ]
+   }
+  }
+ },
+ "workflow": {
+  "conversation_variables": [],
+  "environment_variables": [],
+  "graph": {
+   "nodes": [
+    {
+     "id": "start",
+     "data": {
+      "type": "start",
+      "title": "Start",
+      "variables": [
+       {
+        "variable": "needle",
+        "type": "text-input",
+        "label": "needle"
+       }
+      ]
+     }
+    },
+    {
+     "id": "data",
+     "data": {
+      "type": "code",
+      "title": "Data",
+      "code": "def main():\n    return {}\n",
+      "code_language": "python3",
+      "variables": [],
+      "outputs": {
+       "strs": {
+        "type": "array[string]",
+        "children": null
+       },
+       "nums": {
+        "type": "array[number]",
+        "children": null
+       },
+       "flags": {
+        "type": "array[boolean]",
+        "children": null
+       }
+      }
+     }
+    },
+    {
+     "id": "strs",
+     "data": {
+      "type": "list-operator",
+      "title": "Strings",
+      "variable": [
+       "data",
+       "strs"
+      ],
+      "filter_by": {
+       "enabled": true,
+       "conditions": [
+        {
+         "key": "",
+         "comparison_operator": "contains",
+         "value": "{{#start.needle#}}"
+        }
+       ]
+      },
+      "order_by": {
+       "enabled": true,
+       "key": "",
+       "value": "desc"
+      },
+      "limit": {
+       "enabled": true,
+       "size": 2
+      },
+      "extract_by": {
+       "enabled": false,
+       "serial": "1"
+      }
+     }
+    },
+    {
+     "id": "nums",
+     "data": {
+      "type": "list-operator",
+      "title": "Numbers",
+      "variable": [
+       "data",
+       "nums"
+      ],
+      "filter_by": {
+       "enabled": true,
+       "conditions": [
+        {
+         "key": "",
+         "comparison_operator": "≥",
+         "value": "2"
+        }
+       ]
+      },
+      "order_by": {
+       "enabled": true,
+       "key": "",
+       "value": "asc"
+      },
+      "limit": {
+       "enabled": true,
+       "size": -1
+      },
+      "extract_by": {
+       "enabled": false,
+       "serial": "1"
+      }
+     }
+    },
+    {
+     "id": "pick",
+     "data": {
+      "type": "list-operator",
+      "title": "Pick",
+      "variable": [
+       "data",
+       "nums"
+      ],
+      "filter_by": {
+       "enabled": false,
+       "conditions": []
+      },
+      "order_by": {
+       "enabled": false,
+       "key": "",
+       "value": "asc"
+      },
+      "limit": {
+       "enabled": false,
+       "size": -1
+      },
+      "extract_by": {
+       "enabled": true,
+       "serial": "2"
+      }
+     }
+    },
+    {
+     "id": "flags",
+     "data": {
+      "type": "list-operator",
+      "title": "Flags",
+      "variable": [
+       "data",
+       "flags"
+      ],
+      "filter_by": {
+       "enabled": true,
+       "conditions": [
+        {
+         "key": "",
+         "comparison_operator": "is",
+         "value": true
+        }
+       ]
+      },
+      "order_by": {
+       "enabled": false,
+       "key": "",
+       "value": "asc"
+      },
+      "limit": {
+       "enabled": false,
+       "size": -1
+      },
+      "extract_by": {
+       "enabled": false,
+       "serial": "1"
+      }
+     }
+    },
+    {
+     "id": "end",
+     "data": {
+      "type": "end",
+      "title": "End",
+      "outputs": [
+       {
+        "variable": "strs",
+        "value_selector": [
+         "strs",
+         "result"
+        ],
+        "value_type": "array[string]"
+       },
+       {
+        "variable": "first",
+        "value_selector": [
+         "strs",
+         "first_record"
+        ],
+        "value_type": "string"
+       },
+       {
+        "variable": "nums",
+        "value_selector": [
+         "nums",
+         "result"
+        ],
+        "value_type": "array[number]"
+       },
+       {
+        "variable": "pick",
+        "value_selector": [
+         "pick",
+         "first_record"
+        ],
+        "value_type": "number"
+       },
+       {
+        "variable": "flags",
+        "value_selector": [
+         "flags",
+         "result"
+        ],
+        "value_type": "array[boolean]"
+       }
+      ]
+     }
+    }
+   ],
+   "edges": [
+    {
+     "source": "start",
+     "target": "data",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "data",
+     "target": "strs",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "data",
+     "target": "nums",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "data",
+     "target": "pick",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "data",
+     "target": "flags",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "strs",
+     "target": "end",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "nums",
+     "target": "end",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "pick",
+     "target": "end",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "flags",
+     "target": "end",
+     "sourceHandle": "source"
+    }
+   ]
+  }
+ },
+ "status": "failed",
+ "error": "Invalid serial index: must be <= 1, got 2",
+ "trace": [
+  {
+   "event": "GraphRunStartedEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "start"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "start",
+   "outputs": {
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "sys.needle": "zzz",
+    "query": "hello",
+    "needle": "zzz"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "data"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "data",
+   "outputs": {
+    "strs": [],
+    "nums": [
+     1
+    ],
+    "flags": [
+     false
+    ]
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "strs"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "strs",
+   "outputs": {
+    "result": [],
+    "first_record": null,
+    "last_record": null
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "nums"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "nums",
+   "outputs": {
+    "result": [],
+    "first_record": null,
+    "last_record": null
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "pick"
+  },
+  {
+   "event": "NodeRunFailedEvent",
+   "node": "pick"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "flags"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "flags",
+   "outputs": {
+    "result": [],
+    "first_record": null,
+    "last_record": null
+   }
+  },
+  {
+   "event": "GraphRunFailedEvent"
+  }
+ ]
+}

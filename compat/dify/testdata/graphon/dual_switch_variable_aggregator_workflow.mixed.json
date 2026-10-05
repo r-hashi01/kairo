@@ -610,12 +610,13 @@
    "event": "NodeRunSucceededEvent",
    "node": "1754405559643",
    "outputs": {
-    "query": "hello",
-    "switch1": 2,
-    "switch2": 1,
+    "sys.workflow_execution_id": "harness-run",
     "sys.query": "hello",
     "sys.switch1": 2,
-    "sys.switch2": 1
+    "sys.switch2": 1,
+    "query": "hello",
+    "switch1": 2,
+    "switch2": 1
    }
   },
   {
@@ -662,20 +663,6 @@
   },
   {
    "event": "NodeRunStartedEvent",
-   "node": "1754405668235"
-  },
-  {
-   "event": "GraphEdgeTakenEvent"
-  },
-  {
-   "event": "NodeRunSucceededEvent",
-   "node": "1754405668235",
-   "outputs": {
-    "output": "tpl:1754405668235"
-   }
-  },
-  {
-   "event": "NodeRunStartedEvent",
    "node": "1754405636857"
   },
   {
@@ -686,6 +673,20 @@
    "node": "1754405636857",
    "outputs": {
     "output": "tpl:1754405636857"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "1754405668235"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "1754405668235",
+   "outputs": {
+    "output": "tpl:1754405668235"
    }
   },
   {

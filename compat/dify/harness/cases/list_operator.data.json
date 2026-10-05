@@ -1,0 +1,1 @@
+{"inputs":{"needle":"an"},"outputs":{"data":{"strs":["banana","apple","mango","pecan","kiwi"],"nums":[5,1,4,2.5,3],"flags":[true,false,true]}}}

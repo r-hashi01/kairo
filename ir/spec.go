@@ -197,6 +197,8 @@ const (
 	// exists, as its variable-aggregator does (ADR 0028).
 	ActionTemplate = "kairo.template"
 	ActionCoalesce = "kairo.coalesce"
+	// ActionList is Dify's list-operator.
+	ActionList = "kairo.list"
 )
 
 // Registry holds node specs by action name.
@@ -212,6 +214,7 @@ func NewRegistry() *Registry {
 	r.Register(NodeSpec{Action: ActionAssign, Effect: EffectProtected})
 	r.Register(NodeSpec{Action: ActionTemplate, Effect: EffectProtected})
 	r.Register(NodeSpec{Action: ActionCoalesce, Effect: EffectProtected})
+	r.Register(NodeSpec{Action: ActionList, Effect: EffectProtected})
 	// The output is Dify's if-else's: {"result", "selected_case_id"}; the
 	// case id (or "false") is the branch.
 	r.Register(NodeSpec{Action: ActionSwitch, Effect: EffectProtected, Branch: "selected_case_id", Outputs: map[string]FieldType{

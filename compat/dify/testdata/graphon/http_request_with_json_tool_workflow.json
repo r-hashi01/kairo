@@ -260,10 +260,11 @@
    "event": "NodeRunSucceededEvent",
    "node": "start_node",
    "outputs": {
-    "query": "hello",
-    "url": "hello",
+    "sys.workflow_execution_id": "harness-run",
     "sys.query": "hello",
-    "sys.url": "hello"
+    "sys.url": "hello",
+    "query": "hello",
+    "url": "hello"
    }
   },
   {

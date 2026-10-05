@@ -1,0 +1,275 @@
+{
+ "fixture": "question_classifier.yml",
+ "inputs": {
+  "query": "hello",
+  "q": "hello"
+ },
+ "case": {},
+ "workflow": {
+  "conversation_variables": [],
+  "environment_variables": [],
+  "graph": {
+   "nodes": [
+    {
+     "id": "start",
+     "data": {
+      "type": "start",
+      "title": "Start",
+      "variables": [
+       {
+        "variable": "q",
+        "type": "text-input",
+        "label": "q"
+       }
+      ]
+     }
+    },
+    {
+     "id": "qc",
+     "data": {
+      "type": "question-classifier",
+      "title": "Classify",
+      "query_variable_selector": [
+       "start",
+       "q"
+      ],
+      "model": {
+       "provider": "langgenius/openai/openai",
+       "name": "gpt-4o",
+       "mode": "chat",
+       "completion_params": {}
+      },
+      "classes": [
+       {
+        "id": "refund",
+        "name": "Refund"
+       },
+       {
+        "id": "tech",
+        "name": "Tech"
+       },
+       {
+        "id": "other",
+        "name": "Other"
+       }
+      ]
+     }
+    },
+    {
+     "id": "refund_tpl",
+     "data": {
+      "type": "template-transform",
+      "title": "Refund",
+      "template": "refund",
+      "variables": []
+     }
+    },
+    {
+     "id": "tech_tpl",
+     "data": {
+      "type": "template-transform",
+      "title": "Tech",
+      "template": "tech",
+      "variables": []
+     }
+    },
+    {
+     "id": "other_tpl",
+     "data": {
+      "type": "template-transform",
+      "title": "Other",
+      "template": "other",
+      "variables": []
+     }
+    },
+    {
+     "id": "agg",
+     "data": {
+      "type": "variable-aggregator",
+      "title": "Join",
+      "output_type": "string",
+      "variables": [
+       [
+        "refund_tpl",
+        "output"
+       ],
+       [
+        "tech_tpl",
+        "output"
+       ],
+       [
+        "other_tpl",
+        "output"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "end",
+     "data": {
+      "type": "end",
+      "title": "End",
+      "outputs": [
+       {
+        "variable": "route",
+        "value_selector": [
+         "qc",
+         "class_id"
+        ],
+        "value_type": "string"
+       },
+       {
+        "variable": "reply",
+        "value_selector": [
+         "agg",
+         "output"
+        ],
+        "value_type": "string"
+       }
+      ]
+     }
+    }
+   ],
+   "edges": [
+    {
+     "source": "start",
+     "target": "qc",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "qc",
+     "target": "refund_tpl",
+     "sourceHandle": "refund"
+    },
+    {
+     "source": "qc",
+     "target": "tech_tpl",
+     "sourceHandle": "tech"
+    },
+    {
+     "source": "qc",
+     "target": "other_tpl",
+     "sourceHandle": "other"
+    },
+    {
+     "source": "refund_tpl",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "tech_tpl",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "other_tpl",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "agg",
+     "target": "end",
+     "sourceHandle": "source"
+    }
+   ]
+  }
+ },
+ "status": "succeeded",
+ "outputs": {
+  "route": "refund",
+  "reply": "tpl:refund_tpl"
+ },
+ "trace": [
+  {
+   "event": "GraphRunStartedEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "start"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "start",
+   "outputs": {
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "sys.q": "hello",
+    "query": "hello",
+    "q": "hello"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "qc"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "qc",
+   "outputs": {
+    "class_id": "refund",
+    "class_name": "qc:qc"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "refund_tpl"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "refund_tpl",
+   "outputs": {
+    "output": "tpl:refund_tpl"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "agg"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "agg",
+   "outputs": {
+    "output": "tpl:refund_tpl"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "end",
+   "outputs": {
+    "route": "refund",
+    "reply": "tpl:refund_tpl"
+   }
+  },
+  {
+   "event": "GraphRunSucceededEvent"
+  }
+ ]
+}

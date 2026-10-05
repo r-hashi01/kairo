@@ -406,8 +406,9 @@
    "node": "1759032354471",
    "outputs": {
     "conversation.answer": "",
-    "query": "hello",
-    "sys.query": "hello"
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "query": "hello"
    }
   },
   {

@@ -1,0 +1,271 @@
+{
+ "fixture": "human_input.yml",
+ "inputs": {
+  "query": "hello"
+ },
+ "case": {
+  "human": {
+   "review": {
+    "handle": "reject",
+    "outputs": {
+     "comment": "needs work",
+     "__action_id": "reject"
+    }
+   }
+  }
+ },
+ "workflow": {
+  "conversation_variables": [],
+  "environment_variables": [],
+  "graph": {
+   "nodes": [
+    {
+     "id": "start",
+     "data": {
+      "type": "start",
+      "title": "Start",
+      "variables": []
+     }
+    },
+    {
+     "id": "review",
+     "data": {
+      "type": "human-input",
+      "title": "Review",
+      "form_content": "Please review. {{#$output.comment#}}",
+      "inputs": [
+       {
+        "type": "paragraph",
+        "output_variable_name": "comment"
+       }
+      ],
+      "user_actions": [
+       {
+        "id": "approve",
+        "title": "Approve"
+       },
+       {
+        "id": "reject",
+        "title": "Reject"
+       }
+      ],
+      "timeout": 2,
+      "timeout_unit": "day"
+     }
+    },
+    {
+     "id": "approved",
+     "data": {
+      "type": "template-transform",
+      "title": "Approved",
+      "template": "approved",
+      "variables": []
+     }
+    },
+    {
+     "id": "rejected",
+     "data": {
+      "type": "template-transform",
+      "title": "Rejected",
+      "template": "rejected",
+      "variables": []
+     }
+    },
+    {
+     "id": "expired",
+     "data": {
+      "type": "template-transform",
+      "title": "Expired",
+      "template": "expired",
+      "variables": []
+     }
+    },
+    {
+     "id": "agg",
+     "data": {
+      "type": "variable-aggregator",
+      "title": "Join",
+      "output_type": "string",
+      "variables": [
+       [
+        "approved",
+        "output"
+       ],
+       [
+        "rejected",
+        "output"
+       ],
+       [
+        "expired",
+        "output"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "end",
+     "data": {
+      "type": "end",
+      "title": "End",
+      "outputs": [
+       {
+        "variable": "result",
+        "value_selector": [
+         "agg",
+         "output"
+        ],
+        "value_type": "string"
+       },
+       {
+        "variable": "comment",
+        "value_selector": [
+         "review",
+         "comment"
+        ],
+        "value_type": "string"
+       }
+      ]
+     }
+    }
+   ],
+   "edges": [
+    {
+     "source": "start",
+     "target": "review",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "review",
+     "target": "approved",
+     "sourceHandle": "approve"
+    },
+    {
+     "source": "review",
+     "target": "rejected",
+     "sourceHandle": "reject"
+    },
+    {
+     "source": "review",
+     "target": "expired",
+     "sourceHandle": "__timeout"
+    },
+    {
+     "source": "approved",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "rejected",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "expired",
+     "target": "agg",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "agg",
+     "target": "end",
+     "sourceHandle": "source"
+    }
+   ]
+  }
+ },
+ "status": "succeeded",
+ "outputs": {
+  "result": "tpl:rejected",
+  "comment": "needs work"
+ },
+ "trace": [
+  {
+   "event": "GraphRunStartedEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "start"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "start",
+   "outputs": {
+    "sys.workflow_execution_id": "harness-run",
+    "sys.query": "hello",
+    "query": "hello"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "review"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "review",
+   "outputs": {
+    "comment": "needs work",
+    "__action_id": "reject"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "rejected"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "rejected",
+   "outputs": {
+    "output": "tpl:rejected"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "agg"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "agg",
+   "outputs": {
+    "output": "tpl:rejected"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "end",
+   "outputs": {
+    "result": "tpl:rejected",
+    "comment": "needs work"
+   }
+  },
+  {
+   "event": "GraphRunSucceededEvent"
+  }
+ ]
+}

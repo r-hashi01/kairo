@@ -191,6 +191,15 @@ func (c *converter) graph(parent, entry string, sc scope) (*ir.Def, error) {
 		if !reach[n.ID] {
 			continue
 		}
+		if c.data[n.ID].Type == "human-input" {
+			wait, route, err := c.humanInput(n, sc)
+			if err != nil {
+				return nil, fmt.Errorf("dify: node %s (human-input): %w", n.ID, err)
+			}
+			g.Nodes = append(g.Nodes, wait, route)
+			g.Edges = append(g.Edges, ir.EdgeDef{From: wait.ID, To: route.ID, Handle: ir.HandleSource})
+			continue
+		}
 		d, err := c.node(n, sc)
 		if err != nil {
 			return nil, fmt.Errorf("dify: node %s (%s): %w", n.ID, c.data[n.ID].Type, err)
@@ -206,7 +215,11 @@ func (c *converter) graph(parent, entry string, sc scope) (*ir.Def, error) {
 		if h == "" {
 			h = ir.HandleSource
 		}
-		ed := ir.EdgeDef{From: e.Source, To: e.Target, Handle: h}
+		from := e.Source
+		if c.data[from].Type == "human-input" {
+			from = routeID(from) // its branches leave from the route
+		}
+		ed := ir.EdgeDef{From: from, To: e.Target, Handle: h}
 		if !seen[ed] { // Dify may store an edge twice
 			seen[ed] = true
 			g.Edges = append(g.Edges, ed)
@@ -244,6 +257,8 @@ func (c *converter) node(n *Node, sc scope) (*ir.Def, error) {
 		}
 	case "assigner":
 		err = c.assigner(d, n, sc)
+	case "list-operator":
+		err = c.listOperator(d, n, sc)
 	case "iteration-start", "loop-start":
 		d.Action = ir.ActionPass
 	case "loop-end":
@@ -566,6 +581,79 @@ func (c *converter) assigner(d *ir.Def, n *Node, sc scope) error {
 	return nil
 }
 
+func (c *converter) listOperator(d *ir.Def, n *Node, sc scope) error {
+	var data struct {
+		Variable []string `json:"variable"`
+	}
+	if err := json.Unmarshal(n.Data, &data); err != nil {
+		return err
+	}
+	d.Action = ir.ActionList
+	d.Input = map[string]string{}
+	name := strings.Join(data.Variable, ".")
+	if r, err := c.ref(data.Variable, sc); err == nil {
+		d.Input[name] = r
+	}
+	// Templates in condition values and the extract serial.
+	for _, sel := range selectors(n.Data) {
+		if r, err := c.ref(sel, sc); err == nil {
+			d.Input[strings.Join(sel, ".")] = r
+		}
+	}
+	var params map[string]json.RawMessage
+	json.Unmarshal(n.Data, &params)
+	params["variable_input"], _ = json.Marshal(name)
+	d.Params, _ = json.Marshal(params)
+	return nil
+}
+
+// HumanTimeout is the handle a human input takes when its form times out
+// (Dify's TIMEOUT_HANDLE).
+const HumanTimeout = "__timeout"
+
+// HumanSignal is the signal that answers human input node id. Its payload
+// is {"handle": <user action id>, "outputs": {<field>: value, ...}}, sent by
+// the host when the form is submitted (ADR 0036).
+func HumanSignal(id string) string { return "human-input:" + id }
+
+func routeID(id string) string { return id + "__route" }
+
+// humanInput converts a human input node into a wait for its signal (with
+// the node's timeout) and a route that branches on the chosen action, or
+// on the timeout. References to the node read the submitted outputs.
+func (c *converter) humanInput(n *Node, sc scope) (*ir.Def, *ir.Def, error) {
+	var data struct {
+		UserActions []struct {
+			ID string `json:"id"`
+		} `json:"user_actions"`
+		Timeout     *int   `json:"timeout"`
+		TimeoutUnit string `json:"timeout_unit"`
+	}
+	if err := json.Unmarshal(n.Data, &data); err != nil {
+		return nil, nil, err
+	}
+	timeout := 36 * time.Hour
+	if data.Timeout != nil {
+		unit := time.Hour
+		if data.TimeoutUnit == "day" {
+			unit = 24 * time.Hour
+		}
+		timeout = time.Duration(*data.Timeout) * unit
+	}
+	wait := &ir.Def{Kind: "wait", ID: n.ID, Signal: HumanSignal(n.ID), Timeout: ir.Duration(timeout)}
+	sw := ir.Switch{Cases: []ir.SwitchCase{{ID: HumanTimeout, Logic: "and",
+		Conds: []ir.Condition{{Var: "w.timed_out", Op: "is", Value: json.RawMessage("true")}}}}}
+	for _, a := range data.UserActions {
+		v, _ := json.Marshal(a.ID)
+		sw.Cases = append(sw.Cases, ir.SwitchCase{ID: a.ID, Logic: "and",
+			Conds: []ir.Condition{{Var: "w.handle", Op: "is", Value: v}}})
+	}
+	params, _ := json.Marshal(sw)
+	route := &ir.Def{Kind: "step", ID: routeID(n.ID), Action: ir.ActionSwitch, Params: params,
+		Input: map[string]string{"w.timed_out": n.ID + ".timed_out", "w.handle": n.ID + ".payload.handle"}}
+	return wait, route, nil
+}
+
 func (c *converter) isLoop(id string) bool {
 	return c.data[id].Type == "loop"
 }
@@ -799,6 +887,9 @@ func (c *converter) ref(sel []string, sc scope) (string, error) {
 		return "", fmt.Errorf("selector %v: no node %s", sel, head)
 	}
 	switch c.data[head].Type {
+	case "human-input":
+		// The submitted form: the signal's outputs.
+		return head + ".payload.outputs" + path(rest), nil
 	case "iteration":
 		inner := len(sc) > 0 && sc[len(sc)-1].ID == head
 		switch rest[0] {

@@ -16,6 +16,8 @@ Dify の DSL の `workflow`（グラフ、会話変数、環境変数）を JSON
   | if-else | `kairo.switch` |
   | variable-aggregator | `kairo.coalesce` |
   | assigner | `kairo.assign` |
+  | list-operator | `kairo.list` |
+  | human-input | 待機（signal `human-input:<ID>`）と分岐（`<ID>__route`） |
   | iteration | `map` |
   | loop | `loop` |
 

@@ -40,6 +40,13 @@ type golden struct {
 type mockCase struct {
 	Outputs map[string]map[string]any `json:"outputs"`
 	Errors  map[string]string         `json:"errors"`
+	// Human decides human input nodes: an action and the submitted
+	// outputs, or that the form expired. Default: the first action.
+	Human map[string]struct {
+		Handle  string         `json:"handle"`
+		Outputs map[string]any `json:"outputs"`
+		Expired bool           `json:"expired"`
+	} `json:"human"`
 }
 
 // mockOutputs is harness/graphon_trace.py's default_outputs.
@@ -53,6 +60,20 @@ func mockOutputs(typ, id string, params json.RawMessage) map[string]any {
 		return map[string]any{"status_code": 200, "body": "http:" + id, "headers": map[string]any{}, "files": []any{}}
 	case "tool":
 		return map[string]any{"text": "tool:" + id, "files": []any{}, "json": []any{}}
+	case "question-classifier":
+		var d struct {
+			Classes []struct {
+				ID string `json:"id"`
+			} `json:"classes"`
+		}
+		json.Unmarshal(params, &d)
+		first := ""
+		if len(d.Classes) > 0 {
+			first = d.Classes[0].ID
+		}
+		return map[string]any{"class_id": first, "class_name": "qc:" + id}
+	case "parameter-extractor":
+		return map[string]any{"__is_success": 1, "__reason": nil}
 	case "code":
 		var d struct {
 			Outputs map[string]struct {
@@ -130,11 +151,37 @@ func run(t *testing.T, p *ir.Plan, input json.RawMessage, mc mockCase) (*core.St
 			if o, ok := mc.Outputs[n.ID]; ok {
 				out = o
 			}
-			if len(n.Handles) > 0 {
+			if _, ok := out[n.Spec.Branch]; len(n.Handles) > 0 && !ok {
 				out[n.Spec.Branch] = n.Handles[0]
 			}
 			b, _ := json.Marshal(out)
 			apply(core.Event{Kind: core.EvStepOK, Act: c.Act, Attempt: c.Attempt, Data: b})
+			continue
+		}
+		// A person answers the human input nodes that wait.
+		if waits := core.Waits(p, s); len(waits) > 0 {
+			w := waits[0]
+			id := strings.TrimPrefix(w.Signal, "human-input:")
+			d, ok := mc.Human[id]
+			if !ok {
+				// The first action: the route's first case after the timeout.
+				if r, ok := p.ByID[id+"__route"]; ok && len(p.Nodes[r].Switch.Cases) > 1 {
+					d.Handle = p.Nodes[r].Switch.Cases[1].ID
+				}
+			}
+			if d.Expired {
+				for _, c := range timers {
+					if c.Act == w.Act {
+						delete(timers, c.Timer)
+						now = max(now, c.At)
+						apply(core.Event{Kind: core.EvTimer, Act: c.Act, Timer: c.Timer})
+						break
+					}
+				}
+				continue
+			}
+			payload, _ := json.Marshal(map[string]any{"handle": d.Handle, "outputs": d.Outputs})
+			apply(core.Event{Kind: core.EvSignal, Act: w.Act, Name: w.Signal, Data: payload})
 			continue
 		}
 		if len(timers) == 0 {
@@ -240,7 +287,7 @@ func TestGraphonParity(t *testing.T) {
 				case "start", "iteration-start", "loop-start":
 					return true
 				}
-				return false
+				return strings.HasSuffix(id, "__route") // a human input's branch
 			}
 			var want, got []string
 			for _, ev := range g.Trace {
@@ -259,8 +306,21 @@ func TestGraphonParity(t *testing.T) {
 				}
 				var out any
 				json.Unmarshal(tr.Output, &out)
-				if w.nodeType(id) == "iteration" {
+				switch w.nodeType(id) {
+				case "iteration":
 					out = map[string]any{"output": out}
+				case "human-input":
+					// The node's outputs are the submitted form.
+					var sig struct {
+						Payload struct {
+							Outputs map[string]any `json:"outputs"`
+						} `json:"payload"`
+					}
+					json.Unmarshal(tr.Output, &sig)
+					out = map[string]any{}
+					for k, v := range sig.Payload.Outputs {
+						out.(map[string]any)[k] = v
+					}
 				}
 				m, _ := out.(map[string]any)
 				got = append(got, id+" "+canonical(normalize(m)))
@@ -276,7 +336,10 @@ func TestGraphonParity(t *testing.T) {
 			}
 			slices.Sort(want)
 			slices.Sort(got)
-			if !slices.Equal(want, got) {
+			// In a failed run, how far parallel branches got before the
+			// failure stopped them depends on scheduling (graphon runs them
+			// on threads): only the status is compared.
+			if status == "succeeded" && !slices.Equal(want, got) {
 				t.Errorf("succeeded nodes differ:\n graphon: %s\n kairo:   %s", strings.Join(want, "\n          "), strings.Join(got, "\n          "))
 			}
 			// The run's outputs.
