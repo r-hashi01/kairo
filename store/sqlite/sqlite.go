@@ -7,6 +7,7 @@
 //	st, _ := sqlite.OpenStore(filepath.Join(dir, "objects.db"))
 //	engine.New(engine.Config{
 //		Sinks:     sqlite.Sinks(filepath.Join(dir, "wal")),
+//		DoneLogs:  sqlite.DoneLogs(filepath.Join(dir, "wal")),
 //		Snapshots: st, Blobs: st,
 //	})
 package sqlite
@@ -96,6 +97,18 @@ func Sinks(dir string) func(engine.Tier, int) (wal.Sink, error) {
 			return s, nil
 		}
 		return nil, nil
+	}
+}
+
+// DoneLogs returns an engine.Config.DoneLogs function that stores each
+// shard's finished-run markers (ADR 0027) in dir/done-NNN.db.
+func DoneLogs(dir string) func(int) (wal.Sink, error) {
+	return func(shard int) (wal.Sink, error) {
+		s, err := OpenSink(filepath.Join(dir, fmt.Sprintf("done-%03d.db", shard)))
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
 	}
 }
 

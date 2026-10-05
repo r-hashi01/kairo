@@ -39,7 +39,7 @@ func (s RunStatus) MarshalText() ([]byte, error) { return []byte(s.String()), ni
 type EventKind uint8
 
 const (
-	EvStart   EventKind = iota + 1 // Data = run input
+	EvStart   EventKind = iota + 1 // Data = run input; Name = entry node of a root graph ("" = all)
 	EvStepOK                       // Act, Attempt, Data = output
 	EvStepErr                      // Act, Attempt, Err, Retryable, Unknown
 	EvTimer                        // Act, Timer
@@ -63,7 +63,19 @@ type Event struct {
 	Data      json.RawMessage
 	Err       string
 	Retryable bool
-	Unknown   bool // outcome unknown (timeout, disconnect)
+	Unknown   bool   // outcome unknown (timeout, disconnect)
+	ErrType   string // EvStepErr: the executor's error class (ADR 0030)
+
+	// EvStart: limits of the run (ADR 0030). Deadline is absolute (unix
+	// ms), so replaying the log reproduces it; 0 means none.
+	MaxSteps int32
+	Deadline int64
+	Depth    int32 // nesting depth of the run (a workflow called as a tool)
+	// EvStart: initial values of the run variables (an object, ADR 0033).
+	Vars json.RawMessage
+	// EvStepOK / EvStepErr: the executor's process data and metadata,
+	// passed through to the step's trace (ADR 0034).
+	Meta json.RawMessage
 }
 
 type CmdKind uint8
@@ -97,6 +109,7 @@ const (
 	fRetryWait
 	fReview
 	fSignalWait
+	fFailBranch // finished as an exception that takes the fail-branch edges
 )
 
 // Act is one activation of a plan node.
@@ -105,14 +118,37 @@ type Act struct {
 	Parent  uint32 // activation id of the parent, 0 for the root
 	Scope   uint32
 	Idx     int32 // child position in parent, or map element index
-	Pos     int32 // seq: current child; map: next element; loop: iterations done
-	Pending int32 // par/map: children outstanding
+	Pos     int32 // map: next element; loop: iterations done
+	Pending int32 // graph/map: children outstanding
 	Attempt int32
 	Flags   uint8
 	Timer   uint32
 	TimerAt int64
-	Results []json.RawMessage // par/map
+	Results []json.RawMessage // map
 	Items   []json.RawMessage // map elements
+	G       *Graph            // graph: member and edge states
+}
+
+// Member states of a graph activation.
+const (
+	mUnrun uint8 = iota
+	mRunning
+	mDone
+	mSkipped
+)
+
+// Edge states of a graph activation.
+const (
+	eUnknown uint8 = iota
+	eTaken
+	eSkipped
+)
+
+// Graph is the state of a graph activation (ADR 0029): one byte per
+// member and per edge of the plan's graph node.
+type Graph struct {
+	Members []uint8
+	Edges   []uint8
 }
 
 // Scope holds node values. Scope 0 is the run's root scope; each map element
@@ -136,8 +172,15 @@ type State struct {
 	NextScope uint32
 	NextTimer uint32
 	Inflight  int32 // dispatched steps
-	Acts      map[uint32]*Act
-	Scopes    map[uint32]*Scope
+	// Limits and counters (ADR 0030).
+	Steps         int32 // activations started (steps, waits, containers)
+	MaxSteps      int32
+	Exceptions    int32 // steps that failed into on_error
+	Deadline      int64
+	DeadlineTimer uint32
+	Depth         int32
+	Acts          map[uint32]*Act
+	Scopes        map[uint32]*Scope
 	// Signals that arrived before anything waited for them.
 	Mailbox map[string][]json.RawMessage
 }
@@ -157,6 +200,13 @@ func (s *State) Quiescent() bool { return s.Inflight == 0 && !s.Status.Done() }
 
 // NodeEffect is a helper for callers holding a command.
 func NodeEffect(p *ir.Plan, c *Command) ir.Effect { return p.Nodes[c.Node].Effect() }
+
+// Dispatched reports whether activation act is outstanding on an executor
+// with attempt attempt (not aborted, finished or superseded since).
+func Dispatched(s *State, act uint32, attempt int32) bool {
+	a := s.Acts[act]
+	return a != nil && a.Flags&fDispatched != 0 && a.Attempt == attempt
+}
 
 // NeedsReview reports whether the activation is a real step stopped with an
 // unknown outcome.

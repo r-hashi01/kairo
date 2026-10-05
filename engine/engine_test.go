@@ -570,7 +570,7 @@ func TestEvictionBurstUsesFixedIOPool(t *testing.T) {
 
 func walSegments(t testing.TB, dir string) []string {
 	t.Helper()
-	segs, _ := filepath.Glob(filepath.Join(dir, "wal", "*.wal"))
+	segs, _ := filepath.Glob(filepath.Join(dir, "wal", "shard-*.wal"))
 	return segs
 }
 
@@ -706,8 +706,11 @@ func TestRunIDReuseSurvivesRestart(t *testing.T) {
 	plans := []string{fiveNodes, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`}
 	ft := TierFile
 	// RecentRuns: 1, so finishing another run moves "x" out of the
-	// idempotency window and the id can be reused (ADR 0023).
-	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, EvictAfter: time.Millisecond, RecentRuns: 1})
+	// in-memory window (ADR 0023), and the clock then passes
+	// IdempotencyTTL, so its marker expires too (ADR 0027).
+	var skew atomic.Int64
+	now := func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }
+	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, EvictAfter: time.Millisecond, RecentRuns: 1, Now: now})
 	for _, p := range plans {
 		mustPlan(t, e1, p)
 	}
@@ -719,13 +722,17 @@ func TestRunIDReuseSurvivesRestart(t *testing.T) {
 	wait(t, e1, "x")
 	other, _ := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
 	wait(t, e1, other)
+	if r, _ := e1.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft, RunID: "x"}); !r.Existing {
+		t.Fatal("reused within IdempotencyTTL")
+	}
+	skew.Store(int64(25 * time.Hour))
 	if r, err := e1.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft, RunID: "x"}); err != nil || r.Existing {
 		t.Fatalf("reuse after the window: %+v %v", r, err)
 	}
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), "x"); return ri.Plan == "w" && ri.Evicted })
 	e1.Close()
 
-	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true})
+	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, Now: now})
 	defer e2.Close()
 	for _, p := range plans {
 		mustPlan(t, e2, p)

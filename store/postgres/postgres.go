@@ -4,7 +4,9 @@
 //
 //	db, err := postgres.Open(os.Getenv("KAIRO_PG_DSN"), postgres.Options{})
 //	b, err := sqlstore.NewBackend(db, postgres.Dialect, sqlstore.Options{Namespace: "prod"})
-//	engine.New(engine.Config{Sinks: b.Sinks, Snapshots: b.Store, Blobs: b.Store})
+//	cfg := engine.Config{}
+//	b.Configure(&cfg) // Sinks, DoneLogs, Snapshots, Blobs
+//	engine.New(cfg)
 package postgres
 
 import (

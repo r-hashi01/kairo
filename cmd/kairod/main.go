@@ -43,6 +43,7 @@ func main() {
 		maxQueued = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
 		perTenant = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
 		httpConc  = flag.Int("http-concurrency", 2048, "concurrent requests of the built-in HTTP executor")
+		idemTTL   = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
 
@@ -88,11 +89,12 @@ func main() {
 	}
 
 	e, err := engine.New(engine.Config{
-		Shards:      *shards,
-		Registry:    reg,
-		DataDir:     *dataDir,
-		NoSync:      *noSync,
-		DefaultTier: tier,
+		Shards:         *shards,
+		Registry:       reg,
+		DataDir:        *dataDir,
+		NoSync:         *noSync,
+		DefaultTier:    tier,
+		IdempotencyTTL: *idemTTL,
 		Admission: sched.AdmissionConfig{
 			MaxActive: *maxActive, MaxQueued: *maxQueued,
 			MaxActivePerTenant: func(string) int { return *perTenant },

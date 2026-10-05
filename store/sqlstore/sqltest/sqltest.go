@@ -70,7 +70,8 @@ func Engine(t testing.TB, db *sql.DB, d sqlstore.Dialect, o sqlstore.Options, cf
 	}
 	reg := ir.NewRegistry()
 	reg.Register(ir.NodeSpec{Action: "llm", Effect: ir.EffectUnprotected})
-	cfg.Registry, cfg.Sinks, cfg.Snapshots, cfg.Blobs = reg, b.Sinks, b.Store, b.Store
+	cfg.Registry = reg
+	b.Configure(&cfg)
 	e, err := engine.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +123,12 @@ func engineScenario(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 	e1 := Engine(t, db, d, o, engine.Config{Shards: 2, CompactEvery: 64, EvictAfter: 50 * time.Millisecond})
 	waiting, _ := submit(e1, engine.SubmitRequest{Plan: "approve", Tenant: "t", Tier: &ft})
 	waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), waiting); return ri.Evicted })
+	// Finished first: its records are retired, only its marker remains
+	// (ADR 0027).
+	if _, err := submit(e1, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"k"}`), Tenant: "t", Tier: &ft, RunID: "Kept"}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, e1, "Kept")
 	for i := 0; i < 200; i++ {
 		id, _ := submit(e1, engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
 		wait(t, e1, id)
@@ -147,6 +154,15 @@ func engineScenario(t *testing.T, db *sql.DB, d sqlstore.Dialect) {
 	defer e2.Close()
 	if st := e2.Stats(); st.Active != 1 {
 		t.Fatalf("recovered %d active runs, want 1", st.Active)
+	}
+	if r, err := e2.Submit(context.Background(), engine.SubmitRequest{Plan: "five", Tenant: "t", Tier: &ft, RunID: "Kept"}); err != nil || !r.Existing {
+		t.Fatalf("resubmitting a finished run after restart: %+v %v", r, err)
+	}
+	if ri, err := e2.Get(context.Background(), "Kept"); err != nil || !ri.Trimmed || ri.Status != "completed" {
+		t.Fatalf("finished run after restart: %+v %v", ri, err)
+	}
+	if r, _ := e2.Submit(context.Background(), engine.SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"k"}`), Tenant: "t", Tier: &ft, RunID: "kept"}); r.Existing {
+		t.Fatal("ids differing in case were taken for the same run")
 	}
 	e2.Signal(waiting, "go", json.RawMessage(`"bob"`))
 	if ri := wait(t, e2, waiting); ri.Status != "completed" || !strings.Contains(string(ri.Output), `"by":"bob"`) {

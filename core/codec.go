@@ -10,7 +10,10 @@ import (
 // Snapshot encoding: a compact, deterministic binary form of State. Equal
 // states encode to equal bytes, which is what the replay tests compare.
 
-const codecVersion = 1
+// Version 2 adds graph state (ADR 0029). Version 1 snapshots still decode;
+// their seq, par and cond activations are migrated on first use. Version 3
+// adds run limits and counters (ADR 0030).
+const codecVersion = 3
 
 var errCorrupt = errors.New("core: corrupt snapshot")
 
@@ -35,6 +38,12 @@ func (s *State) Encode(b []byte) []byte {
 	e.u(uint64(s.NextScope))
 	e.u(uint64(s.NextTimer))
 	e.i(int64(s.Inflight))
+	e.i(int64(s.Steps))
+	e.i(int64(s.MaxSteps))
+	e.i(int64(s.Exceptions))
+	e.i(s.Deadline)
+	e.u(uint64(s.DeadlineTimer))
+	e.i(int64(s.Depth))
 
 	ids := sortedActs(s)
 	e.u(uint64(len(ids)))
@@ -58,6 +67,13 @@ func (s *State) Encode(b []byte) []byte {
 		e.u(uint64(len(a.Items)))
 		for _, r := range a.Items {
 			e.raw(r)
+		}
+		if a.G == nil {
+			e.u(0)
+		} else {
+			e.u(1)
+			e.bytes(a.G.Members)
+			e.bytes(a.G.Edges)
 		}
 	}
 
@@ -166,7 +182,8 @@ func (d *dec) count() int {
 // DecodeState decodes a snapshot produced by Encode.
 func DecodeState(b []byte) (*State, error) {
 	d := &dec{b: b}
-	if d.u() != codecVersion {
+	version := d.u()
+	if version < 1 || version > codecVersion {
 		return nil, errCorrupt
 	}
 	s := &State{Acts: map[uint32]*Act{}, Scopes: map[uint32]*Scope{}}
@@ -179,6 +196,14 @@ func DecodeState(b []byte) (*State, error) {
 	s.NextScope = uint32(d.u())
 	s.NextTimer = uint32(d.u())
 	s.Inflight = int32(d.i())
+	if version >= 3 {
+		s.Steps = int32(d.i())
+		s.MaxSteps = int32(d.i())
+		s.Exceptions = int32(d.i())
+		s.Deadline = d.i()
+		s.DeadlineTimer = uint32(d.u())
+		s.Depth = int32(d.i())
+	}
 	for n := d.count(); n > 0 && d.err == nil; n-- {
 		id := uint32(d.u())
 		a := &Act{}
@@ -203,6 +228,9 @@ func DecodeState(b []byte) (*State, error) {
 			for j := range a.Items {
 				a.Items[j] = d.bytes()
 			}
+		}
+		if version >= 2 && d.u() == 1 {
+			a.G = &Graph{Members: d.bytes(), Edges: d.bytes()}
 		}
 		s.Acts[id] = a
 	}

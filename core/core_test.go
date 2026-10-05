@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -52,6 +53,7 @@ type sim struct {
 	rng     *rand.Rand
 	limit   int64 // if set, timers after this tick are not fired
 	handler func(c Command, n *ir.Node) Event
+	traces  []Trace
 }
 
 func newSim(t testing.TB, p *ir.Plan) *sim {
@@ -60,7 +62,8 @@ func newSim(t testing.TB, p *ir.Plan) *sim {
 
 func (x *sim) apply(ev Event) {
 	ev.At = x.now
-	out, err := Apply(x.p, x.s, &ev, nil)
+	out, tr, err := ApplyTraced(x.p, x.s, &ev, nil, x.traces)
+	x.traces = tr
 	if err == ErrIgnored {
 		return
 	}
@@ -151,6 +154,19 @@ func (x *sim) checkReplay() {
 	a, b := x.s.Encode(nil), r.Encode(nil)
 	if !bytes.Equal(a, b) {
 		x.t.Fatalf("replayed state differs\nlive:   %x\nreplay: %x", a, b)
+	}
+	// Traces are not logged: replaying must reproduce them exactly
+	// (ADR 0034).
+	rt := NewState(x.s.RunID)
+	var tr []Trace
+	for i := range x.log {
+		var err error
+		if _, tr, err = ApplyTraced(x.p, rt, &x.log[i], nil, tr); err != nil {
+			x.t.Fatalf("traced replay event %d: %v", i, err)
+		}
+	}
+	if !reflect.DeepEqual(tr, x.traces) {
+		x.t.Fatalf("replayed traces differ: %d vs %d", len(tr), len(x.traces))
 	}
 	d, err := DecodeState(a)
 	if err != nil {

@@ -15,11 +15,25 @@ import (
 type Definition struct {
 	Name   string               `json:"name"`
 	Inputs map[string]FieldType `json:"inputs,omitempty"`
-	Root   *Def                 `json:"root"`
+	// Vars are the run's variables (ADR 0033): read as $var.<name>,
+	// written by kairo.assign, given initial values by the submission.
+	Vars map[string]VarDef `json:"vars,omitempty"`
+	Root *Def              `json:"root"`
 }
 
-// Def is one node of the definition tree. Kind is one of
-// step | seq | par | cond | map | loop | wait.
+// VarDef declares a variable: its Dify type (string, number, integer,
+// float, boolean, object, array[string], array[number], array[object],
+// array[boolean], array[any], file, array[file], secret) and its initial
+// value, a constant (Value) or, for loop variables, a reference (Ref).
+type VarDef struct {
+	Type  string          `json:"type"`
+	Value json.RawMessage `json:"value,omitempty"`
+	Ref   string          `json:"ref,omitempty"`
+}
+
+// Def is one node of the definition. Kind is one of
+// graph | step | map | loop | wait, or seq | par | cond, which compile to
+// graphs (ADR 0029).
 type Def struct {
 	Kind string `json:"kind"`
 	ID   string `json:"id,omitempty"`
@@ -28,9 +42,27 @@ type Def struct {
 	Action string            `json:"action,omitempty"`
 	Input  map[string]string `json:"input,omitempty"` // name -> ref
 	Params json.RawMessage   `json:"params,omitempty"`
+	// Per-node retry and error handling (ADR 0030), overriding the
+	// action's spec.
+	Retry   *RetryDef   `json:"retry,omitempty"`
+	OnError *OnErrorDef `json:"on_error,omitempty"`
+	// Handles of a branching step at this place (ADR 0031): the values its
+	// branch field may take, instead of the spec's enum values.
+	Handles []string `json:"handles,omitempty"`
+	// OnUnknown "fail" treats an unknown outcome of a real step as a
+	// definite failure, without retrying it (ADR 0035); the default,
+	// "review", stops the run for an operator.
+	OnUnknown string `json:"on_unknown,omitempty"`
 
-	// seq, par
+	// graph, seq, par
 	Nodes []*Def `json:"nodes,omitempty"`
+
+	// graph: edges between Nodes (by id), the entry nodes (default: those
+	// without incoming edges) and the output object (name -> ref; default:
+	// the outputs of the nodes without outgoing edges that ran, by id).
+	Edges  []EdgeDef         `json:"edges,omitempty"`
+	Entry  []string          `json:"entry,omitempty"`
+	Output map[string]string `json:"output,omitempty"`
 
 	// cond
 	If   *PredDef `json:"if,omitempty"`
@@ -44,10 +76,65 @@ type Def struct {
 	While          *PredDef `json:"while,omitempty"`
 	MaxIter        int      `json:"max_iter,omitempty"`
 
+	// map (ADR 0032): what a failing element does (fail | null | omit),
+	// the node inside the body whose output is the element's result, and
+	// whether results that are all lists are concatenated.
+	OnElementError string `json:"on_element_error,omitempty"`
+	ElementOutput  string `json:"element_output,omitempty"`
+	Flatten        bool   `json:"flatten,omitempty"`
+	// loop (ADR 0032, 0033): check "before" also tests the condition
+	// before the first round; Break is a Dify condition over BreakInput
+	// (instead of While); BreakOn ends the loop after a round in which one
+	// of these nodes ran; Vars are loop variables, read as <loop>.<name>.
+	Check      string            `json:"check,omitempty"`
+	Break      *SwitchCase       `json:"break,omitempty"`
+	BreakInput map[string]string `json:"break_input,omitempty"`
+	BreakOn    []string          `json:"break_on,omitempty"`
+	Vars       map[string]VarDef `json:"vars,omitempty"`
+	// LoopOutput "vars" makes the loop's output its variables plus
+	// loop_round, as a Dify loop's; the default is the body's last output.
+	LoopOutput string `json:"loop_output,omitempty"`
+
 	// wait: a duration, or a named signal (optionally with timeout)
 	Duration Duration `json:"duration,omitempty"`
 	Signal   string   `json:"signal,omitempty"`
 	Timeout  Duration `json:"timeout,omitempty"`
+}
+
+// RetryDef overrides a step's retries: at most MaxAttempts attempts,
+// Interval apart (0: the spec's exponential backoff).
+type RetryDef struct {
+	MaxAttempts int      `json:"max_attempts"`
+	Interval    Duration `json:"interval,omitempty"`
+}
+
+// OnErrorDef says what a step's definite failure (retries exhausted) does
+// instead of failing the run: "fail-branch" takes the node's fail-branch
+// edges with {error_message, error_type} as output; "default-value"
+// outputs Value plus those fields and goes on.
+type OnErrorDef struct {
+	Strategy string          `json:"strategy"`
+	Value    json.RawMessage `json:"value,omitempty"`
+}
+
+// Error strategies (ADR 0030).
+const (
+	OnErrorFail uint8 = iota
+	OnErrorBranch
+	OnErrorDefault
+)
+
+// HandleFailBranch is the handle taken by a step that failed with
+// on_error fail-branch.
+const HandleFailBranch = "fail-branch"
+
+// EdgeDef connects two nodes of a graph. Handle selects the edge by the
+// source's branch value; "" means "source", the handle of nodes that do
+// not branch.
+type EdgeDef struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Handle string `json:"handle,omitempty"`
 }
 
 // PredDef is a condition on a typed field: {"field":"classify.label",
@@ -62,15 +149,39 @@ type Kind uint8
 
 const (
 	KStep Kind = iota
-	KSeq
-	KPar
-	KCond
+	KGraph
 	KMap
 	KLoop
 	KWait
+	// KTest is the condition of a compiled cond: a graph member that is
+	// evaluated in place (no activation) and takes its "true" or "false"
+	// edge.
+	KTest
 )
 
-var kindNames = []string{"step", "seq", "par", "cond", "map", "loop", "wait"}
+var kindNames = []string{"step", "graph", "map", "loop", "wait", "test"}
+
+// Sugar records which construct a graph was compiled from. It decides the
+// graph's output: seq the last node's, par an object of all nodes', cond
+// the branch that ran, a graph its Output (ADR 0029).
+type Sugar uint8
+
+const (
+	SugarGraph Sugar = iota
+	SugarSeq
+	SugarPar
+	SugarCond
+)
+
+// HandleSource is the handle of the edges of a node that does not branch.
+const HandleSource = "source"
+
+// Edge is a compiled graph edge between members (indices into the graph
+// node's Children).
+type Edge struct {
+	From, To int32
+	Handle   string
+}
 
 func (k Kind) String() string { return kindNames[k] }
 
@@ -81,6 +192,7 @@ const (
 	RefItem                 // $item (innermost map element)
 	RefIndex                // $index (innermost map index)
 	RefNode                 // <node id>
+	RefVar                  // $var.<name> (Path[0] is the name)
 )
 
 type Ref struct {
@@ -133,20 +245,60 @@ type Node struct {
 	Spec   *NodeSpec
 	Params json.RawMessage
 	Inputs []Input
+	// Retries and error handling, resolved from the spec and the node's
+	// overrides: MaxAttempts attempts, RetryInterval apart (0: the spec's
+	// exponential backoff); OnError is one of OnErrorFail/Branch/Default,
+	// ErrValue the default-value object.
+	MaxAttempts   int32
+	RetryInterval time.Duration
+	OnError       uint8
+	ErrValue      json.RawMessage
+	UnknownFails  bool // on_unknown: fail
+	// Handles of a branching step (its spec has Branch); Switch is the
+	// compiled condition of a kairo.switch step.
+	Handles []string
+	Switch  *Switch
 
-	// cond / loop
+	// graph: members are Children. In and Out list edge indices per
+	// member; Topo is the order in which ready members are started; Entry
+	// lists the entry members.
+	Sugar   Sugar
+	Edges   []Edge
+	In, Out [][]int32
+	Topo    []int32
+	Entry   []int32
+	Output  []Input // SugarGraph with an explicit output
+	// reach[i] has bit j set if member j reaches member i (SugarGraph).
+	reach [][]uint64
+
+	// test / loop
 	Pred *Pred
 
 	// map
 	Over    Ref
 	MaxConc int32
+	ElemErr uint8 // ElemFail, ElemNull or ElemOmit
+	ElemOut *Ref
+	Flatten bool
 	// loop
 	MaxIter int32
+	Before  bool        // test the condition before the first round too
+	Break   *SwitchCase // Dify break conditions over BreakIn
+	BreakIn []Input
+	BreakOn []int32
+	Vars    []Var // loop variables, by name
+	VarsOut bool  // output the variables and loop_round
+	// kairo.assign
+	Assign []AssignItem
 
 	// wait
 	Wait    time.Duration
 	Signal  string
 	Timeout time.Duration
+
+	// End is one past the last node of this node's subtree (nodes are
+	// numbered depth first; cond tests come after all of them).
+	End int32
 
 	// Innermost enclosing map node (-1 if none). Values of this node live in
 	// the scope created by that map for each element.
@@ -164,6 +316,34 @@ func (n *Node) Effect() Effect {
 	return EffectProtected
 }
 
+// Element error modes of a map (ADR 0032).
+const (
+	ElemFail uint8 = iota
+	ElemNull
+	ElemOmit
+)
+
+// Var is a compiled variable declaration: its type and initial value
+// (Init, or the value of Ref).
+type Var struct {
+	Name string
+	Type string
+	Init json.RawMessage
+	Ref  *Ref
+}
+
+// AssignItem is one operation of a kairo.assign step (ADR 0033): Op on
+// variable Name of loop Loop (-1: a run variable), with the step input
+// named Input or the constant Value.
+type AssignItem struct {
+	Loop  int32
+	Name  string
+	Type  string
+	Op    string
+	Input string
+	Value json.RawMessage
+}
+
 // Plan is an immutable compiled definition shared by all runs.
 type Plan struct {
 	Name    string
@@ -172,6 +352,7 @@ type Plan struct {
 	ByID    map[string]int32
 	HasReal bool
 	Inputs  map[string]FieldType
+	Vars    []Var // run variables, by name
 	Def     *Definition
 }
 
@@ -181,8 +362,26 @@ func Compile(def *Definition, reg *Registry) (*Plan, error) {
 		return nil, errors.New("ir: empty definition")
 	}
 	c := &compiler{reg: reg, plan: &Plan{Name: def.Name, ByID: map[string]int32{}, Inputs: def.Inputs, Def: def}}
+	vars, err := compileVars(def.Vars, "run", false)
+	if err != nil {
+		return nil, err
+	}
+	c.plan.Vars = vars
 	if _, err := c.add(def.Root, -1, 0, -1); err != nil {
 		return nil, err
+	}
+	// The conditions of conds are appended after every other node, so
+	// node indices (kept in states and snapshots) are those of the tree.
+	if err := c.addTests(); err != nil {
+		return nil, err
+	}
+	// Only a node of a hand-written graph has fail-branch edges to take.
+	for _, n := range c.plan.Nodes {
+		if n.Kind == KStep && n.OnError == OnErrorBranch {
+			if n.Parent < 0 || c.plan.Nodes[n.Parent].Kind != KGraph || c.plan.Nodes[n.Parent].Sugar != SugarGraph {
+				return nil, fmt.Errorf("ir: step %q: on_error fail-branch needs the step to be a node of a graph", n.ID)
+			}
+		}
 	}
 	// Second pass: resolve references now that all IDs are known.
 	for i := range c.plan.Nodes {
@@ -204,9 +403,10 @@ func Compile(def *Definition, reg *Registry) (*Plan, error) {
 }
 
 type compiler struct {
-	reg  *Registry
-	plan *Plan
-	defs []*Def
+	reg   *Registry
+	plan  *Plan
+	defs  []*Def
+	conds []int32 // cond graphs waiting for their test member
 }
 
 func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, error) {
@@ -218,12 +418,14 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 	switch d.Kind {
 	case "step":
 		n.Kind = KStep
+	case "graph":
+		n.Kind, n.Sugar = KGraph, SugarGraph
 	case "seq":
-		n.Kind = KSeq
+		n.Kind, n.Sugar = KGraph, SugarSeq
 	case "par":
-		n.Kind = KPar
+		n.Kind, n.Sugar = KGraph, SugarPar
 	case "cond":
-		n.Kind = KCond
+		n.Kind, n.Sugar = KGraph, SugarCond
 	case "map":
 		n.Kind = KMap
 	case "loop":
@@ -265,15 +467,30 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 		if spec.Effect == EffectWait {
 			return -1, fmt.Errorf("ir: step %q: action %q declares effect wait; use a wait node", n.ID, d.Action)
 		}
-	case KSeq, KPar:
-		kids = d.Nodes
-	case KCond:
-		if d.If == nil || d.Then == nil {
-			return -1, fmt.Errorf("ir: cond %q needs if and then", n.ID)
+		if err := c.branchHandles(i, d); err != nil {
+			return -1, err
 		}
-		kids = []*Def{d.Then}
-		if d.Else != nil {
-			kids = append(kids, d.Else)
+		if spec.Action == ActionAssign {
+			if err := c.compileAssign(i, d); err != nil {
+				return -1, err
+			}
+		}
+		if err := c.errorHandling(i, d); err != nil {
+			return -1, err
+		}
+	case KGraph:
+		switch n.Sugar {
+		case SugarCond:
+			if d.If == nil || d.Then == nil {
+				return -1, fmt.Errorf("ir: cond %q needs if and then", n.ID)
+			}
+			kids = []*Def{d.Then}
+			if d.Else != nil {
+				kids = append(kids, d.Else)
+			}
+			c.conds = append(c.conds, i)
+		default:
+			kids = d.Nodes
 		}
 	case KMap:
 		if d.Body == nil || d.Over == "" {
@@ -282,15 +499,48 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 		kids = []*Def{d.Body}
 		childScope = i
 		c.plan.Nodes[i].MaxConc = int32(d.MaxConcurrency)
+		switch d.OnElementError {
+		case "", "fail":
+		case "null":
+			c.plan.Nodes[i].ElemErr = ElemNull
+		case "omit":
+			c.plan.Nodes[i].ElemErr = ElemOmit
+		default:
+			return -1, fmt.Errorf("ir: map %q: on_element_error must be fail, null or omit", n.ID)
+		}
+		c.plan.Nodes[i].Flatten = d.Flatten
 	case KLoop:
-		if d.Body == nil || d.While == nil {
-			return -1, fmt.Errorf("ir: loop %q needs body and while", n.ID)
+		if d.Body == nil || (d.While != nil && d.Break != nil) {
+			return -1, fmt.Errorf("ir: loop %q needs a body and at most one of while and break", n.ID)
+		}
+		switch d.Check {
+		case "", "after":
+		case "before":
+			c.plan.Nodes[i].Before = true
+		default:
+			return -1, fmt.Errorf("ir: loop %q: check must be before or after", n.ID)
 		}
 		if d.MaxIter <= 0 {
 			return -1, fmt.Errorf("ir: loop %q needs max_iter > 0", n.ID)
 		}
 		kids = []*Def{d.Body}
 		c.plan.Nodes[i].MaxIter = int32(d.MaxIter)
+		vars, err := compileVars(d.Vars, "loop "+n.ID, true)
+		if err != nil {
+			return -1, err
+		}
+		c.plan.Nodes[i].Vars = vars
+		switch d.LoopOutput {
+		case "", "body":
+			if len(vars) > 0 {
+				// The loop's value holds its variables.
+				return -1, fmt.Errorf("ir: loop %q: loop variables need loop_output vars", n.ID)
+			}
+		case "vars":
+			c.plan.Nodes[i].VarsOut = true
+		default:
+			return -1, fmt.Errorf("ir: loop %q: loop_output must be body or vars", n.ID)
+		}
 	case KWait:
 		if (d.Duration == 0) == (d.Signal == "") {
 			return -1, fmt.Errorf("ir: wait %q needs exactly one of duration or signal", n.ID)
@@ -305,6 +555,12 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 			return -1, err
 		}
 		c.plan.Nodes[i].Children = append(c.plan.Nodes[i].Children, ci)
+	}
+	c.plan.Nodes[i].End = int32(len(c.plan.Nodes))
+	if n.Kind == KGraph && n.Sugar != SugarCond {
+		if err := c.edges(i, d); err != nil {
+			return -1, err
+		}
 	}
 	return i, nil
 }
@@ -326,26 +582,58 @@ func (c *compiler) resolve(i int32) error {
 			}
 			n.Inputs = append(n.Inputs, Input{Name: name, Ref: r})
 		}
-	case KCond:
-		p, err := c.parsePred(i, d.If)
+	case KTest:
+		// Evaluated in the cond's scope; references are checked from the
+		// cond node, as before conds became graphs.
+		p, err := c.parsePred(n.Parent, c.defs[n.Parent].If)
 		if err != nil {
-			return fmt.Errorf("ir: cond %q: %w", n.ID, err)
+			return fmt.Errorf("ir: cond %q: %w", c.plan.Nodes[n.Parent].ID, err)
 		}
 		n.Pred = p
+	case KGraph:
+		if n.Sugar == SugarGraph && len(d.Output) > 0 {
+			names := make([]string, 0, len(d.Output))
+			for k := range d.Output {
+				names = append(names, k)
+			}
+			slices.Sort(names)
+			for _, name := range names {
+				r, err := c.parseRef(i, d.Output[name])
+				if err != nil {
+					return fmt.Errorf("ir: graph %q output %q: %w", n.ID, name, err)
+				}
+				n.Output = append(n.Output, Input{Name: name, Ref: r})
+			}
+		}
 	case KLoop:
-		// The while condition is evaluated in the loop's own scope, after the
-		// body has run, so it may reference nodes inside the body.
-		p, err := c.parsePred(n.Children[0], d.While)
-		if err != nil {
-			return fmt.Errorf("ir: loop %q: %w", n.ID, err)
+		// The conditions are evaluated in the loop's own scope, after the
+		// body has run, so they may reference nodes inside the body.
+		if d.While != nil {
+			p, err := c.parsePred(n.Children[0], d.While)
+			if err != nil {
+				return fmt.Errorf("ir: loop %q: %w", n.ID, err)
+			}
+			n.Pred = p
 		}
-		n.Pred = p
+		if err := c.loopExtras(i, d); err != nil {
+			return err
+		}
 	case KMap:
 		r, err := c.parseRef(i, d.Over)
 		if err != nil {
 			return fmt.Errorf("ir: map %q over: %w", n.ID, err)
 		}
 		n.Over = r
+		if d.ElementOutput != "" {
+			r, err := c.parseRef(n.Children[0], d.ElementOutput)
+			if err != nil {
+				return fmt.Errorf("ir: map %q element_output: %w", n.ID, err)
+			}
+			if r.Kind != RefNode || !isAncestor(c.plan, i, r.Node) {
+				return fmt.Errorf("ir: map %q: element_output must be a node inside the body", n.ID)
+			}
+			n.ElemOut = &r
+		}
 	}
 	return nil
 }
@@ -376,6 +664,11 @@ func (c *compiler) parseRef(from int32, s string) (Ref, error) {
 	switch head {
 	case "$input":
 		return Ref{Kind: RefInput, Path: path}, nil
+	case "$var":
+		if len(path) == 0 || !slices.ContainsFunc(c.plan.Vars, func(v Var) bool { return v.Name == path[0] }) {
+			return Ref{}, fmt.Errorf("undeclared run variable %q", s)
+		}
+		return Ref{Kind: RefVar, Path: path}, nil
 	case "$item", "$index":
 		// Only inside a map body. (A map node itself lives in the enclosing
 		// scope, so its own "over" sees the outer map's item, if any.)
@@ -400,8 +693,11 @@ func (c *compiler) parseRef(from int32, s string) (Ref, error) {
 	if !c.visible(from, t) {
 		return Ref{}, fmt.Errorf("node %q is inside a map body that does not enclose the reference", head)
 	}
-	if isAncestor(c.plan, t, from) {
+	if isAncestor(c.plan, t, from) && !c.loopVarRef(t, path) {
 		return Ref{}, fmt.Errorf("node %q references its own ancestor", head)
+	}
+	if err := c.graphOrder(from, t); err != nil {
+		return Ref{}, err
 	}
 	return Ref{Kind: RefNode, Node: t, Path: path}, nil
 }

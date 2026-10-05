@@ -50,17 +50,30 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 	defer cancel()
 	go func() { <-ctx.Done(); c.Close() }()
 
-	tasks := make(chan *task.Task, conc)
+	type job struct {
+		t   *task.Task
+		ctx context.Context
+	}
+	// Cancel functions of received tasks, by seq (ADR 0026).
+	var cmu sync.Mutex
+	cancels := map[uint64]context.CancelFunc{}
+	tasks := make(chan job, conc)
 	var wg sync.WaitGroup
 	for i := 0; i < conc; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for t := range tasks {
-				seq := t.Seq
+			for j := range tasks {
+				seq := j.t.Seq
 				emit := func(b []byte) { send(MsgChunk, Chunk{Seq: seq, Data: b}) }
-				res := wk.Handler(ctx, t, emit)
-				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens})
+				res := wk.Handler(j.ctx, j.t, emit)
+				cmu.Lock()
+				if cancel := cancels[seq]; cancel != nil {
+					cancel()
+					delete(cancels, seq)
+				}
+				cmu.Unlock()
+				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta})
 			}
 		}()
 	}
@@ -71,14 +84,28 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 			rerr = err
 			break
 		}
-		if typ != MsgTask {
-			continue
+		switch typ {
+		case MsgTask:
+			var t task.Task
+			if err := json.Unmarshal(body, &t); err != nil {
+				continue
+			}
+			tctx, cancel := context.WithCancel(ctx)
+			cmu.Lock()
+			cancels[t.Seq] = cancel
+			cmu.Unlock()
+			tasks <- job{t: &t, ctx: tctx}
+		case MsgCancel:
+			var cn Cancel
+			if json.Unmarshal(body, &cn) != nil {
+				continue
+			}
+			cmu.Lock()
+			if cancel := cancels[cn.Seq]; cancel != nil {
+				cancel()
+			}
+			cmu.Unlock()
 		}
-		var t task.Task
-		if err := json.Unmarshal(body, &t); err != nil {
-			continue
-		}
-		tasks <- &t
 	}
 	close(tasks)
 	wg.Wait()

@@ -19,10 +19,22 @@ var ErrIgnored = errors.New("core: event ignored")
 var null = json.RawMessage("null")
 
 type machine struct {
-	p   *ir.Plan
-	s   *State
-	at  int64
-	out []Command
+	p     *ir.Plan
+	s     *State
+	at    int64
+	out   []Command
+	entry string // EvStart: the entry chosen for the root graph
+
+	// Tracing (ADR 0034): traces are appended to tr. meta belongs to the
+	// step metaAct the event reports on. endStatus etc. describe how the
+	// activation complete is about to finish failed (exception).
+	tracing   bool
+	tr        []Trace
+	meta      json.RawMessage
+	metaAct   uint32
+	endStatus string
+	endErr    string
+	endType   string
 }
 
 // Apply applies ev to s, appending the resulting commands to out.
@@ -46,6 +58,16 @@ func (m *machine) apply(ev *Event) error {
 		if len(s.Input) == 0 {
 			s.Input = json.RawMessage("{}")
 		}
+		m.entry = ev.Name
+		s.MaxSteps, s.Depth = ev.MaxSteps, ev.Depth
+		m.initRunVars(ev.Vars)
+		m.trace(Trace{Kind: TrRunStart, Input: s.Input})
+		if ev.Deadline > 0 {
+			// One timer for the whole run (ADR 0030).
+			s.NextTimer++
+			s.Deadline, s.DeadlineTimer = ev.Deadline, s.NextTimer
+			m.out = append(m.out, Command{Kind: CmdTimer, Timer: s.DeadlineTimer, At: s.Deadline})
+		}
 		m.start(0, 0, 0, 0)
 		return nil
 
@@ -64,7 +86,7 @@ func (m *machine) apply(ev *Event) error {
 			m.complete(ev.Act, a, out)
 			return nil
 		}
-		m.stepFailed(ev.Act, a, ev.Err, ev.Retryable, ev.Unknown)
+		m.stepFailed(ev.Act, a, ev.Err, ev.ErrType, ev.Retryable, ev.Unknown)
 		return nil
 
 	case EvIntent:
@@ -76,6 +98,11 @@ func (m *machine) apply(ev *Event) error {
 		return nil
 
 	case EvTimer:
+		if ev.Act == 0 && ev.Timer != 0 && ev.Timer == s.DeadlineTimer {
+			s.DeadlineTimer = 0
+			m.fail(StatusFailed, "max execution time exceeded")
+			return nil
+		}
 		a := s.Acts[ev.Act]
 		if a == nil || a.Timer == 0 || a.Timer != ev.Timer {
 			return ErrIgnored
@@ -95,7 +122,7 @@ func (m *machine) apply(ev *Event) error {
 			// Step timeout: the outcome is unknown.
 			m.out = append(m.out, Command{Kind: CmdAbort, Act: ev.Act, Node: a.Node, Attempt: a.Attempt})
 			m.undispatch(a)
-			m.stepFailed(ev.Act, a, "timeout", true, true)
+			m.stepFailed(ev.Act, a, "timeout", "timeout", true, true)
 		default:
 			return ErrIgnored
 		}
@@ -194,13 +221,42 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 	a := &Act{Node: node, Parent: parent, Scope: scope, Idx: idx}
 	s.Acts[id] = a
 	n := &m.p.Nodes[node]
+	if n.Kind != ir.KGraph {
+		// Graphs and cond tests are structure, not steps (ADR 0030).
+		s.Steps++
+		if s.MaxSteps > 0 && s.Steps > s.MaxSteps {
+			m.fail(StatusFailed, "max steps exceeded")
+			return
+		}
+	}
+	if m.tracing && n.Kind != ir.KStep {
+		m.traceStart(id, a, n, nil)
+	}
 	switch n.Kind {
 	case ir.KStep:
 		if n.Spec.Effect == ir.EffectProtected {
+			if m.tracing {
+				m.traceStart(id, a, n, m.buildInput(n, scope))
+			}
 			// Evaluated in the core; never leaves the process.
 			out, err := m.protected(n, scope)
 			if err != nil {
-				m.fail(StatusFailed, "step "+m.stepID(id, a)+": "+err.Error())
+				if n.OnError != ir.OnErrorFail {
+					typ := "error"
+					var ce *condError
+					if errors.As(err, &ce) {
+						typ = ce.typ
+					}
+					m.exception(id, a, n, err.Error(), typ)
+					return
+				}
+				typ := "error"
+				var ce *condError
+				if errors.As(err, &ce) {
+					typ = ce.typ
+				}
+				m.traceEnd(id, a, nil, "failed", err.Error(), typ)
+				m.failAt(id, "step "+m.stepID(id, a)+": "+err.Error())
 				return
 			}
 			m.complete(id, a, out)
@@ -208,41 +264,14 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 		}
 		m.dispatch(id, a)
 
-	case ir.KSeq:
-		if len(n.Children) == 0 {
-			m.complete(id, a, null)
-			return
-		}
-		m.start(n.Children[0], id, scope, 0)
-
-	case ir.KPar:
-		if len(n.Children) == 0 {
-			m.complete(id, a, json.RawMessage("{}"))
-			return
-		}
-		a.Results = make([]json.RawMessage, len(n.Children))
-		a.Pending = int32(len(n.Children))
-		for i, c := range n.Children {
-			if s.Acts[id] == nil { // failed while starting siblings
-				return
-			}
-			m.start(c, id, scope, int32(i))
-		}
-
-	case ir.KCond:
-		if m.evalPred(n.Pred, scope) {
-			m.start(n.Children[0], id, scope, 0)
-		} else if len(n.Children) > 1 {
-			m.start(n.Children[1], id, scope, 1)
-		} else {
-			m.complete(id, a, null)
-		}
+	case ir.KGraph:
+		m.startGraph(id, a, n)
 
 	case ir.KMap:
 		list := m.resolve(n.Over, scope)
 		var items []json.RawMessage
 		if err := json.Unmarshal(list, &items); err != nil || bytes.Equal(bytes.TrimSpace(list), null) {
-			m.fail(StatusFailed, "map "+n.ID+": value to map over is not a list")
+			m.failAt(id, "map "+n.ID+": value to map over is not a list")
 			return
 		}
 		if len(items) == 0 {
@@ -260,7 +289,7 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 		}
 
 	case ir.KLoop:
-		m.start(n.Children[0], id, scope, 0)
+		m.startLoop(id, a, n, node)
 
 	case ir.KWait:
 		if n.Signal != "" {
@@ -292,6 +321,7 @@ func (m *machine) launchElement(id uint32, a *Act, n *ir.Node) {
 	s.NextScope++
 	sc := s.NextScope
 	s.Scopes[sc] = &Scope{Parent: a.Scope, Map: m.nodeIndex(n), Index: i, Item: a.Items[i]}
+	m.trace(Trace{Kind: TrRoundStart, Act: id, Node: a.Node, StepID: m.stepID(id, a), Index: i})
 	m.start(n.Children[0], id, sc, i)
 }
 
@@ -307,6 +337,7 @@ func (m *machine) dispatch(id uint32, a *Act) {
 	a.Flags &^= fIntent
 	m.s.Inflight++
 	stepID := m.stepID(id, a)
+	in := m.buildInput(n, a.Scope)
 	m.out = append(m.out, Command{
 		Kind:    CmdDispatch,
 		Act:     id,
@@ -314,8 +345,11 @@ func (m *machine) dispatch(id uint32, a *Act) {
 		Attempt: a.Attempt,
 		StepID:  stepID,
 		IdemKey: m.s.RunID + "/" + stepID,
-		Input:   m.buildInput(n, a.Scope),
+		Input:   in,
 	})
+	if a.Attempt == 1 {
+		m.traceStart(id, a, n, in) // retries are TrNodeRetry
+	}
 	if n.Spec.Timeout > 0 {
 		m.armTimer(id, a, m.at+time.Duration(n.Spec.Timeout).Milliseconds())
 	}
@@ -376,13 +410,19 @@ func (m *machine) cancelTimer(a *Act) {
 	}
 }
 
-func (m *machine) stepFailed(id uint32, a *Act, msg string, retryable, unknown bool) {
+func (m *machine) stepFailed(id uint32, a *Act, msg, errType string, retryable, unknown bool) {
 	n := &m.p.Nodes[a.Node]
 	spec := n.Spec
 	if unknown {
 		if spec.Effect == ir.EffectReal && !spec.IdempotentRetry {
 			// Never treat an unknown outcome of a real command as success,
-			// and never retry it blindly: stop and ask.
+			// and never retry it blindly: stop and ask, or, where the
+			// definition says so, fail without retrying (ADR 0035).
+			if n.UnknownFails {
+				m.giveUp(id, a, n, msg, "outcome_unknown")
+				return
+			}
+			m.trace(Trace{Kind: TrNodeReview, Act: id, Node: a.Node, StepID: m.stepID(id, a), Attempt: a.Attempt, Err: msg})
 			a.Flags |= fReview
 			m.s.Status = StatusBlocked
 			m.out = append(m.out, Command{Kind: CmdReview, Act: id, Node: a.Node, Attempt: a.Attempt, StepID: m.stepID(id, a)})
@@ -390,16 +430,55 @@ func (m *machine) stepFailed(id uint32, a *Act, msg string, retryable, unknown b
 		}
 		retryable = true
 	}
-	if retryable && int(a.Attempt) < spec.MaxAttempts {
-		backoff := time.Duration(spec.Backoff) << (a.Attempt - 1)
-		if backoff > time.Minute {
-			backoff = time.Minute
+	if retryable && a.Attempt < n.MaxAttempts {
+		backoff := n.RetryInterval
+		if backoff == 0 {
+			backoff = time.Duration(spec.Backoff) << (a.Attempt - 1)
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
 		}
 		a.Flags |= fRetryWait
+		m.trace(Trace{Kind: TrNodeRetry, Act: id, Node: a.Node, StepID: m.stepID(id, a), Attempt: a.Attempt, Err: msg, ErrType: errType})
 		m.armTimer(id, a, m.at+backoff.Milliseconds())
 		return
 	}
-	m.fail(StatusFailed, "step "+m.stepID(id, a)+": "+msg)
+	m.giveUp(id, a, n, msg, errType)
+}
+
+// giveUp ends a step that failed for good: through its on_error strategy,
+// or by failing its map element or the run.
+func (m *machine) giveUp(id uint32, a *Act, n *ir.Node, msg, errType string) {
+	if n.OnError != ir.OnErrorFail {
+		m.exception(id, a, n, msg, errType)
+		return
+	}
+	m.traceEnd(id, a, nil, "failed", msg, errType)
+	m.failAt(id, "step "+m.stepID(id, a)+": "+msg)
+}
+
+// exception finishes a failed step through its on_error strategy
+// (ADR 0030): its output describes the error (plus the default value), and
+// with fail-branch it takes its fail-branch edges.
+func (m *machine) exception(id uint32, a *Act, n *ir.Node, msg, errType string) {
+	m.s.Exceptions++
+	if errType == "" {
+		errType = "error"
+	}
+	var obj map[string]json.RawMessage
+	if n.OnError == ir.OnErrorDefault {
+		json.Unmarshal(n.ErrValue, &obj) // validated at compile time
+	} else {
+		a.Flags |= fFailBranch
+	}
+	if obj == nil {
+		obj = map[string]json.RawMessage{}
+	}
+	obj["error_message"], _ = json.Marshal(msg)
+	obj["error_type"], _ = json.Marshal(errType)
+	out, _ := json.Marshal(obj) // sorted keys: deterministic
+	m.endStatus, m.endErr, m.endType = "exception", msg, errType
+	m.complete(id, a, out)
 }
 
 func (m *machine) refreshBlocked() {
@@ -423,10 +502,25 @@ func (m *machine) complete(id uint32, a *Act, out json.RawMessage) {
 		}
 		sc.Vals[a.Node] = out
 	}
+	if m.tracing {
+		status := "succeeded"
+		if m.endStatus != "" {
+			status = m.endStatus
+		}
+		m.traceEnd(id, a, out, status, m.endErr, m.endType)
+		m.endStatus, m.endErr, m.endType = "", "", ""
+	}
+	if a.Parent != 0 {
+		if pa := s.Acts[a.Parent]; pa.G == nil && m.p.Nodes[pa.Node].Kind == ir.KGraph {
+			m.migrateGraph(a.Parent, pa, &m.p.Nodes[pa.Node])
+		}
+	}
 	delete(s.Acts, id)
 	if a.Parent == 0 {
+		m.cancelDeadline()
 		s.Status = StatusCompleted
 		s.Output = out
+		m.trace(Trace{Kind: TrRunEnd, Status: s.Status.String(), Output: out})
 		m.out = append(m.out, Command{Kind: CmdDone})
 		return
 	}
@@ -434,61 +528,19 @@ func (m *machine) complete(id uint32, a *Act, out json.RawMessage) {
 	pa := s.Acts[pid]
 	pn := &m.p.Nodes[pa.Node]
 	switch pn.Kind {
-	case ir.KSeq:
-		pa.Pos++
-		if int(pa.Pos) < len(pn.Children) {
-			m.start(pn.Children[pa.Pos], pid, pa.Scope, pa.Pos)
-			return
-		}
-		m.complete(pid, pa, out)
-
-	case ir.KPar:
-		pa.Results[a.Idx] = out
-		pa.Pending--
-		if pa.Pending == 0 {
-			m.complete(pid, pa, m.parOutput(pn, pa))
-		}
-
-	case ir.KCond:
-		m.complete(pid, pa, out)
+	case ir.KGraph:
+		m.memberDone(pid, pa, a, out)
 
 	case ir.KMap:
-		pa.Results[a.Idx] = out
-		pa.Pending--
+		if pn.ElemOut != nil {
+			out = m.resolve(*pn.ElemOut, a.Scope) // the element's chosen node
+		}
 		delete(s.Scopes, a.Scope)
-		if int(pa.Pos) < len(pa.Items) {
-			m.launchElement(pid, pa, pn)
-			return
-		}
-		if pa.Pending == 0 {
-			res := joinArray(pa.Results)
-			pa.Results, pa.Items = nil, nil
-			m.complete(pid, pa, res)
-		}
+		m.elementDone(pid, pa, pn, a.Idx, out, false)
 
 	case ir.KLoop:
-		pa.Pos++
-		if int(pa.Pos) < int(pn.MaxIter) && m.evalPred(pn.Pred, pa.Scope) {
-			m.start(pn.Children[0], pid, pa.Scope, 0)
-			return
-		}
-		m.complete(pid, pa, out)
+		m.roundDone(pid, pa, pn, out)
 	}
-}
-
-func (m *machine) parOutput(pn *ir.Node, pa *Act) json.RawMessage {
-	var b []byte
-	b = append(b, '{')
-	for i, c := range pn.Children {
-		if i > 0 {
-			b = append(b, ',')
-		}
-		b = strconv.AppendQuote(b, m.p.Nodes[c].ID)
-		b = append(b, ':')
-		b = append(b, pa.Results[i]...)
-	}
-	b = append(b, '}')
-	return b
 }
 
 func joinArray(parts []json.RawMessage) json.RawMessage {
@@ -521,15 +573,27 @@ func (m *machine) fail(status RunStatus, msg string) {
 		}
 	}
 	clear(s.Acts)
+	m.cancelDeadline()
 	s.Inflight = 0
 	s.Status = status
 	s.Error = msg
+	m.trace(Trace{Kind: TrRunEnd, Status: status.String(), Err: msg})
 	m.out = append(m.out, Command{Kind: CmdDone})
+}
+
+func (m *machine) cancelDeadline() {
+	if m.s.DeadlineTimer != 0 {
+		m.out = append(m.out, Command{Kind: CmdCancelTimer, Timer: m.s.DeadlineTimer})
+		m.s.DeadlineTimer = 0
+	}
 }
 
 // recover re-issues everything that was in flight when the process died.
 func (m *machine) recover() {
 	s := m.s
+	if s.DeadlineTimer != 0 {
+		m.out = append(m.out, Command{Kind: CmdTimer, Timer: s.DeadlineTimer, At: s.Deadline})
+	}
 	for _, id := range sortedActs(s) {
 		a := s.Acts[id]
 		if s.Acts[id] == nil {
@@ -547,7 +611,7 @@ func (m *machine) recover() {
 			if n.Spec.Effect == ir.EffectReal && a.Flags&fIntent != 0 {
 				// It may have been executed: the outcome is unknown.
 				m.undispatch(a)
-				m.stepFailed(id, a, "outcome unknown after restart", true, true)
+				m.stepFailed(id, a, "outcome unknown after restart", "outcome_unknown", true, true)
 				continue
 			}
 			// Unprotected, or real but provably never released.

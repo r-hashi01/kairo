@@ -58,7 +58,7 @@ func TestDispatcherRoundRobinBetweenTenants(t *testing.T) {
 	var order []string
 	for i := 0; i < 8; i++ {
 		tk := <-p.C
-		order = append(order, tk.Tenant)
+		order = append(order, tk.Task.Tenant)
 	}
 	// B must not wait behind all of A's tasks.
 	if got := join(order); got != "A B A B A A A A" {
@@ -93,7 +93,7 @@ func TestDispatcherTenantConcurrency(t *testing.T) {
 		tasks = append(tasks, tk)
 		d.Submit(tk)
 	}
-	got := []*task.Task{<-p.C, <-p.C}
+	got := []*task.Task{(<-p.C).Task, (<-p.C).Task}
 	select {
 	case <-p.C:
 		t.Fatal("tenant exceeded its concurrency cap")
@@ -148,5 +148,104 @@ func TestAdmissionCancel(t *testing.T) {
 	}
 	if active, queued := a.Stats(); active != 1 || queued != 0 {
 		t.Fatalf("active %d queued %d", active, queued)
+	}
+}
+
+func TestAbortCancelsDeliveredTask(t *testing.T) {
+	d := NewDispatcher(func(string) DestLimits { return DestLimits{TenantConcurrency: 1} })
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, 2)
+	a := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "x"}
+	b := &task.Task{RunID: "r", Act: 2, Tenant: "t", Action: "x", Destination: "x"}
+	d.Submit(a)
+	d.Submit(b)
+	dl := <-p.C
+	d.Abort(a.Key())
+	select {
+	case <-dl.Ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("aborting a delivered task did not cancel its context")
+	}
+	// The slot stays taken until the worker reports Done (ADR 0026).
+	select {
+	case <-p.C:
+		t.Fatal("concurrency slot released before Done")
+	case <-time.After(30 * time.Millisecond):
+	}
+	d.Done(a, 0)
+	select {
+	case dl := <-p.C:
+		if dl.Ctx.Err() != nil {
+			t.Fatal("the next task arrived cancelled")
+		}
+		d.Done(dl.Task, 0)
+	case <-time.After(time.Second):
+		t.Fatal("slot not reused after Done")
+	}
+	waitTracked(t, d, 0)
+}
+
+func TestAbortLeavesNothingBehind(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	// Aborted while queued (no worker yet), after delivery, after Done and
+	// while delivered but not taken (then Unpoll): no key is remembered.
+	for i := 0; i < 1000; i++ {
+		d.Submit(&task.Task{RunID: "q", Act: uint32(i), Tenant: "t", Action: "x", Destination: "x"})
+		d.Abort(task.Key{RunID: "q", Act: uint32(i)})
+	}
+	p := d.NewPoller([]string{"x"}, 1)
+	for i := 0; i < 1000; i++ {
+		tk := &task.Task{RunID: "r", Act: uint32(i), Tenant: "t", Action: "x", Destination: "x"}
+		d.Submit(tk)
+		dl := <-p.C
+		if i%2 == 0 {
+			d.Abort(tk.Key())
+			<-dl.Ctx.Done()
+			d.Done(tk, 0)
+		} else {
+			d.Done(tk, 0)
+			d.Abort(tk.Key())
+		}
+		d.Poll(p, 1)
+	}
+	d.Unpoll(p)
+	p2 := d.NewPoller([]string{"y"}, 4)
+	for i := 0; i < 4; i++ {
+		d.Submit(&task.Task{RunID: "u", Act: uint32(i), Tenant: "t", Action: "y", Destination: "y"})
+	}
+	waitFor(t, func() bool { return len(p2.C) == 4 })
+	for i := 0; i < 2; i++ {
+		d.Abort(task.Key{RunID: "u", Act: uint32(i)})
+	}
+	d.Unpoll(p2) // two requeued, two dropped as aborted
+	waitTracked(t, d, 2)
+	if q := d.Queued(); q != 2 {
+		t.Fatalf("queued %d, want 2", q)
+	}
+	p3 := d.NewPoller([]string{"y"}, 4)
+	for i := 0; i < 2; i++ {
+		dl := <-p3.C
+		if dl.Task.RunID != "u" || dl.Task.Act < 2 {
+			t.Fatalf("an aborted task was requeued: %+v", dl.Task)
+		}
+		d.Done(dl.Task, 0)
+	}
+	waitTracked(t, d, 0)
+}
+
+func waitTracked(t *testing.T, d *Dispatcher, n int) {
+	t.Helper()
+	waitFor(t, func() bool { return d.Tracked() == n })
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

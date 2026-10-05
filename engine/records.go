@@ -75,8 +75,31 @@ func encodeEvent(b []byte, runID string, ev *core.Event) []byte {
 	if ev.Unknown {
 		flags |= 2
 	}
-	return append(b, flags)
+	ext := ev.ErrType != "" || ev.MaxSteps != 0 || ev.Deadline != 0 || ev.Depth != 0 || len(ev.Vars) > 0 || len(ev.Meta) > 0
+	if !ext {
+		return append(b, flags)
+	}
+	// Extension fields, added after v0 (ADR 0030). Records without the
+	// flag decode as before. Later fields go after these, under a higher
+	// extension version.
+	b = append(b, flags|flagExt)
+	b = binary.AppendUvarint(b, extVersion)
+	b = appendStr(b, ev.ErrType)
+	b = binary.AppendVarint(b, int64(ev.MaxSteps))
+	b = binary.AppendVarint(b, ev.Deadline)
+	b = binary.AppendVarint(b, int64(ev.Depth))
+	// Version 2 (ADR 0033).
+	b = binary.AppendUvarint(b, uint64(len(ev.Vars)))
+	b = append(b, ev.Vars...)
+	// Version 3 (ADR 0034).
+	b = binary.AppendUvarint(b, uint64(len(ev.Meta)))
+	return append(b, ev.Meta...)
 }
+
+const (
+	flagExt    byte = 4
+	extVersion      = 3
+)
 
 type rdr struct {
 	b   []byte
@@ -180,6 +203,21 @@ func decodeRecord(rec []byte) (record, error) {
 		flags := r.byte1()
 		e.Retryable = flags&1 != 0
 		e.Unknown = flags&2 != 0
+		if flags&flagExt != 0 {
+			v := r.u()
+			if v >= 1 {
+				e.ErrType = r.str()
+				e.MaxSteps = int32(r.i())
+				e.Deadline = r.i()
+				e.Depth = int32(r.i())
+			}
+			if v >= 2 {
+				e.Vars = r.bytes()
+			}
+			if v >= 3 {
+				e.Meta = r.bytes()
+			}
+		}
 		out.ev = e
 	default:
 		return out, errBadRecord

@@ -11,6 +11,11 @@
 //	worker -> runtime   Chunk  {"seq":17,"data":"<base64>"}      (live output)
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
 //	worker -> runtime   Credit {"n":4}                            (optional extra credit)
+//	runtime -> worker   Cancel {"seq":17}                         (the step was abandoned)
+//
+// Cancel is a request (ADR 0026): the worker should stop the task and must
+// still send its Result, which releases the task's concurrency slot and
+// credit. Workers that predate Cancel skip it like any unknown type.
 package protocol
 
 import (
@@ -29,6 +34,7 @@ const (
 	MsgResult MsgType = 3
 	MsgCredit MsgType = 4
 	MsgChunk  MsgType = 5
+	MsgCancel MsgType = 6
 )
 
 const maxFrame = 64 << 20
@@ -46,6 +52,12 @@ type Result struct {
 	Retryable bool            `json:"retryable,omitempty"`
 	Unknown   bool            `json:"unknown,omitempty"`
 	Tokens    int             `json:"tokens,omitempty"`
+	ErrType   string          `json:"error_type,omitempty"`
+	Meta      json.RawMessage `json:"meta,omitempty"`
+}
+
+type Cancel struct {
+	Seq uint64 `json:"seq"`
 }
 
 type Credit struct {

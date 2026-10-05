@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -95,13 +96,39 @@ type Config struct {
 	SegmentSize int64
 
 	// RecentRuns is how many finished runs Get, Wait and Submit's
-	// idempotency remember (default 100,000).
+	// idempotency remember with their output, in memory (default 100,000).
 	RecentRuns int
+
+	// IdempotencyTTL is how long a finished run of the file tier or above
+	// is remembered across restarts (ADR 0027): a RunID submitted again
+	// within it starts nothing. Default 24h; negative disables the markers.
+	IdempotencyTTL time.Duration
+	// IdempotencyMax caps the markers kept in memory (default 10,000,000);
+	// beyond it the oldest are forgotten early, with a warning.
+	IdempotencyMax int
+	// DoneLogs overrides the per-shard log of finished-run markers.
+	// Default: files under DataDir/wal, or memory (with a warning) if
+	// there is no DataDir.
+	DoneLogs func(shard int) (wal.Sink, error)
 
 	// EvictAfter: a run that has nothing in flight and will not be woken
 	// for at least this long is snapshotted and dropped from memory.
 	// Default 2s; negative disables eviction.
 	EvictAfter time.Duration
+
+	// RunLimits applies to runs that do not set their own (ADR 0030).
+	RunLimits RunLimits
+	// Feeds names the durable subscriptions of the execution event feed
+	// (ADR 0034). While a subscription has not acknowledged an entry, run
+	// state is not snapshotted past it and the log is kept from it on.
+	Feeds []string
+	// FeedLimit cuts a subscription holding more unacknowledged entries
+	// than this (default 1,000,000).
+	FeedLimit int
+
+	// MaxDepth rejects runs nested deeper than this (a workflow called as a
+	// tool from a workflow ...); 0 means no limit.
+	MaxDepth int
 
 	Admission sched.AdmissionConfig
 	Limits    func(dest string) sched.DestLimits
@@ -126,6 +153,26 @@ type SubmitRequest struct {
 	Tenant string          `json:"tenant"`
 	Tier   *Tier           `json:"tier,omitempty"`
 	RunID  string          `json:"run_id,omitempty"`
+	// Entry starts the run at one entry node of its root graph (e.g. the
+	// trigger that fired); the other entries' paths are skipped. Empty
+	// starts at all of them (ADR 0029).
+	Entry string `json:"entry,omitempty"`
+	// Limits overrides Config.RunLimits; Depth is the nesting depth of the
+	// run (0 for a top-level run; a worker starting a workflow from a task
+	// passes the task's Depth+1).
+	Limits *RunLimits `json:"limits,omitempty"`
+	Depth  int        `json:"depth,omitempty"`
+	// Vars gives initial values to the plan's run variables (an object;
+	// e.g. a Dify conversation's variables, ADR 0033).
+	Vars json.RawMessage `json:"vars,omitempty"`
+}
+
+// RunLimits bound one run (ADR 0030): the number of steps, waits and
+// containers it starts, and its total duration including waits. Zero
+// means no limit.
+type RunLimits struct {
+	MaxSteps    int           `json:"max_steps,omitempty"`
+	MaxDuration time.Duration `json:"max_duration,omitempty"`
 }
 
 // RunInfo describes a run.
@@ -142,6 +189,16 @@ type RunInfo struct {
 	// Waits lists steps waiting for a signal (approvals, webhooks, user
 	// messages) while the run has nothing in flight.
 	Waits []core.Wait `json:"waits,omitempty"`
+	// Trimmed: only the finished-run marker is left (ADR 0027); Status and
+	// FinishedAt are set, the output and other details are gone.
+	Trimmed bool `json:"trimmed,omitempty"`
+	// Exceptions counts steps that failed into their on_error strategy;
+	// Dify reports such a run as partial-succeeded (ADR 0030).
+	Exceptions int `json:"exceptions,omitempty"`
+	// Vars are the run variables' current (when finished: final) values;
+	// the host persists them (ADR 0033).
+	Vars       json.RawMessage `json:"vars,omitempty"`
+	FinishedAt time.Time       `json:"finished_at,omitzero"`
 }
 
 type Review struct {
@@ -178,6 +235,9 @@ type Engine struct {
 	finished map[string]RunInfo
 	finOrder []string
 
+	doneMax int      // markers per shard (ADR 0027)
+	feed    *feedHub // nil without Config.Feeds (ADR 0034)
+
 	execMu  sync.Mutex
 	pollers []*sched.Poller
 	stopped chan struct{}
@@ -200,6 +260,15 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.RecentRuns <= 0 {
 		cfg.RecentRuns = 100_000
+	}
+	if cfg.IdempotencyTTL == 0 {
+		cfg.IdempotencyTTL = 24 * time.Hour
+	}
+	if cfg.IdempotencyMax <= 0 {
+		cfg.IdempotencyMax = 10_000_000
+	}
+	if cfg.FeedLimit <= 0 {
+		cfg.FeedLimit = 1_000_000
 	}
 	if cfg.CompactEvery == 0 {
 		cfg.CompactEvery = 65536
@@ -317,9 +386,18 @@ func New(cfg Config) (*Engine, error) {
 		e.snaps = blob.Encrypted(e.snaps, cfg.Keys)
 		e.blobs = blob.Encrypted(e.blobs, cfg.Keys)
 	}
+	dones, err := e.doneSinks(sinks)
+	if err != nil {
+		return nil, err
+	}
+	e.doneMax = (cfg.IdempotencyMax + cfg.Shards - 1) / cfg.Shards
 	e.shards = make([]*shard, cfg.Shards)
 	for i := range e.shards {
-		e.shards[i] = newShard(e, i, sinks[i])
+		e.shards[i] = newShard(e, i, sinks[i], dones[i])
+	}
+	if len(cfg.Feeds) > 0 {
+		e.feed = newFeedHub(e)
+		go e.feed.run()
 	}
 	return e, nil
 }
@@ -327,10 +405,30 @@ func New(cfg Config) (*Engine, error) {
 // Start recovers runs from the logs (plans must already be registered) and
 // starts the shard loops.
 func (e *Engine) Start() error {
+	if h := e.feed; h != nil {
+		if err := h.load(); err != nil {
+			return err
+		}
+		for _, s := range e.shards {
+			s.feedBound = h.bounds[s.id]
+		}
+	}
 	for _, s := range e.shards {
 		if err := s.recover(); err != nil {
 			return fmt.Errorf("shard %d: %w", s.id, err)
 		}
+	}
+	if h := e.feed; h != nil {
+		for _, s := range e.shards {
+			for t := TierFile; t < tierCount; t++ {
+				if l := s.logs[t]; l != nil {
+					h.setStart(s.id, t, l.lsn)
+				}
+			}
+		}
+		h.mu.Lock()
+		h.computeBounds(true)
+		h.mu.Unlock()
 	}
 	for _, s := range e.shards {
 		e.wg.Add(1)
@@ -353,10 +451,15 @@ func (e *Engine) Close() {
 		e.disp.Unpoll(p)
 	}
 	e.execMu.Unlock()
+	e.disp.AbortAll() // running executors see their context end
 	for _, s := range e.shards {
 		s.inbox.Push(msg{kind: mStop})
 	}
 	e.wg.Wait()
+	if e.feed != nil {
+		close(e.feed.stop)
+		<-e.feed.done
+	}
 	e.disp.Close()
 	close(e.ioStop) // the feeder drains what is queued, then closes e.io
 	e.ioWG.Wait()
@@ -490,6 +593,12 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 	if p == nil {
 		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
 	}
+	if e.cfg.MaxDepth > 0 && req.Depth > e.cfg.MaxDepth {
+		return SubmitResult{}, fmt.Errorf("%w: depth %d > %d", ErrTooDeep, req.Depth, e.cfg.MaxDepth)
+	}
+	if req.Entry != "" && !hasEntry(p, req.Entry) {
+		return SubmitResult{}, fmt.Errorf("%w: %q is not an entry of plan %s", ErrUnknownEntry, req.Entry, p.Name)
+	}
 	tier := e.cfg.DefaultTier
 	if req.Tier != nil {
 		tier = *req.Tier
@@ -507,12 +616,25 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 		e.waitMu.Lock()
 		_, done := e.finished[id]
 		e.waitMu.Unlock()
+		if !done {
+			_, done = e.marker(id)
+		}
 		if done {
 			return SubmitResult{RunID: id, Existing: true}, nil
 		}
 	}
 	reply := make(chan startReply, 1)
-	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, reply: reply}
+	// A request's limits apply field by field; zero keeps the configured one.
+	lim := e.cfg.RunLimits
+	if l := req.Limits; l != nil {
+		if l.MaxSteps > 0 {
+			lim.MaxSteps = l.MaxSteps
+		}
+		if l.MaxDuration > 0 {
+			lim.MaxDuration = l.MaxDuration
+		}
+	}
+	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, reply: reply}
 	sh := e.shardFor(id)
 	ticket, err := e.adm.Admit(req.Tenant, func() { sh.inbox.Push(msg{kind: mStart, start: sr}) })
 	if err != nil {
@@ -527,6 +649,26 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 		}
 		return SubmitResult{RunID: id}, ErrUnconfirmed
 	}
+}
+
+// ErrUnknownEntry: SubmitRequest.Entry names no entry of the plan's root
+// graph.
+var ErrUnknownEntry = errors.New("engine: unknown entry")
+
+// ErrTooDeep: SubmitRequest.Depth exceeds Config.MaxDepth.
+var ErrTooDeep = errors.New("engine: workflow nested too deep")
+
+func hasEntry(p *ir.Plan, id string) bool {
+	root := &p.Nodes[0]
+	if root.Kind != ir.KGraph || root.Sugar != ir.SugarGraph {
+		return false
+	}
+	for _, mi := range root.Entry {
+		if p.Nodes[root.Children[mi]].ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Signal delivers an external event (webhook, approval) to a run.
@@ -569,6 +711,9 @@ func (e *Engine) Get(ctx context.Context, runID string) (RunInfo, error) {
 			if ok {
 				return ri, nil
 			}
+			if ri, ok := e.trimmed(runID); ok {
+				return ri, nil
+			}
 			return RunInfo{}, ErrUnknownRun
 		}
 		return r.info, nil
@@ -585,6 +730,10 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 		e.waitMu.Unlock()
 		return ri, nil
 	}
+	if ri, ok := e.trimmed(runID); ok {
+		e.waitMu.Unlock()
+		return ri, nil
+	}
 	e.waiters[runID] = append(e.waiters[runID], ch)
 	e.waitMu.Unlock()
 	select {
@@ -593,6 +742,55 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 	case <-ctx.Done():
 		return RunInfo{}, ctx.Err()
 	}
+}
+
+// trimmed describes a run known only by its finished-run marker.
+func (e *Engine) trimmed(runID string) (RunInfo, bool) {
+	en, ok := e.marker(runID)
+	if !ok {
+		return RunInfo{}, false
+	}
+	return RunInfo{RunID: runID, Status: en.status, Trimmed: true, FinishedAt: time.UnixMilli(en.at)}, true
+}
+
+// doneSinks opens the per-shard logs of finished-run markers (ADR 0027).
+// None are needed if markers are disabled or no shard has a log tier that
+// survives a restart.
+func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) ([]wal.Sink, error) {
+	cfg := e.cfg
+	out := make([]wal.Sink, cfg.Shards)
+	if cfg.IdempotencyTTL < 0 || (!e.tiers[TierFile] && !e.tiers[TierReplicated]) {
+		return out, nil
+	}
+	if cfg.DoneLogs == nil && cfg.DataDir == "" {
+		log.Printf("kairo: no DataDir and no DoneLogs: finished-run markers are kept in memory and lost on restart")
+	}
+	for i := range out {
+		var s wal.Sink
+		var err error
+		switch {
+		case cfg.DoneLogs != nil:
+			s, err = cfg.DoneLogs(i)
+		case cfg.DataDir != "":
+			var fs *wal.FileSink
+			if fs, err = wal.OpenFile(filepath.Join(cfg.DataDir, "wal"), fmt.Sprintf("done-%03d", i), cfg.NoSync); err == nil {
+				s = fs
+			}
+		default:
+			s = &wal.MemSink{}
+		}
+		if err != nil {
+			return nil, err
+		}
+		if s == nil {
+			return nil, fmt.Errorf("engine: DoneLogs returned no sink for shard %d", i)
+		}
+		if cfg.Keys != nil {
+			s = wal.Encrypted(s, cfg.Keys, fmt.Sprintf("shard-%03d/done", i))
+		}
+		out[i] = s
+	}
+	return out, nil
 }
 
 // rememberFinished records a finished run for Get and Submit's
@@ -629,6 +827,9 @@ type Stats struct {
 	DispatchQueued          int
 	InMemory, Evicted       int
 	ObsDropped              uint64
+	// FeedBacklog is the most unacknowledged feed entries any subscription
+	// holds (ADR 0034).
+	FeedBacklog int
 	// FailedLogs counts shard logs whose writes failed with an unknown
 	// outcome. Their real commands and completions are held: those runs
 	// cannot make progress until the engine is restarted.
@@ -644,6 +845,9 @@ func (e *Engine) Stats() Stats {
 		st.Evicted += int(s.evicted.Load())
 	}
 	st.ObsDropped = e.obs.Dropped()
+	if e.feed != nil {
+		st.FeedBacklog = e.feed.backlog()
+	}
 	for _, s := range e.shards {
 		st.FailedLogs += int(s.failedLogs.Load())
 	}

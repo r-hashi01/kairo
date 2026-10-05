@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"net"
@@ -119,4 +120,89 @@ func TestWorkerDisconnect(t *testing.T) {
 func submit(e *engine.Engine, req engine.SubmitRequest) (string, error) {
 	r, err := e.Submit(context.Background(), req)
 	return r.RunID, err
+}
+
+// Cancelling a run reaches a task running in a remote worker (ADR 0026).
+func TestWorkerReceivesCancel(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	wk := &Worker{Name: "w1", Actions: []string{"code.run"}, Handler: func(ctx context.Context, tk *task.Task, _ func([]byte)) task.Result {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+		return task.Result{Err: "cancelled"}
+	}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	e.Cancel(id, "user")
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker's task was not cancelled")
+	}
+	waitTracked(t, e)
+}
+
+// A worker that predates Cancel skips the frame; its late result is still
+// accepted and releases the task.
+func TestOldWorkerIgnoresCancel(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	WriteFrame(w, MsgHello, Hello{Worker: "old", Actions: []string{"code.run"}, Credit: 1})
+	w.Flush()
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	typ, body, err := ReadFrame(r)
+	if err != nil || typ != MsgTask {
+		t.Fatalf("%v %v", typ, err)
+	}
+	var tk task.Task
+	json.Unmarshal(body, &tk)
+	e.Cancel(id, "user")
+	typ, body, err = ReadFrame(r)
+	if err != nil || typ != MsgCancel {
+		t.Fatalf("got %v %v, want a Cancel frame", typ, err)
+	}
+	var cn Cancel
+	if json.Unmarshal(body, &cn); cn.Seq != tk.Seq {
+		t.Fatalf("cancel for seq %d, task has %d", cn.Seq, tk.Seq)
+	}
+	if e.Dispatcher().Tracked() != 1 {
+		t.Fatal("the task was released before its result")
+	}
+	WriteFrame(w, MsgResult, Result{Seq: tk.Seq, Output: json.RawMessage(`{}`)})
+	w.Flush()
+	waitTracked(t, e)
+	wctx, wc := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wc()
+	if ri, err := e.Wait(wctx, id); err != nil || ri.Status != "cancelled" {
+		t.Fatalf("%v %+v", err, ri)
+	}
+}
+
+func waitTracked(t *testing.T, e *engine.Engine) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for e.Dispatcher().Tracked() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("dispatcher still tracks %d tasks", e.Dispatcher().Tracked())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

@@ -138,6 +138,11 @@ type NodeSpec struct {
 	// fields stay inline in the run state even when the payload is moved
 	// out to a blob, so conditions can always be evaluated.
 	Outputs map[string]FieldType `json:"outputs,omitempty"`
+	// Branch names an enum field of Outputs whose value chooses the node's
+	// outgoing edges in a graph (ADR 0029): the edges whose handle equals
+	// the value are taken, the others skipped. The enum's values are the
+	// node's handles.
+	Branch string `json:"branch,omitempty"`
 }
 
 func (s *NodeSpec) normalize() {
@@ -180,9 +185,13 @@ func (d *Duration) UnmarshalText(b []byte) error {
 //
 // ActionAppend outputs one list: its inputs in name order, arrays spliced
 // in, nulls skipped, other values appended as single elements.
+//
+// ActionSwitch evaluates Dify-style conditions (ADR 0031) and branches on
+// the first case that holds ("false" if none).
 const (
 	ActionPass   = "kairo.pass"
 	ActionAppend = "kairo.append"
+	ActionSwitch = "kairo.switch"
 )
 
 // Registry holds node specs by action name.
@@ -195,6 +204,12 @@ func NewRegistry() *Registry {
 	r := &Registry{specs: map[string]*NodeSpec{}}
 	r.Register(NodeSpec{Action: ActionPass, Effect: EffectProtected})
 	r.Register(NodeSpec{Action: ActionAppend, Effect: EffectProtected})
+	r.Register(NodeSpec{Action: ActionAssign, Effect: EffectProtected})
+	r.Register(NodeSpec{Action: ActionSwitch, Effect: EffectProtected, Branch: "handle", Outputs: map[string]FieldType{
+		"handle":           {Type: FieldEnum},
+		"result":           {Type: FieldBool},
+		"selected_case_id": {Type: FieldText},
+	}})
 	return r
 }
 

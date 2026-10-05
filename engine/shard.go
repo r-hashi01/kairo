@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -34,9 +35,18 @@ type shard struct {
 	timer *time.Timer
 	armed int64 // tick the OS timer is armed for, 0 if none
 	logs  [tierCount]*shardLog
-	cmds  []core.Command
-	fired []timerRef
-	now   int64
+	// doneLog holds finished-run markers (ADR 0027); nil if disabled.
+	doneLog *doneLog
+	cmds    []core.Command
+	// Feed (ADR 0034): traces of this loop iteration, the LSN per tier up
+	// to which run state may be snapshotted and records retired, and the
+	// runs waiting for it to advance.
+	traces    []core.Trace
+	feedOut   []FeedEntry
+	feedBound [tierCount]uint64
+	feedWait  []*run
+	fired     []timerRef
+	now       int64
 
 	inMemory   atomic.Int64
 	evicted    atomic.Int64
@@ -102,6 +112,8 @@ type run struct {
 	pendSnap  uint64 // LSN of a snapshot being written, not yet checkpointed
 	pendFirst uint64 // first own record after pendSnap
 	finishJob func() // finished while a snapshot write was in flight: run after it
+	afterFeed func() // waits for the feed's acknowledgements (ADR 0034)
+	feedLSN   uint64 // LSN of the run's last event that produced traces
 	started   bool   // the start is durable (Submit answered)
 	startWait []chan startReply
 	compactCP bool        // the snapshot in flight was requested by compaction
@@ -125,6 +137,10 @@ type startReq struct {
 	plan   *ir.Plan
 	tier   Tier
 	input  json.RawMessage
+	entry  string
+	limits RunLimits
+	depth  int
+	vars   json.RawMessage
 	reply  chan startReply // answered once the start is durable
 }
 
@@ -142,6 +158,9 @@ const (
 	mSnapStored
 	mSnapDeleted
 	mQuery
+	mDoneAck
+	mFeedBound
+	mFeedStart
 	mStop
 )
 
@@ -156,6 +175,8 @@ type msg struct {
 	data  []byte
 	run   *run
 	reply chan queryReply
+	// mFeedStart
+	feedReply chan [tierCount]uint64
 }
 
 type queryReply struct {
@@ -163,7 +184,7 @@ type queryReply struct {
 	found bool
 }
 
-func newShard(e *Engine, id int, sinks [tierCount]wal.Sink) *shard {
+func newShard(e *Engine, id int, sinks [tierCount]wal.Sink, done wal.Sink) *shard {
 	s := &shard{
 		e:     e,
 		id:    id,
@@ -186,6 +207,9 @@ func newShard(e *Engine, id int, sinks [tierCount]wal.Sink) *shard {
 		l.buf = l.committer.Buffer()
 		s.logs[t] = l
 	}
+	if done != nil {
+		s.doneLog = newDoneLog(s, done)
+	}
 	return s
 }
 
@@ -195,6 +219,10 @@ func (s *shard) close() {
 			l.committer.Close()
 			l.sink.Close()
 		}
+	}
+	if d := s.doneLog; d != nil {
+		d.committer.Close()
+		d.sink.Close()
 	}
 }
 
@@ -236,6 +264,10 @@ func (s *shard) flush() {
 			l.buf = l.committer.Buffer()
 		}
 	}
+	if d := s.doneLog; d != nil && len(d.buf) > 0 {
+		d.committer.Submit(d.buf, d.lsn)
+		d.buf = d.committer.Buffer()
+	}
 }
 
 func (s *shard) rearm() {
@@ -270,6 +302,22 @@ func (s *shard) handle(m *msg) {
 		s.event(r, m.ev)
 	case mAck:
 		s.ack(m.tier, m.lsn, m.err)
+	case mDoneAck:
+		s.doneAck(m.lsn, m.err)
+	case mFeedBound:
+		s.feedBound[m.tier] = m.lsn
+		s.feedAdvanced()
+	case mFeedStart:
+		// A subscription starts over from the present: nothing past here
+		// may be snapshotted until it acknowledges (ADR 0034).
+		var at [tierCount]uint64
+		for t := TierFile; t < tierCount; t++ {
+			if l := s.logs[t]; l != nil {
+				at[t] = l.lsn
+				s.feedBound[t] = min(s.feedBound[t], l.lsn)
+			}
+		}
+		m.feedReply <- at
 	case mLoaded:
 		s.loaded(m.run, m.data, m.err)
 	case mSnapStored:
@@ -324,7 +372,8 @@ func (s *shard) handle(m *msg) {
 func (s *shard) info(r *run) RunInfo {
 	ri := RunInfo{RunID: r.id, Plan: r.plan.Name, Tenant: r.tenant, Tier: r.tier, Status: r.status.String(), Evicted: r.st == nil, Reviews: r.reviews, Waits: r.waits}
 	if st := r.st; st != nil {
-		ri.Output, ri.Error = st.Output, st.Error
+		ri.Output, ri.Error, ri.Exceptions = st.Output, st.Error, int(st.Exceptions)
+		ri.Vars = core.RunVars(st)
 	}
 	return ri
 }
@@ -373,11 +422,20 @@ func (s *shard) startRun(sr *startReq) {
 		}
 		return
 	}
+	if d := s.doneLog; d != nil {
+		if _, ok := d.idx.get(sr.runID, s.markerCut()); ok {
+			// Finished within IdempotencyTTL (ADR 0027).
+			s.e.adm.Release(sr.tenant)
+			sr.reply <- startReply{existing: true}
+			return
+		}
+	}
 	if old := s.pins[sr.runID]; old != nil {
 		old.starts = append(old.starts, sr)
 		return
 	}
 	r := &run{id: sr.runID, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
+	s.forgetMarker(r.id) // an expired marker of an earlier run with this id
 	s.runs[r.id] = r
 	s.inMemory.Add(1)
 	if l := s.logFor(r); l != nil {
@@ -387,7 +445,12 @@ func (s *shard) startRun(sr *startReq) {
 	}
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "run.start", RunID: r.id, Tenant: r.tenant, Data: sr.input})
 	r.startWait = append(r.startWait, sr.reply)
-	s.event(r, core.Event{Kind: core.EvStart, Data: sr.input})
+	ev := core.Event{Kind: core.EvStart, Data: sr.input, Name: sr.entry,
+		MaxSteps: int32(sr.limits.MaxSteps), Depth: int32(sr.depth), Vars: sr.vars}
+	if d := sr.limits.MaxDuration; d > 0 {
+		ev.Deadline = s.now + d.Milliseconds()
+	}
+	s.event(r, ev)
 	if l := s.logFor(r); l != nil {
 		// Durable once the start record and the EvStart event are. Held at
 		// lastLSN (at or after both) to keep the held list in LSN order.
@@ -419,12 +482,26 @@ func (s *shard) event(r *run, ev core.Event) {
 		return
 	}
 	ev.At = s.now
-	out, err := core.Apply(r.plan, r.st, &ev, s.cmds[:0])
+	var out []core.Command
+	var err error
+	if s.e.feed != nil {
+		out, s.traces, err = core.ApplyTraced(r.plan, r.st, &ev, s.cmds[:0], s.traces[:0])
+	} else {
+		out, err = core.Apply(r.plan, r.st, &ev, s.cmds[:0])
+	}
 	s.cmds = out[:0]
 	if err != nil {
 		return // ignored (stale) events are not logged
 	}
 	s.record(r, &ev)
+	if s.e.feed != nil && len(s.traces) > 0 {
+		// Before the commands: a task's chunks must not overtake the trace
+		// of its start.
+		s.feedTraces(r, r.lastLSN, s.traces)
+		if r.tier >= TierFile {
+			r.feedLSN = r.lastLSN
+		}
+	}
 	if r.status = r.st.Status; r.status == core.StatusBlocked || r.reviews != nil {
 		r.reviews = reviews(r)
 	}
@@ -488,6 +565,7 @@ func (s *shard) dispatch(r *run, c *core.Command) {
 		Effect: n.Spec.Effect, Input: c.Input, Params: n.Params,
 	}
 	t.EstTokens = s.e.cfg.EstimateTokens(t)
+	t.Depth = int(r.st.Depth)
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "step.dispatch", RunID: r.id, Tenant: r.tenant, StepID: c.StepID,
 		Action: t.Action, Effect: t.Effect.String(), Attempt: c.Attempt, Data: c.Input})
 	l := s.logFor(r)
@@ -561,7 +639,9 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 func (s *shard) release(h held) {
 	switch h.kind {
 	case hDispatch:
-		if !h.run.done {
+		// Not if the step was aborted while its intent was becoming durable
+		// (a failed map element, a timeout, ADR 0032).
+		if r := h.run; !r.done && r.st != nil && core.Dispatched(r.st, h.task.Act, h.task.Attempt) {
 			s.e.disp.Submit(h.task)
 		}
 	case hDone:
@@ -646,6 +726,9 @@ func (s *shard) maybeCompact(l *shardLog) {
 	}
 	l.checkedAt = ext
 	bound := l.durable + 1
+	if b := s.feedBound[l.tier]; s.e.feed != nil && b != math.MaxUint64 {
+		bound = min(bound, b+1) // keep what the feed may need again
+	}
 	// Runs whose pin is older than a few check intervals are moved forward.
 	// A waiting run is rewritten about once per compactStale intervals of
 	// workload growth, never on its own.
@@ -683,7 +766,7 @@ func (s *shard) maybeCompact(l *shardLog) {
 // so its old records can be retired. Only durable state is snapshotted.
 func (s *shard) checkpointLive(r *run) {
 	l := s.logFor(r)
-	if r.tier < TierFile || r.st == nil || r.writing || l == nil || l.durable < r.lastLSN {
+	if r.tier < TierFile || r.st == nil || r.writing || l == nil || l.durable < r.lastLSN || !s.feedOK(r) {
 		return
 	}
 	r.writing, r.compactCP = true, true
@@ -741,16 +824,33 @@ func (s *shard) finish(r *run) {
 			s.inbox.Push(msg{kind: mSnapDeleted, run: r})
 		}
 	}
-	if tier >= TierFile {
-		// Keep the run's records until its snapshot and blobs are gone, so a
-		// crash in between cannot resurrect it (ADR 0016).
-		s.pins[r.id] = r
+	if tier < TierFile {
+		s.e.doIO(job)
+		return
+	}
+	// Keep the run's records until its snapshot and blobs are gone, so a
+	// crash in between cannot resurrect it (ADR 0016).
+	s.pins[r.id] = r
+	var start func()
+	start = func() {
+		if !s.feedOK(r) {
+			// The records must stay until the feed has its traces (ADR 0034).
+			s.waitFeed(r, start)
+			return
+		}
 		if r.writing {
 			r.finishJob = job // after the in-flight snapshot write
 			return
 		}
+		s.e.doIO(job)
 	}
-	s.e.doIO(job)
+	if s.doneLog == nil {
+		start()
+		return
+	}
+	// Clean up only once the marker is durable: until then the records
+	// are what tells a restart that the run finished (ADR 0027).
+	s.addMarker(id, ri.Status, start)
 }
 
 // maybeEvict snapshots a run that is only waiting (timers far away,
@@ -773,6 +873,10 @@ func (s *shard) maybeEvict(r *run) {
 		// Only snapshot what is already durable, so a snapshot never
 		// refers to log positions that a crash could lose.
 		s.hold(l, r, hEvict, nil)
+		return
+	}
+	if !s.feedOK(r) {
+		s.waitFeed(r, func() { s.maybeEvict(r) })
 		return
 	}
 	r.snap = s.startSnapshot(r)

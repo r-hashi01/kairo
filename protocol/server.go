@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"log"
 	"net"
@@ -9,7 +10,7 @@ import (
 	"time"
 
 	"kairo/engine"
-	"kairo/live"
+	"kairo/sched"
 	"kairo/task"
 )
 
@@ -48,43 +49,75 @@ func (s *Server) handle(c net.Conn) {
 	d := s.E.Dispatcher()
 	p := d.NewPoller(h.Actions, h.Credit)
 
+	type sent struct {
+		t    *task.Task
+		stop func() bool // unregisters the Cancel sender
+	}
 	var mu sync.Mutex
-	outstanding := map[uint64]*task.Task{}
+	outstanding := map[uint64]sent{}
+	// take removes a task from outstanding; it no longer gets a Cancel.
+	take := func(seq uint64) *task.Task {
+		mu.Lock()
+		o, ok := outstanding[seq]
+		delete(outstanding, seq)
+		mu.Unlock()
+		if !ok {
+			return nil
+		}
+		o.stop()
+		return o.t
+	}
+	var wmu sync.Mutex // the writer goroutine and Cancel senders share w
 	done := make(chan struct{})
 	writerDone := make(chan struct{})
 
 	go func() {
 		defer close(writerDone)
 		for {
-			var t *task.Task
+			var dl sched.Delivery
 			select {
-			case t = <-p.C:
+			case dl = <-p.C:
 			case <-done:
 				return
 			}
-			mu.Lock()
-			outstanding[t.Seq] = t
-			mu.Unlock()
+			t := dl.Task
+			if dl.Ctx.Err() != nil {
+				// Aborted before it was sent: its result would be ignored.
+				s.E.Complete(t, task.Result{Err: "aborted", Retryable: true})
+				d.Poll(p, 1)
+				continue
+			}
 			in, err := s.E.ResolveInput(t.Input)
 			if err != nil {
-				mu.Lock()
-				delete(outstanding, t.Seq)
-				mu.Unlock()
 				s.E.Complete(t, task.Result{Err: "resolving input: " + err.Error(), Retryable: true})
 				d.Poll(p, 1)
 				continue
 			}
+			seq := t.Seq
 			tt := *t
 			tt.Input = in
-			if err := WriteFrame(w, MsgTask, &tt); err != nil {
+			// Registered before the frame is written (a large frame reaches
+			// the worker before WriteFrame returns, and so may its Result),
+			// under wmu, which the Cancel sender also needs: a Cancel never
+			// overtakes its task.
+			wmu.Lock()
+			mu.Lock()
+			outstanding[seq] = sent{t: t, stop: context.AfterFunc(dl.Ctx, func() {
+				wmu.Lock()
+				defer wmu.Unlock()
+				if WriteFrame(w, MsgCancel, Cancel{Seq: seq}) != nil || w.Flush() != nil {
+					c.Close()
+				}
+			})}
+			mu.Unlock()
+			err = WriteFrame(w, MsgTask, &tt)
+			if err == nil && len(p.C) == 0 {
+				err = w.Flush()
+			}
+			wmu.Unlock()
+			if err != nil {
 				c.Close()
 				return
-			}
-			if len(p.C) == 0 {
-				if err := w.Flush(); err != nil {
-					c.Close()
-					return
-				}
 			}
 		}
 	}()
@@ -100,14 +133,11 @@ func (s *Server) handle(c net.Conn) {
 			if json.Unmarshal(body, &res) != nil {
 				continue
 			}
-			mu.Lock()
-			t := outstanding[res.Seq]
-			delete(outstanding, res.Seq)
-			mu.Unlock()
+			t := take(res.Seq)
 			if t == nil {
 				continue
 			}
-			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens})
+			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta})
 			d.Poll(p, 1)
 		case MsgCredit:
 			var cr Credit
@@ -120,10 +150,10 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			mu.Lock()
-			t := outstanding[ch.Seq]
+			o, ok := outstanding[ch.Seq]
 			mu.Unlock()
-			if t != nil {
-				s.E.Live().Publish(live.Chunk{RunID: t.RunID, StepID: t.StepID, Data: ch.Data})
+			if t := o.t; ok {
+				s.E.PublishChunk(t.RunID, t.StepID, ch.Data)
 			}
 		}
 	}
@@ -138,8 +168,9 @@ func (s *Server) handle(c net.Conn) {
 	if len(lost) > 0 {
 		log.Printf("kairo: worker %q disconnected with %d tasks outstanding", h.Worker, len(lost))
 	}
-	for _, t := range lost {
+	for _, o := range lost {
+		o.stop()
 		// The task may or may not have run.
-		s.E.Complete(t, task.Result{Err: "worker disconnected", Unknown: true})
+		s.E.Complete(o.t, task.Result{Err: "worker disconnected", Unknown: true})
 	}
 }

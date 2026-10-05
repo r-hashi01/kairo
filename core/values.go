@@ -72,6 +72,8 @@ func (m *machine) resolve(r ir.Ref, scope uint32) json.RawMessage {
 		}
 	case ir.RefNode:
 		v = m.lookup(r.Node, scope)
+	case ir.RefVar:
+		v = RunVars(m.s)
 	}
 	if len(v) == 0 {
 		return null
@@ -132,9 +134,14 @@ func extract(v json.RawMessage, path []string) json.RawMessage {
 
 // buildInput assembles the step's input object from its references.
 func (m *machine) buildInput(n *ir.Node, scope uint32) json.RawMessage {
+	return m.buildObject(n.Inputs, scope)
+}
+
+// buildObject assembles an object from named references.
+func (m *machine) buildObject(ins []ir.Input, scope uint32) json.RawMessage {
 	b := make([]byte, 0, 64)
 	b = append(b, '{')
-	for i, in := range n.Inputs {
+	for i, in := range ins {
 		if i > 0 {
 			b = append(b, ',')
 		}
@@ -203,6 +210,12 @@ func (m *machine) evalPred(p *ir.Pred, scope uint32) bool {
 
 // protected evaluates a protected step.
 func (m *machine) protected(n *ir.Node, scope uint32) (json.RawMessage, error) {
+	if n.Switch != nil {
+		return m.evalSwitch(n, scope)
+	}
+	if n.Spec.Action == ir.ActionAssign {
+		return m.evalAssign(n, scope)
+	}
 	if n.Spec.Action == ir.ActionAppend {
 		b := []byte{'['}
 		first := true

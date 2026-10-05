@@ -11,7 +11,7 @@ import (
 	"kairo/blob"
 	"kairo/core"
 	"kairo/ir"
-	"kairo/live"
+	"kairo/sched"
 	"kairo/task"
 )
 
@@ -19,6 +19,10 @@ import (
 // goroutines (per registration, not per run), never from a shard loop, so
 // it may block on I/O. CPU-heavy work belongs in a separate worker process
 // connected through the worker protocol.
+//
+// ctx is cancelled when the step is abandoned (timeout, run cancelled,
+// sibling branch failed) or the engine stops (ADR 0026). Whatever the
+// executor returns after that is ignored by the run.
 type Executor interface {
 	Execute(ctx context.Context, t *task.Task, emit func(chunk []byte)) task.Result
 }
@@ -39,16 +43,14 @@ func (e *Engine) RegisterExecutor(actions []string, concurrency int, ex Executor
 	e.execMu.Lock()
 	e.pollers = append(e.pollers, p)
 	e.execMu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { <-e.stopped; cancel() }()
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			for {
 				select {
 				case <-e.stopped:
 					return
-				case t := <-p.C:
-					e.runTask(ctx, ex, t)
+				case dl := <-p.C:
+					e.runTask(ex, dl)
 					e.disp.Poll(p, 1)
 				}
 			}
@@ -56,7 +58,14 @@ func (e *Engine) RegisterExecutor(actions []string, concurrency int, ex Executor
 	}
 }
 
-func (e *Engine) runTask(ctx context.Context, ex Executor, t *task.Task) {
+func (e *Engine) runTask(ex Executor, dl sched.Delivery) {
+	t := dl.Task
+	if dl.Ctx.Err() != nil {
+		// Aborted before it started: its result would be ignored anyway.
+		e.Complete(t, task.Result{Err: "aborted", Retryable: true})
+		return
+	}
+	ctx := dl.Ctx
 	in, err := e.ResolveInput(t.Input)
 	if err != nil {
 		e.Complete(t, task.Result{Err: "resolving input: " + err.Error(), Retryable: true})
@@ -64,9 +73,7 @@ func (e *Engine) runTask(ctx context.Context, ex Executor, t *task.Task) {
 	}
 	tt := *t
 	tt.Input = in
-	emit := func(chunk []byte) {
-		e.live.Publish(live.Chunk{RunID: t.RunID, StepID: t.StepID, Data: chunk})
-	}
+	emit := func(chunk []byte) { e.publishChunk(t.RunID, t.StepID, chunk) }
 	res := ex.Execute(ctx, &tt, emit)
 	e.Complete(t, res)
 }
@@ -76,14 +83,23 @@ func (e *Engine) runTask(ctx context.Context, ex Executor, t *task.Task) {
 // the shard loop.
 func (e *Engine) Complete(t *task.Task, res task.Result) {
 	e.disp.Done(t, res.Tokens)
-	ev := core.Event{Act: t.Act, Attempt: t.Attempt}
+	ev := core.Event{Act: t.Act, Attempt: t.Attempt, Meta: res.Meta}
+	if len(ev.Meta) > e.cfg.BlobThreshold {
+		// Like a large output: the log keeps only a reference (ADR 0034).
+		if key, err := blob.PutRunContent(e.blobs, t.RunID, ev.Meta); err == nil {
+			ev.Meta, _ = json.Marshal(map[string]any{"$blob": key, "size": len(res.Meta)})
+		} else {
+			log.Printf("kairo: run %s: storing step metadata: %v (dropped)", t.RunID, err)
+			ev.Meta = nil
+		}
+	}
 	if res.Err != "" || res.Unknown {
 		ev.Kind = core.EvStepErr
 		ev.Err = res.Err
 		if ev.Err == "" {
 			ev.Err = "outcome unknown"
 		}
-		ev.Retryable, ev.Unknown = res.Retryable, res.Unknown
+		ev.Retryable, ev.Unknown, ev.ErrType = res.Retryable, res.Unknown, res.ErrType
 	} else {
 		ev.Kind = core.EvStepOK
 		ev.Data = res.Output

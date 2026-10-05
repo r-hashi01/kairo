@@ -30,5 +30,16 @@
 | [0023](0023-durable-idempotent-submit.md) | Submit は開始が耐久化してから返し、RunID を冪等キーとして扱う | 承認 |
 | [0024](0024-per-run-blob-collection.md) | ブロブは実行ごとにまとめて保存し、実行の終了時に消す | 承認（SQL 側は 0025 で置き換え） |
 | [0025](0025-binary-collation-and-prefix-group-delete.md) | 名前は大文字小文字を区別してバイト順で比較し、MySQL / TiDB には VARBINARY で手当てする | 承認 |
+| [0026](0026-cancel-running-tasks.md) | 中断した手順は、実行中のタスクにも取り消しを届ける | 承認 |
+| [0027](0027-durable-finished-markers.md) | 終わった実行の記録を期限つきで永続化し、再起動をまたいで冪等にする | 承認 |
+| [0028](0028-dify-workflow-backend.md) | Dify のワークフロー実行を置き換えられるエンジンにする（ノードは Python ワーカーで動かす） | 承認 |
+| [0029](0029-graph-execution-model.md) | 任意のグラフ（DAG）を実行の基本形にする（木の構成要素はグラフに変換する） | 承認 |
+| [0030](0030-error-strategies-and-run-limits.md) | ノードごとのエラー処理（retry / fail-branch / default-value）と、実行の上限を持つ | 承認 |
+| [0031](0031-dify-conditions-and-node-handles.md) | Dify の条件は組み込みの保護ステップで評価し、分岐のハンドルはノードの設置ごとに宣言できるようにする | 承認 |
+| [0032](0032-iteration-and-loop-semantics.md) | map と loop を、Dify の iteration と loop の意味論で動かせるようにする | 承認 |
+| [0033](0033-variables-and-assignment.md) | 書き換えられる変数（loop 変数と会話変数）を持ち、代入は組み込みの保護ステップで行う | 承認 |
+| [0034](0034-execution-event-feed.md) | 欠落しない実行イベントの出口を、ログから決定的に導いて作る | 承認 |
+| [0035](0035-dify-node-effects-and-unknown-outcomes.md) | Dify のノードに作用の型を割り当て、結果が不明な実の命令は、明示した設置に限って「失敗」として扱えるようにする | 承認 |
+| [0036](0036-dify-adapter-synthesizes-graphon-events.md) | Dify 側のアダプタは、kairo のトレースから graphon のイベントを合成し、Dify の既存の下流をそのまま使う | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

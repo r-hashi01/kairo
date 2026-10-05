@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"context"
 	"math"
 	"sync"
 	"time"
@@ -37,12 +38,18 @@ type Dispatcher struct {
 	timer    *time.Timer
 	timerAt  time.Time
 	seq      uint64
-	aborted  map[task.Key]struct{}
-	stop     chan struct{}
-	done     chan struct{}
+	// pending: queued tasks. aborted marks the pending ones to drop when
+	// they reach the head of their queue. delivered: tasks handed to a
+	// poller and not yet Done, with the cancel of their context (ADR 0026).
+	pending   map[task.Key]struct{}
+	aborted   map[task.Key]struct{}
+	delivered map[task.Key]handed
+	stop      chan struct{}
+	done      chan struct{}
 
 	statsMu sync.Mutex
 	queued  int
+	tracked int // len(pending) + len(aborted) + len(delivered)
 }
 
 type dmsgKind uint8
@@ -53,6 +60,7 @@ const (
 	mUnpoll
 	mDone
 	mAbort
+	mAbortAll
 	mWake
 )
 
@@ -68,11 +76,24 @@ type dmsg struct {
 	key    task.Key
 }
 
+type handed struct {
+	task   *task.Task
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// Delivery is a task handed to a worker. Ctx is cancelled when the task is
+// aborted (step timeout, run cancelled) or reported Done.
+type Delivery struct {
+	Task *task.Task
+	Ctx  context.Context
+}
+
 // Poller is a worker's standing request for tasks. Tasks are delivered on
 // C; the worker grants more credit with Dispatcher.Poll.
 type Poller struct {
 	Actions []string
-	C       chan *task.Task
+	C       chan Delivery
 	credit  int
 	gone    bool
 }
@@ -138,15 +159,17 @@ func NewDispatcher(limits func(dest string) DestLimits) *Dispatcher {
 		limits = func(string) DestLimits { return DestLimits{} }
 	}
 	d := &Dispatcher{
-		q:        mpsc.New[dmsg](),
-		now:      time.Now,
-		dests:    map[string]*dest{},
-		pollers:  map[string][]*Poller{},
-		byAction: map[string][]*dest{},
-		limits:   limits,
-		aborted:  map[task.Key]struct{}{},
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		q:         mpsc.New[dmsg](),
+		now:       time.Now,
+		dests:     map[string]*dest{},
+		pollers:   map[string][]*Poller{},
+		byAction:  map[string][]*dest{},
+		limits:    limits,
+		pending:   map[task.Key]struct{}{},
+		aborted:   map[task.Key]struct{}{},
+		delivered: map[task.Key]handed{},
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	go d.loop()
 	return d
@@ -160,7 +183,7 @@ func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
 	if credit < 1 {
 		credit = 1
 	}
-	p := &Poller{Actions: actions, C: make(chan *task.Task, credit)}
+	p := &Poller{Actions: actions, C: make(chan Delivery, credit)}
 	d.q.Push(dmsg{kind: mPoll, poller: p, credit: credit})
 	return p
 }
@@ -171,17 +194,32 @@ func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
 func (d *Dispatcher) Poll(p *Poller, n int) { d.q.Push(dmsg{kind: mPoll, poller: p, credit: n}) }
 
 // Unpoll removes p. Tasks already delivered to p.C but not taken are
-// returned to their queues.
+// returned to their queues; the worker must report Done for the ones it
+// took, even if it gives up on them.
 func (d *Dispatcher) Unpoll(p *Poller) { d.q.Push(dmsg{kind: mUnpoll, poller: p}) }
 
-// Done reports that a task finished, with its actual token usage.
+// Done reports that a task finished, with its actual token usage. Its
+// concurrency slot is released only now, not when it was aborted, so a
+// worker that ignores cancellation still counts against the limits.
 func (d *Dispatcher) Done(t *task.Task, tokens int) {
-	d.q.Push(dmsg{kind: mDone, dest: t.Destination, tenant: t.Tenant, est: t.EstTokens, actual: tokens})
+	d.q.Push(dmsg{kind: mDone, task: t, key: t.Key(), dest: t.Destination, tenant: t.Tenant, est: t.EstTokens, actual: tokens})
 }
 
-// Abort drops a queued task (best effort; a task already handed to a
-// worker runs to completion and its result is ignored).
+// Abort drops a queued task, or cancels the context of a delivered one
+// (ADR 0026). A task that is neither (already done) is left alone.
 func (d *Dispatcher) Abort(k task.Key) { d.q.Push(dmsg{kind: mAbort, key: k}) }
+
+// Tracked is how many task keys the dispatcher remembers (queued, marked
+// aborted or delivered). It must return to 0 when all work is done.
+func (d *Dispatcher) Tracked() int {
+	d.statsMu.Lock()
+	defer d.statsMu.Unlock()
+	return d.tracked
+}
+
+// AbortAll cancels the contexts of all delivered tasks (the engine is
+// stopping). Their slots are still released by Done.
+func (d *Dispatcher) AbortAll() { d.q.Push(dmsg{kind: mAbortAll}) }
 
 // Queued is the number of tasks waiting for quota or workers.
 func (d *Dispatcher) Queued() int {
@@ -202,6 +240,11 @@ func (d *Dispatcher) loop() {
 		select {
 		case <-d.q.Ready():
 		case <-d.stop:
+			// Messages still queued (an AbortAll among them) are not
+			// processed: cancel what was handed out.
+			for _, h := range d.delivered {
+				h.cancel()
+			}
 			return
 		}
 		buf = d.q.Drain(buf)
@@ -224,6 +267,7 @@ func (d *Dispatcher) loop() {
 				}
 				tq.q = append(tq.q, m.task)
 				ds.queued++
+				d.pending[m.task.Key()] = struct{}{}
 				if !ds.listed {
 					ds.listed = true
 					d.byAction[ds.action] = append(d.byAction[ds.action], ds)
@@ -251,15 +295,21 @@ func (d *Dispatcher) loop() {
 				d.removePoller(p)
 				for {
 					select {
-					case t := <-p.C:
-						d.requeue(t)
-						touched[d.dests[t.Destination]] = struct{}{}
+					case dl := <-p.C:
+						if d.requeue(dl.Task) {
+							touched[d.dests[dl.Task.Destination]] = struct{}{}
+						}
 						continue
 					default:
 					}
 					break
 				}
 			case mDone:
+				// The same task: a reused key may belong to a newer one.
+				if h, ok := d.delivered[m.key]; ok && h.task == m.task {
+					h.cancel() // releases the context
+					delete(d.delivered, m.key)
+				}
 				ds := d.dests[m.dest]
 				if ds == nil {
 					continue
@@ -276,7 +326,15 @@ func (d *Dispatcher) loop() {
 				}
 				touched[ds] = struct{}{}
 			case mAbort:
-				d.aborted[m.key] = struct{}{}
+				if _, ok := d.pending[m.key]; ok {
+					d.aborted[m.key] = struct{}{}
+				} else if h, ok := d.delivered[m.key]; ok {
+					h.cancel()
+				}
+			case mAbortAll:
+				for _, h := range d.delivered {
+					h.cancel()
+				}
 			case mWake:
 				wakeAll = true
 			}
@@ -301,6 +359,7 @@ func (d *Dispatcher) loop() {
 			n += ds.queued
 		}
 		d.queued = n
+		d.tracked = len(d.pending) + len(d.aborted) + len(d.delivered)
 		d.statsMu.Unlock()
 	}
 }
@@ -337,7 +396,16 @@ func (d *Dispatcher) dest(name, action string) *dest {
 	return ds
 }
 
-func (d *Dispatcher) requeue(t *task.Task) {
+// requeue returns a task that was delivered but never taken to the head of
+// its queue. A task aborted in the meantime is dropped instead (false).
+func (d *Dispatcher) requeue(t *task.Task) bool {
+	k := t.Key()
+	aborted := false
+	if h, ok := d.delivered[k]; ok {
+		aborted = h.ctx.Err() != nil
+		h.cancel()
+		delete(d.delivered, k)
+	}
 	ds := d.dest(t.Destination, t.Action)
 	tq := ds.tenants[t.Tenant]
 	if tq == nil {
@@ -345,6 +413,13 @@ func (d *Dispatcher) requeue(t *task.Task) {
 		ds.tenants[t.Tenant] = tq
 	}
 	tq.inflight--
+	if aborted {
+		if tq.inflight <= 0 && len(tq.q) == 0 {
+			delete(ds.tenants, t.Tenant)
+		}
+		return false
+	}
+	d.pending[k] = struct{}{}
 	if len(tq.q) == 0 {
 		ds.ring = append(ds.ring, t.Tenant)
 	}
@@ -354,6 +429,7 @@ func (d *Dispatcher) requeue(t *task.Task) {
 		ds.listed = true
 		d.byAction[ds.action] = append(d.byAction[ds.action], ds)
 	}
+	return true
 }
 
 func (d *Dispatcher) removePoller(p *Poller) {
@@ -393,10 +469,12 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 			q := ds.tenants[name]
 			// Drop aborted tasks at the head.
 			for len(q.q) > 0 {
-				if _, ab := d.aborted[q.q[0].Key()]; !ab {
+				k := q.q[0].Key()
+				if _, ab := d.aborted[k]; !ab {
 					break
 				}
-				delete(d.aborted, q.q[0].Key())
+				delete(d.aborted, k)
+				delete(d.pending, k)
 				q.q = q.q[1:]
 				ds.queued--
 			}
@@ -445,9 +523,13 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 				}
 			}
 		}
+		k := t.Key()
+		delete(d.pending, k)
+		ctx, cancel := context.WithCancel(context.Background())
+		d.delivered[k] = handed{t, ctx, cancel}
 		p := ps[0]
 		p.credit--
-		p.C <- t // cannot block: credit <= free capacity of C
+		p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C
 		if p.credit == 0 {
 			d.removePoller(p)
 		} else {

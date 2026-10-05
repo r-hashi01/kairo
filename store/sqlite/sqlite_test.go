@@ -81,6 +81,7 @@ func start(t testing.TB, dir string, cfg engine.Config) *env {
 		t.Fatal(err)
 	}
 	cfg.Sinks = Sinks(filepath.Join(dir, "wal"))
+	cfg.DoneLogs = DoneLogs(filepath.Join(dir, "wal"))
 	cfg.Snapshots, cfg.Blobs = st, st
 	x := startWith(t, cfg)
 	x.store = st

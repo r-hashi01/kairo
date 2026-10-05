@@ -28,6 +28,9 @@ type Task struct {
 
 	// Seq is assigned by the dispatcher for tracking outstanding tasks.
 	Seq uint64 `json:"seq"`
+	// Depth is the nesting depth of the run (ADR 0030). A worker that
+	// starts a workflow from this task submits it with Depth+1.
+	Depth int `json:"depth,omitempty"`
 }
 
 // Key identifies a task attempt.
@@ -54,4 +57,10 @@ type Result struct {
 	Unknown bool `json:"unknown,omitempty"`
 	// Tokens actually consumed, for TPM accounting.
 	Tokens int `json:"tokens,omitempty"`
+	// ErrType classifies a failure; it becomes error_type of a step that
+	// fails into its on_error strategy (ADR 0030).
+	ErrType string `json:"error_type,omitempty"`
+	// Meta is passed through to the step's trace (ADR 0034): e.g. Dify's
+	// process_data and execution metadata (token usage).
+	Meta json.RawMessage `json:"meta,omitempty"`
 }
