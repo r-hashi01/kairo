@@ -1,0 +1,349 @@
+{
+ "fixture": "iteration_errors.yml",
+ "inputs": {
+  "query": "hello"
+ },
+ "case": {},
+ "workflow": {
+  "conversation_variables": [],
+  "environment_variables": [],
+  "graph": {
+   "nodes": [
+    {
+     "id": "start",
+     "data": {
+      "type": "start",
+      "title": "Start",
+      "variables": []
+     }
+    },
+    {
+     "id": "list",
+     "data": {
+      "type": "code",
+      "title": "List",
+      "code": "def main():\n    return {'items': [1, 2]}\n",
+      "code_language": "python3",
+      "outputs": {
+       "items": {
+        "type": "array[number]",
+        "children": null
+       }
+      },
+      "variables": []
+     }
+    },
+    {
+     "id": "cont",
+     "data": {
+      "type": "iteration",
+      "title": "Continue",
+      "iterator_selector": [
+       "list",
+       "items"
+      ],
+      "output_selector": [
+       "cinner",
+       "out"
+      ],
+      "is_parallel": false,
+      "parallel_nums": 10,
+      "error_handle_mode": "continue-on-error",
+      "start_node_id": "contstart",
+      "flatten_output": false
+     }
+    },
+    {
+     "id": "contstart",
+     "parentId": "cont",
+     "data": {
+      "type": "iteration-start",
+      "title": "s",
+      "isInIteration": true
+     }
+    },
+    {
+     "id": "cinner",
+     "parentId": "cont",
+     "data": {
+      "type": "code",
+      "title": "Inner",
+      "code": "def main():\n    return {'out': 'x'}\n",
+      "code_language": "python3",
+      "outputs": {
+       "out": {
+        "type": "string",
+        "children": null
+       }
+      },
+      "variables": [
+       {
+        "variable": "x",
+        "value_selector": [
+         "cont",
+         "item"
+        ],
+        "value_type": "number"
+       }
+      ],
+      "isInIteration": true,
+      "iteration_id": "cont"
+     }
+    },
+    {
+     "id": "rem",
+     "data": {
+      "type": "iteration",
+      "title": "Remove",
+      "iterator_selector": [
+       "list",
+       "items"
+      ],
+      "output_selector": [
+       "rinner",
+       "out"
+      ],
+      "is_parallel": true,
+      "parallel_nums": 2,
+      "error_handle_mode": "remove-abnormal-output",
+      "start_node_id": "remstart",
+      "flatten_output": false
+     }
+    },
+    {
+     "id": "remstart",
+     "parentId": "rem",
+     "data": {
+      "type": "iteration-start",
+      "title": "s",
+      "isInIteration": true
+     }
+    },
+    {
+     "id": "rinner",
+     "parentId": "rem",
+     "data": {
+      "type": "code",
+      "title": "Inner",
+      "code": "def main():\n    return {'out': 'y'}\n",
+      "code_language": "python3",
+      "outputs": {
+       "out": {
+        "type": "string",
+        "children": null
+       }
+      },
+      "variables": [],
+      "isInIteration": true,
+      "iteration_id": "rem"
+     }
+    },
+    {
+     "id": "end",
+     "data": {
+      "type": "end",
+      "title": "End",
+      "outputs": [
+       {
+        "variable": "cont",
+        "value_selector": [
+         "cont",
+         "output"
+        ],
+        "value_type": "array[string]"
+       },
+       {
+        "variable": "rem",
+        "value_selector": [
+         "rem",
+         "output"
+        ],
+        "value_type": "array[string]"
+       }
+      ]
+     }
+    }
+   ],
+   "edges": [
+    {
+     "source": "start",
+     "target": "list",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "list",
+     "target": "cont",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "contstart",
+     "target": "cinner",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "cont",
+     "target": "rem",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "remstart",
+     "target": "rinner",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "rem",
+     "target": "end",
+     "sourceHandle": "source"
+    }
+   ]
+  }
+ },
+ "status": "succeeded",
+ "outputs": {
+  "cont": [
+   "code:cinner"
+  ],
+  "rem": [
+   "code:rinner"
+  ]
+ },
+ "trace": [
+  {
+   "event": "GraphRunStartedEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "start"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "start",
+   "outputs": {
+    "query": "hello",
+    "sys.query": "hello"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "list"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "list",
+   "outputs": {
+    "items": [
+     1
+    ]
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "cont"
+  },
+  {
+   "event": "NodeRunIterationStartedEvent",
+   "node": "cont"
+  },
+  {
+   "event": "NodeRunIterationNextEvent",
+   "node": "cont"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "cinner"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "cinner",
+   "outputs": {
+    "out": "code:cinner"
+   }
+  },
+  {
+   "event": "NodeRunIterationSucceededEvent",
+   "node": "cont"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "cont",
+   "outputs": {
+    "output": [
+     "code:cinner"
+    ]
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "rem"
+  },
+  {
+   "event": "NodeRunIterationStartedEvent",
+   "node": "rem"
+  },
+  {
+   "event": "NodeRunIterationNextEvent",
+   "node": "rem"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "rinner"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "rinner",
+   "outputs": {
+    "out": "code:rinner"
+   }
+  },
+  {
+   "event": "NodeRunIterationSucceededEvent",
+   "node": "rem"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "rem",
+   "outputs": {
+    "output": [
+     "code:rinner"
+    ]
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "end",
+   "outputs": {
+    "cont": [
+     "code:cinner"
+    ],
+    "rem": [
+     "code:rinner"
+    ]
+   }
+  },
+  {
+   "event": "GraphRunSucceededEvent"
+  }
+ ]
+}

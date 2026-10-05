@@ -118,8 +118,8 @@ func TestMapElementOutputAndFlatten(t *testing.T) {
 const counterLoop = `{"name":"l","root":{"kind":"seq","nodes":[
   {"kind":"loop","id":"l","max_iter":10,"check":"before","loop_output":"vars",
    "vars":{"n":{"type":"integer","value":0},"log":{"type":"array[string]","value":[]}},
-   "break":{"logical_operator":"and","conditions":[{"var":"n","operator":"≥","value":"{{#limit#}}"}]},
-   "break_input":{"n":"l.n","limit":"$input.limit"},
+   "break":{"logical_operator":"and","conditions":[{"var":"n","operator":"≥","value":"{{#in.limit#}}"}]},
+   "break_input":{"n":"l.n","in.limit":"$input.limit"},
    "body":{"kind":"seq","nodes":[
      {"kind":"step","id":"inc","action":"kairo.assign","input":{"tag":"$input.tag"},
       "params":{"items":[{"var":"l.n","op":"+=","value":1},{"var":"l.log","op":"append","input":"tag"}]}}]}},
@@ -240,7 +240,6 @@ func TestVarsCompileErrors(t *testing.T) {
 	for _, tc := range []struct{ js, want string }{
 		{`{"name":"x","root":{"kind":"step","id":"s","action":"kairo.pass","input":{"a":"$var.nope"}}}`, "undeclared run variable"},
 		{`{"name":"x","vars":{"v":{"type":"strng"}},"root":{"kind":"step","id":"s","action":"kairo.pass"}}`, "unknown type"},
-		{`{"name":"x","vars":{"v":{"type":"string"}},"root":{"kind":"map","over":"$input.xs","body":{"kind":"step","id":"s","action":"kairo.assign","params":{"items":[{"var":"$var.v","op":"clear"}]}}}}`, "inside a map"},
 		{`{"name":"x","root":{"kind":"step","id":"s","action":"kairo.assign","params":{"items":[{"var":"elsewhere.v","op":"clear"}]}}}`, "enclosing loop"},
 		{`{"name":"x","root":{"kind":"loop","id":"l","max_iter":1,"vars":{"v":{"type":"string"}},"body":{"kind":"step","id":"s","action":"kairo.pass"}}}`, "loop_output vars"},
 		{`{"name":"x","root":{"kind":"loop","id":"l","max_iter":1,"break_on":["zz"],"body":{"kind":"step","id":"s","action":"kairo.pass"}}}`, "break_on"},
@@ -389,4 +388,20 @@ func TestReviewCompileErrors(t *testing.T) {
 			t.Errorf("%s: %v", tc.js, err)
 		}
 	}
+}
+
+// A map element's writes to run variables stay in that element, as
+// graphon copies the variables for each iteration element.
+func TestRunVarsWrittenInsideMap(t *testing.T) {
+	p := compile(t, `{"name":"m","vars":{"v":{"type":"string","value":"outer"}},"root":{"kind":"seq","nodes":[
+	  {"kind":"map","id":"m","over":"$input.xs","body":{"kind":"seq","nodes":[
+	    {"kind":"step","id":"set","action":"kairo.assign","input":{"x":"$item"},"params":{"items":[{"var":"$var.v","op":"over-write","input":"x"}]}},
+	    {"kind":"step","id":"read","action":"kairo.pass","input":{"v":"$var.v"}}]}},
+	  {"kind":"step","id":"after","action":"kairo.pass","input":{"v":"$var.v","m":"m"}}]}}`)
+	x := newSim(t, p)
+	x.run(`{"xs":["a","b"]}`)
+	if x.s.Status != StatusCompleted || string(x.s.Output) != `{"m":[{"v":"a"},{"v":"b"}],"v":"outer"}` {
+		t.Fatalf("%v %s %s", x.s.Status, x.s.Error, x.s.Output)
+	}
+	x.checkReplay()
 }

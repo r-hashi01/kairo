@@ -27,6 +27,42 @@ func RunVars(s *State) json.RawMessage {
 	return nil
 }
 
+// runVarsScope is the scope holding the run variables as seen from scope:
+// a map element that wrote them has its own copy (graphon copies the
+// variable pool for each iteration element, so such writes are not seen
+// outside it; ADR 0033).
+func (m *machine) runVarsScope(scope uint32) *Scope {
+	for {
+		sc := m.s.Scopes[scope]
+		if sc == nil {
+			return m.s.Scopes[0]
+		}
+		if _, ok := sc.Vals[runVarsNode]; ok || scope == 0 {
+			return sc
+		}
+		scope = sc.Parent
+	}
+}
+
+// localRunVars returns the scope to write run variables to from scope:
+// the innermost map element's, copying them there on first write.
+func (m *machine) localRunVars(scope uint32) *Scope {
+	for x := scope; x != 0; {
+		sc := m.s.Scopes[x]
+		if sc == nil {
+			break
+		}
+		if sc.Map >= 0 {
+			if _, ok := sc.Vals[runVarsNode]; !ok {
+				setVal(sc, runVarsNode, m.runVarsScope(sc.Parent).Vals[runVarsNode])
+			}
+			return sc
+		}
+		x = sc.Parent
+	}
+	return m.s.Scopes[0]
+}
+
 // zeroValue is the value of a variable of type t that has none
 // (SegmentType.get_zero_value).
 func zeroValue(t string) json.RawMessage {
@@ -374,7 +410,7 @@ func (m *machine) evalAssign(n *ir.Node, scope uint32) (json.RawMessage, error) 
 	var order []target
 	var updated []ir.AssignItem
 	get := func(it ir.AssignItem) (target, map[string]json.RawMessage) {
-		t := target{node: runVarsNode, sc: m.s.Scopes[0]}
+		t := target{node: runVarsNode, sc: m.localRunVars(scope)}
 		if it.Loop >= 0 {
 			t = target{node: it.Loop, sc: m.scopeOf(it.Loop, scope)}
 		}
@@ -436,7 +472,7 @@ func (m *machine) evalAssign(n *ir.Node, scope uint32) (json.RawMessage, error) 
 				continue
 			}
 			seen[k] = true
-			t := target{node: runVarsNode, sc: m.s.Scopes[0]}
+			t := target{node: runVarsNode, sc: m.localRunVars(scope)}
 			if it.Loop >= 0 {
 				t = target{node: it.Loop, sc: m.scopeOf(it.Loop, scope)}
 			}

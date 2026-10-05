@@ -73,7 +73,7 @@ func (m *machine) resolve(r ir.Ref, scope uint32) json.RawMessage {
 	case ir.RefNode:
 		v = m.lookup(r.Node, scope)
 	case ir.RefVar:
-		v = RunVars(m.s)
+		v = m.runVarsScope(scope).Vals[runVarsNode]
 	}
 	if len(v) == 0 {
 		return null
@@ -213,8 +213,13 @@ func (m *machine) protected(n *ir.Node, scope uint32) (json.RawMessage, error) {
 	if n.Switch != nil {
 		return m.evalSwitch(n, scope)
 	}
-	if n.Spec.Action == ir.ActionAssign {
+	switch n.Spec.Action {
+	case ir.ActionAssign:
 		return m.evalAssign(n, scope)
+	case ir.ActionTemplate:
+		return m.evalTemplate(n, scope)
+	case ir.ActionCoalesce:
+		return m.evalCoalesce(n, scope)
 	}
 	if n.Spec.Action == ir.ActionAppend {
 		b := []byte{'['}

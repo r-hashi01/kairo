@@ -1,0 +1,257 @@
+{
+ "fixture": "error_strategies.yml",
+ "inputs": {
+  "query": "hello"
+ },
+ "case": {
+  "errors": {
+   "fb": "boom",
+   "dv": "bang"
+  }
+ },
+ "workflow": {
+  "conversation_variables": [],
+  "environment_variables": [],
+  "graph": {
+   "nodes": [
+    {
+     "id": "start",
+     "data": {
+      "type": "start",
+      "title": "Start",
+      "variables": []
+     }
+    },
+    {
+     "id": "fb",
+     "data": {
+      "type": "code",
+      "title": "Fail branch",
+      "code": "def main():\n    return {'result': 'ok'}\n",
+      "code_language": "python3",
+      "outputs": {
+       "result": {
+        "type": "string",
+        "children": null
+       }
+      },
+      "variables": [],
+      "error_strategy": "fail-branch",
+      "retry_config": {
+       "retry_enabled": true,
+       "max_retries": 2,
+       "retry_interval": 10
+      }
+     }
+    },
+    {
+     "id": "ok_end",
+     "data": {
+      "type": "end",
+      "title": "OK",
+      "outputs": [
+       {
+        "variable": "ok",
+        "value_selector": [
+         "fb",
+         "result"
+        ],
+        "value_type": "string"
+       }
+      ]
+     }
+    },
+    {
+     "id": "fail_end",
+     "data": {
+      "type": "end",
+      "title": "Failed",
+      "outputs": [
+       {
+        "variable": "message",
+        "value_selector": [
+         "fb",
+         "error_message"
+        ],
+        "value_type": "string"
+       },
+       {
+        "variable": "kind",
+        "value_selector": [
+         "fb",
+         "error_type"
+        ],
+        "value_type": "string"
+       }
+      ]
+     }
+    },
+    {
+     "id": "dv",
+     "data": {
+      "type": "code",
+      "title": "Default value",
+      "code": "def main():\n    return {'n': 1}\n",
+      "code_language": "python3",
+      "outputs": {
+       "n": {
+        "type": "number",
+        "children": null
+       }
+      },
+      "variables": [],
+      "error_strategy": "default-value",
+      "default_value": [
+       {
+        "key": "n",
+        "type": "number",
+        "value": 42
+       }
+      ]
+     }
+    },
+    {
+     "id": "dv_end",
+     "data": {
+      "type": "end",
+      "title": "Default",
+      "outputs": [
+       {
+        "variable": "n",
+        "value_selector": [
+         "dv",
+         "n"
+        ],
+        "value_type": "number"
+       }
+      ]
+     }
+    }
+   ],
+   "edges": [
+    {
+     "source": "start",
+     "target": "fb",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "fb",
+     "target": "ok_end",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "fb",
+     "target": "fail_end",
+     "sourceHandle": "fail-branch"
+    },
+    {
+     "source": "start",
+     "target": "dv",
+     "sourceHandle": "source"
+    },
+    {
+     "source": "dv",
+     "target": "dv_end",
+     "sourceHandle": "source"
+    }
+   ]
+  }
+ },
+ "status": "succeeded",
+ "outputs": {
+  "n": 42,
+  "message": "boom",
+  "kind": "MockError"
+ },
+ "trace": [
+  {
+   "event": "GraphRunStartedEvent"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "start"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "start",
+   "outputs": {
+    "query": "hello",
+    "sys.query": "hello"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "fb"
+  },
+  {
+   "event": "NodeRunRetryEvent",
+   "node": "fb"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "dv"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunExceptionEvent",
+   "node": "dv",
+   "outputs": {
+    "n": 42,
+    "error_message": "bang",
+    "error_type": "MockError"
+   }
+  },
+  {
+   "event": "NodeRunRetryEvent",
+   "node": "fb"
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "dv_end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "dv_end",
+   "outputs": {
+    "n": 42
+   }
+  },
+  {
+   "event": "GraphEdgeSkippedEvent"
+  },
+  {
+   "event": "GraphEdgeTakenEvent"
+  },
+  {
+   "event": "NodeRunExceptionEvent",
+   "node": "fb",
+   "outputs": {
+    "error_message": "boom",
+    "error_type": "MockError"
+   }
+  },
+  {
+   "event": "NodeRunStartedEvent",
+   "node": "fail_end"
+  },
+  {
+   "event": "NodeRunSucceededEvent",
+   "node": "fail_end",
+   "outputs": {
+    "message": "boom",
+    "kind": "MockError"
+   }
+  },
+  {
+   "event": "GraphRunPartialSucceededEvent"
+  }
+ ]
+}

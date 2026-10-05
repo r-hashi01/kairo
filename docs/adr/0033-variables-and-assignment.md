@@ -86,3 +86,8 @@ Variable Assigner（v2）の操作は、over-write、clear、append、extend、s
   - `TestRunVarsAcrossRestart`（engine）
   - 並列の枝からの書き換えの順序を入れ替える検査は、`TestMapElementErrorModes` と同じ方法で、実行イベントの出口（ADR 0034）のテストと一緒に足す。
 - **レビューで直したこと（2026-10-05）:** 代入の結果が有限の数でない（オーバーフロー）ときは `InvalidInputValueError` にする。JSON にできず、変数のオブジェクトごと消えていた。テスト: `TestAssignOverflow`
+- **map の中からの実行の変数の書き換え（2026-10-05、差分ハーネスで決めた）。**
+  - 拒否するのをやめ、graphon と同じく、その要素の中だけに効くようにした。最初に書いたときに、要素のスコープに写しを作る（`localRunVars`）。
+  - 要素の中の参照は写しを読み、外には伝わらない。
+  - Dify のテスト用データ `update-conversation-variable-in-iteration` が、この挙動を前提にしている（最後の answer は空文字になる）。
+  - テスト: `TestRunVarsWrittenInsideMap`

@@ -44,9 +44,7 @@ func (m *machine) evalSwitch(n *ir.Node, scope uint32) (json.RawMessage, error) 
 		}
 	}
 	h, _ := json.Marshal(handle)
-	b := []byte(`{"handle":`)
-	b = append(b, h...)
-	b = append(b, `,"result":`...)
+	b := []byte(`{"result":`)
 	b = strconv.AppendBool(b, result)
 	b = append(b, `,"selected_case_id":`...)
 	b = append(b, h...)
@@ -123,7 +121,7 @@ func (m *machine) resolveFound(r ir.Ref, scope uint32) (json.RawMessage, bool) {
 	case ir.RefIndex:
 		return m.resolve(r, scope), true
 	case ir.RefVar:
-		v = RunVars(m.s)
+		v = m.runVarsScope(scope).Vals[runVarsNode]
 	}
 	if len(v) == 0 {
 		return nil, false
@@ -189,8 +187,9 @@ func (m *machine) expected(raw json.RawMessage, actual any, inputs map[string]ir
 	return nil, typeErr("unexpected expected value")
 }
 
-// template replaces {{#name#}} with the text of input name
-// (convert_template); unknown names are left as they are.
+// template replaces {{#name#}} with the text of input name, as graphon's
+// convert_template does (a name that resolves to nothing stays as its
+// text, without the braces).
 func (m *machine) template(s string, inputs map[string]ir.Ref, scope uint32) string {
 	if !strings.Contains(s, "{{#") {
 		return s
@@ -207,31 +206,24 @@ func (m *machine) template(s string, inputs map[string]ir.Ref, scope uint32) str
 		}
 		name := s[i+3 : i+3+j]
 		b.WriteString(s[:i])
-		if r, ok := inputs[name]; ok {
-			b.WriteString(segmentText(m.resolve(r, scope)))
-		} else {
+		switch r, ok := inputs[name]; {
+		case !validSelector(name):
 			b.WriteString(s[i : i+3+j+3])
+		case !ok:
+			b.WriteString(name)
+		default:
+			raw, found := m.resolveFound(r, scope)
+			v, err := pyDecode(raw)
+			if !found || err != nil {
+				b.WriteString(name)
+			} else {
+				b.WriteString(segText(v))
+			}
 		}
 		s = s[i+3+j+3:]
 	}
 	b.WriteString(s)
 	return b.String()
-}
-
-// segmentText is a value's text in a template: strings as they are, null
-// as empty, anything else as JSON.
-func segmentText(v json.RawMessage) string {
-	t := bytes.TrimSpace(v)
-	if len(t) == 0 || bytes.Equal(t, null) {
-		return ""
-	}
-	if t[0] == '"' {
-		var s string
-		if json.Unmarshal(t, &s) == nil {
-			return s
-		}
-	}
-	return string(t)
 }
 
 func isBoolish(v any) bool {

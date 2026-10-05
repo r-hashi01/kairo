@@ -19,6 +19,7 @@ func runSwitch(t *testing.T, input, logic string, conds ...string) (string, stri
 	json.Unmarshal([]byte(input), &vars)
 	for k := range vars {
 		in[k] = "$input." + k
+		in["in."+k] = "$input." + k // as {{#in.k#}} in templates
 	}
 	inJSON, _ := json.Marshal(in)
 	js := `{"name":"sw","root":{"kind":"step","id":"s","action":"kairo.switch","input":` + string(inJSON) +
@@ -37,7 +38,9 @@ func runSwitch(t *testing.T, input, logic string, conds ...string) (string, stri
 	if x.s.Status != StatusCompleted {
 		return "", x.s.Error
 	}
-	var out struct{ Handle string }
+	var out struct {
+		Handle string `json:"selected_case_id"`
+	}
 	json.Unmarshal(x.s.Output, &out)
 	return out.Handle, ""
 }
@@ -64,7 +67,7 @@ func TestSwitchConditions(t *testing.T) {
 		{`{"enabled":false}`, "and", []string{cond("enabled", "is", `"false"`)}, "yes", ""},
 		{`{"text":"graphon"}`, "and", []string{cond("text", "contains", `"pho"`)}, "yes", ""},
 		{`{"tags":["a","b"]}`, "and", []string{cond("tags", "contains", `"a"`)}, "yes", ""},
-		{`{"text":"graphon","needle":"pho"}`, "and", []string{cond("text", "contains", `"{{#needle#}}"`)}, "yes", ""},
+		{`{"text":"graphon","n":"pho"}`, "and", []string{cond("text", "contains", `"{{#in.n#}}"`)}, "yes", ""},
 		// Strings.
 		{`{"s":"Hello"}`, "and", []string{cond("s", "start with", `"He"`), cond("s", "end with", `"lo"`)}, "yes", ""},
 		{`{"s":""}`, "and", []string{cond("s", "start with", `"He"`)}, "false", ""},

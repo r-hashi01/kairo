@@ -5,3 +5,5 @@ kairo-data/
 .claude/.cache/
 bin/
 store/.certs/
+__pycache__/
+*.egg-info/

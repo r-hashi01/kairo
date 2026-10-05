@@ -84,3 +84,7 @@ ADR 0013 は、自由文での分岐を防ぐために、条件を型付きの�
 - **テスト:**
   - `TestSwitchConditions`: graphon のテストの移植と、演算子ごとの表
   - `TestSwitchMissingVariable`、`TestSwitchFileConditions`、`TestSwitchCasesAndErrors`、`TestPerNodeHandles`
+- **出力を Dify の if-else と同じ形にした（2026-10-05）。** 出力は `{"result", "selected_case_id"}` で、分岐のフィールドも `selected_case_id` にした（`handle` のキーをやめた）。
+- **期待値の中のテンプレートの解決も graphon に合わせた。**
+  - 見つからない変数は、波括弧を外した名前のまま残る。
+  - 値の文字列化は `Segment.text` と同じにした（配列は Python のリストの表記、オブジェクトは `json.dumps`）。

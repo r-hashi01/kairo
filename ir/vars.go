@@ -139,11 +139,6 @@ func (c *compiler) compileAssign(i int32, d *Def) error {
 			if k < 0 {
 				return fmt.Errorf("ir: assign %q: undeclared run variable %q", n.ID, it.Var)
 			}
-			if n.MapScope >= 0 {
-				// Dify copies the variables for each iteration element, so
-				// such a write would not be seen outside (ADR 0033).
-				return fmt.Errorf("ir: assign %q: run variables cannot be written inside a map", n.ID)
-			}
 			item.Name, item.Type = name, c.plan.Vars[k].Type
 		} else {
 			l, ok := c.plan.ByID[head]

@@ -73,3 +73,28 @@ graphon には、次の弱点がある（調査メモの 3 節）。
 - ノードもすべて Go に移植する: ir-runtime で、Jinja2、文書抽出、ナレッジ検索、認証情報の扱いの互換性を保てなかった。Python 実装を捨てる前提でしか成り立たない。
 - graphon の API（GraphEngine と Layer）を模倣して、プロセス内で差し替える: Layer と RuntimeState は Python のオブジェクトを受け渡す前提で、Go のプロセスからは提供できない。
 - graphon を高速化する（Rust/PyO3 を含む）: 1 回の実行の速さは上がるが、クラッシュからの再開、待っている実行のコスト、外部の割り当ての配分は解決しない。
+
+## 実装で詰めた詳細（2026-10-05 追記、ADR 0017）
+
+- **変換器（`compat/dify`）。**
+  - ADR のとおり別のモジュールにした。
+  - 入力は DSL の YAML ではなく、`workflow` の JSON にした。Dify は DB にグラフを JSON で持っており、YAML のための依存を足さずに済む。差分ハーネスでは、Python 側が YAML を JSON にして渡す。
+- **純粋なノードのための組み込みの保護アクション。** 決定の「純粋なノードは Go の保護ステップにする」の範囲で、2 つ足した。
+  - `kairo.template`: answer のテンプレートを、graphon の書式（値の文字列化、見つからない変数の扱い）のまま展開する。
+  - `kairo.coalesce`: variable-aggregator。最初に存在する変数を選ぶ。null でも存在すれば選び、どれもなければキーを作らない。グループにも対応する。
+- **list-operator。** v1 ではワーカーで動かす（`dify.list-operator`）。Go への移植は、差分ハーネスのデータが揃ってから行う。
+- **差分ハーネスの実際。**
+  - graphon 0.7.0 の `graphon.dsl.loads` で Dify の DSL を読み込み、外部に作用するノードの `_run` と、モデルやツールの実体を作る処理をモックに差し替えて実行する（`harness/graphon_trace.py`）。
+  - 正解データはリポジトリに置き（`compat/dify/testdata/graphon`）、CI では Python を使わない。
+  - 比べるのは、実行の状態、成功・例外で終わったノードとその出力、実行全体の出力。SSE のイベント列の比較は、アダプタ（ADR 0036）を作るときに足す。
+  - 2026-10-05 の時点で、31 本がすべて一致している。内訳は、Dify のテスト用データ 24 本、入力やモックを変えたケース 3 本、自前のデータ 2 本（エラー処理、iteration の要素の失敗）とそのケース 2 本。
+- **テスト用データの写し。** Dify のワークフローのテスト用データから作った正解データを、kairo のリポジトリに置いている。
+- **Python のワーカー SDK（`sdk/python`、2026-10-05）。**
+  - ワーカープロトコルの実装は依存なし（`kairo_worker.Worker`）。graphon のノードを 1 つずつ実行する実行器は、graphon が入っているときだけ使う（`kairo_worker.graphon.GraphonNodeRunner`）。
+  - 実行器は、タスクの入力を新しい変数プールに入れ、ノードファクトリでノードを作って実行する。
+    - チャンクはライブの出力にする。
+    - 結果のうち、`inputs`、`process_data`、`metadata` は `meta` に、使用量は `tokens` に入れる。
+    - 外部に作用するノードのタイムアウトや切断は、「結果が不明」として返す。
+  - ノードファクトリは差し替えられる。Dify では DifyNodeFactory（モデル、プラグイン、ファイル）を渡す。ここでは graphon の DSL 用のファクトリ（`slim_factory`）を使う。
+  - エンドツーエンドのテスト（`TestGraphonWorkerEndToEnd`）: Dify のワークフローを変換して kairo のエンジンで実行し、ノードは Python のワーカーが graphon の実装（Jinja2 のテンプレート、ローカルの HTTP サーバへのリクエスト）で実行する。`GRAPHON_PYTHON` があるときだけ動く。
+- **リトライは、graphon と同じく llm / code / http-request / tool にだけ付ける。** graphon は、ほかのノードの `retry_config` を無視するため。

@@ -55,6 +55,13 @@ for m in $modules; do
   (cd "$m" && go test -count=1 ./...)
 done
 
+# The Python worker SDK (sdk/python; its graphon runner needs graphon and
+# is covered by compat/dify's end-to-end test when GRAPHON_PYTHON is set).
+if command -v python3 >/dev/null; then
+  step "python sdk tests"
+  (cd sdk/python && python3 -m unittest discover -s tests 2>&1 | tail -1)
+fi
+
 # The invariants of the requirements (section 6), run by name so a rename or
 # deletion shows up here instead of silently dropping coverage.
 step "invariants"

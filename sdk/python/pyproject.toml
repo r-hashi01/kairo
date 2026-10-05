@@ -1,0 +1,17 @@
+[project]
+name = "kairo-worker"
+version = "0.1.0"
+description = "Worker SDK for the kairo workflow runtime: the worker protocol, and running graphon (Dify) nodes as kairo tasks."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+# Running Dify's workflow nodes (ADR 0028).
+graphon = ["graphon==0.7.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["kairo_worker"]
