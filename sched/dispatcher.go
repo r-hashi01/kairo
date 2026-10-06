@@ -3,6 +3,8 @@ package sched
 import (
 	"context"
 	"math"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +22,33 @@ type DestLimits struct {
 	// TenantConcurrency caps outstanding tasks per tenant at this
 	// destination (0 = unlimited).
 	TenantConcurrency int
+	// Concurrency caps outstanding tasks at this destination (0 =
+	// unlimited). Below it, the dispatcher finds how many the destination
+	// takes from its answers (ADR 0039).
+	Concurrency int
 }
+
+// Outcome is how a task went, for the destination's concurrency (ADR
+// 0039). RateLimited: the destination refused it for its limits (an HTTP
+// 429, a provider's rate limit error); TimedOut: it did not answer in
+// time. Both lower the destination's concurrency.
+type Outcome struct {
+	Tokens      int
+	RateLimited bool
+	TimedOut    bool
+}
+
+// The adaptive concurrency of a destination (ADR 0039): unlimited (up to a
+// declared Concurrency) until the destination first refuses a task for its
+// limits; then half of what was outstanding, halved again on a refusal (at
+// most once per round trip), and grown by one per round trip while the
+// recent latency stays within latencyTolerance of the long-run one.
+const (
+	latencyTolerance = 2.0
+	srttWeight       = 0.125
+	baseWeight       = 1.0 / 64
+	statsEvery       = 100 * time.Millisecond
+)
 
 // Dispatcher holds ready tasks and hands them to pulling workers, visiting
 // tenants round-robin and respecting each destination's RPM/TPM buckets.
@@ -48,6 +76,8 @@ type Dispatcher struct {
 	done      chan struct{}
 
 	statsMu sync.Mutex
+	dstats  []DestStat
+	statsAt time.Time
 	queued  int
 	tracked int // len(pending) + len(aborted) + len(delivered)
 }
@@ -65,21 +95,23 @@ const (
 )
 
 type dmsg struct {
-	kind   dmsgKind
-	task   *task.Task
-	poller *Poller
-	credit int
-	dest   string
-	tenant string
-	est    int
-	actual int
-	key    task.Key
+	kind    dmsgKind
+	task    *task.Task
+	poller  *Poller
+	credit  int
+	dest    string
+	tenant  string
+	est     int
+	actual  int
+	limited bool
+	key     task.Key
 }
 
 type handed struct {
 	task   *task.Task
 	ctx    context.Context
 	cancel context.CancelFunc
+	at     time.Time // when it was delivered
 }
 
 // Delivery is a task handed to a worker. Ctx is cancelled when the task is
@@ -108,6 +140,65 @@ type dest struct {
 	rr       int
 	queued   int
 	listed   bool
+
+	// Adaptive concurrency (ADR 0039). limited: the destination refused a
+	// task once; until then limit is the declared cap.
+	inflight      int
+	limit         float64
+	limited       bool
+	srtt, baseRTT time.Duration // recent and long-run round trip
+	lastDecrease  time.Time
+	refused       uint64
+}
+
+func (ds *dest) maxLimit() float64 {
+	if ds.lim.Concurrency > 0 {
+		return float64(ds.lim.Concurrency)
+	}
+	return math.MaxInt32
+}
+
+// observe adjusts the concurrency after a task took rtt.
+func (ds *dest) observe(now time.Time, rtt time.Duration, limited bool) {
+	if limited {
+		ds.refused++
+		// At most one decrease per round trip: refusals of tasks sent
+		// together are one signal. Before any success, the refused task's
+		// own round trip is the measure.
+		window := ds.srtt
+		if window == 0 {
+			window = rtt
+		}
+		switch {
+		case !ds.limited:
+			// The first refusal: half of what was outstanding.
+			ds.limited = true
+			ds.limit = math.Max(1, float64(ds.inflight+1)/2)
+			ds.lastDecrease = now
+		case now.Sub(ds.lastDecrease) >= window:
+			ds.limit = math.Max(1, ds.limit/2)
+			ds.lastDecrease = now
+		}
+		return
+	}
+	if rtt > 0 {
+		if ds.srtt == 0 {
+			ds.srtt, ds.baseRTT = rtt, rtt
+		} else {
+			ds.srtt += time.Duration(srttWeight * float64(rtt-ds.srtt))
+			ds.baseRTT += time.Duration(baseWeight * float64(rtt-ds.baseRTT))
+		}
+	}
+	switch {
+	case !ds.limited:
+		return // not limited: nothing to grow
+	case float64(ds.srtt) > latencyTolerance*float64(ds.baseRTT):
+		// Recent latency well above the long-run one: the destination slows
+		// down under the load; stay.
+	default:
+		ds.limit += 1 / ds.limit
+	}
+	ds.limit = math.Min(ds.limit, ds.maxLimit())
 }
 
 type tenantQ struct {
@@ -155,12 +246,16 @@ func (b *bucket) wait(n float64) time.Duration {
 }
 
 func NewDispatcher(limits func(dest string) DestLimits) *Dispatcher {
+	return newDispatcher(limits, time.Now)
+}
+
+func newDispatcher(limits func(dest string) DestLimits, now func() time.Time) *Dispatcher {
 	if limits == nil {
 		limits = func(string) DestLimits { return DestLimits{} }
 	}
 	d := &Dispatcher{
 		q:         mpsc.New[dmsg](),
-		now:       time.Now,
+		now:       now,
 		dests:     map[string]*dest{},
 		pollers:   map[string][]*Poller{},
 		byAction:  map[string][]*dest{},
@@ -201,8 +296,13 @@ func (d *Dispatcher) Unpoll(p *Poller) { d.q.Push(dmsg{kind: mUnpoll, poller: p}
 // Done reports that a task finished, with its actual token usage. Its
 // concurrency slot is released only now, not when it was aborted, so a
 // worker that ignores cancellation still counts against the limits.
-func (d *Dispatcher) Done(t *task.Task, tokens int) {
-	d.q.Push(dmsg{kind: mDone, task: t, key: t.Key(), dest: t.Destination, tenant: t.Tenant, est: t.EstTokens, actual: tokens})
+func (d *Dispatcher) Done(t *task.Task, tokens int) { d.Finish(t, Outcome{Tokens: tokens}) }
+
+// Finish is Done with how the task went, which adjusts its destination's
+// concurrency (ADR 0039).
+func (d *Dispatcher) Finish(t *task.Task, o Outcome) {
+	d.q.Push(dmsg{kind: mDone, task: t, key: t.Key(), dest: t.Destination, tenant: t.Tenant, est: t.EstTokens,
+		actual: o.Tokens, limited: o.RateLimited || o.TimedOut})
 }
 
 // Abort drops a queued task, or cancels the context of a delivered one
@@ -220,6 +320,22 @@ func (d *Dispatcher) Tracked() int {
 // AbortAll cancels the contexts of all delivered tasks (the engine is
 // stopping). Their slots are still released by Done.
 func (d *Dispatcher) AbortAll() { d.q.Push(dmsg{kind: mAbortAll}) }
+
+// DestStat is a destination's concurrency (ADR 0039). Limit is 0 while
+// the destination has not refused a task (not limited).
+type DestStat struct {
+	Name     string  `json:"name"`
+	Inflight int     `json:"inflight"`
+	Limit    float64 `json:"limit,omitempty"`
+	Refused  uint64  `json:"refused,omitempty"`
+}
+
+// Dests is each destination's concurrency, by name.
+func (d *Dispatcher) Dests() []DestStat {
+	d.statsMu.Lock()
+	defer d.statsMu.Unlock()
+	return slices.Clone(d.dstats)
+}
 
 // Queued is the number of tasks waiting for quota or workers.
 func (d *Dispatcher) Queued() int {
@@ -306,13 +422,23 @@ func (d *Dispatcher) loop() {
 				}
 			case mDone:
 				// The same task: a reused key may belong to a newer one.
-				if h, ok := d.delivered[m.key]; ok && h.task == m.task {
+				var rtt time.Duration
+				h, ok := d.delivered[m.key]
+				if ok && h.task == m.task {
 					h.cancel() // releases the context
 					delete(d.delivered, m.key)
+					rtt = d.now().Sub(h.at)
 				}
 				ds := d.dests[m.dest]
 				if ds == nil {
 					continue
+				}
+				// Every delivered task counted once in inflight, and every
+				// Done is of a delivered task (even when a newer task reused
+				// its key).
+				ds.inflight--
+				if ok && h.task == m.task {
+					ds.observe(d.now(), rtt, m.limited)
 				}
 				if tq := ds.tenants[m.tenant]; tq != nil {
 					tq.inflight--
@@ -358,6 +484,19 @@ func (d *Dispatcher) loop() {
 		for _, ds := range d.dests {
 			n += ds.queued
 		}
+		// The destinations' concurrency, for Stats: not on every round.
+		if now := d.now(); now.Sub(d.statsAt) >= statsEvery {
+			d.statsAt = now
+			d.dstats = d.dstats[:0]
+			for _, ds := range d.dests {
+				st := DestStat{Name: ds.name, Inflight: ds.inflight, Refused: ds.refused}
+				if ds.limited {
+					st.Limit = ds.limit
+				}
+				d.dstats = append(d.dstats, st)
+			}
+			slices.SortFunc(d.dstats, func(a, b DestStat) int { return strings.Compare(a.Name, b.Name) })
+		}
 		d.queued = n
 		d.tracked = len(d.pending) + len(d.aborted) + len(d.delivered)
 		d.statsMu.Unlock()
@@ -391,6 +530,7 @@ func (d *Dispatcher) dest(name, action string) *dest {
 			tpm:     newBucket(lim.TPM, lim.BurstSeconds, now),
 			tenants: map[string]*tenantQ{},
 		}
+		ds.limit = ds.maxLimit()
 		d.dests[name] = ds
 	}
 	return ds
@@ -401,12 +541,13 @@ func (d *Dispatcher) dest(name, action string) *dest {
 func (d *Dispatcher) requeue(t *task.Task) bool {
 	k := t.Key()
 	aborted := false
-	if h, ok := d.delivered[k]; ok {
+	ds := d.dest(t.Destination, t.Action)
+	ds.inflight-- // it was delivered
+	if h, ok := d.delivered[k]; ok && h.task == t {
 		aborted = h.ctx.Err() != nil
 		h.cancel()
 		delete(d.delivered, k)
 	}
-	ds := d.dest(t.Destination, t.Action)
 	tq := ds.tenants[t.Tenant]
 	if tq == nil {
 		tq = &tenantQ{}
@@ -459,6 +600,9 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		ps := d.pollers[ds.action]
 		if len(ps) == 0 {
 			return 0
+		}
+		if float64(ds.inflight) >= math.Floor(ds.limit) {
+			return 0 // a Done makes room
 		}
 		// Pick the next tenant round-robin that is under its concurrency cap.
 		var t *task.Task
@@ -526,7 +670,8 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		k := t.Key()
 		delete(d.pending, k)
 		ctx, cancel := context.WithCancel(context.Background())
-		d.delivered[k] = handed{t, ctx, cancel}
+		d.delivered[k] = handed{t, ctx, cancel, now}
+		ds.inflight++
 		p := ps[0]
 		p.credit--
 		p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C

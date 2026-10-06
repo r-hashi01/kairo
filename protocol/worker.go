@@ -20,6 +20,7 @@ type Worker struct {
 	Actions     []string
 	Concurrency int
 	Handler     Handler
+	Token       string // the server's Token, if it has one (ADR 0037)
 }
 
 // Run connects to the runtime and serves tasks until ctx is cancelled or
@@ -43,7 +44,7 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 		}
 		return w.Flush()
 	}
-	if err := send(MsgHello, Hello{Worker: wk.Name, Actions: wk.Actions, Credit: conc}); err != nil {
+	if err := send(MsgHello, Hello{Worker: wk.Name, Actions: wk.Actions, Credit: conc, Token: wk.Token}); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -73,7 +74,7 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 					delete(cancels, seq)
 				}
 				cmu.Unlock()
-				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta})
+				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited})
 			}
 		}()
 	}

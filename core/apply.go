@@ -229,8 +229,8 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 			return
 		}
 	}
-	if m.tracing && n.Kind != ir.KStep {
-		m.traceStart(id, a, n, nil)
+	if m.tracing && n.Kind != ir.KStep && n.Kind != ir.KMap && n.Kind != ir.KLoop {
+		m.traceStart(id, a, n, nil) // maps and loops trace their input below
 	}
 	switch n.Kind {
 	case ir.KStep:
@@ -269,6 +269,7 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 
 	case ir.KMap:
 		list := m.resolve(n.Over, scope)
+		m.traceStart(id, a, n, list)
 		var items []json.RawMessage
 		if err := json.Unmarshal(list, &items); err != nil || bytes.Equal(bytes.TrimSpace(list), null) {
 			m.failAt(id, "map "+n.ID+": value to map over is not a list")

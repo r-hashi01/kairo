@@ -163,6 +163,9 @@ func (m *machine) startLoop(id uint32, a *Act, n *ir.Node, node int32) {
 		}
 		b, _ := json.Marshal(obj)
 		setVal(m.s.Scopes[a.Scope], node, b)
+		m.traceStart(id, a, n, b)
+	} else {
+		m.traceStart(id, a, n, nil)
 	}
 	if n.Before {
 		stop := n.Pred != nil && !m.evalPred(n.Pred, a.Scope)

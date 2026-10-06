@@ -3,6 +3,7 @@
     python -m kairo_worker.serve --socket /path/to/worker.sock \\
         --actions dify.template-transform,dify.http-request [--concurrency 8]
 
+The runtime's worker token, if it has one, is read from KAIRO_WORKER_TOKEN.
 For Dify itself, build a Worker with GraphonNodeRunner and Dify's node
 factory instead.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 from .graphon import GraphonNodeRunner, slim_factory
 from .worker import Worker
@@ -31,7 +33,8 @@ def main() -> None:
     else:
         host, port = a.tcp.rsplit(":", 1)
         addr = (host, int(port))
-    Worker(a.name, a.actions.split(","), GraphonNodeRunner(slim_factory()), a.concurrency).run(addr)
+    token = os.environ.get("KAIRO_WORKER_TOKEN", "")
+    Worker(a.name, a.actions.split(","), GraphonNodeRunner(slim_factory()), a.concurrency, token=token).run(addr)
 
 
 if __name__ == "__main__":

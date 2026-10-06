@@ -63,4 +63,8 @@ type Result struct {
 	// Meta is passed through to the step's trace (ADR 0034): e.g. Dify's
 	// process_data and execution metadata (token usage).
 	Meta json.RawMessage `json:"meta,omitempty"`
+	// RateLimited: the destination refused the task for its limits (an
+	// HTTP 429, a provider's rate limit error). It lowers the destination's
+	// concurrency (ADR 0039); it does not change the failure itself.
+	RateLimited bool `json:"rate_limited,omitempty"`
 }

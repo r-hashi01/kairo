@@ -94,5 +94,28 @@ func TestTraceOfMapLoopAndVars(t *testing.T) {
 	if got := summarize(x); got != want {
 		t.Fatalf("traces\n got: %s\nwant: %s", got, want)
 	}
+	// A map's start carries the list it maps over.
+	if in := string(x.traces[1].Input); in != `[1,2]` {
+		t.Fatalf("map start input %s", in)
+	}
+	x.checkReplay()
+}
+
+// A loop's start carries its variables' initial values.
+func TestTraceOfLoopStartInput(t *testing.T) {
+	x := newSim(t, compile(t, `{"name":"l","root":{"kind":"loop","id":"lp","max_iter":2,"check":"before","loop_output":"vars",
+	  "vars":{"num":{"type":"integer","value":1}},
+	  "body":{"kind":"step","id":"inc","action":"kairo.assign","params":{"items":[{"var":"lp.num","op":"+=","value":1}]}}}}`))
+	x.run(`{}`)
+	var start *Trace
+	for i := range x.traces {
+		if x.traces[i].Kind == TrNodeStart && x.traces[i].StepID == "lp" {
+			start = &x.traces[i]
+			break
+		}
+	}
+	if start == nil || string(start.Input) != `{"num":1}` {
+		t.Fatalf("loop start %+v\n%s", start, summarize(x))
+	}
 	x.checkReplay()
 }

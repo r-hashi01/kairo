@@ -9,7 +9,8 @@
 // their params are the node's data, their inputs every variable the data
 // refers to, named by selector ("node.var").
 //
-// The run's input is {<start variable>: value, ..., "sys": {"query": ...}};
+// The run's input is {<start variable>: value, ..., "sys": {"query": ...},
+// "__env": {<environment variable>: value}};
 // conversation variables are the run's variables (ADR 0033), given and
 // returned by the host.
 package dify
@@ -55,6 +56,10 @@ type Variable struct {
 	Value     json.RawMessage `json:"value"`
 }
 
+// ConverterVersion changes whenever Convert's output for a workflow can
+// change; hosts keep plans converted by different versions apart.
+const ConverterVersion = 4
+
 // Converted is a kairo definition and the specs of the dify.* actions it
 // uses (register them before compiling).
 type Converted struct {
@@ -84,6 +89,7 @@ type common struct {
 }
 
 type converter struct {
+	in       string // the reference to the run's input: "$input", or the prepare step's payload
 	w        *Workflow
 	byID     map[string]*Node
 	data     map[string]common
@@ -93,9 +99,37 @@ type converter struct {
 	env      bool
 }
 
+// Options change what Convert produces.
+type Options struct {
+	// Prepare starts the run with a wait for the signal PrepareSignal
+	// (ADR 0038): the host submits the run with only its own parameters,
+	// and the worker that builds the run's variables sends them in the
+	// signal's payload {"input": <what the run's input would be>, "vars":
+	// {<conversation variable>: value}}. References to the run's input read
+	// the payload's input; the conversation variables are set from its
+	// vars.
+	Prepare bool
+}
+
+// PrepareSignal is the signal of the prepare step; PrepareNode its id.
+const (
+	PrepareSignal = "dify.prepare"
+	PrepareNode   = "__prepare"
+	varsNode      = "__vars"
+)
+
 // Convert converts a workflow into a definition named name.
 func Convert(name string, w *Workflow) (*Converted, error) {
-	c := &converter{w: w, byID: map[string]*Node{}, data: map[string]common{}, children: map[string][]*Node{}, specs: map[string]ir.NodeSpec{}}
+	return ConvertWith(name, w, Options{})
+}
+
+// ConvertWith is Convert with options.
+func ConvertWith(name string, w *Workflow, opt Options) (*Converted, error) {
+	in := "$input"
+	if opt.Prepare {
+		in = PrepareNode + ".payload.input"
+	}
+	c := &converter{in: in, w: w, byID: map[string]*Node{}, data: map[string]common{}, children: map[string][]*Node{}, specs: map[string]ir.NodeSpec{}}
 	for i := range w.Graph.Nodes {
 		n := &w.Graph.Nodes[i]
 		var cm common
@@ -135,6 +169,9 @@ func Convert(name string, w *Workflow) (*Converted, error) {
 	if c.env {
 		g = c.withEnv(g)
 	}
+	if opt.Prepare {
+		g = c.withPrepare(g, def)
+	}
 	def.Root = g
 	out := &Converted{Definition: def, Responses: c.resp}
 	for _, s := range c.specs {
@@ -144,14 +181,56 @@ func Convert(name string, w *Workflow) (*Converted, error) {
 	return out, nil
 }
 
-// withEnv runs the environment step before the graph.
-func (c *converter) withEnv(g *ir.Def) *ir.Def {
+// EnvInput is the run input field holding the environment variables'
+// values ({name: value}). They are given per run, not kept in the plan:
+// secret variables must not end up in stored plans (ADR 0037).
+const EnvInput = "__env"
+
+// EnvValues are a workflow's environment variables as EnvInput expects
+// them, for hosts that do not have them otherwise.
+func EnvValues(w *Workflow) map[string]json.RawMessage {
 	vals := map[string]json.RawMessage{}
-	for _, v := range c.w.EnvironmentVariables {
+	for _, v := range w.EnvironmentVariables {
 		vals[v.Name] = constValue(v.ValueType, v.Value)
 	}
-	params, _ := json.Marshal(vals)
-	return &ir.Def{Kind: "seq", Nodes: []*ir.Def{{Kind: "step", ID: envNode, Action: ir.ActionPass, Params: params}, g}}
+	return vals
+}
+
+// withEnv runs the environment step, reading EnvInput, before the graph.
+func (c *converter) withEnv(g *ir.Def) *ir.Def {
+	in := map[string]string{}
+	for _, v := range c.w.EnvironmentVariables {
+		in[v.Name] = c.in + "." + EnvInput + "." + v.Name
+	}
+	return &ir.Def{Kind: "seq", Nodes: []*ir.Def{{Kind: "step", ID: envNode, Action: ir.ActionPass, Input: in}, g}}
+}
+
+// withPrepare runs the prepare step, then sets the conversation variables
+// from its payload, before the graph.
+func (c *converter) withPrepare(g *ir.Def, def *ir.Definition) *ir.Def {
+	wait := &ir.Def{Kind: "wait", ID: PrepareNode, Signal: PrepareSignal, Timeout: ir.Duration(time.Hour)}
+	nodes := []*ir.Def{wait}
+	if len(def.Vars) > 0 {
+		names := make([]string, 0, len(def.Vars))
+		for name := range def.Vars {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		type item struct {
+			Var   string `json:"var"`
+			Op    string `json:"op"`
+			Input string `json:"input"`
+		}
+		var items []item
+		in := map[string]string{}
+		for _, name := range names {
+			items = append(items, item{Var: "$var." + name, Op: "over-write", Input: "v." + name})
+			in["v."+name] = PrepareNode + ".payload.vars." + name
+		}
+		params, _ := json.Marshal(map[string]any{"items": items})
+		nodes = append(nodes, &ir.Def{Kind: "step", ID: varsNode, Action: ir.ActionAssign, Params: params, Input: in})
+	}
+	return &ir.Def{Kind: "seq", Nodes: append(nodes, g)}
 }
 
 // scope is where a node is: the iterations and loops around it, innermost
@@ -296,7 +375,7 @@ func (c *converter) start(d *ir.Def, n *Node) error {
 	d.Action = ir.ActionPass
 	d.Input = map[string]string{}
 	for _, v := range data.Variables {
-		d.Input[v.Variable] = "$input." + v.Variable
+		d.Input[v.Variable] = c.in + "." + v.Variable
 	}
 	return nil
 }
@@ -641,8 +720,12 @@ func (c *converter) humanInput(n *Node, sc scope) (*ir.Def, *ir.Def, error) {
 		timeout = time.Duration(*data.Timeout) * unit
 	}
 	wait := &ir.Def{Kind: "wait", ID: n.ID, Signal: HumanSignal(n.ID), Timeout: ir.Duration(timeout)}
-	sw := ir.Switch{Cases: []ir.SwitchCase{{ID: HumanTimeout, Logic: "and",
-		Conds: []ir.Condition{{Var: "w.timed_out", Op: "is", Value: json.RawMessage("true")}}}}}
+	// Timed out here, or expired at the host (its signal names the timeout
+	// handle).
+	timeoutHandle, _ := json.Marshal(HumanTimeout)
+	sw := ir.Switch{Cases: []ir.SwitchCase{{ID: HumanTimeout, Logic: "or",
+		Conds: []ir.Condition{{Var: "w.timed_out", Op: "is", Value: json.RawMessage("true")},
+			{Var: "w.handle", Op: "is", Value: timeoutHandle}}}}}
 	for _, a := range data.UserActions {
 		v, _ := json.Marshal(a.ID)
 		sw.Cases = append(sw.Cases, ir.SwitchCase{ID: a.ID, Logic: "and",
@@ -767,17 +850,28 @@ func (c *converter) loop(n *Node, sc scope) (*ir.Def, error) {
 // retries are the node types graphon retries.
 var retries = map[string]bool{"llm": true, "code": true, "http-request": true, "tool": true}
 
+// cpu are the node types that compute rather than wait for the outside
+// (ADR 0039): code and templates run in the sandbox, documents are parsed.
+var cpu = map[string]bool{"code": true, "template-transform": true, "document-extractor": true}
+
 // effects of the node types run by workers (ADR 0035).
 var real = map[string]bool{"http-request": true, "tool": true, "agent": true, "knowledge-index": true}
+
+// Inputs every worker step gets besides its selectors (ADR 0037): the
+// host's run context (Dify's "_dify": tenant, app, user, ...) and all
+// system variables, both from the run's input. Workers build the node's
+// run context and system variables from them.
+const (
+	RunContextInput = "__dify"
+	SysInput        = "__sys"
+)
 
 func (c *converter) worker(d *ir.Def, n *Node, sc scope) error {
 	t := c.data[n.ID].Type
 	d.Action = "dify." + t
 	d.Params = n.Data
 	sels := selectors(n.Data)
-	if len(sels) > 0 {
-		d.Input = map[string]string{}
-	}
+	d.Input = map[string]string{RunContextInput: c.in + "." + RunContextInput, SysInput: c.in + ".sys"}
 	for _, sel := range sels {
 		r, err := c.ref(sel, sc)
 		if err != nil {
@@ -785,7 +879,12 @@ func (c *converter) worker(d *ir.Def, n *Node, sc scope) error {
 		}
 		d.Input[strings.Join(sel, ".")] = r
 	}
-	spec := ir.NodeSpec{Action: d.Action, Effect: ir.EffectUnprotected}
+	// One attempt unless the node's retry is enabled (errorHandling): graphon
+	// does not retry otherwise.
+	spec := ir.NodeSpec{Action: d.Action, Effect: ir.EffectUnprotected, MaxAttempts: 1, Resource: ir.ResourceIO}
+	if cpu[t] {
+		spec.Resource = ir.ResourceCPU
+	}
 	if real[t] {
 		spec.Effect = ir.EffectReal
 		d.OnUnknown = "fail" // Dify does not stop for review (ADR 0035)
@@ -875,7 +974,7 @@ func (c *converter) ref(sel []string, sc scope) (string, error) {
 	}
 	switch head {
 	case "sys":
-		return "$input.sys" + path(rest), nil
+		return c.in + ".sys" + path(rest), nil
 	case "env":
 		c.env = true
 		return envNode + path(rest), nil

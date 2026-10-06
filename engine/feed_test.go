@@ -175,7 +175,7 @@ func sameTrace(a, b *core.Trace) bool {
 // engine back; subscribing again starts from the present.
 func TestFeedLag(t *testing.T) {
 	e := newEngine(t, Config{Shards: 1, DataDir: t.TempDir(), NoSync: true, EvictAfter: time.Millisecond,
-		Feeds: []string{"dify"}, FeedLimit: 20})
+		Feeds: []string{"dify"}, FeedLimit: 20, FeedHold: -1})
 	defer e.Close()
 	mustPlan(t, e, fiveNodes)
 	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`)
@@ -351,4 +351,77 @@ func TestFeedTracelessEventsDoNotHoldRuns(t *testing.T) {
 	e2 := start()
 	defer e2.Close()
 	waitFor(t, func() bool { ri, _ := e2.Get(context.Background(), id); return ri.Evicted })
+}
+
+// Subscribers that fall behind hold the engine back: no new runs start
+// until they catch up; runs in progress go on (ADR 0039).
+func TestFeedBackpressure(t *testing.T) {
+	e := newEngine(t, Config{Shards: 1, DataDir: t.TempDir(), NoSync: true, Feeds: []string{"dify"}, FeedHold: 30})
+	defer e.Close()
+	mustPlan(t, e, fiveNodes)
+	e.RegisterExecutor([]string{"llm"}, 4, echoExec())
+	e.Start()
+	f, _ := e.Subscribe("dify")
+	ft := TierFile
+	holdBack(t, e, 30, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+	// The subscriber catches up: the engine goes on.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() {
+		for ctx.Err() == nil {
+			es, err := f.Next(ctx, 64)
+			if err != nil {
+				return
+			}
+			f.Ack(es[len(es)-1].Cursor)
+		}
+	}()
+	waitFor(t, func() bool { return e.Stats().FeedBacklog < 15 })
+	if _, err := submit(e, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft}); err != nil {
+		t.Fatalf("after catching up: %v", err)
+	}
+}
+
+// holdBack runs req until more than hold entries are unacknowledged, then
+// waits until new runs are held back (the hold is applied by the feed's
+// goroutine, after the entries arrive).
+func holdBack(t *testing.T, e *Engine, hold int, req SubmitRequest) {
+	t.Helper()
+	for e.Stats().FeedBacklog <= hold {
+		id, err := submit(e, req)
+		if err != nil {
+			break // held already
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err = e.Wait(ctx, id)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, err := e.Submit(ctx, req)
+		return err != nil
+	})
+}
+
+// Removing the subscription that held the engine back releases it (and
+// so does any other path that trims entries).
+func TestFeedBackpressureReleasedByUnsubscribe(t *testing.T) {
+	e := newEngine(t, Config{Shards: 1, DataDir: t.TempDir(), NoSync: true, Feeds: []string{"dify"}, FeedHold: 20})
+	defer e.Close()
+	mustPlan(t, e, fiveNodes)
+	e.RegisterExecutor([]string{"llm"}, 4, echoExec())
+	e.Start()
+	e.Subscribe("dify")
+	ft := TierFile
+	holdBack(t, e, 20, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft})
+	if err := e.Unsubscribe("dify"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submit(e, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"x"}`), Tenant: "t", Tier: &ft}); err != nil {
+		t.Fatalf("still held after the subscription went away: %v", err)
+	}
 }

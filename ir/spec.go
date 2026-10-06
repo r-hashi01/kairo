@@ -143,7 +143,18 @@ type NodeSpec struct {
 	// the value are taken, the others skipped. The enum's values are the
 	// node's handles.
 	Branch string `json:"branch,omitempty"`
+	// Resource is what a task of the node mostly uses (ADR 0039):
+	// ResourceIO (the default: it waits for the outside, as an LLM or an
+	// HTTP call) or ResourceCPU (it computes). Executors size how many
+	// tasks they take by it.
+	Resource string `json:"resource,omitempty"`
 }
+
+// Resources of NodeSpec.Resource.
+const (
+	ResourceIO  = "io"
+	ResourceCPU = "cpu"
+)
 
 func (s *NodeSpec) normalize() {
 	if s.MaxAttempts <= 0 {

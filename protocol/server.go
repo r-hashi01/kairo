@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net"
@@ -17,6 +18,8 @@ import (
 // Server accepts worker connections for an engine.
 type Server struct {
 	E *engine.Engine
+	// Token, if set, must be in every worker's Hello (ADR 0037).
+	Token string
 }
 
 func (s *Server) Serve(l net.Listener) error {
@@ -40,6 +43,10 @@ func (s *Server) handle(c net.Conn) {
 	}
 	var h Hello
 	if json.Unmarshal(body, &h) != nil || len(h.Actions) == 0 {
+		return
+	}
+	if s.Token != "" && subtle.ConstantTimeCompare([]byte(h.Token), []byte(s.Token)) != 1 {
+		log.Printf("kairo: worker %q rejected: bad token", h.Worker)
 		return
 	}
 	c.SetReadDeadline(time.Time{})
@@ -137,7 +144,7 @@ func (s *Server) handle(c net.Conn) {
 			if t == nil {
 				continue
 			}
-			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta})
+			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited})
 			d.Poll(p, 1)
 		case MsgCredit:
 			var cr Credit

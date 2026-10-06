@@ -136,7 +136,9 @@ func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte))
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 		switch resp.StatusCode {
-		case 429, 502, 503, 504:
+		case 429:
+			return task.Result{Err: msg, Retryable: true, RateLimited: true}
+		case 502, 503, 504:
 			return task.Result{Err: msg, Retryable: true}
 		}
 		return task.Result{Err: msg}

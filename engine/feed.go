@@ -91,6 +91,11 @@ type feedHub struct {
 	bufs    []feedBuf
 	changed chan struct{} // closed when entries arrive or subscriptions change
 	bounds  [][tierCount]uint64
+	hold    int  // Config.FeedHold, resolved
+	held    bool // backpressure wanted (ADR 0039)
+	applyMu sync.Mutex
+	applied bool // backpressure applied to the admission
+	durable int  // buffered entries with a log position (they need acknowledgements)
 	stop    chan struct{}
 	done    chan struct{}
 }
@@ -99,6 +104,10 @@ func newFeedHub(e *Engine) *feedHub {
 	h := &feedHub{e: e, limit: e.cfg.FeedLimit, q: mpsc.New[feedMsg](), subs: map[string]*feedSub{},
 		bufs: make([]feedBuf, e.cfg.Shards), changed: make(chan struct{}), bounds: make([][tierCount]uint64, e.cfg.Shards),
 		stop: make(chan struct{}), done: make(chan struct{})}
+	h.hold = e.cfg.FeedHold
+	if h.hold == 0 {
+		h.hold = h.limit / 2
+	}
 	for _, name := range e.cfg.Feeds {
 		h.subs[name] = &feedSub{name: name, acks: map[[2]int]Cursor{}, read: make([]int, e.cfg.Shards), since: make([]int, e.cfg.Shards)}
 	}
@@ -178,12 +187,59 @@ func (h *feedHub) run() {
 		for _, m := range buf {
 			b := &h.bufs[m.shard]
 			b.entries = append(b.entries, m.entries...)
+			for _, en := range m.entries {
+				if en.Cursor.LSN > 0 {
+					h.durable++
+				}
+			}
 		}
 		clear(buf)
 		h.checkLag()
 		h.notify()
 		h.mu.Unlock()
+		h.reconcile()
 	}
+}
+
+// pressure updates whether the subscribers fall behind (ADR 0039): more
+// than Config.FeedHold entries unacknowledged (entries without a log
+// position, live chunks, need none and do not count) hold back new runs
+// until at most half of it are. Runs in progress go on: what lets their
+// entries be acknowledged is that they proceed. The database behind the
+// subscribers is then what bounds the throughput. Called with h.mu held;
+// reconcile applies it.
+func (h *feedHub) pressure() {
+	if h.hold < 0 {
+		return
+	}
+	switch {
+	case !h.held && h.durable > h.hold:
+		h.held = true
+	case h.held && h.durable <= h.hold/2:
+		h.held = false
+	}
+}
+
+// reconcile brings the admission in line with the latest pressure. It is
+// called, without h.mu, after anything that adds or trims entries; the
+// last call applies the latest state whatever the order of the callers.
+func (h *feedHub) reconcile() {
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+	h.mu.Lock()
+	h.pressure()
+	want := h.held
+	h.mu.Unlock()
+	if want == h.applied {
+		return
+	}
+	h.applied = want
+	if want {
+		log.Printf("kairo: feed subscribers are behind: holding back new runs")
+	} else {
+		log.Printf("kairo: feed subscribers caught up: admitting runs")
+	}
+	h.e.adm.Hold(want)
 }
 
 func (h *feedHub) notify() {
@@ -278,6 +334,11 @@ func (h *feedHub) computeBounds(push bool) {
 			n++
 		}
 		if n > 0 {
+			for _, en := range buf.entries[:n] {
+				if en.Cursor.LSN > 0 {
+					h.durable--
+				}
+			}
 			clear(buf.entries[:n])
 			buf.entries = buf.entries[n:]
 			buf.base += n
@@ -347,7 +408,6 @@ func (e *Engine) Subscribe(name string) (*Feed, error) {
 		}
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	for i := range h.bufs {
 		s.read[i] = h.bufs[i].base // redeliver what is not acknowledged
 		s.since[i] = h.bufs[i].base + len(h.bufs[i].entries)
@@ -356,6 +416,8 @@ func (e *Engine) Subscribe(name string) (*Feed, error) {
 	s.cur = f
 	h.computeBounds(true)
 	h.notify()
+	h.mu.Unlock()
+	h.reconcile()
 	return f, nil
 }
 
@@ -403,6 +465,7 @@ func (f *Feed) Next(ctx context.Context, limit int) ([]FeedEntry, error) {
 		}
 		h.mu.Unlock()
 		if len(out) > 0 {
+			h.reconcile()
 			return out, nil
 		}
 		select {
@@ -462,6 +525,7 @@ func (f *Feed) Ack(c Cursor) error {
 	f.sub.acks[k] = c
 	h.computeBounds(true)
 	h.mu.Unlock()
+	h.reconcile()
 	return nil
 }
 
@@ -497,6 +561,7 @@ func (e *Engine) Unsubscribe(name string) error {
 	h.computeBounds(true)
 	h.notify()
 	h.mu.Unlock()
+	h.reconcile()
 	return e.snaps.Delete(feedKey(name))
 }
 

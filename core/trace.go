@@ -15,7 +15,7 @@ type TraceKind uint8
 
 const (
 	TrRunStart   TraceKind = iota + 1 // Input
-	TrNodeStart                       // Act, Node, StepID, Attempt, Input (steps, waits, maps, loops)
+	TrNodeStart                       // Act, Node, StepID, Attempt, Input (a step's input, a map's list, a loop's initial variables)
 	TrNodeEnd                         // Status succeeded|exception|failed, Output, Handle, Err, ErrType, Meta
 	TrNodeSkip                        // Node, StepID: a graph member that will not run
 	TrNodeRetry                       // Attempt (the one that failed), Err, ErrType

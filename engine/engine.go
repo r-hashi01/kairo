@@ -125,6 +125,11 @@ type Config struct {
 	// FeedLimit cuts a subscription holding more unacknowledged entries
 	// than this (default 1,000,000).
 	FeedLimit int
+	// FeedHold holds back new runs (they wait for admission; runs in
+	// progress go on) while more entries than this are unacknowledged,
+	// until at most half of it are (ADR 0039): the subscribers' storage
+	// bounds the throughput. 0: FeedLimit/2; negative: never.
+	FeedHold int
 
 	// MaxDepth rejects runs nested deeper than this (a workflow called as a
 	// tool from a workflow ...); 0 means no limit.
@@ -240,6 +245,7 @@ type Engine struct {
 
 	execMu  sync.Mutex
 	pollers []*sched.Poller
+	budgets map[string]chan struct{} // in-process tasks at once, by resource (ADR 0039)
 	stopped chan struct{}
 	wg      sync.WaitGroup // shard loops
 	ioWG    sync.WaitGroup
@@ -534,7 +540,11 @@ func (e *Engine) plan(name string) *ir.Plan {
 	return e.plans[name]
 }
 
-func (e *Engine) Registry() *ir.Registry        { return e.cfg.Registry }
+func (e *Engine) Registry() *ir.Registry { return e.cfg.Registry }
+
+// Shards is the number of shards; a run's feed entries all carry its shard
+// (Cursor.Shard).
+func (e *Engine) Shards() int                   { return len(e.shards) }
 func (e *Engine) Live() *live.Hub               { return e.live }
 func (e *Engine) Dispatcher() *sched.Dispatcher { return e.disp }
 func (e *Engine) Blobs() blob.Store             { return e.blobs }
@@ -834,12 +844,15 @@ type Stats struct {
 	// outcome. Their real commands and completions are held: those runs
 	// cannot make progress until the engine is restarted.
 	FailedLogs int
+	// Dests is each destination's concurrency (ADR 0039).
+	Dests []sched.DestStat `json:",omitempty"`
 }
 
 func (e *Engine) Stats() Stats {
 	var st Stats
 	st.Active, st.AdmissionQueued = e.adm.Stats()
 	st.DispatchQueued = e.disp.Queued()
+	st.Dests = e.disp.Dests()
 	for _, s := range e.shards {
 		st.InMemory += int(s.inMemory.Load())
 		st.Evicted += int(s.evicted.Load())

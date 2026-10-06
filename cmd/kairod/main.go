@@ -42,7 +42,7 @@ func main() {
 		maxActive = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
 		maxQueued = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
 		perTenant = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
-		httpConc  = flag.Int("http-concurrency", 2048, "concurrent requests of the built-in HTTP executor")
+		httpConc  = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
 		idemTTL   = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()

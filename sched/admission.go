@@ -30,6 +30,7 @@ type Admission struct {
 	ring      []string
 	rr        int
 	queued    int
+	held      bool // start nothing new (backpressure, ADR 0039)
 }
 
 type entry struct {
@@ -94,6 +95,9 @@ func (a *Admission) tenantCap(t string) int {
 }
 
 func (a *Admission) canStart(t string) bool {
+	if a.held {
+		return false
+	}
 	if a.cfg.MaxActive > 0 && a.active >= a.cfg.MaxActive {
 		return false
 	}
@@ -139,15 +143,37 @@ func (a *Admission) Readmit(tenant string) {
 	a.mu.Unlock()
 }
 
+// Hold stops (true) or resumes (false) starting runs: they queue (until
+// the queue is full) while the results' consumers are behind (ADR 0039).
+func (a *Admission) Hold(on bool) {
+	a.mu.Lock()
+	a.held = on
+	starts := a.startQueued()
+	a.mu.Unlock()
+	for _, s := range starts {
+		s()
+	}
+}
+
 // Release is called when a run finishes. It starts queued runs, visiting
 // tenants round-robin.
 func (a *Admission) Release(tenant string) {
-	var starts []func()
 	a.mu.Lock()
 	a.active--
 	if a.perTenant[tenant]--; a.perTenant[tenant] <= 0 {
 		delete(a.perTenant, tenant)
 	}
+	starts := a.startQueued()
+	a.mu.Unlock()
+	for _, s := range starts {
+		s()
+	}
+}
+
+// startQueued takes the queued runs that may start now, round-robin; the
+// caller starts them after unlocking.
+func (a *Admission) startQueued() []func() {
+	var starts []func()
 	for len(a.ring) > 0 {
 		progressed := false
 		for i := 0; i < len(a.ring); i++ {
@@ -181,10 +207,7 @@ func (a *Admission) Release(tenant string) {
 			break
 		}
 	}
-	a.mu.Unlock()
-	for _, s := range starts {
-		s()
-	}
+	return starts
 }
 
 func (a *Admission) Stats() (active, queued int) {

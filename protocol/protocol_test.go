@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -204,5 +206,51 @@ func waitTracked(t *testing.T, e *engine.Engine) {
 			t.Fatalf("dispatcher still tracks %d tasks", e.Dispatcher().Tracked())
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// A server with a token disconnects workers without it, and serves the
+// ones that have it (ADR 0037).
+func TestWorkerToken(t *testing.T) {
+	e, _ := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	sock := filepath.Join(t.TempDir(), "t.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go (&Server{E: e, Token: "secret"}).Serve(l)
+
+	for _, tok := range []string{"", "wrong"} {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, w := bufio.NewReader(c), bufio.NewWriter(c)
+		WriteFrame(w, MsgHello, Hello{Worker: "x", Actions: []string{"code.run"}, Credit: 1, Token: tok})
+		w.Flush()
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
+			t.Fatalf("token %q: got %v, want the connection closed", tok, err)
+		}
+		c.Close()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wk := &Worker{Name: "ok", Actions: []string{"code.run"}, Token: "secret",
+		Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+			return task.Result{Output: json.RawMessage(`{"ok":true}`)}
+		}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wc := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wc()
+	if ri, err := e.Wait(wctx, id); err != nil || ri.Status != "completed" {
+		t.Fatalf("%v %+v", err, ri)
 	}
 }

@@ -41,5 +41,10 @@
 | [0034](0034-execution-event-feed.md) | 欠落しない実行イベントの出口を、ログから決定的に導いて作る | 承認 |
 | [0035](0035-dify-node-effects-and-unknown-outcomes.md) | Dify のノードに作用の型を割り当て、結果が不明な実の命令は、明示した設置に限って「失敗」として扱えるようにする | 承認 |
 | [0036](0036-dify-adapter-synthesizes-graphon-events.md) | Dify 側のアダプタは、kairo のトレースから graphon のイベントを合成し、Dify の既存の下流をそのまま使う | 承認 |
+| [0037](0037-dify-integration-plan.md) | Dify との統合は、WorkflowEntry の差し替えと、Dify 専用の kairo デーモンで行う | 承認 |
+| [0038](0038-dify-without-celery.md) | Dify のワークフローの実行から Celery をなくし、仕事の配布は kairo が担う。枠の単位は実行ではなくノードの実行にする | 承認 |
+| [0039](0039-concurrency-from-constraints.md) | 同時実行数は固定値で決めず、外部の制約、手元の資源、下流の容量から決める | 承認 |
+| [0040](0040-downstream-that-cannot-finish.md) | Dify の記録を書けない実行は、やり直したうえで失敗として記録し、ack する | 承認 |
+| [0041](0041-per-run-cost.md) | 実行 1 回あたりのコストは、その実行に要る仕事だけにする | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

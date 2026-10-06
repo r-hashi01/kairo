@@ -59,6 +59,12 @@ class WorkerTest(unittest.TestCase):
             break
         self.assertEqual(b"".join(chunks), b"hello")
 
+    def test_hello_carries_the_token(self) -> None:
+        rt = FakeRuntime()
+        serve(Worker("w", ["x"], lambda t, c: Result(), 1, token="s3"), rt)
+        _, hello = rt.recv()
+        self.assertEqual(hello["token"], "s3")
+
     def test_cancel_reaches_the_handler(self) -> None:
         started = threading.Event()
 

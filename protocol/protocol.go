@@ -6,7 +6,7 @@
 // tasks it can hold and grants one credit back per finished task, so the
 // runtime never pushes more work than a worker asked for.
 //
-//	worker -> runtime   Hello  {"worker":"py-1","actions":["code.run"],"credit":8}
+//	worker -> runtime   Hello  {"worker":"py-1","actions":["code.run"],"credit":8,"token":"..."}
 //	runtime -> worker   Task   {task}
 //	worker -> runtime   Chunk  {"seq":17,"data":"<base64>"}      (live output)
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
@@ -16,6 +16,9 @@
 // Cancel is a request (ADR 0026): the worker should stop the task and must
 // still send its Result, which releases the task's concurrency slot and
 // credit. Workers that predate Cancel skip it like any unknown type.
+//
+// A server with a Token accepts only workers whose Hello carries it
+// (ADR 0037); others are disconnected without an answer.
 package protocol
 
 import (
@@ -43,6 +46,7 @@ type Hello struct {
 	Worker  string   `json:"worker"`
 	Actions []string `json:"actions"`
 	Credit  int      `json:"credit"`
+	Token   string   `json:"token,omitempty"`
 }
 
 type Result struct {
@@ -54,6 +58,8 @@ type Result struct {
 	Tokens    int             `json:"tokens,omitempty"`
 	ErrType   string          `json:"error_type,omitempty"`
 	Meta      json.RawMessage `json:"meta,omitempty"`
+	// RateLimited: the destination refused the task for its limits (ADR 0039).
+	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
 type Cancel struct {

@@ -3,7 +3,7 @@
 Every message is a 4-byte big-endian length, a 1-byte type and a JSON body;
 the length counts the type byte and the body.
 
-    worker  -> runtime  Hello  {"worker": "py-1", "actions": [...], "credit": 8}
+    worker  -> runtime  Hello  {"worker": "py-1", "actions": [...], "credit": 8, "token": "..."}
     runtime -> worker   Task   {task}
     worker  -> runtime  Chunk  {"seq": 17, "data": "<base64>"}
     worker  -> runtime  Result {"seq": 17, "output": {...}}   (grants 1 credit)
@@ -41,9 +41,13 @@ class Hello:
     worker: str
     actions: list[str]
     credit: int
+    token: str = ""  # the runtime's worker token, if it has one (ADR 0037)
 
     def body(self) -> dict[str, Any]:
-        return {"worker": self.worker, "actions": self.actions, "credit": self.credit}
+        b: dict[str, Any] = {"worker": self.worker, "actions": self.actions, "credit": self.credit}
+        if self.token:
+            b["token"] = self.token
+        return b
 
 
 @dataclass
@@ -51,7 +55,8 @@ class Result:
     """A task's result. ``unknown``: the outcome is not known (a timeout, a
     broken connection); never treated as success. ``retryable``: a definite
     failure that may be retried. ``meta`` is passed to the step's trace
-    (ADR 0034)."""
+    (ADR 0034). ``rate_limited``: the destination refused the task for its
+    limits; it lowers the destination's concurrency (ADR 0039)."""
 
     seq: int = 0
     output: Any = None
@@ -61,6 +66,7 @@ class Result:
     tokens: int = 0
     error_type: str = ""
     meta: Any = None
+    rate_limited: bool = False
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"seq": self.seq}
@@ -68,7 +74,7 @@ class Result:
             b["error"] = self.error
         else:
             b["output"] = self.output
-        for k in ("retryable", "unknown", "tokens", "error_type", "meta"):
+        for k in ("retryable", "unknown", "tokens", "error_type", "meta", "rate_limited"):
             v = getattr(self, k)
             if v:
                 b[k] = v

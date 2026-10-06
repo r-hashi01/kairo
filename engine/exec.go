@@ -33,29 +33,53 @@ func (f ExecutorFunc) Execute(ctx context.Context, t *task.Task, emit func([]byt
 	return f(ctx, t, emit)
 }
 
-// RegisterExecutor serves actions with ex using concurrency goroutines that
-// pull tasks from the dispatcher.
+// RegisterExecutor serves actions with ex. Each task runs on a goroutine
+// of its own while it is outstanding; how many at once is bounded by
+// concurrency for this registration, and by the engine-wide budget of the
+// resource the actions use (ADR 0039). concurrency <= 0: the budget alone.
 func (e *Engine) RegisterExecutor(actions []string, concurrency int, ex Executor) {
-	if concurrency <= 0 {
-		concurrency = 1
+	slots := e.execBudget(resourceOf(e.cfg.Registry, actions))
+	if concurrency <= 0 || concurrency > cap(slots) {
+		concurrency = cap(slots)
 	}
 	p := e.disp.NewPoller(actions, concurrency)
 	e.execMu.Lock()
 	e.pollers = append(e.pollers, p)
 	e.execMu.Unlock()
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			for {
+	go func() {
+		for {
+			select {
+			case <-e.stopped:
+				return
+			case dl := <-p.C:
 				select {
+				case slots <- struct{}{}:
 				case <-e.stopped:
 					return
-				case dl := <-p.C:
+				}
+				go func() {
+					defer func() { <-slots }()
 					e.runTask(ex, dl)
 					e.disp.Poll(p, 1)
-				}
+				}()
 			}
-		}()
+		}
+	}()
+}
+
+// execBudget is the engine-wide semaphore of in-process tasks of resource.
+func (e *Engine) execBudget(resource string) chan struct{} {
+	e.execMu.Lock()
+	defer e.execMu.Unlock()
+	if e.budgets == nil {
+		e.budgets = map[string]chan struct{}{}
 	}
+	b := e.budgets[resource]
+	if b == nil {
+		b = make(chan struct{}, budget(resource))
+		e.budgets[resource] = b
+	}
+	return b
 }
 
 func (e *Engine) runTask(ex Executor, dl sched.Delivery) {
@@ -82,7 +106,7 @@ func (e *Engine) runTask(ex Executor, dl sched.Delivery) {
 // goroutine: moving a large output into the blob store happens here, off
 // the shard loop.
 func (e *Engine) Complete(t *task.Task, res task.Result) {
-	e.disp.Done(t, res.Tokens)
+	e.disp.Finish(t, sched.Outcome{Tokens: res.Tokens, RateLimited: res.RateLimited, TimedOut: timedOut(res)})
 	ev := core.Event{Act: t.Act, Attempt: t.Attempt, Meta: res.Meta}
 	if len(ev.Meta) > e.cfg.BlobThreshold {
 		// Like a large output: the log keeps only a reference (ADR 0034).
@@ -216,4 +240,14 @@ func (e *Engine) resolveValue(v any) (any, error) {
 		}
 	}
 	return v, nil
+}
+
+// timedOut reports a task that did not answer in time (ADR 0039: it lowers
+// its destination's concurrency, as a refusal does).
+func timedOut(res task.Result) bool {
+	if res.Err == "" {
+		return false
+	}
+	t := strings.ToLower(res.ErrType + " " + res.Err)
+	return strings.Contains(t, "timeout") || strings.Contains(t, "timed out") || strings.Contains(t, "deadline exceeded")
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import threading
 from collections.abc import Callable
@@ -62,6 +63,46 @@ class TaskContext:
 Handler = Callable[[Task, TaskContext], Result]
 
 
+# What one IO task is assumed to hold in memory (a thread, its buffers).
+IO_TASK_BYTES = 2 << 20
+
+
+def _memory_limit() -> int:
+    """The memory the process may use: its cgroup's limit, else the machine's."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            if v.isdigit() and int(v) < 1 << 60:
+                return int(v)
+        except OSError:
+            pass
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 4 << 30
+
+
+def default_concurrency(resource: str = "io") -> int:
+    """How many tasks a worker takes at once when not told (kairo ADR
+    0039): CPU tasks one per CPU; IO tasks (waiting for the outside) as many
+    as half the open file limit and a quarter of the memory allow."""
+    cpus = os.cpu_count() or 1
+    if resource == "cpu":
+        return cpus
+    try:
+        import resource as rlimit
+
+        soft, _ = rlimit.getrlimit(rlimit.RLIMIT_NOFILE)
+        if soft == rlimit.RLIM_INFINITY:
+            soft = 1 << 16
+    except (ImportError, ValueError, OSError):
+        soft = 1024
+    by_files = max(soft // 2, 1)
+    by_memory = max(_memory_limit() // 4 // IO_TASK_BYTES, 1)
+    return max(min(by_files, by_memory), cpus)
+
+
 class Worker:
     """Serves actions with handler, concurrency tasks at a time.
 
@@ -71,8 +112,20 @@ class Worker:
     concurrency slot and credit at the runtime.
     """
 
-    def __init__(self, name: str, actions: list[str], handler: Handler, concurrency: int = 4) -> None:
+    def __init__(
+        self,
+        name: str,
+        actions: list[str],
+        handler: Handler,
+        concurrency: int | None = None,
+        *,
+        token: str = "",
+        resource: str = "io",
+    ) -> None:
         self.name = name
+        self.token = token
+        if not concurrency:
+            concurrency = default_concurrency(resource)
         self.actions = actions
         self.handler = handler
         self.concurrency = max(concurrency, 1)
@@ -99,7 +152,7 @@ class Worker:
             sock.close()
 
     def _run_on(self, r: Any, w: Any) -> None:
-        self._send(w, MsgType.HELLO, Hello(self.name, self.actions, self.concurrency).body())
+        self._send(w, MsgType.HELLO, Hello(self.name, self.actions, self.concurrency, self.token).body())
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix=self.name) as pool:
             try:
                 while True:

@@ -270,6 +270,7 @@ func TestGraphonParity(t *testing.T) {
 				sys["query"] = q
 			}
 			in["sys"], _ = json.Marshal(sys)
+			in[EnvInput], _ = json.Marshal(EnvValues(&w))
 			input, _ := json.Marshal(in)
 			s, traces := run(t, p, input, g.Case)
 
