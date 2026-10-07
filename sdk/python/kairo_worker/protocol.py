@@ -56,7 +56,8 @@ class Result:
     broken connection); never treated as success. ``retryable``: a definite
     failure that may be retried. ``meta`` is passed to the step's trace
     (ADR 0034). ``rate_limited``: the destination refused the task for its
-    limits; it lowers the destination's concurrency (ADR 0039)."""
+    limits; it lowers the destination's concurrency (ADR 0039). ``wait``:
+    the step waits until a deadline, then ends with an output (ADR 0045)."""
 
     seq: int = 0
     output: Any = None
@@ -67,11 +68,16 @@ class Result:
     error_type: str = ""
     meta: Any = None
     rate_limited: bool = False
+    # wait: {"until": <unix ms>, "output": ...}: the step waits until then
+    # and ends with that output (ADR 0045).
+    wait: dict[str, Any] | None = None
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"seq": self.seq}
         if self.error or self.unknown:
             b["error"] = self.error
+        elif self.wait is not None:
+            b["wait"] = {"until": int(self.wait["until"]), "output": self.wait.get("output")}
         else:
             b["output"] = self.output
         for k in ("retryable", "unknown", "tokens", "error_type", "meta", "rate_limited"):
