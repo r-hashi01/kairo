@@ -67,6 +67,12 @@ if command -v python3 >/dev/null; then
   (cd sdk/python && python3 -m unittest discover -s tests 2>&1 | tail -1)
 fi
 
+# The TypeScript SDK (sdk/ts): its suites build kairod and kairo.wasm.
+if command -v node >/dev/null; then
+  step "typescript sdk tests"
+  (cd sdk/ts && node --test --test-reporter=dot --test-timeout=120000 src/*.test.ts)
+fi
+
 # The invariants of the requirements (section 6), run by name so a rename or
 # deletion shows up here instead of silently dropping coverage.
 step "invariants"

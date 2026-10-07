@@ -1,7 +1,7 @@
 {
   "name": "@kairo/worker",
   "version": "0.1.0",
-  "description": "kairo worker protocol for Node.js: pull tasks from a kairo runtime and run them",
+  "description": "kairo for Node.js: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -12,13 +12,15 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "wasm"
   ],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build:wasm": "cd ../.. && GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o sdk/ts/wasm/kairo.wasm ./cmd/kairo-wasm",
+    "build": "npm run build:wasm && tsc -p tsconfig.json",
     "test": "node --test src/*.test.ts"
   },
   "license": "UNLICENSED",

@@ -6,9 +6,10 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 
-import { Client, KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
+import { HttpBackend, type Backend } from './backend.ts';
+import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
 import type { Result, Task } from './protocol.ts';
-import { Worker, type Address, type TaskContext } from './worker.ts';
+import type { Address, TaskContext } from './worker.ts';
 
 /** An action: what a step of a workflow runs, on this process's worker. */
 export interface ActionDef<I = any, O = any> {
@@ -24,6 +25,11 @@ export interface ActionDef<I = any, O = any> {
 export type WorkflowFn<I = any, O = any> = (ctx: Context, input: I) => Promise<O>;
 
 export interface KairoOptions {
+	/**
+	 * Where calls run: kairod (HttpBackend, the default, from url and
+	 * worker) or the runtime embedded here (EmbeddedBackend, ADR 0051).
+	 */
+	backend?: Backend;
 	/** kairod's HTTP API. */
 	url?: string;
 	/** kairod's worker socket (a UNIX socket path, or {host, port}). */
@@ -57,17 +63,16 @@ function canonical(v: unknown): string {
 }
 
 export class Kairo {
-	readonly client: Client;
+	readonly backend: Backend;
 	private readonly opts: KairoOptions;
 	private readonly actions = new Map<string, ActionDef>();
 	private readonly workflows = new Map<string, WorkflowFn>();
 	private readonly planned = new Set<string>();
 	private readonly driving = new Set<AbortController>();
-	private worker?: Worker;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
-		this.client = new Client(opts.url);
+		this.backend = opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
 	}
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
@@ -79,7 +84,7 @@ export class Kairo {
 		this.workflows.set(name, fn);
 	}
 
-	/** Registers the actions and their plans with kairod, and serves the actions on its worker socket. */
+	/** Registers the actions and their plans, and starts running the actions' steps. */
 	async start(): Promise<void> {
 		const specs: NodeSpec[] = [...this.actions].map(([action, def]) => ({
 			action,
@@ -88,29 +93,9 @@ export class Kairo {
 			...(def.destination ? { destination: def.destination } : {}),
 		}));
 		for (const action of Object.values(BUILTIN)) specs.push({ action, effect: 'unprotected' });
-		await this.client.registerNodes(specs);
+		await this.backend.start(specs, (task, ctx) => this.serve(task, ctx));
 		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action, input: { in: '$input.in' } });
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
-		if (this.opts.worker !== undefined) {
-			this.worker = new Worker({
-				name: `kairo-sdk-${process.pid}`,
-				actions: specs.map((s) => s.action),
-				token: this.opts.token,
-				concurrency: this.opts.concurrency,
-				handler: (task, ctx) => this.serve(task, ctx),
-			});
-			const addr = this.opts.worker;
-			void (async () => {
-				while (this.worker) {
-					try {
-						await this.worker.run(addr);
-					} catch {
-						// kairod went away: connect again.
-					}
-					if (this.worker) await new Promise((r) => setTimeout(r, 500));
-				}
-			})();
-		}
 	}
 
 	/**
@@ -119,14 +104,12 @@ export class Kairo {
 	 */
 	async close(): Promise<void> {
 		for (const a of this.driving) a.abort();
-		const w = this.worker;
-		this.worker = undefined;
-		w?.stop();
+		await this.backend.close();
 	}
 
 	private async plan(name: string, root: unknown, vars?: Record<string, unknown>): Promise<void> {
 		if (this.planned.has(name)) return;
-		await this.client.registerPlan({ name, root, ...(vars ? { vars } : {}) });
+		await this.backend.registerPlan({ name, root, ...(vars ? { vars } : {}) });
 		this.planned.add(name);
 	}
 
@@ -160,28 +143,28 @@ export class Kairo {
 			const runId = callId(id, PLAN_WAIT + name, null, n);
 			let r: RunInfo;
 			try {
-				r = await this.client.get(runId);
+				r = await this.backend.get(runId);
 			} catch (e) {
 				if (e instanceof KairoError && e.status === 404) throw new Error(`workflow ${id} does not wait for ${name}`);
 				throw e;
 			}
 			if (finished(r)) continue;
-			await this.client.signal(runId, name, payload);
+			await this.backend.signal(runId, name, payload);
 			return;
 		}
 	}
 
 	/** Cancels workflow id: the calls it is waiting for are cancelled with it. */
 	async cancel(id: string): Promise<void> {
-		await this.client.cancel(id);
+		await this.backend.cancel(id);
 	}
 
 	private async runAs(name: string, input: unknown, id: string, parent?: AbortSignal): Promise<unknown> {
 		const fn = this.workflows.get(name);
 		if (!fn) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
-		const started = await this.client.run(PLAN_WORKFLOW, { workflow: name }, { runId: id, tier: 'file', vars: { started_at: Date.now() } });
-		const info = await this.client.get(id);
+		const started = await this.backend.run(PLAN_WORKFLOW, { workflow: name }, { runId: id, vars: { started_at: Date.now() } });
+		const info = await this.backend.get(id);
 		if (finished(info)) return done(id, info);
 		if (started.existing) {
 			// Resuming: the calls' records must still be there (ADR 0049).
@@ -196,17 +179,17 @@ export class Kairo {
 		const stop = () => abort.abort();
 		parent?.addEventListener('abort', stop);
 		// The workflow's own run ends when it is cancelled: stop the calls.
-		void this.client.wait(id, abort.signal).then((r) => {
+		void this.backend.wait(id, abort.signal).then((r) => {
 			if (r.status === 'cancelled') abort.abort();
 		}, () => {});
 		const ctx = new Context(this, id, abort.signal);
 		try {
 			const value = await fn(ctx, input);
-			await this.client.signal(id, 'done', { ok: true, value: value ?? null });
+			await this.backend.signal(id, 'done', { ok: true, value: value ?? null });
 			return value;
 		} catch (e) {
 			if (abort.signal.aborted) throw new CancelledError(`workflow ${id} cancelled`);
-			await this.client.signal(id, 'done', { ok: false, error: String((e as Error)?.message ?? e) }).catch(() => {});
+			await this.backend.signal(id, 'done', { ok: false, error: String((e as Error)?.message ?? e) }).catch(() => {});
 			throw e;
 		} finally {
 			parent?.removeEventListener('abort', stop);
@@ -218,13 +201,13 @@ export class Kairo {
 	/** One call: a run of its own, found again by its id. */
 	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, signal: AbortSignal): Promise<unknown> {
 		if (root) await this.plan(plan, root);
-		await this.client.run(plan, { in: input }, { runId, tier: 'file' });
+		await this.backend.run(plan, { in: input }, { runId });
 		let r: RunInfo;
 		try {
-			r = await this.client.wait(runId, signal);
+			r = await this.backend.wait(runId, signal);
 		} catch (e) {
 			if (signal.aborted) {
-				await this.client.cancel(runId).catch(() => {});
+				await this.backend.cancel(runId).catch(() => {});
 				throw new CancelledError(`call ${runId} cancelled`);
 			}
 			throw e;

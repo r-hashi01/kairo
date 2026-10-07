@@ -2,3 +2,7 @@ export * from './protocol.ts';
 export * from './worker.ts';
 export * from './client.ts';
 export * from './workflow.ts';
+export * from './backend.ts';
+export * from './core.ts';
+export * from './embedded.ts';
+export * from './store.ts';
