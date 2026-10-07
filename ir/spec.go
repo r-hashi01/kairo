@@ -143,6 +143,10 @@ type NodeSpec struct {
 	// the value are taken, the others skipped. The enum's values are the
 	// node's handles.
 	Branch string `json:"branch,omitempty"`
+	// Ports makes the step's output a list of ports (ADR 0043): port i is
+	// live when element i is not null; the step's edges in a graph leave
+	// by port, and several may be live at once.
+	Ports bool `json:"ports,omitempty"`
 	// Resource is what a task of the node mostly uses (ADR 0039):
 	// ResourceIO (the default: it waits for the outside, as an LLM or an
 	// HTTP call) or ResourceCPU (it computes). Executors size how many
@@ -210,6 +214,13 @@ const (
 	ActionCoalesce = "kairo.coalesce"
 	// ActionList is Dify's list-operator.
 	ActionList = "kairo.list"
+	// ActionSlice takes the next part of a list (ADR 0043): inputs
+	// "items" (a list), "size" (or params {"size"}) and "done" (any
+	// value); its ports are
+	// [done, part, rest]: part is items[:size] and rest the remainder
+	// while items is not empty, and when it is, done is the "done" input
+	// and part and rest are null.
+	ActionSlice = "kairo.slice"
 )
 
 // Registry holds node specs by action name.
@@ -226,6 +237,7 @@ func NewRegistry() *Registry {
 	r.Register(NodeSpec{Action: ActionTemplate, Effect: EffectProtected})
 	r.Register(NodeSpec{Action: ActionCoalesce, Effect: EffectProtected})
 	r.Register(NodeSpec{Action: ActionList, Effect: EffectProtected})
+	r.Register(NodeSpec{Action: ActionSlice, Effect: EffectProtected, Ports: true})
 	// The output is Dify's if-else's: {"result", "selected_case_id"}; the
 	// case id (or "false") is the branch.
 	r.Register(NodeSpec{Action: ActionSwitch, Effect: EffectProtected, Branch: "selected_case_id", Outputs: map[string]FieldType{

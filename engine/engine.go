@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kairo/blob"
@@ -239,6 +240,7 @@ type Engine struct {
 	waiters  map[string][]chan RunInfo
 	finished map[string]RunInfo
 	finOrder []string
+	runEnd   atomic.Pointer[[]func(runID string)] // ADR 0044
 
 	doneMax int      // markers per shard (ADR 0027)
 	feed    *feedHub // nil without Config.Feeds (ADR 0034)
@@ -829,6 +831,34 @@ func (e *Engine) finish(ri RunInfo) {
 		w <- ri
 	}
 	e.live.End(ri.RunID)
+	if fns := e.runEnd.Load(); fns != nil {
+		for _, fn := range *fns {
+			fn(ri.RunID)
+		}
+	}
+}
+
+// OnRunEnd registers fn to be called when a run has finished, once its
+// end is durable (when Wait returns). It is called from the shard loop, so
+// it must not block (ADR 0044).
+func (e *Engine) OnRunEnd(fn func(runID string)) {
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	var fns []func(string)
+	if old := e.runEnd.Load(); old != nil {
+		fns = append(fns, *old...)
+	}
+	fns = append(fns, fn)
+	e.runEnd.Store(&fns)
+}
+
+// Finished reports whether the run has finished, as far as the engine
+// remembers (the recent runs, ADR 0023).
+func (e *Engine) Finished(runID string) bool {
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	_, ok := e.finished[runID]
+	return ok
 }
 
 // Stats is a snapshot of engine counters.

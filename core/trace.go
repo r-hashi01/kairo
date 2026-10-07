@@ -24,6 +24,7 @@ const (
 	TrRoundEnd                        // Node, Index
 	TrVarUpdate                       // Var, Loop (-1: a run variable), Output (the new value)
 	TrRunEnd                          // Status, Output, Err
+	TrNodeWait                        // Act, Node, StepID, Until, Meta: a step waits for its deadline (ADR 0045)
 )
 
 // Trace is one record of the feed. At is the time of the event applied.
@@ -44,6 +45,7 @@ type Trace struct {
 	Meta    json.RawMessage
 	Var     string
 	Loop    int32
+	Until   int64 // TrNodeWait: the deadline (unix ms)
 }
 
 // ApplyTraced is Apply that also appends the traces of the transition to

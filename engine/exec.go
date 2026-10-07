@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strconv"
 	"strings"
 
 	"kairo/blob"
@@ -127,6 +128,10 @@ func (e *Engine) Complete(t *task.Task, res task.Result) {
 	} else {
 		ev.Kind = core.EvStepOK
 		ev.Data = res.Output
+		if res.Wait != nil {
+			// Wait until the deadline, then end with this output (ADR 0045).
+			ev.Kind, ev.Deadline, ev.Data = core.EvStepWait, res.Wait.Until, res.Wait.Output
+		}
 		if len(ev.Data) > e.cfg.BlobThreshold {
 			env, err := e.externalize(t, ev.Data)
 			if err != nil {
@@ -164,6 +169,20 @@ func (e *Engine) externalize(t *task.Task, out json.RawMessage) (json.RawMessage
 		Fields map[string]json.RawMessage `json:"fields,omitempty"`
 	}{Blob: key, Size: len(out)}
 	spec := e.cfg.Registry.Lookup(t.Action)
+	if t := bytes.TrimSpace(out); len(t) > 0 && t[0] == '[' {
+		// A list short enough to be ports (ADR 0043): its length and its
+		// dead ports are kept, so that the edges are decided without the
+		// blob; a live port reads as a reference into it.
+		var ports []json.RawMessage
+		if json.Unmarshal(t, &ports) == nil && len(ports) <= ir.MaxPort+1 {
+			env.Fields = map[string]json.RawMessage{"$ports": json.RawMessage(strconv.Itoa(len(ports)))}
+			for i, p := range ports {
+				if bytes.Equal(bytes.TrimSpace(p), []byte("null")) {
+					env.Fields[strconv.Itoa(i)] = p
+				}
+			}
+		}
+	}
 	if len(spec.Outputs) > 0 {
 		var obj map[string]json.RawMessage
 		if json.Unmarshal(out, &obj) == nil {
@@ -213,12 +232,23 @@ func (e *Engine) resolveValue(v any) (any, error) {
 			}
 			if path, _ := x["$path"].(string); path != "" {
 				for _, seg := range strings.Split(path, ".") {
-					m, ok := val.(map[string]any)
-					if !ok {
+					switch c := val.(type) {
+					case map[string]any:
+						val = c[seg]
+					case []any:
+						// A port of a list of ports (ADR 0043).
+						i, err := strconv.Atoi(seg)
+						if err != nil || i < 0 || i >= len(c) {
+							val = nil
+						} else {
+							val = c[i]
+						}
+					default:
 						val = nil
+					}
+					if val == nil {
 						break
 					}
-					val = m[seg]
 				}
 			}
 			return val, nil

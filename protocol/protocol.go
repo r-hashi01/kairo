@@ -10,12 +10,20 @@
 //	runtime -> worker   Task   {task}
 //	worker -> runtime   Chunk  {"seq":17,"data":"<base64>"}      (live output)
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
+//	                           {"seq":17,"wait":{"until":<ms>,"output":{...}}} (ADR 0045)
 //	worker -> runtime   Credit {"n":4}                            (optional extra credit)
 //	runtime -> worker   Cancel {"seq":17}                         (the step was abandoned)
+//	runtime -> worker   RunEnd {"run_id":"r1"}                    (the run finished)
 //
 // Cancel is a request (ADR 0026): the worker should stop the task and must
 // still send its Result, which releases the task's concurrency slot and
 // credit. Workers that predate Cancel skip it like any unknown type.
+//
+// RunEnd goes only to workers whose Hello asked for it ("run_end": true),
+// once per run they were sent a task of, after those tasks (ADR 0044): a
+// worker that keeps something per run can let it go. It is not sent for
+// runs whose tasks were sent before a restart or a reconnection, so a
+// worker must cope without it.
 //
 // A server with a Token accepts only workers whose Hello carries it
 // (ADR 0037); others are disconnected without an answer.
@@ -27,6 +35,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+
+	"kairo/task"
 )
 
 type MsgType byte
@@ -38,6 +48,7 @@ const (
 	MsgCredit MsgType = 4
 	MsgChunk  MsgType = 5
 	MsgCancel MsgType = 6
+	MsgRunEnd MsgType = 7
 )
 
 const maxFrame = 64 << 20
@@ -47,6 +58,8 @@ type Hello struct {
 	Actions []string `json:"actions"`
 	Credit  int      `json:"credit"`
 	Token   string   `json:"token,omitempty"`
+	// RunEnd asks for a RunEnd per run the worker was sent a task of.
+	RunEnd bool `json:"run_end,omitempty"`
 }
 
 type Result struct {
@@ -60,10 +73,16 @@ type Result struct {
 	Meta      json.RawMessage `json:"meta,omitempty"`
 	// RateLimited: the destination refused the task for its limits (ADR 0039).
 	RateLimited bool `json:"rate_limited,omitempty"`
+	// Wait: wait until a deadline, then end with an output (ADR 0045).
+	Wait *task.Wait `json:"wait,omitempty"`
 }
 
 type Cancel struct {
 	Seq uint64 `json:"seq"`
+}
+
+type RunEnd struct {
+	RunID string `json:"run_id"`
 }
 
 type Credit struct {

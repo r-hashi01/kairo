@@ -55,16 +55,31 @@ func (c *compiler) userEdges(i int32, d *Def) error {
 		if !ok1 || !ok2 {
 			return fmt.Errorf("edge %s -> %s: both ends must be nodes of this graph", ed.From, ed.To)
 		}
-		h := ed.Handle
-		if h == "" {
-			h = HandleSource
+		var e Edge
+		if ported := c.plan.Nodes[n.Children[from]].Ports; ported && ed.Handle != HandleFailBranch {
+			// A node with ports: the edge leaves by a port (ADR 0043).
+			if ed.Port == nil || ed.Handle != "" {
+				return fmt.Errorf("edge %s -> %s: %s has ports: the edge needs a port and no handle", ed.From, ed.To, ed.From)
+			}
+			if *ed.Port < 0 || *ed.Port > MaxPort {
+				return fmt.Errorf("edge %s -> %s: port %d out of range 0..%d", ed.From, ed.To, *ed.Port, MaxPort)
+			}
+			e = Edge{From: from, To: to, Port: int32(*ed.Port)}
+		} else {
+			if ed.Port != nil {
+				return fmt.Errorf("edge %s -> %s: %s has no ports", ed.From, ed.To, ed.From)
+			}
+			h := ed.Handle
+			if h == "" {
+				h = HandleSource
+			}
+			if hs := c.handles(n.Children[from]); !slices.Contains(hs, h) {
+				return fmt.Errorf("edge %s -> %s: %s has no handle %q (handles: %v)", ed.From, ed.To, ed.From, h, hs)
+			}
+			e = Edge{From: from, To: to, Handle: h}
 		}
-		if hs := c.handles(n.Children[from]); !slices.Contains(hs, h) {
-			return fmt.Errorf("edge %s -> %s: %s has no handle %q (handles: %v)", ed.From, ed.To, ed.From, h, hs)
-		}
-		e := Edge{From: from, To: to, Handle: h}
 		if seen[e] {
-			return fmt.Errorf("duplicate edge %s -[%s]-> %s", ed.From, h, ed.To)
+			return fmt.Errorf("duplicate edge %s -[%s:%d]-> %s", ed.From, e.Handle, e.Port, ed.To)
 		}
 		seen[e] = true
 		n.Edges = append(n.Edges, e)

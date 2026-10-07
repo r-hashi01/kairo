@@ -89,6 +89,31 @@ func (m *machine) apply(ev *Event) error {
 		m.stepFailed(ev.Act, a, ev.Err, ev.ErrType, ev.Retryable, ev.Unknown)
 		return nil
 
+	case EvStepWait:
+		// The step's result: wait until the deadline, then end with this
+		// output (ADR 0045). A definite result, also for real steps.
+		a := s.Acts[ev.Act]
+		if a == nil || m.p.Nodes[a.Node].Kind != ir.KStep || a.Flags&fDispatched == 0 || a.Attempt != ev.Attempt {
+			return ErrIgnored
+		}
+		m.undispatch(a)
+		m.cancelTimer(a)
+		out := ev.Data
+		if len(out) == 0 {
+			out = null
+		}
+		if ev.Deadline <= m.at {
+			m.complete(ev.Act, a, out)
+			return nil
+		}
+		a.Flags |= fStepWait
+		a.Results = []json.RawMessage{out}
+		m.armTimer(ev.Act, a, ev.Deadline)
+		// The executor's metadata goes with the wait: the end at the deadline
+		// comes from a timer, which has none.
+		m.trace(Trace{Kind: TrNodeWait, Act: ev.Act, Node: a.Node, StepID: m.stepID(ev.Act, a), Attempt: a.Attempt, Until: ev.Deadline, Meta: m.meta})
+		return nil
+
 	case EvIntent:
 		a := s.Acts[ev.Act]
 		if a == nil || a.Flags&fDispatched == 0 || a.Attempt != ev.Attempt {
@@ -115,6 +140,11 @@ func (m *machine) apply(ev *Event) error {
 			m.complete(ev.Act, a, json.RawMessage(`{"timed_out":true,"payload":null}`))
 		case n.Kind == ir.KWait:
 			m.complete(ev.Act, a, null)
+		case a.Flags&fStepWait != 0:
+			a.Flags &^= fStepWait
+			out := a.Results[0]
+			a.Results = nil
+			m.complete(ev.Act, a, out)
 		case a.Flags&fRetryWait != 0:
 			a.Flags &^= fRetryWait
 			m.dispatch(ev.Act, a)

@@ -74,7 +74,7 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 					delete(cancels, seq)
 				}
 				cmu.Unlock()
-				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited})
+				send(MsgResult, Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait})
 			}
 		}()
 	}

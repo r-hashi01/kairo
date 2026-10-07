@@ -49,6 +49,10 @@ type Def struct {
 	// Handles of a branching step at this place (ADR 0031): the values its
 	// branch field may take, instead of the spec's enum values.
 	Handles []string `json:"handles,omitempty"`
+	// Ports makes the node's output a list of ports (ADR 0043): port i is
+	// live when element i is not null, and the node's edges leave by port.
+	// A step whose spec has Ports has them without saying so.
+	Ports bool `json:"ports,omitempty"`
 	// OnUnknown "fail" treats an unknown outcome of a real step as a
 	// definite failure, without retrying it (ADR 0035); the default,
 	// "review", stops the run for an operator.
@@ -135,6 +139,9 @@ type EdgeDef struct {
 	From   string `json:"from"`
 	To     string `json:"to"`
 	Handle string `json:"handle,omitempty"`
+	// Port is the output port the edge leaves by, for an edge from a node
+	// with ports (ADR 0043); such edges have no handle.
+	Port *int `json:"port,omitempty"`
 }
 
 // PredDef is a condition on a typed field: {"field":"classify.label",
@@ -181,7 +188,13 @@ const HandleSource = "source"
 type Edge struct {
 	From, To int32
 	Handle   string
+	// Port is the output port of an edge from a node with ports (ADR
+	// 0043); its Handle is empty.
+	Port int32
 }
+
+// MaxPort bounds the ports of a node (as n8n's slots).
+const MaxPort = 100
 
 func (k Kind) String() string { return kindNames[k] }
 
@@ -258,6 +271,9 @@ type Node struct {
 	// compiled condition of a kairo.switch step.
 	Handles []string
 	Switch  *Switch
+	// Ports: the node's output is a list of ports and its edges leave by
+	// port (ADR 0043).
+	Ports bool
 
 	// graph: members are Children. In and Out list edge indices per
 	// member; Topo is the order in which ready members are started; Entry
@@ -450,6 +466,10 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 	c.plan.ByID[n.ID] = i
 	c.plan.Nodes = append(c.plan.Nodes, n)
 	c.defs = append(c.defs, d)
+	c.plan.Nodes[i].Ports = d.Ports
+	if d.Ports && n.Kind != KStep && n.Kind != KLoop && n.Kind != KMap && n.Kind != KGraph {
+		return -1, fmt.Errorf("ir: node %q: only steps, graphs, maps and loops have ports", n.ID)
+	}
 
 	var kids []*Def
 	childScope := mapScope
@@ -469,6 +489,12 @@ func (c *compiler) add(d *Def, parent int32, idx int32, mapScope int32) (int32, 
 		}
 		if err := c.branchHandles(i, d); err != nil {
 			return -1, err
+		}
+		if spec.Ports {
+			c.plan.Nodes[i].Ports = true
+		}
+		if c.plan.Nodes[i].Ports && (spec.Branch != "" || len(d.Handles) > 0) {
+			return -1, fmt.Errorf("ir: step %q: a step branches by handle or by port, not both", n.ID)
 		}
 		if spec.Action == ActionAssign {
 			if err := c.compileAssign(i, d); err != nil {

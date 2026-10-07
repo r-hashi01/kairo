@@ -35,6 +35,18 @@ type blobEnvelope struct {
 	Path   string                     `json:"$path,omitempty"`
 }
 
+// portOutOfRange reports whether seg names a port beyond the list of ports
+// a blob holds (its "$ports" field, ADR 0043).
+func portOutOfRange(fields map[string]json.RawMessage, seg string) bool {
+	n, ok := fields["$ports"]
+	if !ok {
+		return false
+	}
+	var k int
+	i, err := strconv.Atoi(seg)
+	return err == nil && json.Unmarshal(n, &k) == nil && i >= k
+}
+
 // lookup finds the value of node in the scope chain starting at scope.
 func (m *machine) lookup(node int32, scope uint32) json.RawMessage {
 	want := m.p.Nodes[node].MapScope
@@ -72,6 +84,9 @@ func (m *machine) resolve(r ir.Ref, scope uint32) json.RawMessage {
 		}
 	case ir.RefNode:
 		v = m.lookup(r.Node, scope)
+		if len(r.Path) > 0 && m.p.Nodes[r.Node].Ports && IsBlobRef(v) && !portLive(v, portIndex(r.Path[0])) {
+			return null // a dead port of an output kept as a blob (ADR 0043)
+		}
 	case ir.RefVar:
 		v = m.runVarsScope(scope).Vals[runVarsNode]
 	}
@@ -79,6 +94,15 @@ func (m *machine) resolve(r ir.Ref, scope uint32) json.RawMessage {
 		return null
 	}
 	return extract(v, r.Path)
+}
+
+// portIndex is the port a path segment names (-1: none).
+func portIndex(seg string) int32 {
+	i, err := strconv.Atoi(seg)
+	if err != nil || i < 0 || i > ir.MaxPort {
+		return -1
+	}
+	return int32(i)
 }
 
 // extract follows path into v. Missing values are null.
@@ -92,6 +116,9 @@ func extract(v json.RawMessage, path []string) json.RawMessage {
 			if f, ok := env.Fields[seg]; ok {
 				v = f
 				continue
+			}
+			if i == 0 && env.Path == "" && portOutOfRange(env.Fields, seg) {
+				return null // a port beyond the list (ADR 0043)
 			}
 			rest := strings.Join(path[i:], ".")
 			if env.Path != "" {
@@ -222,6 +249,8 @@ func (m *machine) protected(n *ir.Node, scope uint32) (json.RawMessage, error) {
 		return m.evalCoalesce(n, scope)
 	case ir.ActionList:
 		return m.evalList(n, scope)
+	case ir.ActionSlice:
+		return m.evalSlice(n, scope)
 	}
 	if n.Spec.Action == ir.ActionAppend {
 		b := []byte{'['}

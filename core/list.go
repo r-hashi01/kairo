@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"slices"
 	"strings"
@@ -304,4 +305,60 @@ func pyCompare(a, b any) int {
 	sa, _ := a.(string)
 	sb, _ := b.(string)
 	return strings.Compare(sa, sb)
+}
+
+// evalSlice evaluates a kairo.slice step (ADR 0043): its ports are
+// [done, part, rest]. While items is not empty, part is its first size
+// elements (size: an input, or the params' "size") and rest the others;
+// once it is empty, done is the "done" input.
+func (m *machine) evalSlice(n *ir.Node, scope uint32) (json.RawMessage, error) {
+	var items []json.RawMessage
+	var size int
+	done := null
+	if len(n.Params) > 0 {
+		var p struct {
+			Size int `json:"size"`
+		}
+		if json.Unmarshal(n.Params, &p) == nil {
+			size = p.Size
+		}
+	}
+	for _, in := range n.Inputs {
+		v := bytes.TrimSpace(m.resolve(in.Ref, scope))
+		switch in.Name {
+		case "items":
+			if len(v) > 0 && !bytes.Equal(v, null) {
+				if err := json.Unmarshal(v, &items); err != nil {
+					return nil, valueErr("kairo.slice: items is not a list")
+				}
+			}
+		case "size":
+			if err := json.Unmarshal(v, &size); err != nil || size < 1 {
+				return nil, valueErr("kairo.slice: size must be an integer of at least 1")
+			}
+		case "done":
+			if len(v) > 0 {
+				done = v
+			}
+		}
+	}
+	if size < 1 {
+		return nil, valueErr("kairo.slice: size must be an integer of at least 1")
+	}
+	if len(items) == 0 {
+		if bytes.Equal(done, null) {
+			done = json.RawMessage("[]") // done is live even with nothing gathered
+		}
+		return json.Marshal([]json.RawMessage{done, null, null})
+	}
+	k := min(size, len(items))
+	part, err := json.Marshal(items[:k])
+	if err != nil {
+		return nil, err
+	}
+	rest, err := json.Marshal(items[k:])
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal([]json.RawMessage{null, part, rest})
 }

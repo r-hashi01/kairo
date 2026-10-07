@@ -254,3 +254,152 @@ func TestWorkerToken(t *testing.T) {
 		t.Fatalf("%v %+v", err, ri)
 	}
 }
+
+// A worker that asked for RunEnd gets one per run it was sent a task of,
+// after those tasks; one that did not ask gets none; a closed connection
+// is forgotten (ADR 0044).
+func TestRunEnd(t *testing.T) {
+	reg := ir.NewRegistry()
+	reg.Register(ir.NodeSpec{Action: "code.run", Effect: ir.EffectUnprotected})
+	reg.Register(ir.NodeSpec{Action: "other", Effect: ir.EffectUnprotected})
+	reg.Register(ir.NodeSpec{Action: "solo", Effect: ir.EffectUnprotected})
+	e, err := engine.New(engine.Config{Shards: 2, Registry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	srv := &Server{E: e}
+	go srv.Serve(l)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+	plan(t, e, `{"name":"p","root":{"kind":"seq","nodes":[
+	  {"kind":"step","id":"a","action":"code.run"},
+	  {"kind":"step","id":"b","action":"code.run"},
+	  {"kind":"step","id":"c","action":"other"}]}}`)
+
+	type wconn struct {
+		c net.Conn
+		r *bufio.Reader
+		w *bufio.Writer
+	}
+	dial := func(actions []string, runEnd bool) *wconn {
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		x := &wconn{c, bufio.NewReader(c), bufio.NewWriter(c)}
+		WriteFrame(x.w, MsgHello, Hello{Worker: "w", Actions: actions, Credit: 4, RunEnd: runEnd})
+		x.w.Flush()
+		return x
+	}
+	asks := dial([]string{"code.run"}, true)
+	old := dial([]string{"other"}, false)
+	// Serves one task: answers it and returns its run.
+	serve := func(x *wconn) string {
+		t.Helper()
+		x.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		typ, body, err := ReadFrame(x.r)
+		if err != nil || typ != MsgTask {
+			t.Fatalf("want a task, got %v %v", typ, err)
+		}
+		var tk task.Task
+		json.Unmarshal(body, &tk)
+		WriteFrame(x.w, MsgResult, Result{Seq: tk.Seq, Output: json.RawMessage(`{}`)})
+		x.w.Flush()
+		return tk.RunID
+	}
+	var ids []string
+	for round := 0; round < 2; round++ {
+		id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		if serve(asks) != id || serve(asks) != id || serve(old) != id {
+			t.Fatal("tasks of another run")
+		}
+		wctx, wc := context.WithTimeout(context.Background(), 5*time.Second)
+		ri, err := e.Wait(wctx, id)
+		wc()
+		if err != nil || ri.Status != "completed" {
+			t.Fatalf("%v %+v", err, ri)
+		}
+		asks.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		typ, body, err := ReadFrame(asks.r)
+		var end RunEnd
+		json.Unmarshal(body, &end)
+		if err != nil || typ != MsgRunEnd || end.RunID != id {
+			t.Fatalf("want RunEnd for %s, got %v %s %v", id, typ, body, err)
+		}
+	}
+	// Nothing more: one RunEnd per run, none for the worker that did not
+	// ask.
+	for _, x := range []*wconn{asks, old} {
+		x.c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if typ, body, err := ReadFrame(x.r); err == nil {
+			t.Fatalf("unexpected frame %v %s", typ, body)
+		}
+	}
+	// A task of a run that has finished is not sent (it was abandoned; its
+	// RunEnd may have gone by).
+	ec := &endConn{runs: map[string]struct{}{}, wake: make(chan struct{}, 1)}
+	if srv.sending(ec, ids[0]) || len(ec.runs) != 0 {
+		t.Fatal("a finished run's task would be sent")
+	}
+	// A run ends while the connection that took its task is gone: the
+	// connection is forgotten.
+	plan(t, e, `{"name":"q","root":{"kind":"step","id":"s","action":"solo"}}`)
+	gone := dial([]string{"solo"}, true)
+	id, _ := submit(e, engine.SubmitRequest{Plan: "q", Tenant: "t"})
+	if serve(gone) != id {
+		t.Fatal("task of another run")
+	}
+	gone.c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		srv.rmu.Lock()
+		n := len(srv.runs)
+		srv.rmu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d runs still tracked after the connections closed", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A worker's result can be a wait: the step ends at the deadline with the
+// output the worker gave (ADR 0045).
+func TestWorkerResultWaits(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	until := time.Now().Add(200 * time.Millisecond)
+	wk := &Worker{Name: "w", Actions: []string{"code.run"}, Concurrency: 1, Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+		return task.Result{Wait: &task.Wait{Until: until.UnixMilli(), Output: json.RawMessage(`{"later":true}`)}}
+	}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wc := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wc()
+	ri, err := e.Wait(wctx, id)
+	if err != nil || ri.Status != "completed" || string(ri.Output) != `{"later":true}` {
+		t.Fatalf("%v %+v", err, ri)
+	}
+	if time.Now().Before(until.Truncate(time.Millisecond)) {
+		t.Fatal("ended before the deadline")
+	}
+}

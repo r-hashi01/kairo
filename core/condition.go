@@ -126,9 +126,26 @@ func (m *machine) resolveFound(r ir.Ref, scope uint32) (json.RawMessage, bool) {
 	if len(v) == 0 {
 		return nil, false
 	}
-	for _, seg := range r.Path {
-		var obj map[string]json.RawMessage
+	// A node with ports is read by port (ADR 0043): its first segment may
+	// index its list of ports, also when the engine kept it as a blob.
+	// Other references walk objects only, as graphon's variable pool.
+	ported := r.Kind == ir.RefNode && m.p.Nodes[r.Node].Ports
+	for i, seg := range r.Path {
 		t := bytes.TrimSpace(v)
+		if ported && i == 0 && IsBlobRef(t) {
+			x := extract(t, r.Path)
+			return x, !bytes.Equal(bytes.TrimSpace(x), null)
+		}
+		if ported && i == 0 && len(t) > 0 && t[0] == '[' {
+			var arr []json.RawMessage
+			i, err := strconv.Atoi(seg)
+			if err != nil || json.Unmarshal(t, &arr) != nil || i < 0 || i >= len(arr) {
+				return nil, false
+			}
+			v = arr[i]
+			continue
+		}
+		var obj map[string]json.RawMessage
 		if len(t) == 0 || t[0] != '{' || json.Unmarshal(t, &obj) != nil {
 			return nil, false
 		}

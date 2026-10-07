@@ -434,7 +434,7 @@ func (m *machine) evalAssign(n *ir.Node, scope uint32) (json.RawMessage, error) 
 		if !ok {
 			return nil, &condError{"VariableNotFoundError", "variable " + it.Name + " not found"}
 		}
-		value, skip, err := m.assignInput(it, inputs, scope)
+		value, raw, skip, err := m.assignInput(it, inputs, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -453,7 +453,11 @@ func (m *machine) evalAssign(n *ir.Node, scope uint32) (json.RawMessage, error) 
 			// inf and nan have no JSON form.
 			return nil, &condError{"InvalidInputValueError", "result of " + it.Op + " on " + it.Name + " is not a finite number"}
 		}
-		obj[it.Name] = pyEncode(nil, nv)
+		if b, ok := spliceAssign(it.Op, cur, raw, nv); ok {
+			obj[it.Name] = b
+		} else {
+			obj[it.Name] = pyEncode(nil, nv)
+		}
 		updated = append(updated, it)
 	}
 	for _, t := range order {
@@ -487,56 +491,185 @@ func (m *machine) evalAssign(n *ir.Node, scope uint32) (json.RawMessage, error) 
 
 var noValueOps = []string{"clear", "remove-first", "remove-last"}
 
+// spliceAssign builds the result of an operation that only moves values
+// (over-write, append, extend, remove-first, remove-last) from the bytes
+// of the variable and of the input, so that objects inside keep their
+// keys in order (as Python's dicts and JavaScript's objects do; decoding
+// to a Go map would sort them). The result is the same value as nv, which
+// was checked; ok is false when it cannot be spliced (nv is not a list or
+// an object, or the bytes are not what was decoded).
+func spliceAssign(op string, cur, in json.RawMessage, nv any) (json.RawMessage, bool) {
+	switch nv.(type) {
+	case []any, map[string]any:
+	default:
+		return nil, false
+	}
+	elems := func(b json.RawMessage) ([]json.RawMessage, bool) {
+		var l []json.RawMessage
+		if json.Unmarshal(b, &l) != nil {
+			return nil, false
+		}
+		return l, true
+	}
+	var out []json.RawMessage
+	switch op {
+	case "over-write":
+		if in == nil {
+			return nil, false
+		}
+		return pyReencode(in)
+	case "append":
+		l, ok := elems(cur)
+		if !ok || in == nil {
+			return nil, false
+		}
+		out = append(l, in)
+	case "extend":
+		l, ok1 := elems(cur)
+		add, ok2 := elems(in)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		out = append(l, add...)
+	case "remove-first", "remove-last":
+		l, ok := elems(cur)
+		if !ok {
+			return nil, false
+		}
+		if len(l) > 0 && op == "remove-first" {
+			l = l[1:]
+		} else if len(l) > 0 {
+			l = l[:len(l)-1]
+		}
+		out = l
+	default:
+		return nil, false
+	}
+	if l, ok := nv.([]any); !ok || len(l) != len(out) {
+		return nil, false
+	}
+	b := []byte{'['}
+	for i, e := range out {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, e...)
+	}
+	return pyReencode(append(b, ']'))
+}
+
+// pyReencode writes a JSON value as pyEncode would (numbers in Python's
+// form, strings as json.Marshal writes them, no spaces) but keeps object
+// keys in the order they come. ok is false for invalid JSON or a number
+// with no finite value.
+func pyReencode(raw []byte) (json.RawMessage, bool) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	var b []byte
+	// Per open container: whether it is an object, and how many tokens
+	// (keys and values) it has had.
+	type level struct {
+		obj bool
+		n   int
+	}
+	var stack []level
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return nil, false
+		}
+		if top := len(stack) - 1; top >= 0 {
+			if _, closing := tok.(json.Delim); !closing || (tok != json.Delim('}') && tok != json.Delim(']')) {
+				l := &stack[top]
+				switch {
+				case l.obj && l.n%2 == 1:
+					b = append(b, ':')
+				case l.n > 0:
+					b = append(b, ',')
+				}
+				l.n++
+			}
+		}
+		switch x := tok.(type) {
+		case json.Delim:
+			b = append(b, byte(x))
+			switch x {
+			case '{', '[':
+				stack = append(stack, level{obj: x == '{'})
+			default:
+				stack = stack[:len(stack)-1]
+			}
+		case json.Number:
+			v := pyNums(x)
+			if f, ok := v.(float64); ok && (f != f || f > 1.7976931348623157e308 || f < -1.7976931348623157e308) {
+				return nil, false
+			}
+			b = pyEncode(b, v)
+		default:
+			b = pyEncode(b, x)
+		}
+		if len(stack) == 0 {
+			break
+		}
+	}
+	if len(bytes.TrimSpace(raw[d.InputOffset():])) > 0 {
+		return nil, false
+	}
+	return b, true
+}
+
 // assignInput checks that the item's operation and input kind fit the
-// variable's type and returns its input value (skip: a null variable
-// input, which graphon ignores).
-func (m *machine) assignInput(it ir.AssignItem, inputs map[string]ir.Ref, scope uint32) (any, bool, error) {
+// variable's type and returns its input value and the bytes it was
+// decoded from (skip: a null variable input, which graphon ignores).
+func (m *machine) assignInput(it ir.AssignItem, inputs map[string]ir.Ref, scope uint32) (any, json.RawMessage, bool, error) {
 	if !opSupported(it.Type, it.Op) {
-		return nil, false, &condError{"OperationNotSupportedError", "operation " + it.Op + " is not supported for type " + it.Type}
+		return nil, nil, false, &condError{"OperationNotSupportedError", "operation " + it.Op + " is not supported for type " + it.Type}
 	}
 	noValue := slices.Contains(noValueOps, it.Op)
 	if it.Input != "" || noValue {
 		if slices.Contains([]string{"set", "+=", "-=", "*=", "/="}, it.Op) {
-			return nil, false, &condError{"InputTypeNotSupportedError", "input type variable is not supported for " + it.Op}
+			return nil, nil, false, &condError{"InputTypeNotSupportedError", "input type variable is not supported for " + it.Op}
 		}
 	} else if !constantSupported(it.Type, it.Op) {
-		return nil, false, &condError{"InputTypeNotSupportedError", "input type constant is not supported for " + it.Op}
+		return nil, nil, false, &condError{"InputTypeNotSupportedError", "input type constant is not supported for " + it.Op}
 	}
 	if noValue {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	var value any
+	var raw json.RawMessage
 	if it.Input != "" {
-		raw, found := m.resolveFound(inputs[it.Input], scope)
+		var found bool
+		raw, found = m.resolveFound(inputs[it.Input], scope)
 		if !found {
-			return nil, false, &condError{"VariableNotFoundError", "variable " + it.Input + " not found"}
+			return nil, nil, false, &condError{"VariableNotFoundError", "variable " + it.Input + " not found"}
 		}
 		v, err := pyDecode(raw)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 		if v == nil {
-			return nil, true, nil
+			return nil, nil, true, nil
 		}
 		value = v
 	} else if len(bytes.TrimSpace(it.Value)) > 0 {
 		v, err := pyDecode(it.Value)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
-		value = v
+		value, raw = v, it.Value
 	}
 	if s, ok := value.(string); ok && it.Op == "set" && it.Type == "object" {
 		v, err := pyDecode(json.RawMessage(s))
 		if err != nil {
-			return nil, false, &condError{"InvalidInputValueError", "invalid input value " + s}
+			return nil, nil, false, &condError{"InvalidInputValueError", "invalid input value " + s}
 		}
 		value = v
 	}
 	if !inputValid(it.Type, it.Op, value) {
-		return nil, false, &condError{"InvalidInputValueError", "invalid input value for " + it.Op + " on " + it.Type}
+		return nil, nil, false, &condError{"InvalidInputValueError", "invalid input value for " + it.Op + " on " + it.Type}
 	}
-	return value, false, nil
+	return value, raw, false, nil
 }
 
 func isNumericType(t string) bool { return t == "number" || t == "integer" || t == "float" }

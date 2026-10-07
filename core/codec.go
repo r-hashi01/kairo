@@ -12,8 +12,11 @@ import (
 
 // Version 2 adds graph state (ADR 0029). Version 1 snapshots still decode;
 // their seq, par and cond activations are migrated on first use. Version 3
-// adds run limits and counters (ADR 0030).
-const codecVersion = 3
+// adds run limits and counters (ADR 0030). Version 4 has the same layout:
+// an activation may be a step waiting for its deadline (ADR 0045), which
+// older code would not understand, so it refuses version 4 snapshots
+// instead of leaving such a run stuck.
+const codecVersion = 4
 
 var errCorrupt = errors.New("core: corrupt snapshot")
 

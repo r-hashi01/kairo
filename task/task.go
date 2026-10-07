@@ -67,4 +67,13 @@ type Result struct {
 	// HTTP 429, a provider's rate limit error). It lowers the destination's
 	// concurrency (ADR 0039); it does not change the failure itself.
 	RateLimited bool `json:"rate_limited,omitempty"`
+	// Wait: the step waits until a deadline and then ends with an output
+	// (ADR 0045). Not with Err or Output.
+	Wait *Wait `json:"wait,omitempty"`
+}
+
+// Wait is a step's result that waits (ADR 0045).
+type Wait struct {
+	Until  int64           `json:"until"` // unix milliseconds
+	Output json.RawMessage `json:"output,omitempty"`
 }

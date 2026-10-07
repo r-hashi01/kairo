@@ -91,3 +91,13 @@ Variable Assigner（v2）の操作は、over-write、clear、append、extend、s
   - 要素の中の参照は写しを読み、外には伝わらない。
   - Dify のテスト用データ `update-conversation-variable-in-iteration` が、この挙動を前提にしている（最後の answer は空文字になる）。
   - テスト: `TestRunVarsWrittenInsideMap`
+- **値を動かすだけの操作では、オブジェクトのキーの順番を保つ（2026-10-06、n8n との比較で見つけた。ADR 0042 の段階 5）。**
+  - これまでは、値を Go の map に戻してから書いていたので、オブジェクトのキーが辞書順に並び替わっていた。Python の dict（graphon）も、JavaScript のオブジェクト（n8n）も、挿入順を保つ。
+  - 対象の操作: over-write、append、extend、remove-first、remove-last。結果は、変数と入力の元のバイト列から組み立てる（`core/vars.go` の `spliceAssign`）。
+  - 数値と文字列は、これまでと同じ pyEncode の表記で書き直す（`pyReencode`）。たとえば `1e2` は `100.0` に、`-0` は `0` になる。キーの順番だけが変わる。
+  - 有限でない数（要素の中の `1e400` など）は、これまでどおり `InvalidInputValueError` で失敗する。組み立てを諦めて従来の経路に戻し、そこで止める。
+  - 検証と意味は、これまでどおりデコードした値で行う。状態の形式とログの形式は変わらない。古いログをリプレイすると、変数のバイト列がキーの順番の分だけ変わりうる。ただし、保存済みのバイト列と照合する箇所はない。
+  - 残る違い:
+    - `set` でオブジェクトに文字列を渡したときは、今もキーを辞書順に並べる。graphon（json.loads）は挿入順を保つ。
+    - 重複したキーは、組み立てた結果にそのまま残る。後勝ちで読めば、値は同じ。
+  - テスト: `TestSliceLoopKeepsKeyOrder`、`TestSpliceAssignWritesAsPython`

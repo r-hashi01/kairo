@@ -107,6 +107,10 @@ func (m *machine) memberDone(id uint32, a *Act, c *Act, out json.RawMessage) {
 	// "source" and every member runs, as before they became graphs.
 	if c.Flags&fFailBranch != 0 {
 		h = ir.HandleFailBranch
+	} else if n.Sugar == ir.SugarGraph && child.Ports {
+		m.takePorts(n, a.G, mi, out)
+		m.settle(id)
+		return
 	} else if n.Sugar == ir.SugarGraph && child.Kind == ir.KStep && child.Spec.Branch != "" {
 		var v string
 		if json.Unmarshal(extract(out, []string{child.Spec.Branch}), &v) != nil ||
@@ -129,6 +133,43 @@ func (m *machine) takeEdges(n *ir.Node, g *Graph, mi int32, h string) {
 			g.Edges[e] = eSkipped
 		}
 	}
+}
+
+// takePorts takes member mi's edges whose port is live in out, the
+// member's output, and skips the others (ADR 0043). Port i is live when
+// element i of out is not null; several may be.
+func (m *machine) takePorts(n *ir.Node, g *Graph, mi int32, out json.RawMessage) {
+	for _, e := range n.Out[mi] {
+		ed := n.Edges[e]
+		if ed.Handle == "" && portLive(out, ed.Port) {
+			g.Edges[e] = eTaken
+		} else {
+			g.Edges[e] = eSkipped
+		}
+	}
+}
+
+// portLive reports whether port i of out is live: out is a list (or an
+// object keyed "0", "1", ...) whose element i is not null. An output kept
+// as a blob is a list of ports only if the engine recorded it as one
+// ("$ports"); its dead ports are among its fields.
+func portLive(out json.RawMessage, i int32) bool {
+	if i < 0 {
+		return false
+	}
+	seg := strconv.Itoa(int(i))
+	if IsBlobRef(out) {
+		var env blobEnvelope
+		if json.Unmarshal(out, &env) != nil || env.Path != "" {
+			return false
+		}
+		if _, ok := env.Fields["$ports"]; !ok || portOutOfRange(env.Fields, seg) {
+			return false
+		}
+		f, dead := env.Fields[seg]
+		return !dead || !bytes.Equal(bytes.TrimSpace(f), null)
+	}
+	return !bytes.Equal(bytes.TrimSpace(extract(out, []string{seg})), null)
 }
 
 // skipMember marks member mi skipped. In a hand-written graph its values

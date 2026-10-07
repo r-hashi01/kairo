@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kairo/engine"
@@ -20,9 +21,93 @@ type Server struct {
 	E *engine.Engine
 	// Token, if set, must be in every worker's Hello (ADR 0037).
 	Token string
+
+	once sync.Once
+	// asking counts the connections that asked for RunEnd: with none, a
+	// run's end costs nothing here.
+	asking atomic.Int64
+	rmu    sync.Mutex
+	// By run: the connections that asked for RunEnd and were sent a task
+	// of it (ADR 0044).
+	runs map[string]map[*endConn]struct{}
+}
+
+// endConn is a connection that asked for RunEnd: its writer sends the
+// ends queued here.
+type endConn struct {
+	runs map[string]struct{} // under Server.rmu
+	mu   sync.Mutex
+	ends []string
+	wake chan struct{}
+}
+
+// sending records that c is about to be sent a task of run. It is false
+// if the run has already finished: the task is not sent (it was abandoned,
+// and its RunEnd might have gone by already). The check is under rmu, so a
+// run that finishes after it finds c in the table.
+func (s *Server) sending(c *endConn, run string) bool {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	if _, ok := c.runs[run]; ok {
+		return true
+	}
+	if s.E.Finished(run) {
+		return false
+	}
+	if s.runs == nil {
+		s.runs = map[string]map[*endConn]struct{}{}
+	}
+	cs := s.runs[run]
+	if cs == nil {
+		cs = map[*endConn]struct{}{}
+		s.runs[run] = cs
+	}
+	cs[c] = struct{}{}
+	c.runs[run] = struct{}{}
+	return true
+}
+
+// runEnded queues a RunEnd on the connections that were sent a task of
+// run. It is called from the shard loop: it only wakes their writers.
+func (s *Server) runEnded(run string) {
+	if s.asking.Load() == 0 {
+		return
+	}
+	s.rmu.Lock()
+	cs := s.runs[run]
+	delete(s.runs, run)
+	for c := range cs {
+		delete(c.runs, run)
+	}
+	s.rmu.Unlock()
+	for c := range cs {
+		c.mu.Lock()
+		c.ends = append(c.ends, run)
+		c.mu.Unlock()
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// forget removes a closed connection.
+func (s *Server) forget(c *endConn) {
+	s.rmu.Lock()
+	defer s.rmu.Unlock()
+	for run := range c.runs {
+		if cs := s.runs[run]; cs != nil {
+			delete(cs, c)
+			if len(cs) == 0 {
+				delete(s.runs, run)
+			}
+		}
+	}
+	c.runs = nil
 }
 
 func (s *Server) Serve(l net.Listener) error {
+	s.once.Do(func() { s.E.OnRunEnd(s.runEnded) })
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -77,6 +162,17 @@ func (s *Server) handle(c net.Conn) {
 	var wmu sync.Mutex // the writer goroutine and Cancel senders share w
 	done := make(chan struct{})
 	writerDone := make(chan struct{})
+	var ec *endConn
+	var wake chan struct{} // nil (never ready) without RunEnd
+	if h.RunEnd {
+		ec = &endConn{runs: map[string]struct{}{}, wake: make(chan struct{}, 1)}
+		wake = ec.wake
+		s.asking.Add(1)
+		defer func() {
+			s.forget(ec)
+			s.asking.Add(-1)
+		}()
+	}
 
 	go func() {
 		defer close(writerDone)
@@ -84,6 +180,27 @@ func (s *Server) handle(c net.Conn) {
 			var dl sched.Delivery
 			select {
 			case dl = <-p.C:
+			case <-wake:
+				ec.mu.Lock()
+				ends := ec.ends
+				ec.ends = nil
+				ec.mu.Unlock()
+				wmu.Lock()
+				var err error
+				for _, run := range ends {
+					if err = WriteFrame(w, MsgRunEnd, RunEnd{RunID: run}); err != nil {
+						break
+					}
+				}
+				if err == nil {
+					err = w.Flush()
+				}
+				wmu.Unlock()
+				if err != nil {
+					c.Close()
+					return
+				}
+				continue
 			case <-done:
 				return
 			}
@@ -100,6 +217,14 @@ func (s *Server) handle(c net.Conn) {
 				d.Poll(p, 1)
 				continue
 			}
+			if ec != nil && !s.sending(ec, t.RunID) {
+				// Its run has finished: the task was abandoned.
+				s.E.Complete(t, task.Result{Err: "aborted", Retryable: true})
+				d.Poll(p, 1)
+				continue
+			}
+			// (Recorded before the task is written: its run's end comes
+			// after it, from this goroutine.)
 			seq := t.Seq
 			tt := *t
 			tt.Input = in
@@ -144,7 +269,7 @@ func (s *Server) handle(c net.Conn) {
 			if t == nil {
 				continue
 			}
-			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited})
+			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait})
 			d.Poll(p, 1)
 		case MsgCredit:
 			var cr Credit
