@@ -10,6 +10,8 @@ export interface RunRow {
 	plan: string;
 	hash: string;
 	state: Uint8Array;
+	/** The run's input (JSON). */
+	input: string | null;
 	status: string;
 	output: string | null; // JSON
 	error: string | null;
@@ -76,7 +78,7 @@ export interface Store {
 
 const DDL = (p: string, blob: string, big: string) => [
 	`CREATE TABLE IF NOT EXISTS ${p}run (id TEXT PRIMARY KEY, plan TEXT NOT NULL, hash TEXT NOT NULL, state ${blob} NOT NULL,
-	  status TEXT NOT NULL, output TEXT, error TEXT, seq ${big} NOT NULL, created_at ${big} NOT NULL, updated_at ${big} NOT NULL)`,
+	  input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq ${big} NOT NULL, created_at ${big} NOT NULL, updated_at ${big} NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS ${p}event (run TEXT NOT NULL, seq ${big} NOT NULL, body TEXT NOT NULL, PRIMARY KEY (run, seq))`,
 	`CREATE TABLE IF NOT EXISTS ${p}timer (run TEXT NOT NULL, timer ${big} NOT NULL, act ${big} NOT NULL, at ${big} NOT NULL, PRIMARY KEY (run, timer))`,
 	`CREATE INDEX IF NOT EXISTS ${p}timer_at ON ${p}timer (at)`,
@@ -116,8 +118,8 @@ export class SQLiteStore implements Store {
 		const p = this.p;
 		this.q = {
 			get: this.db.prepare(`SELECT * FROM ${p}run WHERE id = ?`),
-			put: this.db.prepare(`INSERT INTO ${p}run (id, plan, hash, state, status, output, error, seq, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status,
+			put: this.db.prepare(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status,
 				output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`),
 			event: this.db.prepare(`INSERT INTO ${p}event (run, seq, body) VALUES (?, ?, ?)`),
 			setTimer: this.db.prepare(`INSERT INTO ${p}timer (run, timer, act, at) VALUES (?, ?, ?, ?) ON CONFLICT (run, timer) DO UPDATE SET at = excluded.at`),
@@ -136,7 +138,7 @@ export class SQLiteStore implements Store {
 
 	private row(r: any): RunRow | undefined {
 		if (!r) return undefined;
-		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), status: r.status, output: r.output, error: r.error,
+		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
 			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at) };
 	}
 
@@ -151,7 +153,7 @@ export class SQLiteStore implements Store {
 			for (const ev of c.events) this.q.event.run(id, seq++, JSON.stringify(ev));
 			if (c.row) {
 				const r = c.row;
-				this.q.put.run(r.id, r.plan, r.hash, r.state, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt);
+				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt);
 			}
 			if (c.clearTimers) {
 				this.q.clearTimers.run(id);
@@ -227,7 +229,7 @@ export class PostgresStore implements Store {
 
 	private row(r: any): RunRow | undefined {
 		if (!r) return undefined;
-		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), status: r.status, output: r.output, error: r.error,
+		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
 			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at) };
 	}
 
@@ -244,10 +246,10 @@ export class PostgresStore implements Store {
 				const r = ch.row;
 				// A new run's row: two submissions racing for one id insert it
 				// once; the loser's insert fails and its transaction rolls back.
-				await c.query(`INSERT INTO ${p}run (id, plan, hash, state, status, output, error, seq, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO UPDATE SET state = excluded.state,
+				await c.query(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET state = excluded.state,
 					status = excluded.status, output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`,
-					[r.id, r.plan, r.hash, Buffer.from(r.state), r.status, r.output, r.error, seq, r.createdAt, r.updatedAt]);
+					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt]);
 			}
 			if (ch.clearTimers) {
 				await c.query(`DELETE FROM ${p}timer WHERE run = $1`, [id]);

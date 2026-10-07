@@ -18,6 +18,12 @@ export interface Backend {
 	signal(runId: string, name: string, payload: unknown): Promise<void>;
 	cancel(runId: string): Promise<void>;
 	close(): Promise<void>;
+	/** Embedded only: once the work started here is done. */
+	idle?(): Promise<void>;
+	/** Embedded only: calls hook with each run that settles here. */
+	onSettled?(hook: (r: RunInfo) => void): () => void;
+	/** Embedded only: takes up due timers and steps whose process stopped. */
+	tick?(): Promise<void>;
 }
 
 export interface HttpBackendOptions {
@@ -136,5 +142,17 @@ export class EmbeddedBackend implements Backend {
 
 	close(): Promise<void> {
 		return this.runtime.close();
+	}
+
+	idle(): Promise<void> {
+		return this.runtime.idle();
+	}
+
+	onSettled(hook: (r: RunInfo) => void): () => void {
+		return this.runtime.onSettled(hook);
+	}
+
+	tick(): Promise<void> {
+		return this.runtime.tick();
 	}
 }

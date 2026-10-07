@@ -12,7 +12,7 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend, HttpBackend, type Backend } from './backend.ts';
 import { PostgresStore, SQLiteStore } from './store.ts';
-import { CancelledError, Kairo } from './workflow.ts';
+import { CancelledError, Kairo, Suspended } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-'));
@@ -182,3 +182,47 @@ if (dsn && pgDir) {
 	});
 	suite('embedded (PostgreSQL)', async () => EmbeddedBackend.open({ store: new PostgresStore(pool, { prefix }), wasm }));
 }
+
+// Serverless (suspend mode, ADR 0051): each "invocation" is a new process
+// that goes as far as it can and returns. A scheduler's tick and a signal
+// drive the workflow on; no call runs twice.
+describe('serverless (suspend)', { skip: !hasGo }, () => {
+	test('a workflow goes on across invocations', async () => {
+		const path = join(dir, 'serverless.db');
+		const runs = { llm: 0, write: 0 };
+		async function invocation(): Promise<Kairo> {
+			const k = new Kairo({ backend: await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm }), mode: 'suspend' });
+			k.defineAction('llm', { effect: 'unprotected', handler: async (i: { q: string }) => (runs.llm++, i.q.toUpperCase()) });
+			k.defineAction('write', { effect: 'real', handler: async (i: { v: string }) => (runs.write++, `wrote ${i.v}`) });
+			k.workflow('job', async (ctx, input: { q: string }) => {
+				const a = await ctx.call('llm', { q: input.q });
+				await ctx.sleep(300);
+				const w = await ctx.call('write', { v: a });
+				const ok = await ctx.waitFor<{ by: string }>('approve');
+				return { a, w, by: ok.by };
+			});
+			await k.start();
+			return k;
+		}
+
+		// 1: starts, runs llm, and suspends at the sleep.
+		let k = await invocation();
+		await assert.rejects(k.run('job', { q: 'hi' }, { id: 'sl-1' }), Suspended);
+		assert.deepEqual(runs, { llm: 1, write: 0 });
+		await k.close();
+
+		// 2: the scheduler's tick after the sleep: write runs, then it waits for the signal.
+		await new Promise((r) => setTimeout(r, 350));
+		k = await invocation();
+		await k.tick();
+		assert.deepEqual(runs, { llm: 1, write: 1 });
+		await k.close();
+
+		// 3: the signal: the workflow ends.
+		k = await invocation();
+		await k.signal('sl-1', 'approve', { by: 'alice' });
+		assert.deepEqual(await k.run('job', { q: 'hi' }, { id: 'sl-1' }), { a: 'HI', w: 'wrote HI', by: 'alice' });
+		assert.deepEqual(runs, { llm: 1, write: 1 }, 'no call ran twice');
+		await k.close();
+	});
+});

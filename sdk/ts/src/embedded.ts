@@ -53,6 +53,8 @@ export class Embedded {
 	private readonly plans = new Map<string, Compiled>();
 	private handler?: ActionHandler;
 	private readonly waiters = new Map<string, Set<(r: RunInfo) => void>>();
+	/** Called with each run that settles in this process. */
+	private readonly settledHooks = new Set<(r: RunInfo) => void>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly running = new Map<string, AbortController>();
 	/** Work started by this runtime (steps, timers): close waits for it. */
@@ -89,6 +91,17 @@ export class Embedded {
 		this.track(this.get(runId).then((r) => {
 			if (SETTLED.has(r.status)) for (const w of this.waiters.get(runId) ?? []) w(r);
 		}));
+	}
+
+	/** Calls hook with each run that settles in this process; returns how to stop. */
+	onSettled(hook: (r: RunInfo) => void): () => void {
+		this.settledHooks.add(hook);
+		return () => this.settledHooks.delete(hook);
+	}
+
+	/** Returns once the work started here (steps, timers that fired) is done. */
+	async idle(): Promise<void> {
+		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
 	}
 
 	/** Registers node specs and the handler that runs their steps here. */
@@ -217,8 +230,9 @@ export class Embedded {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
-			if (row && start) return { events: [], result: { existing: true, commands: [] as CoreCommand[], row } };
-			if (!row && !start) return { events: [], endLeases, result: { existing: false, commands: [] as CoreCommand[], row: undefined } };
+			if (row && start) return { events: [], result: { existing: true, settled: false, commands: [] as CoreCommand[], row } };
+			if (!row && !start)
+				return { events: [], endLeases, result: { existing: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plans.get(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
 			if (row && row.hash !== plan.hash) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
@@ -239,13 +253,14 @@ export class Embedded {
 				}
 			};
 			for (const ev of events) apply(ev);
-			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, commands, row } };
+			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, settled: false, commands, row } };
 			const at = start?.at ?? this.now();
 			const next: RunRow = {
 				id: runId,
 				plan: plan.name,
 				hash: plan.hash,
 				state,
+				input: row ? row.input : JSON.stringify(events[0]?.data ?? null),
 				status: res.status,
 				output: res.output === undefined ? null : JSON.stringify(res.output),
 				error: res.error || null,
@@ -272,14 +287,16 @@ export class Embedded {
 				clearTimers: done,
 				endLeases,
 				setLeases,
-				result: { existing: false, commands, row: next },
+				result: { existing: false, settled: SETTLED.has(res.status) && res.status !== row?.status, commands, row: next },
 			};
 		});
 		if (this.closed) return out.existing;
 		for (const c of out.commands) this.carryOut(runId, c);
-		if (out.row && SETTLED.has(out.row.status)) {
+		// Settled by this transaction (not a run found settled already).
+		if (out.settled && out.row) {
 			const r = info(out.row);
 			for (const w of this.waiters.get(runId) ?? []) w(r);
+			for (const h of this.settledHooks) h(r);
 		}
 		// Along the way: what no process is doing (at most once a lease period).
 		if (this.now() - this.lastSweep >= this.leaseMs) this.track(this.tick());
@@ -369,6 +386,7 @@ function info(row: RunRow): RunInfo {
 		plan: row.plan,
 		tenant: 'default',
 		status: row.status,
+		...(row.input !== null ? { input: JSON.parse(row.input) } : {}),
 		...(row.output !== null ? { output: JSON.parse(row.output) } : {}),
 		...(row.error ? { error: row.error } : {}),
 	};
