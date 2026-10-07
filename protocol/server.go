@@ -139,7 +139,14 @@ func (s *Server) handle(c net.Conn) {
 		h.Credit = 1
 	}
 	d := s.E.Dispatcher()
-	p := d.NewPoller(h.Actions, h.Credit)
+	var p *sched.Poller
+	if h.RunEnd {
+		// A worker that keeps state per run: a run's tasks go to the same
+		// connection while it has credit (ADR 0046).
+		p = d.NewAffinePoller(h.Actions, h.Credit)
+	} else {
+		p = d.NewPoller(h.Actions, h.Credit)
+	}
 
 	type sent struct {
 		t    *task.Task

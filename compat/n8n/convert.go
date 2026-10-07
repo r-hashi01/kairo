@@ -20,12 +20,44 @@ import (
 
 // ConverterVersion is part of the plan names: plans of an older converter
 // are kept apart.
-const ConverterVersion = 1
+const ConverterVersion = 2
 
 // ActionNode runs one n8n v1 node on a worker. Its input is the node's
 // input slots by index ("in0", "in1", ...), its params the graph node; its
 // output is its output slots (ports, ADR 0043).
 const ActionNode = "n8n.node"
+
+// ActionPureNode runs an n8n v1 node that acts on nothing outside: it only
+// computes its output from its input, so running it again does no harm
+// and it is unprotected, not real (ADR 0047). Workers run it as ActionNode.
+const ActionPureNode = "n8n.node.pure"
+
+// pureNodeTypes are the n8n node types that act on nothing outside (no
+// request, no credentials, no state kept across executions), each checked
+// in n8n's source (ADR 0047). A type not listed is real. Review the list
+// when n8n's version changes.
+var pureNodeTypes = map[string]bool{
+	"n8n-nodes-base.set":        true,
+	"n8n-nodes-base.if":         true,
+	"n8n-nodes-base.switch":     true,
+	"n8n-nodes-base.merge":      true,
+	"n8n-nodes-base.filter":     true,
+	"n8n-nodes-base.noOp":       true,
+	"n8n-nodes-base.splitOut":   true,
+	"n8n-nodes-base.aggregate":  true,
+	"n8n-nodes-base.sort":       true,
+	"n8n-nodes-base.limit":      true,
+	"n8n-nodes-base.renameKeys": true,
+	"n8n-nodes-base.summarize":  true,
+}
+
+// pureNode reports whether n is of a type that acts on nothing outside.
+func pureNode(n *Node) bool {
+	var cfg struct {
+		NodeType string `json:"nodeType"`
+	}
+	return json.Unmarshal(n.Config, &cfg) == nil && pureNodeTypes[cfg.NodeType]
+}
 
 // TriggerInput is the run input holding the trigger's output slots.
 const TriggerInput = "trigger"
@@ -33,6 +65,7 @@ const TriggerInput = "trigger"
 // Spec registers the n8n actions with a registry.
 func Spec(r *ir.Registry) {
 	r.Register(ir.NodeSpec{Action: ActionNode, Effect: ir.EffectReal, Ports: true})
+	r.Register(ir.NodeSpec{Action: ActionPureNode, Effect: ir.EffectUnprotected, Ports: true})
 }
 
 // Graph is an engine v2 WorkflowGraph.
@@ -221,6 +254,15 @@ func (c *converter) graph(loop, id string) (*ir.Def, error) {
 			params, err := json.Marshal(n)
 			if err != nil {
 				return nil, err
+			}
+			if pureNode(n) {
+				// Acts on nothing outside: not held for a durable intent, and
+				// run again if its outcome is unknown (its worker went away).
+				// A node's own error is not retryable, so it is not retried
+				// (ADR 0047).
+				g.Nodes = append(g.Nodes, &ir.Def{Kind: "step", ID: n.ID, Action: ActionPureNode, Input: c.inputs(n.ID), Params: params,
+					Retry: &ir.RetryDef{MaxAttempts: 3}})
+				continue
 			}
 			// engine v2 does not retry a step, and a step whose outcome is
 			// unknown (its worker went away) fails rather than waiting for

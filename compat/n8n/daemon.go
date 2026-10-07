@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,10 +44,8 @@ type Daemon struct {
 	mu    sync.Mutex
 	plans map[string]*ir.Plan // registered plans, by name
 	runs  map[string]*runInfo // executions being followed, by id
-	// Steps whose start is recorded, by execution then step row id, and
-	// requests waiting for one, by step row id (see stepData).
-	recorded map[string]map[string]bool
-	waiters  map[string][]chan struct{}
+	// Requests waiting for a step's start, by step row id (see stepData).
+	waiters map[string][]chan struct{}
 }
 
 // runInfo is what translating an execution's traces needs.
@@ -58,7 +57,17 @@ type runInfo struct {
 	lastName string
 	// ended holds, by batch loop (plan node), the round its slice found
 	// nothing left: the loop's terminal round, which has no body steps.
-	ended map[int32]int
+	ended   map[int32]int
+	trigger string // the trigger node's id
+	// restored: rebuilt from the records after a restart, so steps that
+	// started before it are known only there.
+	restored bool
+	// What the execution's steps read (ADR 0042), under Daemon.mu: the
+	// steps that started and the completed steps' outputs, by node and
+	// round. Kept from the traces as they are read, before they are
+	// recorded: the traces are durable in kairo's log already.
+	started map[string]bool
+	outputs map[string]map[string]json.RawMessage
 	// waiting holds the steps that wait for their deadline (ADR 0045):
 	// while there are some, a step's start or end sets the execution's
 	// status again.
@@ -78,7 +87,7 @@ func (d *Daemon) Load() error {
 	d.mu.Lock()
 	if d.plans == nil {
 		d.plans, d.runs = map[string]*ir.Plan{}, map[string]*runInfo{}
-		d.recorded, d.waiters = map[string]map[string]bool{}, map[string][]chan struct{}{}
+		d.waiters = map[string][]chan struct{}{}
 	}
 	d.mu.Unlock()
 	if d.Dir == "" {
@@ -434,66 +443,117 @@ func (d *Daemon) Consume(ctx context.Context) error {
 }
 
 func (d *Daemon) consume(ctx context.Context, f *engine.Feed) error {
+	// Reading and recording overlap: while a batch is recorded, the next
+	// is read, and what steps read is up to date as soon as a trace is
+	// read (ADR 0042). Batches are recorded, then acknowledged, in order.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	batches := make(chan *batch, 64)
+	recorded := make(chan error, 1)
+	go func() {
+		recorded <- d.record(ctx, f, batches)
+		cancel() // the reader stops too
+	}()
 	for {
 		entries, err := f.Next(ctx, 1024)
-		if err != nil {
-			return err
-		}
-		if err := d.apply(ctx, entries); err != nil {
-			return err
-		}
-		acks := map[[2]int]engine.Cursor{}
-		for _, en := range entries {
-			if en.Cursor.LSN > 0 {
-				acks[[2]int{en.Cursor.Shard, int(en.Cursor.Tier)}] = en.Cursor
+		if err == nil {
+			var b *batch
+			if b, err = d.read(ctx, entries); err == nil {
+				select {
+				case batches <- b:
+					continue
+				case <-ctx.Done():
+					err = ctx.Err()
+				}
 			}
 		}
-		for _, c := range acks {
-			if err := f.Ack(c); err != nil {
-				return err
-			}
+		close(batches)
+		if rerr := <-recorded; rerr != nil && !errors.Is(rerr, context.Canceled) {
+			return rerr
 		}
+		return err
 	}
 }
 
-// apply records a batch of traces and then notifies.
-func (d *Daemon) apply(ctx context.Context, entries []engine.FeedEntry) error {
-	tx, err := d.Views.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	var events []LifecycleEvent
-	var ended []map[string]any
+// batch is what a batch of traces records, then notifies and acknowledges.
+type batch struct {
+	w      writes
+	events []LifecycleEvent
+	ended  []map[string]any
+	acks   map[[2]int]engine.Cursor
+}
+
+// read translates a batch of traces (see translate).
+func (d *Daemon) read(ctx context.Context, entries []engine.FeedEntry) (*batch, error) {
+	b := &batch{acks: map[[2]int]engine.Cursor{}}
 	for _, en := range entries {
+		if en.Cursor.LSN > 0 {
+			b.acks[[2]int{en.Cursor.Shard, int(en.Cursor.Tier)}] = en.Cursor
+		}
 		if en.Trace == nil {
 			continue // live chunks: nothing to record
 		}
 		ri, err := d.run(ctx, en.RunID)
 		if err != nil {
-			tx.Rollback()
-			return err
+			return nil, err
 		}
 		if ri == nil {
 			continue
 		}
-		evs, end, err := d.translate(ctx, tx, ri, en.Trace)
+		evs, end := d.translate(ri, en.Trace, &b.w)
+		b.events = append(b.events, evs...)
+		if end != nil {
+			b.ended = append(b.ended, end)
+		}
+	}
+	return b, nil
+}
+
+// record records the batches, then notifies and acknowledges them: the
+// batches waiting together in one transaction, so that recording keeps up
+// however small the batches read are.
+func (d *Daemon) record(ctx context.Context, f *engine.Feed, batches <-chan *batch) error {
+	for b := range batches {
+	more:
+		for len(b.w) < 4096 {
+			select {
+			case nb, ok := <-batches:
+				if !ok {
+					break more
+				}
+				b.w = append(b.w, nb.w...)
+				b.events = append(b.events, nb.events...)
+				b.ended = append(b.ended, nb.ended...)
+				for k, c := range nb.acks {
+					b.acks[k] = c // later in the same shard and tier
+				}
+			default:
+				break more
+			}
+		}
+		tx, err := d.Views.Begin(ctx)
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
-		events = append(events, evs...)
-		if end != nil {
-			ended = append(ended, end)
+		for _, op := range b.w {
+			if err := op(ctx, tx); err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	d.markRecorded(events)
-	d.Events.Send(events...)
-	for _, e := range ended {
-		if err := d.Responses.Publish(e["executionId"].(string), e); err != nil {
-			log.Printf("kairo-n8n: execution %s: response not published: %v", e["executionId"], err)
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		d.Events.Send(b.events...)
+		for _, e := range b.ended {
+			if err := d.Responses.Publish(e["executionId"].(string), e); err != nil {
+				log.Printf("kairo-n8n: execution %s: response not published: %v", e["executionId"], err)
+			}
+		}
+		for _, c := range b.acks {
+			if err := f.Ack(c); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -523,10 +583,14 @@ func (d *Daemon) run(ctx context.Context, id string) (*runInfo, error) {
 	var g Graph
 	json.Unmarshal(x.Graph, &g)
 	names := map[string]string{}
+	trigger := ""
 	for _, n := range g.Nodes {
 		names[n.ID] = n.Name
+		if n.Type == "trigger" {
+			trigger = n.ID
+		}
 	}
-	ri = &runInfo{exec: x, plan: plan, names: names}
+	ri = &runInfo{exec: x, plan: plan, names: names, trigger: trigger}
 	if x.Status != "queued" {
 		// Its traces were read before a restart: what the earlier ones
 		// told is in the records (ADR 0042, 0045). A new execution has no
@@ -536,6 +600,7 @@ func (d *Daemon) run(ctx context.Context, id string) (*runInfo, error) {
 			return nil, err
 		}
 		ri.restore(steps)
+		ri.restored = true
 	}
 	d.mu.Lock()
 	d.runs[id] = ri
@@ -555,8 +620,17 @@ func (ri *runInfo) restore(steps []Step) {
 			}
 		}
 	}
+	ri.started = map[string]bool{}
+	ri.outputs = map[string]map[string]json.RawMessage{}
 	for i := range steps {
 		s := &steps[i]
+		ri.started[s.ID] = true
+		if s.Status == "completed" && len(s.Outputs) > 0 && string(s.Outputs) != "null" {
+			if ri.outputs[s.NodeID] == nil {
+				ri.outputs[s.NodeID] = map[string]json.RawMessage{}
+			}
+			ri.outputs[s.NodeID][strconv.Itoa(s.Iteration)] = s.Outputs
+		}
 		switch s.Status {
 		case "waiting":
 			if ri.waiting == nil {
@@ -595,10 +669,12 @@ func (d *Daemon) planOf(name string) (*ir.Plan, error) {
 
 // stepData answers a worker about to run a step: the execution's graph and
 // every completed step's outputs (engine v2's StepData), with what the
-// step's context needs, once the step's start is recorded. The engine hands the step out as soon as it starts it,
-// while its start (and so everything before it in the execution) reaches
-// the records a little later, through the feed: the answer waits for the
-// records to catch up (ADR 0042).
+// step's context needs, once the step's start is read from the feed. The
+// engine hands the step out as soon as it starts it, and its start (and so
+// everything before it in the execution) reaches the daemon a little
+// later, through the feed: the answer waits for it. It comes from what the
+// daemon keeps in memory, or, for an execution it does not follow (after a
+// restart), from the records (ADR 0042).
 func (d *Daemon) stepData(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ExecutionID string `json:"executionId"`
@@ -612,64 +688,89 @@ func (d *Daemon) stepData(w http.ResponseWriter, r *http.Request) {
 	id := stepID(req.ExecutionID, req.NodeID, req.Iteration)
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if err := d.awaitRecorded(ctx, req.ExecutionID, id); err != nil {
-		fail(w, 503, "not_recorded", "the step's start is not recorded yet")
-		return
-	}
-	x, steps, err := d.Views.Get(r.Context(), req.ExecutionID, true)
+	ri, err := d.awaitStarted(ctx, req.ExecutionID, id)
 	if err != nil {
-		fail(w, 500, "internal", "")
+		fail(w, 503, "not_recorded", "the step's start is not known yet")
 		return
 	}
-	if x == nil {
-		fail(w, 404, "not_found", "")
-		return
-	}
+	var x *Execution
 	byNode := map[string]map[string]json.RawMessage{}
-	for _, s := range steps {
-		if s.Status != "completed" || string(s.Outputs) == "null" {
-			continue
+	if ri != nil {
+		x = ri.exec
+		d.mu.Lock()
+		for node, rounds := range ri.outputs {
+			byNode[node] = maps.Clone(rounds)
 		}
-		if byNode[s.NodeID] == nil {
-			byNode[s.NodeID] = map[string]json.RawMessage{}
+		d.mu.Unlock()
+	} else {
+		var steps []Step
+		if x, steps, err = d.Views.Get(r.Context(), req.ExecutionID, true); err != nil {
+			fail(w, 500, "internal", "")
+			return
 		}
-		byNode[s.NodeID][strconv.Itoa(s.Iteration)] = s.Outputs
+		if x == nil {
+			fail(w, 404, "not_found", "")
+			return
+		}
+		for _, s := range steps {
+			if s.Status != "completed" || string(s.Outputs) == "null" {
+				continue
+			}
+			if byNode[s.NodeID] == nil {
+				byNode[s.NodeID] = map[string]json.RawMessage{}
+			}
+			byNode[s.NodeID][strconv.Itoa(s.Iteration)] = s.Outputs
+		}
 	}
 	// What the step's context needs (engine v2's StepExecutionContext).
 	execution := map[string]any{"workflowId": x.WorkflowID, "mode": x.Mode, "callerContext": x.CallerContext}
 	reply(w, 200, map[string]any{"graph": x.Graph, "outputsByNode": byNode, "execution": execution})
 }
 
-// markRecorded notes the steps whose start was just recorded and wakes
-// the requests waiting for them.
-func (d *Daemon) markRecorded(events []LifecycleEvent) {
+// remember keeps what the execution's later steps read of step s, and
+// wakes the requests waiting for its start.
+func (d *Daemon) remember(ri *runInfo, s *Step) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, ev := range events {
-		switch ev.Type {
-		case "step:started":
-			if d.recorded[ev.ExecutionID] == nil {
-				d.recorded[ev.ExecutionID] = map[string]bool{}
-			}
-			d.recorded[ev.ExecutionID][ev.StepID] = true
-			for _, ch := range d.waiters[ev.StepID] {
-				close(ch)
-			}
-			delete(d.waiters, ev.StepID)
-		case "execution:completed", "execution:failed":
-			delete(d.recorded, ev.ExecutionID) // no step of it starts any more
-		}
+	if ri.started == nil {
+		ri.started = map[string]bool{}
 	}
+	ri.started[s.ID] = true
+	if s.Status == "completed" && len(s.Outputs) > 0 && string(s.Outputs) != "null" {
+		if ri.outputs == nil {
+			ri.outputs = map[string]map[string]json.RawMessage{}
+		}
+		if ri.outputs[s.NodeID] == nil {
+			ri.outputs[s.NodeID] = map[string]json.RawMessage{}
+		}
+		ri.outputs[s.NodeID][strconv.Itoa(s.Iteration)] = s.Outputs
+	}
+	for _, ch := range d.waiters[s.ID] {
+		close(ch)
+	}
+	delete(d.waiters, s.ID)
 }
 
-// awaitRecorded returns once step sid of execution exec has its start
-// recorded (in memory, or, after a restart, in the records).
-func (d *Daemon) awaitRecorded(ctx context.Context, exec, sid string) error {
-	d.mu.Lock()
-	if d.recorded[exec][sid] {
-		d.mu.Unlock()
+// awaitStarted returns once step sid of execution exec has started: the
+// execution as the daemon follows it, or nil when only the records know
+// the step (its start was read before a restart).
+func (d *Daemon) awaitStarted(ctx context.Context, exec, sid string) (*runInfo, error) {
+	started := func() *runInfo {
+		if ri := d.runs[exec]; ri != nil && ri.started[sid] {
+			return ri
+		}
 		return nil
 	}
+	d.mu.Lock()
+	if ri := started(); ri != nil {
+		d.mu.Unlock()
+		return ri, nil
+	}
+	// An execution followed since it started: its step's start comes
+	// through the feed. Otherwise it may have come before a restart, and
+	// the records know it.
+	ri := d.runs[exec]
+	ask := ri == nil || ri.restored
 	ch := make(chan struct{})
 	d.waiters[sid] = append(d.waiters[sid], ch)
 	d.mu.Unlock()
@@ -687,13 +788,15 @@ func (d *Daemon) awaitRecorded(ctx context.Context, exec, sid string) error {
 		}
 		d.mu.Unlock()
 	}()
-	if d.Views.HasStep(ctx, exec, sid) {
-		return nil
+	if ask && d.Views.HasStep(ctx, exec, sid) {
+		return nil, nil
 	}
 	select {
 	case <-ch:
-		return nil
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return started(), nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }

@@ -831,6 +831,7 @@ func (e *Engine) finish(ri RunInfo) {
 		w <- ri
 	}
 	e.live.End(ri.RunID)
+	e.disp.RunEnded(ri.RunID) // ADR 0046
 	if fns := e.runEnd.Load(); fns != nil {
 		for _, fn := range *fns {
 			fn(ri.RunID)

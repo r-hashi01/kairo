@@ -43,7 +43,7 @@ func iterationOf(step string) int {
 // variables, the graphs) have no steps of their own.
 func nodeOf(n *ir.Node) (string, bool) {
 	switch {
-	case n.Kind == ir.KStep && n.Spec.Action == ActionNode:
+	case n.Kind == ir.KStep && (n.Spec.Action == ActionNode || n.Spec.Action == ActionPureNode):
 		return n.ID, true
 	case n.Kind == ir.KStep && n.Spec.Action == ir.ActionSlice:
 		return strings.TrimSuffix(n.ID, sliceSuffix), true
@@ -63,26 +63,34 @@ func loopOf(p *ir.Plan, n int32) int32 {
 
 func iso(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z07:00") }
 
-// translate records one trace of execution ri and returns its lifecycle
-// events and, at the end, its "ended" response.
-func (d *Daemon) translate(ctx context.Context, tx *Tx, ri *runInfo, tr *core.Trace) ([]LifecycleEvent, map[string]any, error) {
+// writes are what a batch of traces records, run in one transaction.
+type writes []func(context.Context, *Tx) error
+
+// translate reads one trace of execution ri: it adds what to record to w,
+// updates what the daemon keeps of the execution in memory (what steps
+// read, ADR 0042), and returns its lifecycle events and, at the end, its
+// "ended" response.
+func (d *Daemon) translate(ri *runInfo, tr *core.Trace, w *writes) ([]LifecycleEvent, map[string]any) {
 	x := ri.exec
 	at := time.UnixMilli(tr.At).UTC()
 	switch tr.Kind {
 	case core.TrRunStart:
-		if err := d.Views.Running(ctx, tx, x.ID, at); err != nil {
-			return nil, nil, err
+		*w = append(*w, func(ctx context.Context, tx *Tx) error { return d.Views.Running(ctx, tx, x.ID, at) })
+		if ri.trigger != "" {
+			// The trigger's step was recorded at the start; its outputs are
+			// the run's trigger input.
+			var in map[string]json.RawMessage
+			json.Unmarshal(tr.Input, &in)
+			d.remember(ri, &Step{ID: stepID(x.ID, ri.trigger, 0), NodeID: ri.trigger, Status: "completed", Outputs: in[TriggerInput]})
 		}
 		return []LifecycleEvent{{Type: "execution:started", ExecutionID: x.ID, WorkflowID: x.WorkflowID, At: iso(at),
-			Mode: x.Mode, HostMode: x.HostMode}}, nil, nil
+			Mode: x.Mode, HostMode: x.HostMode}}, nil
 	case core.TrRunEnd:
 		status, typ := "completed", "execution:completed"
 		if tr.Status != "completed" {
 			status, typ = "failed", "execution:failed"
 		}
-		if err := d.Views.Finish(ctx, tx, x.ID, status, at); err != nil {
-			return nil, nil, err
-		}
+		*w = append(*w, func(ctx context.Context, tx *Tx) error { return d.Views.Finish(ctx, tx, x.ID, status, at) })
 		end := map[string]any{"type": "ended", "executionId": x.ID, "workflowId": x.WorkflowID, "status": status}
 		if ri.last != nil {
 			last := map[string]any{"nodeId": ri.last.NodeID, "nodeName": ri.lastName, "status": ri.last.Status,
@@ -95,18 +103,18 @@ func (d *Daemon) translate(ctx context.Context, tx *Tx, ri *runInfo, tr *core.Tr
 		d.mu.Lock()
 		delete(d.runs, x.ID)
 		d.mu.Unlock()
-		return []LifecycleEvent{{Type: typ, ExecutionID: x.ID, WorkflowID: x.WorkflowID, At: iso(at)}}, end, nil
+		return []LifecycleEvent{{Type: typ, ExecutionID: x.ID, WorkflowID: x.WorkflowID, At: iso(at)}}, end
 	case core.TrNodeStart, core.TrNodeEnd, core.TrNodeSkip, core.TrNodeWait:
 	default:
-		return nil, nil, nil
+		return nil, nil
 	}
 	if tr.Node < 0 || int(tr.Node) >= len(ri.plan.Nodes) {
-		return nil, nil, nil
+		return nil, nil
 	}
 	pn := &ri.plan.Nodes[tr.Node]
 	node, ok := nodeOf(pn)
 	if !ok {
-		return nil, nil, nil
+		return nil, nil
 	}
 	it := iterationOf(tr.StepID)
 	if tr.Kind == core.TrNodeSkip && pn.Spec.Action != ir.ActionSlice {
@@ -114,7 +122,7 @@ func (d *Daemon) translate(ctx context.Context, tx *Tx, ri *runInfo, tr *core.Tr
 		// even skipped ones.
 		if l := loopOf(ri.plan, tr.Node); l >= 0 {
 			if r, ok := ri.ended[l]; ok && r == it {
-				return nil, nil, nil
+				return nil, nil
 			}
 		}
 	}
@@ -158,9 +166,8 @@ func (d *Daemon) translate(ctx context.Context, tx *Tx, ri *runInfo, tr *core.Tr
 			s.Error, _ = json.Marshal(map[string]string{"name": name, "message": tr.Err})
 		}
 	}
-	if err := d.Views.PutStep(ctx, tx, x.ID, s); err != nil {
-		return nil, nil, err
-	}
+	*w = append(*w, func(ctx context.Context, tx *Tx) error { return d.Views.PutStep(ctx, tx, x.ID, s) })
+	d.remember(ri, s)
 	if s.Status == "waiting" {
 		if ri.waiting == nil {
 			ri.waiting = map[string]bool{}
@@ -171,12 +178,10 @@ func (d *Daemon) translate(ctx context.Context, tx *Tx, ri *runInfo, tr *core.Tr
 		ri.last, ri.lastName = s, ri.names[node]
 	}
 	if s.Status == "waiting" || len(ri.waiting) > 0 || tr.Kind == core.TrNodeEnd && wasWaiting {
-		if err := d.Views.Live(ctx, tx, x.ID, at); err != nil {
-			return nil, nil, err
-		}
+		*w = append(*w, func(ctx context.Context, tx *Tx) error { return d.Views.Live(ctx, tx, x.ID, at) })
 	}
 	if ev.Type == "" {
-		return nil, nil, nil
+		return nil, nil
 	}
-	return []LifecycleEvent{ev}, nil, nil
+	return []LifecycleEvent{ev}, nil
 }

@@ -7,7 +7,7 @@ import { Worker } from '../../../sdk/ts/src/index.ts';
 const [addr, token] = process.argv.slice(2);
 const worker = new Worker({
 	name: 'interop',
-	actions: ['n8n.node'],
+	actions: ['n8n.node', 'n8n.node.pure'],
 	concurrency: 4,
 	token,
 	handler: async (task) => {

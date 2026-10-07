@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kairo/mpsc"
@@ -75,6 +76,15 @@ type Dispatcher struct {
 	stop      chan struct{}
 	done      chan struct{}
 
+	// affine: by run, the affine poller its tasks go to (ADR 0046).
+	// affinePollers counts the affine pollers: with none, RunEnded does
+	// nothing.
+	affine        map[string]*Poller
+	affinePollers atomic.Int64
+	// affineRuns mirrors affine's keys for RunEnded, which runs on other
+	// goroutines: only a run in the table costs a message when it ends.
+	affineRuns sync.Map
+
 	statsMu sync.Mutex
 	dstats  []DestStat
 	statsAt time.Time
@@ -92,6 +102,7 @@ const (
 	mAbort
 	mAbortAll
 	mWake
+	mRunEnd
 )
 
 type dmsg struct {
@@ -105,6 +116,7 @@ type dmsg struct {
 	actual  int
 	limited bool
 	key     task.Key
+	run     string
 }
 
 type handed struct {
@@ -128,6 +140,10 @@ type Poller struct {
 	C       chan Delivery
 	credit  int
 	gone    bool
+	// affine: a worker that keeps state per run gets a run's tasks while
+	// it has credit (ADR 0046). runs: the runs it is the poller of.
+	affine bool
+	runs   map[string]struct{}
 }
 
 type dest struct {
@@ -283,6 +299,29 @@ func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
 	return p
 }
 
+// NewAffinePoller is NewPoller for a worker that keeps state per run: the
+// tasks of a run go to the poller that took the run's earlier tasks while
+// it has credit (ADR 0046).
+func (d *Dispatcher) NewAffinePoller(actions []string, credit int) *Poller {
+	if credit < 1 {
+		credit = 1
+	}
+	p := &Poller{Actions: actions, C: make(chan Delivery, credit), affine: true, runs: map[string]struct{}{}}
+	d.affinePollers.Add(1)
+	d.q.Push(dmsg{kind: mPoll, poller: p, credit: credit})
+	return p
+}
+
+// RunEnded forgets which poller a finished run's tasks went to (ADR 0046).
+func (d *Dispatcher) RunEnded(runID string) {
+	if d.affinePollers.Load() == 0 {
+		return
+	}
+	if _, ok := d.affineRuns.Load(runID); ok {
+		d.q.Push(dmsg{kind: mRunEnd, run: runID})
+	}
+}
+
 // Poll grants n more credits to p. The worker must have room for them:
 // the number of tasks received but not yet completed plus the outstanding
 // credit must not exceed cap(p.C).
@@ -291,7 +330,12 @@ func (d *Dispatcher) Poll(p *Poller, n int) { d.q.Push(dmsg{kind: mPoll, poller:
 // Unpoll removes p. Tasks already delivered to p.C but not taken are
 // returned to their queues; the worker must report Done for the ones it
 // took, even if it gives up on them.
-func (d *Dispatcher) Unpoll(p *Poller) { d.q.Push(dmsg{kind: mUnpoll, poller: p}) }
+func (d *Dispatcher) Unpoll(p *Poller) {
+	if p.affine {
+		d.affinePollers.Add(-1)
+	}
+	d.q.Push(dmsg{kind: mUnpoll, poller: p})
+}
 
 // Done reports that a task finished, with its actual token usage. Its
 // concurrency slot is released only now, not when it was aborted, so a
@@ -409,6 +453,11 @@ func (d *Dispatcher) loop() {
 				p := m.poller
 				p.gone = true
 				d.removePoller(p)
+				for run := range p.runs {
+					delete(d.affine, run)
+					d.affineRuns.Delete(run)
+				}
+				p.runs = nil
 				for {
 					select {
 					case dl := <-p.C:
@@ -463,6 +512,12 @@ func (d *Dispatcher) loop() {
 				}
 			case mWake:
 				wakeAll = true
+			case mRunEnd:
+				if p := d.affine[m.run]; p != nil {
+					delete(d.affine, m.run)
+					delete(p.runs, m.run)
+				}
+				d.affineRuns.Delete(m.run)
 			}
 		}
 		if wakeAll {
@@ -672,12 +727,26 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		ctx, cancel := context.WithCancel(context.Background())
 		d.delivered[k] = handed{t, ctx, cancel, now}
 		ds.inflight++
-		p := ps[0]
+		p, rotate := ps[0], true
+		if a := d.affine[t.RunID]; a != nil && !a.gone && a.credit > 0 && slices.Contains(a.Actions, ds.action) {
+			// The run's poller (ADR 0046): it has credit, so it is waiting.
+			p, rotate = a, false
+		} else if p.affine {
+			if old := d.affine[t.RunID]; old != nil {
+				delete(old.runs, t.RunID)
+			}
+			if d.affine == nil {
+				d.affine = map[string]*Poller{}
+			}
+			d.affine[t.RunID] = p
+			d.affineRuns.Store(t.RunID, struct{}{})
+			p.runs[t.RunID] = struct{}{}
+		}
 		p.credit--
 		p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C
 		if p.credit == 0 {
 			d.removePoller(p)
-		} else {
+		} else if rotate {
 			// Rotate pollers so work spreads across workers.
 			d.pollers[ds.action] = append(ps[1:], p)
 		}

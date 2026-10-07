@@ -94,7 +94,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.Close)
-	e.RegisterExecutor([]string{ActionNode}, 8, engine.ExecutorFunc(
+	e.RegisterExecutor([]string{ActionNode, ActionPureNode}, 8, engine.ExecutorFunc(
 		func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
 			var node Node
 			json.Unmarshal(tk.Params, &node)
@@ -541,5 +541,48 @@ func TestRunInfoRestore(t *testing.T) {
 	}
 	if len(ri.waiting) != 0 {
 		t.Fatalf("waiting %v", ri.waiting)
+	}
+}
+
+const waitThenMGraph = `{"nodes":[
+  {"id":"trigger","name":"Webhook","type":"trigger"},
+  {"id":"node-wait","name":"Wait","type":"v1-node"},
+  {"id":"node-m","name":"M","type":"v1-node"}],
+ "edges":[
+  {"from":"trigger","to":"node-wait","outputIndex":0,"inputIndex":0},
+  {"from":"node-wait","to":"node-m","outputIndex":0,"inputIndex":0}]}`
+
+// After a restart the daemon rebuilds an execution from the records, and
+// a step reads the outputs before it from there (ADR 0042).
+func TestDaemonStepDataAfterRestart(t *testing.T) {
+	f := newFixture(t)
+	id := "01890a5d-ac96-774b-bcce-b302099a805b"
+	if code := f.do("POST", "/api/workflow-executions", startBody(id, waitThenMGraph), nil); code != 201 {
+		t.Fatalf("start: %d", code)
+	}
+	var snap struct{ Status string }
+	f.waitFor(func() bool {
+		f.do("GET", "/api/workflow-executions/"+id, "", &snap)
+		return snap.Status == "waiting"
+	})
+	f.d.mu.Lock()
+	delete(f.d.runs, id) // as a restart
+	f.d.mu.Unlock()
+	f.waitFor(func() bool {
+		f.do("GET", "/api/workflow-executions/"+id, "", &snap)
+		return snap.Status == "completed"
+	})
+	f.mu.Lock()
+	sd := f.stepData
+	f.mu.Unlock()
+	var data struct {
+		OutputsByNode map[string]map[string]json.RawMessage
+	}
+	json.Unmarshal([]byte(strings.TrimPrefix(sd, "200 ")), &data)
+	// node-wait ended after the restart (its output comes from its trace);
+	// the trigger's comes from the records.
+	if !strings.HasPrefix(sd, "200 ") || string(data.OutputsByNode["node-wait"]["0"]) != `[[{"json":{"waited":true}}]]` ||
+		data.OutputsByNode["trigger"] == nil {
+		t.Fatalf("step data %s", sd)
 	}
 }

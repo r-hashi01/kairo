@@ -45,7 +45,7 @@ func run(t *testing.T, g *Graph, trigger string, exec execFunc) ([]request, stri
 	defer e.Close()
 	var mu sync.Mutex
 	var reqs []request
-	e.RegisterExecutor([]string{ActionNode}, 8, engine.ExecutorFunc(
+	e.RegisterExecutor([]string{ActionNode, ActionPureNode}, 8, engine.ExecutorFunc(
 		func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
 			var node Node
 			json.Unmarshal(tk.Params, &node)
@@ -244,5 +244,46 @@ func TestUnsupported(t *testing.T) {
 		if _, err := Convert("x", g); err == nil {
 			t.Fatalf("converted %+v", g)
 		}
+	}
+}
+
+// Nodes of a type that acts on nothing outside are unprotected steps; any
+// other node is real (ADR 0047).
+func TestPureNodeTypes(t *testing.T) {
+	cfg := func(typ string) json.RawMessage { return json.RawMessage(`{"nodeType":"` + typ + `","typeVersion":1}`) }
+	g := &Graph{Nodes: []Node{
+		{ID: "trigger", Type: "trigger"},
+		{ID: "set", Type: "v1-node", Config: cfg("n8n-nodes-base.set")},
+		{ID: "if", Type: "v1-node", Config: cfg("n8n-nodes-base.if")},
+		{ID: "http", Type: "v1-node", Config: cfg("n8n-nodes-base.httpRequest")},
+		{ID: "code", Type: "v1-node", Config: cfg("n8n-nodes-base.code")},
+		{ID: "dedupe", Type: "v1-node", Config: cfg("n8n-nodes-base.removeDuplicates")},
+		{ID: "community", Type: "v1-node", Config: cfg("n8n-nodes-acme.set")},
+		{ID: "bare", Type: "v1-node"},
+	}, Edges: []Edge{{From: "trigger", To: "set"}, {From: "set", To: "if"}, {From: "if", To: "http"},
+		{From: "http", To: "code"}, {From: "code", To: "dedupe"}, {From: "dedupe", To: "community"}, {From: "community", To: "bare"}}}
+	def, err := Convert("wf", g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := ir.NewRegistry()
+	Spec(reg)
+	p, err := ir.Compile(def, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]ir.Effect{"set": ir.EffectUnprotected, "if": ir.EffectUnprotected, "http": ir.EffectReal,
+		"code": ir.EffectReal, "dedupe": ir.EffectReal, "community": ir.EffectReal, "bare": ir.EffectReal}
+	for i := range p.Nodes {
+		n := &p.Nodes[i]
+		if w, ok := want[n.ID]; ok {
+			if n.Effect() != w {
+				t.Errorf("%s: effect %v, want %v", n.ID, n.Effect(), w)
+			}
+			delete(want, n.ID)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("not in the plan: %v", want)
 	}
 }
