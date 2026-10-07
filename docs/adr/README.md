@@ -52,7 +52,9 @@
 | [0045](0045-step-result-that-waits.md) | ステップの結果として「期限まで待ってから、この出力で終わる」を返せるようにする | 承認 |
 | [0046](0046-run-affinity-for-workers.md) | 実行ごとの状態を持つワーカーには、同じ実行の仕事をなるべく同じ接続に渡す | 承認 |
 | [0047](0047-n8n-node-effects-by-type.md) | 外に作用しない n8n のノードは、「実」でなく「非保護」のステップにする | 承認 |
-| [0048](0048-distribution-as-bundled-binary.md) | kairo は、kairod のバイナリを同梱した言語ごとのパッケージとして配る | 承認 |
+| [0048](0048-distribution-as-bundled-binary.md) | kairo は、kairod のバイナリを同梱した言語ごとのパッケージとして配る | 0051 により置き換え |
 | [0049](0049-sdk-graph-and-code-apis.md) | SDK は、グラフの API と、コードで書くワークフローの API の 2 段で用意する | 承認 |
+| [0050](0050-keep-outputs-of-finished-runs.md) | 指定した実行は、終わった後も出力を冪等の期間のあいだ残す | 提案 |
+| [0051](0051-no-resident-runtime.md) | kairo は常駐するサーバーを前提にしない: コアを利用者のプロセスに埋め込み、DB だけを使う | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

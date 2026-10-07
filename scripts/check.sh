@@ -33,6 +33,11 @@ go vet ./...
 step "go build"
 go build ./...
 
+# The pure core as a WASM module for SDKs that embed it (ADR 0051).
+step "go vet + build (wasip1)"
+GOOS=wasip1 GOARCH=wasm go vet ./cmd/kairo-wasm ./wasmcore ./core ./ir
+GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o /dev/null ./cmd/kairo-wasm
+
 # Nested modules (optional backends with their own dependencies, ADR 0018).
 modules=$(find . -name go.mod -not -path ./go.mod -exec dirname {} \; | sort)
 
