@@ -4,13 +4,23 @@
 // replace the state, arm or disarm timers. The commands are carried out
 // after the commit: a real step only once its intent was committed with it
 // (invariant 4).
+//
+// A step dispatched here is leased to this process while it runs. A
+// process that stops leaves its leases to expire; whoever finds an expired
+// lease applies an unknown outcome to the step, as kairod does when a
+// worker goes away: an unprotected step runs again, a real one stops for
+// review (invariant 5). Expired leases and due timers are looked for when
+// the runtime opens, along the way of its work (at most once a lease
+// period) and on tick(): no polling.
 
 import { fileURLToPath } from 'node:url';
 
 import { Core, type Compiled, type CoreCommand, type CoreEvent } from './core.ts';
 import { KairoError, type NodeSpec, type RunInfo } from './client.ts';
 import type { Result, Task } from './protocol.ts';
-import type { RunRow, Store, TimerRow } from './store.ts';
+import { randomUUID } from 'node:crypto';
+
+import type { LeaseRow, RunRow, Store, TimerRow } from './store.ts';
 import type { TaskContext } from './worker.ts';
 
 /** Runs the actions of dispatched steps in this process. */
@@ -21,9 +31,20 @@ export interface EmbeddedOptions {
 	/** kairo.wasm (cmd/kairo-wasm): a path or its bytes. Default: the one in this package (npm run build:wasm). */
 	wasm?: string | Uint8Array;
 	now?: () => number;
+	/** How long a step is leased to this process without renewal (ms; default 30 s). */
+	leaseMs?: number;
+	/**
+	 * This process's name in the leases (default: random). A process that
+	 * gives the name its earlier self had takes that self's steps as
+	 * stopped when it opens, without waiting for the leases to expire.
+	 */
+	owner?: string;
 }
 
 const DONE = new Set(['completed', 'failed', 'cancelled']);
+/** A run that will not go on by itself: finished, or stopped for review. */
+const SETTLED = new Set([...DONE, 'blocked']);
+const OUTCOMES = new Set(['step_ok', 'step_err', 'step_wait']);
 
 export class Embedded {
 	private readonly core: Core;
@@ -37,17 +58,26 @@ export class Embedded {
 	/** Work started by this runtime (steps, timers): close waits for it. */
 	private readonly busy = new Set<Promise<unknown>>();
 	private closed = false;
+	readonly owner: string;
+	private readonly leaseMs: number;
+	private renewal?: ReturnType<typeof setInterval>;
+	private lastSweep = 0;
 
 	private constructor(core: Core, opts: EmbeddedOptions) {
 		this.core = core;
 		this.store = opts.store;
 		this.now = opts.now ?? Date.now;
+		this.owner = opts.owner ?? randomUUID();
+		this.leaseMs = opts.leaseMs ?? 30_000;
 	}
 
 	static async open(opts: EmbeddedOptions): Promise<Embedded> {
 		const core = await Core.load(opts.wasm ?? fileURLToPath(new URL('../wasm/kairo.wasm', import.meta.url)));
 		await opts.store.init();
-		return new Embedded(core, opts);
+		const e = new Embedded(core, opts);
+		// A process of the same name that stopped: its steps are not running.
+		if (opts.owner) await opts.store.expireLeases(opts.owner, e.now());
+		return e;
 	}
 
 	/** Registers node specs and the handler that runs their steps here. */
@@ -82,7 +112,7 @@ export class Embedded {
 		return info(row);
 	}
 
-	/** Waits until the run has finished (in this process's view). */
+	/** Waits until the run has finished or stopped for review (in this process's view). */
 	async wait(runId: string, signal?: AbortSignal): Promise<RunInfo> {
 		let resolve!: (r: RunInfo) => void;
 		const done = new Promise<RunInfo>((r) => (resolve = r));
@@ -92,7 +122,7 @@ export class Embedded {
 		try {
 			// Registered first, then read: an end between the two still wakes us.
 			const now = await this.get(runId);
-			if (DONE.has(now.status)) return now;
+			if (SETTLED.has(now.status)) return now;
 			if (!signal) return await done;
 			return await new Promise<RunInfo>((res, rej) => {
 				const abort = () => rej(signal.reason ?? new Error('aborted'));
@@ -117,9 +147,21 @@ export class Embedded {
 		await this.process(runId, [{ kind: 'cancel', at: this.now(), error: 'cancelled' }]);
 	}
 
-	/** Fires the timers that are due (also those armed by other processes). */
+	/**
+	 * Takes up what no process is doing: steps whose lease expired (their
+	 * process stopped) and timers that are due (also those armed by other
+	 * processes). Runs whose plan is not registered here are left alone.
+	 */
 	async tick(): Promise<void> {
-		for (const t of await this.store.dueTimers(this.now(), 1000)) await this.fire(t);
+		this.lastSweep = this.now();
+		for (const l of await this.store.expiredLeases(this.now(), 1000)) await this.recover(l).catch(skipUnknownPlan);
+		for (const t of await this.store.dueTimers(this.now(), 1000)) await this.fire(t).catch(skipUnknownPlan);
+	}
+
+	/** The process that ran l's step stopped: its outcome is unknown. */
+	private recover(l: LeaseRow): Promise<boolean> {
+		return this.process(l.run, [{ kind: 'step_err', at: this.now(), act: l.act, attempt: l.attempt, unknown: true, retryable: true,
+			error: 'the process running the step stopped', error_type: 'process_lost' }]);
 	}
 
 	/**
@@ -133,7 +175,20 @@ export class Embedded {
 		this.timers.clear();
 		for (const a of this.running.values()) a.abort();
 		this.running.clear();
+		this.renew();
 		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
+	}
+
+	/** Renews this process's leases while it runs steps; one timer for all of them. */
+	private renew(): void {
+		if (this.running.size > 0 && !this.closed) {
+			this.renewal ??= setInterval(() => {
+				this.track(this.store.renewLeases(this.owner, this.now() + this.leaseMs));
+			}, Math.max(this.leaseMs / 3, 10));
+			return;
+		}
+		clearInterval(this.renewal);
+		this.renewal = undefined;
 	}
 
 	private track(p: Promise<unknown>): void {
@@ -148,8 +203,10 @@ export class Embedded {
 	 */
 	private async process(runId: string, events: CoreEvent[], start?: { plan: Compiled; at: number }): Promise<boolean> {
 		const out = await this.store.withRun(runId, (row) => {
+			// A step's outcome ends its lease, applied or not (a stale one).
+			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
 			if (row && start) return { events: [], result: { existing: true, commands: [] as CoreCommand[], row } };
-			if (!row && !start) return { events: [], result: { existing: false, commands: [] as CoreCommand[], row: undefined } };
+			if (!row && !start) return { events: [], endLeases, result: { existing: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plans.get(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
 			if (row && row.hash !== plan.hash) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
@@ -170,7 +227,7 @@ export class Embedded {
 				}
 			};
 			for (const ev of events) apply(ev);
-			if (recorded.length === 0) return { events: [], result: { existing: false, commands, row } };
+			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, commands, row } };
 			const at = start?.at ?? this.now();
 			const next: RunRow = {
 				id: runId,
@@ -186,19 +243,33 @@ export class Embedded {
 			};
 			const setTimers: TimerRow[] = [];
 			const deleteTimers: number[] = [];
+			const setLeases: LeaseRow[] = [];
 			for (const c of commands) {
 				if (c.kind === 'timer') setTimers.push({ run: runId, timer: c.timer!, act: c.act ?? 0, at: c.at! });
 				if (c.kind === 'cancel_timer') deleteTimers.push(c.timer!);
+				// Dispatched to this process: leased to it while it runs.
+				if (c.kind === 'dispatch') setLeases.push({ run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: this.owner, until: at + this.leaseMs });
 			}
 			const done = DONE.has(res.status);
-			return { events: recorded, row: next, setTimers, deleteTimers, clearTimers: done, result: { existing: false, commands, row: next } };
+			return {
+				events: recorded,
+				row: next,
+				setTimers,
+				deleteTimers,
+				clearTimers: done,
+				endLeases,
+				setLeases,
+				result: { existing: false, commands, row: next },
+			};
 		});
 		if (this.closed) return out.existing;
 		for (const c of out.commands) this.carryOut(runId, c);
-		if (out.row && DONE.has(out.row.status)) {
+		if (out.row && SETTLED.has(out.row.status)) {
 			const r = info(out.row);
 			for (const w of this.waiters.get(runId) ?? []) w(r);
 		}
+		// Along the way: what no process is doing (at most once a lease period).
+		if (this.now() - this.lastSweep >= this.leaseMs) this.track(this.tick());
 		return out.existing;
 	}
 
@@ -240,6 +311,7 @@ export class Embedded {
 		const key = `${runId}\0${c.act}`;
 		const abort = new AbortController();
 		this.running.set(key, abort);
+		this.renew();
 		const task = {
 			run_id: runId,
 			step_id: c.step_id ?? '',
@@ -256,6 +328,7 @@ export class Embedded {
 			res = { error: String((e as Error)?.message ?? e), errorType: (e as Error)?.name };
 		} finally {
 			this.running.delete(key);
+			this.renew();
 		}
 		if (this.closed) return;
 		const at = this.now();
@@ -270,6 +343,11 @@ export class Embedded {
 		}
 		await this.process(runId, [ev]);
 	}
+}
+
+/** A run whose plan this process does not have is another process's to take up. */
+function skipUnknownPlan(e: unknown): void {
+	if (!(e instanceof KairoError && e.status === 404)) throw e;
 }
 
 function info(row: RunRow): RunInfo {
