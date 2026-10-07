@@ -62,6 +62,7 @@ export class Embedded {
 	private readonly leaseMs: number;
 	private renewal?: ReturnType<typeof setInterval>;
 	private lastSweep = 0;
+	private unlisten?: () => Promise<void>;
 
 	private constructor(core: Core, opts: EmbeddedOptions) {
 		this.core = core;
@@ -77,7 +78,17 @@ export class Embedded {
 		const e = new Embedded(core, opts);
 		// A process of the same name that stopped: its steps are not running.
 		if (opts.owner) await opts.store.expireLeases(opts.owner, e.now());
+		// Runs that settle in other processes wake the waits here.
+		if (opts.store.listen) e.unlisten = await opts.store.listen((id) => e.settledElsewhere(id));
 		return e;
+	}
+
+	private settledElsewhere(runId: string): void {
+		const ws = this.waiters.get(runId);
+		if (!ws || ws.size === 0) return;
+		this.track(this.get(runId).then((r) => {
+			if (SETTLED.has(r.status)) for (const w of this.waiters.get(runId) ?? []) w(r);
+		}));
 	}
 
 	/** Registers node specs and the handler that runs their steps here. */
@@ -177,6 +188,7 @@ export class Embedded {
 		this.running.clear();
 		this.renew();
 		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
+		await this.unlisten?.();
 	}
 
 	/** Renews this process's leases while it runs steps; one timer for all of them. */
@@ -252,6 +264,7 @@ export class Embedded {
 			}
 			const done = DONE.has(res.status);
 			return {
+				notify: SETTLED.has(res.status) && res.status !== row?.status,
 				events: recorded,
 				row: next,
 				setTimers,

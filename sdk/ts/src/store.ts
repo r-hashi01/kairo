@@ -47,6 +47,8 @@ export interface Changes<T> {
 	setLeases?: LeaseRow[];
 	/** Steps (acts) whose leases end: their outcome is in. */
 	endLeases?: number[];
+	/** The run settled (finished, or stopped for review): tell the listeners at commit. */
+	notify?: boolean;
 	result: T;
 }
 
@@ -63,6 +65,12 @@ export interface Store {
 	renewLeases(owner: string, until: number): Promise<void>;
 	/** Ends owner's leases now (a process that knows its earlier self stopped). */
 	expireLeases(owner: string, now: number): Promise<void>;
+	/**
+	 * Calls settled with the id of each run that settles in any process
+	 * (Changes.notify), until the returned function is called. Absent:
+	 * runs settled in other processes are not heard of.
+	 */
+	listen?(settled: (runId: string) => void): Promise<() => Promise<void>>;
 	close(): Promise<void>;
 }
 
@@ -190,9 +198,16 @@ function lease(l: any): LeaseRow {
 	return { run: l.run, act: Number(l.act), attempt: Number(l.attempt), owner: l.owner, until: Number(l.until) };
 }
 
+/** A client of the pool (node-postgres's pg.Client fits). */
+export interface PgClient {
+	query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+	release(): void;
+	on?(event: 'notification', listener: (msg: { channel: string; payload?: string }) => void): unknown;
+}
+
 /** The little of a PostgreSQL pool the store uses (node-postgres's pg.Pool fits). */
 export interface PgPool {
-	connect(): Promise<{ query(text: string, params?: unknown[]): Promise<{ rows: any[] }>; release(): void }>;
+	connect(): Promise<PgClient>;
 	query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
 }
 
@@ -247,6 +262,7 @@ export class PostgresStore implements Store {
 			for (const t of ch.setTimers ?? [])
 				await c.query(`INSERT INTO ${p}timer (run, timer, act, at) VALUES ($1, $2, $3, $4) ON CONFLICT (run, timer) DO UPDATE SET at = excluded.at`,
 					[t.run, t.timer, t.act, t.at]);
+			if (ch.notify) await c.query('SELECT pg_notify($1, $2)', [`${p}settled`, id]);
 			await c.query('COMMIT');
 			return ch.result;
 		} catch (e) {
@@ -277,6 +293,23 @@ export class PostgresStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		await this.pool.query(`UPDATE ${this.p}lease SET until = $1 WHERE owner = $2`, [now - 1, owner]);
+	}
+
+	/** One connection of the pool, kept to LISTEN for settled runs. */
+	async listen(settled: (runId: string) => void): Promise<() => Promise<void>> {
+		const c = await this.pool.connect();
+		if (!c.on) {
+			c.release();
+			return async () => {};
+		}
+		c.on('notification', (msg) => {
+			if (msg.channel === `${this.p}settled` && msg.payload) settled(msg.payload);
+		});
+		await c.query(`LISTEN ${this.p}settled`);
+		return async () => {
+			await c.query(`UNLISTEN ${this.p}settled`).catch(() => {});
+			c.release();
+		};
 	}
 
 	async close(): Promise<void> {}

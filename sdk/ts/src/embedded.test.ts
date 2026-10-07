@@ -4,12 +4,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { after, before, test } from 'node:test';
 
 import { Embedded } from './embedded.ts';
-import { SQLiteStore } from './store.ts';
+import { PostgresStore, SQLiteStore } from './store.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-embedded-'));
@@ -160,4 +161,34 @@ test('a running step is not taken up while its process lives', { skip: !hasGo },
 	assert.deepEqual(ranInB, [], 'b took up a step that a was running');
 	await a.close();
 	await b.close();
+});
+
+// With PostgreSQL (KAIRO_SDK_PG_DSN, and KAIRO_SDK_PG_MODULE where "pg" is
+// installed): a run that settles in one process wakes a wait in another.
+const dsn = process.env.KAIRO_SDK_PG_DSN;
+const pgDir = process.env.KAIRO_SDK_PG_MODULE;
+test('a run settled in another process wakes the wait here', { skip: !hasGo || !dsn || !pgDir }, async () => {
+	const pg = createRequire(join(pgDir!, 'x.js'))('pg');
+	const pool = new pg.Pool({ connectionString: dsn, max: 8 });
+	const prefix = `ke${process.pid}_`;
+	try {
+		const plan = { name: 'p', root: { kind: 'wait', id: 'w', signal: 'go' } };
+		const a = await Embedded.open({ store: new PostgresStore(pool, { prefix }), wasm });
+		const b = await Embedded.open({ store: new PostgresStore(pool, { prefix }), wasm });
+		for (const rt of [a, b]) {
+			rt.registerActions([], async () => ({ output: null }));
+			rt.registerPlan(plan);
+		}
+		await a.run('p', null, { runId: 'x1' });
+		const waiting = a.wait('x1');
+		await b.signal('x1', 'go', 'from b');
+		const r = await waiting;
+		assert.equal(r.status, 'completed');
+		assert.deepEqual(r.output, { timed_out: false, payload: 'from b' });
+		await a.close();
+		await b.close();
+	} finally {
+		for (const t of ['run', 'event', 'timer', 'lease']) await pool.query(`DROP TABLE IF EXISTS ${prefix}${t}`);
+		await pool.end();
+	}
 });
