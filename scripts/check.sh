@@ -72,7 +72,9 @@ done
 # is covered by compat/dify's end-to-end test when GRAPHON_PYTHON is set).
 if command -v python3 >/dev/null; then
   step "python sdk tests"
-  (cd sdk/python && python3 -m unittest discover -s tests 2>&1 | tail -1)
+  # The last line, or what failed when something did.
+  (cd sdk/python && { out=$(python3 -m unittest discover -s tests 2>&1) && echo "$out" | tail -1; } || {
+    echo "$out" | grep -E -A30 '^(.\[[0-9;]*m)*(FAIL|ERROR)(.\[[0-9;]*m)*:' | head -120; echo "$out" | tail -1; exit 1; })
 fi
 
 # The TypeScript SDK (sdk/ts): its suites build kairod and kairo.wasm.

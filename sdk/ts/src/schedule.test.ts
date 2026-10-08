@@ -143,6 +143,8 @@ describe('waking the runtime (ADR 0053)', { skip: !hasGo }, () => {
 		assert.equal(await k2.run('w', null, { id: 'wake-1' }), 'AB');
 		await k2.close();
 		assert.equal(runs.llm, 2);
-		assert.equal(ticks, 2, 'woken once per sleep');
+		// Woken at most once per sleep (no polling). Under load a tick can
+		// last until the next sleep is due, and its process goes on with it.
+		assert.ok(ticks >= 1 && ticks <= 2, `woken at most once per sleep: ${ticks}`);
 	});
 });

@@ -20,6 +20,8 @@ kairo は Go 製の LLM ワークフローランタイムです。目標は「�
 | `protocol/` `executor/` | ワーカープロトコル（pull・クレジット制）、HTTP 実行器 | ここで I/O する |
 | `api/` `cmd/kairod/` | デーモンと HTTP API | — |
 | `seal/` | 保存データの暗号化と改ざん検知（ADR 0021）。`wal.Encrypted`、`blob.Encrypted` が使う | なし |
+| `httpaction/` | アクションを HTTP(S) で受ける Go の側（ADR 0052）。署名の作成と検証、`/action` の受け口。SDK と同じ形 | ここで I/O する |
+| `executor/jev/` | 型付きの判断（TypeSafe Jev、ADR 0055）。別モジュール（go-jev に依存）。`cmd/kairo-jev` が kairod のワーカーと HTTP(S) のアクションの両方で配る | ここで I/O する |
 | `store/sqlstore/` | SQL 保存先の共通実装と Dialect（別モジュール。ADR 0020）。`sqltest` は全製品共通のテスト一式 | ここで I/O する |
 | `store/{sqlite,postgres,mysql,oracle}/` | 製品ごとの Dialect とドライバ（それぞれ別モジュール）。TiDB は `store/mysql`。既定の保存先はファイル形式 | ここで I/O する |
 

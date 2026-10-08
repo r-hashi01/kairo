@@ -154,7 +154,9 @@ class ScheduleTest(unittest.TestCase):
             self.assertEqual(await k.run("w", None, id="wake-1"), "AB")
             await k.close()
             self.assertEqual(runs["llm"], 2)
-            self.assertEqual(ticks, 2, "woken once per sleep")
+            # Woken at most once per sleep (no polling). Under load a tick can
+            # last until the next sleep is due, and its process goes on with it.
+            self.assertIn(ticks, (1, 2), "woken at most once per sleep")
 
         run(main)
 
