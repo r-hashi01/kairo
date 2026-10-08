@@ -13,7 +13,7 @@ from .http import SignatureError
 from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import Task, TaskContext, Worker
 from .store import PostgresStore, SQLiteStore
-from .workflow import Cancelled, Context, Kairo, ResultLostError, Suspended
+from .workflow import Cancelled, Context, Kairo, ResultLostError, Suspended, tick_handler
 
 __all__ = [
     "Backend",
@@ -40,5 +40,6 @@ __all__ = [
     "TaskContext",
     "Worker",
     "read_frame",
+    "tick_handler",
     "write_frame",
 ]

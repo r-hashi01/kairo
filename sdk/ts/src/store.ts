@@ -63,6 +63,11 @@ export interface Store {
 	dueTimers(now: number, limit: number): Promise<TimerRow[]>;
 	/** Leases past their time at now: steps whose process stopped. */
 	expiredLeases(now: number, limit: number): Promise<LeaseRow[]>;
+	/**
+	 * When something is next to do (ADR 0053): the earliest timer, or the
+	 * earliest lease to expire; null if neither.
+	 */
+	nextWake(): Promise<number | null>;
 	/** Extends owner's leases to until. */
 	renewLeases(owner: string, until: number): Promise<void>;
 	/**
@@ -138,6 +143,8 @@ export class SQLiteStore implements Store {
 			expired: this.db.prepare(`SELECT run, act, attempt, owner, until FROM ${p}lease WHERE until < ? ORDER BY until LIMIT ?`),
 			renew: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
 			expire: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
+			nextTimer: this.db.prepare(`SELECT MIN(at) AS t FROM ${p}timer`),
+			nextLease: this.db.prepare(`SELECT MIN(until) AS t FROM ${p}lease`),
 			handOver: this.db.prepare(`UPDATE ${p}lease SET owner = ?, until = ? WHERE run = ? AND act = ? AND attempt = ?`),
 		};
 	}
@@ -193,6 +200,10 @@ export class SQLiteStore implements Store {
 		this.q.renew.run(until, owner);
 	}
 
+	async nextWake(): Promise<number | null> {
+		return earliest((this.q.nextTimer.get() as any)?.t, (this.q.nextLease.get() as any)?.t);
+	}
+
 	async handOver(l: LeaseRow): Promise<void> {
 		this.q.handOver.run(l.owner, l.until, l.run, l.act, l.attempt);
 	}
@@ -204,6 +215,12 @@ export class SQLiteStore implements Store {
 	async close(): Promise<void> {
 		this.db?.close();
 	}
+}
+
+/** The earlier of two times as the database gives them (null, number, bigint or numeric text). */
+function earliest(a: unknown, b: unknown): number | null {
+	const ts = [a, b].filter((v) => v !== null && v !== undefined).map(Number);
+	return ts.length ? Math.min(...ts) : null;
 }
 
 function lease(l: any): LeaseRow {
@@ -305,6 +322,12 @@ export class PostgresStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		await this.pool.query(`UPDATE ${this.p}lease SET until = $1 WHERE owner = $2`, [now - 1, owner]);
+	}
+
+	async nextWake(): Promise<number | null> {
+		const t = await this.pool.query(`SELECT MIN(at) AS t FROM ${this.p}timer`);
+		const l = await this.pool.query(`SELECT MIN(until) AS t FROM ${this.p}lease`);
+		return earliest(t.rows[0]?.t, l.rows[0]?.t);
 	}
 
 	async handOver(l: LeaseRow): Promise<void> {

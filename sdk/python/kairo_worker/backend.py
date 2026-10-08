@@ -145,5 +145,8 @@ class EmbeddedBackend:
     async def tick(self) -> None:
         await self.runtime.tick()
 
+    async def next_wake(self) -> int | None:
+        return await self.runtime.next_wake()
+
     async def complete(self, run_id: str, act: int, attempt: int, res: Result) -> None:
         await self.runtime.complete(run_id, act, attempt, res)

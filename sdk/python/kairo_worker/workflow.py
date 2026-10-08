@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import json
 import random
@@ -93,12 +94,20 @@ class Kairo:
         ca: str | None = None,
         allow_insecure: bool = False,
         wait_until: Callable[[Awaitable[Any]], None] | None = None,
+        tick_secret: str | None = None,
+        wake: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         """Actions over HTTP(S) (ADR 0052): secret signs the calls and the
         callbacks; callback_url is where this process takes outcomes (the
         ASGI app's /callback); ca, certificates to trust (PEM) besides the
         system's; allow_insecure allows plain http to other machines;
-        wait_until keeps the host running async actions after the answer."""
+        wait_until keeps the host running async actions after the answer.
+
+        Suspend mode (ADR 0053): tick_secret is the bearer token a scheduler
+        calls the ASGI app's /tick with (without it, /tick is not served);
+        wake is told, before run, tick, signal and callbacks return, when
+        something is next to do (unix ms): schedule a one-off tick then,
+        instead of polling."""
         self.backend: Any = backend or HttpBackend(url, worker=worker, token=token, tenant=tenant, concurrency=concurrency)
         self._ttl = idempotency_ttl
         self._actions: dict[str, _Action] = {}
@@ -120,6 +129,8 @@ class Kairo:
         self._ca = ca
         self._allow_insecure = allow_insecure
         self._wait_until = wait_until
+        self._tick_secret = tick_secret
+        self._wake = wake
         self._background: set[asyncio.Future[Any]] = set()
 
     def action(
@@ -204,12 +215,23 @@ class Kairo:
             t.cancel()
         await self.backend.close()
 
-    async def tick(self) -> None:
+    async def tick(self) -> int | None:
         """Suspend mode: takes up due timers and steps whose process stopped,
         drives on the workflows whose calls settle, and returns once that is
-        done (call it from a scheduler)."""
+        done (call it from a scheduler). Returns when something is next to
+        do (unix ms), or None."""
         await self.backend.tick()
         await self._settle()
+        return await self._wake_up()
+
+    async def _wake_up(self) -> int | None:
+        """Suspend mode: tells wake when something is next to do (ADR 0053); returns it."""
+        if not self.suspend or not hasattr(self.backend, "next_wake"):
+            return None
+        at = await self.backend.next_wake()
+        if at is not None and self._wake is not None:
+            await self._wake(at)
+        return at
 
     async def _settle(self) -> None:
         """Returns once the work started here and the workflows driven on are done."""
@@ -327,7 +349,9 @@ class Kairo:
         """Serves actions called over HTTP(S) and takes their outcomes (ADR
         0052), as an ASGI app: POST <base>/action runs an action's handler
         here; POST <base>/callback applies an outcome to its run. Both are
-        signed with secret."""
+        signed with secret. GET or POST <base>/tick, with "Authorization:
+        Bearer <tick_secret>", is a scheduler's tick (ADR 0053): it answers
+        {"next": <unix ms> | null}."""
 
         async def app(scope: dict[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
             if scope["type"] != "http":
@@ -339,12 +363,24 @@ class Kairo:
                 if not m.get("more_body"):
                     break
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-            status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
+            if scope["path"].endswith("/tick"):
+                status, out = await self._handle_tick(scope["method"], headers.get("authorization"))
+            else:
+                status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
             data = json.dumps(out).encode()
             await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": data})
 
         return app
+
+    async def _handle_tick(self, method: str, authorization: str | None) -> tuple[int, Any]:
+        if not self._tick_secret or not self.suspend:
+            return 404, {"error": "no such path"}
+        if method not in ("GET", "POST"):
+            return 405, {"error": "GET or POST"}
+        if not hmac.compare_digest((authorization or "").encode(), f"Bearer {self._tick_secret}".encode()):
+            return 401, {"error": "bad token"}
+        return 200, {"next": await self.tick()}
 
     async def _handle(self, method: str, path: str, signature: str | None, body: bytes) -> tuple[int, Any]:
         if method != "POST":
@@ -362,6 +398,7 @@ class Kairo:
             await self.backend.complete(m["run_id"], m["act"], m["attempt"], _from_wire(m["result"]))
             if self.suspend:
                 await self._settle()
+                await self._wake_up()
             return 200, {"ok": True}
         if not path.endswith("/action"):
             return 404, {"error": "no such path"}
@@ -402,7 +439,10 @@ class Kairo:
         """Runs workflow name as execution id, or resumes it: calls that
         finished return their recorded results. Returns its result (suspend
         mode: raises Suspended when it waits)."""
-        return await self._run_as(name, input, id or str(uuid.uuid4()))
+        try:
+            return await self._run_as(name, input, id or str(uuid.uuid4()))
+        finally:
+            await self._wake_up()
 
     async def signal(self, id: str, name: str, payload: Any = None) -> None:
         """Sends a signal to the first wait for it in workflow id that has not received one."""
@@ -423,6 +463,7 @@ class Kairo:
             await self.backend.signal(run_id, name, payload)
             if self.suspend:
                 await self._settle()
+                await self._wake_up()
             return
 
     async def cancel(self, id: str) -> None:
@@ -498,6 +539,22 @@ class Kairo:
         if r.get("status") != "completed":
             raise RuntimeError(f"call {run_id} {r.get('status')}: {r.get('error', '')}")
         return r.get("output")
+
+
+def tick_handler(make: Callable[[], Awaitable[Kairo]]) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """A function's entry for a scheduler that calls it, not over HTTP (e.g.
+    AWS Lambda from EventBridge Scheduler, ADR 0053): each call makes a
+    Kairo (started, suspend mode), ticks, and closes it. Returns when
+    something is next to do. (Lambda: ``asyncio.run(handler())``.)"""
+
+    async def handler(*_: Any) -> dict[str, Any]:
+        k = await make()
+        try:
+            return {"next": await k.tick()}
+        finally:
+            await k.close()
+
+    return handler
 
 
 async def _await(a: Awaitable[Any]) -> Any:

@@ -4,7 +4,7 @@
 // function again with the same workflow id returns the calls that
 // finished, and runs nothing twice.
 
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { HttpBackend, type Backend } from './backend.ts';
 import { SignatureError, checkURL, post, sign, verify } from './http.ts';
@@ -74,6 +74,17 @@ export interface KairoOptions {
 	 * Cloudflare's waitUntil): used for async actions served by fetchHandler.
 	 */
 	waitUntil?: (p: Promise<unknown>) => void;
+	/**
+	 * Suspend mode (ADR 0053): the bearer token a scheduler calls
+	 * fetchHandler's /tick with. Without it, /tick is not served.
+	 */
+	tickSecret?: string;
+	/**
+	 * Suspend mode (ADR 0053): told, before run, tick, signal and callbacks
+	 * return, when something is next to do (unix ms): schedule a one-off
+	 * call of /tick (or tick()) then, instead of polling.
+	 */
+	wake?: (at: number) => Promise<void>;
 }
 
 /** The workflow ran into a call whose result kairo no longer keeps. */
@@ -87,6 +98,29 @@ const PLAN_CALL = 'kairo.call/';
 const PLAN_WAIT = 'kairo.wait/';
 const PLAN_WORKFLOW = 'kairo.workflow';
 const BUILTIN = { now: 'kairo.now', random: 'kairo.random', sleep: 'kairo.sleep' };
+
+/** Whether header is "Bearer <token>", compared in constant time. */
+function bearer(header: string | null, token: string): boolean {
+	const digest = (s: string) => createHash('sha256').update(s).digest();
+	return timingSafeEqual(digest(header ?? ''), digest(`Bearer ${token}`));
+}
+
+/**
+ * A function's entry for a scheduler that calls it, not over HTTP (e.g.
+ * AWS Lambda from EventBridge Scheduler, ADR 0053): each call makes a
+ * Kairo (started, suspend mode), ticks, and closes it. Returns when
+ * something is next to do.
+ */
+export function tickHandler(make: () => Promise<Kairo>): () => Promise<{ next: number | null }> {
+	return async () => {
+		const k = await make();
+		try {
+			return { next: await k.tick() };
+		} finally {
+			await k.close();
+		}
+	};
+}
 
 /** A result as actions over HTTP(S) send it (ADR 0052). */
 interface Wire {
@@ -193,11 +227,21 @@ export class Kairo {
 	/**
 	 * Suspend mode: takes up due timers and steps whose process stopped,
 	 * drives on the workflows whose calls settle, and returns once that is
-	 * done (call it from a scheduler).
+	 * done (call it from a scheduler). Returns when something is next to
+	 * do (unix ms), or null.
 	 */
-	async tick(): Promise<void> {
+	async tick(): Promise<number | null> {
 		await this.backend.tick?.();
 		await this.settle();
+		return this.wakeUp();
+	}
+
+	/** Suspend mode: tells wake when something is next to do (ADR 0053); returns it. */
+	private async wakeUp(): Promise<number | null> {
+		if (!this.suspend) return null;
+		const at = (await this.backend.nextWake?.()) ?? null;
+		if (at !== null) await this.opts.wake?.(at);
+		return at;
 	}
 
 	/** Returns once the work started here and the workflows driven on are done. */
@@ -303,11 +347,19 @@ export class Kairo {
 	 * Serves actions called over HTTP(S) and takes their outcomes (ADR
 	 * 0052), as a fetch-style handler: POST <base>/action runs an action's
 	 * handler here; POST <base>/callback applies an outcome to its run.
-	 * Both are signed with secret.
+	 * Both are signed with secret. GET or POST <base>/tick, with
+	 * "Authorization: Bearer <tickSecret>", is a scheduler's tick (ADR
+	 * 0053): it answers {"next": <unix ms> | null}.
 	 */
 	fetchHandler(): (req: Request) => Promise<Response> {
 		const json = (status: number, v: unknown) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } });
 		return async (req) => {
+			if (new URL(req.url).pathname.endsWith('/tick')) {
+				if (!this.opts.tickSecret || !this.suspend) return json(404, { error: 'no such path' });
+				if (req.method !== 'GET' && req.method !== 'POST') return json(405, { error: 'GET or POST' });
+				if (!bearer(req.headers.get('authorization'), this.opts.tickSecret)) return json(401, { error: 'bad token' });
+				return json(200, { next: await this.tick() });
+			}
 			if (req.method !== 'POST') return json(405, { error: 'POST only' });
 			if (!this.opts.secret) return json(500, { error: 'no secret configured' });
 			const body = await req.text();
@@ -322,7 +374,10 @@ export class Kairo {
 			if (path.endsWith('/callback')) {
 				if (!this.backend.complete) return json(501, { error: 'no embedded runtime here' });
 				await this.backend.complete(m.run_id, m.act, m.attempt, fromWire(m.result));
-				if (this.suspend) await this.settle();
+				if (this.suspend) {
+					await this.settle();
+					await this.wakeUp();
+				}
 				return json(200, { ok: true });
 			}
 			if (!path.endsWith('/action')) return json(404, { error: 'no such path' });
@@ -353,7 +408,11 @@ export class Kairo {
 	 * finished return their recorded results. Returns its result.
 	 */
 	async run<O = any>(name: string, input: unknown, opts: { id?: string } = {}): Promise<O> {
-		return (await this.runAs(name, input, opts.id ?? randomUUID())) as O;
+		try {
+			return (await this.runAs(name, input, opts.id ?? randomUUID())) as O;
+		} finally {
+			await this.wakeUp();
+		}
 	}
 
 	/** Sends a signal to the first wait for it in workflow id that has not received one. */
@@ -371,7 +430,10 @@ export class Kairo {
 			}
 			if (finished(r)) continue;
 			await this.backend.signal(runId, name, payload);
-			if (this.suspend) await this.settle();
+			if (this.suspend) {
+				await this.settle();
+				await this.wakeUp();
+			}
 			return;
 		}
 	}

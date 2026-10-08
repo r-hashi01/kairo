@@ -404,6 +404,10 @@ class Embedded:
             return
         await self._process(run_id, [_outcome(res, c["act"], c.get("attempt", 0), self.now())])
 
+    async def next_wake(self) -> int | None:
+        """When something is next to do: the earliest timer or lease expiry (ADR 0053)."""
+        return await self.store.next_wake()
+
     async def complete(self, run_id: str, act: int, attempt: int, res: Result) -> None:
         """Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored."""
         await self._process(run_id, [_outcome(res, act, attempt, self.now())])

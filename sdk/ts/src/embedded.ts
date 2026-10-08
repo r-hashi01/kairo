@@ -372,6 +372,11 @@ export class Embedded {
 		await this.process(runId, [outcome(res, c.act!, c.attempt ?? 0, this.now())]);
 	}
 
+	/** When something is next to do: the earliest timer or lease expiry (ADR 0053). */
+	nextWake(): Promise<number | null> {
+		return this.store.nextWake();
+	}
+
 	/** Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored. */
 	async complete(runId: string, act: number, attempt: number, res: Result): Promise<void> {
 		await this.process(runId, [outcome(res, act, attempt, this.now())]);

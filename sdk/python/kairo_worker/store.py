@@ -73,11 +73,21 @@ class Store(Protocol):
     async def expired_leases(self, now: int, limit: int) -> list[LeaseRow]: ...
     async def renew_leases(self, owner: str, until: int) -> None: ...
     async def expire_leases(self, owner: str, now: int) -> None: ...
+    async def next_wake(self) -> int | None:
+        """When something is next to do (ADR 0053): the earliest timer, or the
+        earliest lease to expire; None if neither."""
+        ...
     async def hand_over(self, lease: LeaseRow) -> None:
         """Hands a step's lease to lease.owner until lease.until (ADR 0052: the
         step runs elsewhere). Nothing if the lease is gone: its outcome is in."""
         ...
     async def close(self) -> None: ...
+
+
+def _earliest(*ts: Any) -> int | None:
+    """The earliest of times as the database gives them (None for none)."""
+    vs = [int(t) for t in ts if t is not None]
+    return min(vs) if vs else None
 
 
 def _prefix(p: str) -> str:
@@ -197,6 +207,12 @@ class SQLiteStore:
         assert self.db is not None
         self.db.execute(f"UPDATE {self.p}lease SET until = ? WHERE owner = ?", (now - 1, owner))
 
+    async def next_wake(self) -> int | None:
+        assert self.db is not None
+        t = self.db.execute(f"SELECT MIN(at) FROM {self.p}timer").fetchone()[0]
+        l = self.db.execute(f"SELECT MIN(until) FROM {self.p}lease").fetchone()[0]
+        return _earliest(t, l)
+
     async def hand_over(self, lease: LeaseRow) -> None:
         assert self.db is not None
         self.db.execute(
@@ -284,6 +300,11 @@ class PostgresStore:
 
     async def expire_leases(self, owner: str, now: int) -> None:
         await self._exec(f"UPDATE {self.p}lease SET until = %s WHERE owner = %s", (now - 1, owner))
+
+    async def next_wake(self) -> int | None:
+        t = await self._exec(f"SELECT MIN(at) FROM {self.p}timer")
+        l = await self._exec(f"SELECT MIN(until) FROM {self.p}lease")
+        return _earliest(t[0][0] if t else None, l[0][0] if l else None)
 
     async def hand_over(self, lease: LeaseRow) -> None:
         await self._exec(

@@ -80,3 +80,22 @@ SDK に、スケジューラーから呼ばれる入口を 1 つと、「次に�
 - **サービスごとの差し込み（EventBridge、Cloud Tasks、QStash）を SDK に入れる:** それぞれの SDK への依存が増え、本体を依存なしに保てない。必要なら、別のパッケージとして足せる（ADR 0018 の考え方）。
 - **`wake` を、タイマーを仕掛けるたびに呼ぶ:** 1 回の処理でタイマーが何度も仕掛けられ、予約の数が増える。戻る前に、全体で一番早い時刻を 1 回だけ知らせれば足りる。
 - **`/tick` にも本文の署名を求める:** スケジューラーは、決まったヘッダーは付けられるが、本文に HMAC を付けられない。
+
+## 実装で詰めた詳細（2026-10-08 追記、ADR 0017）
+
+TypeScript（`sdk/ts/src/workflow.ts`、`embedded.ts`、`store.ts`、`backend.ts`）と Python（`sdk/python/kairo_worker/` の同名のファイル）に入れた。依存は足していない。
+
+- **`tick()` の戻り値:** `tick()` は、次に起こす時刻（unix ms、なければ `null` / `None`）を返すようにした。`/tick` の応答の `next` と、`tickHandler` の戻り値は、これをそのまま使う。wait モードでは常に `null` を返す。
+- **`/tick` を開く条件:** `tickSecret` があり、かつ suspend モードのときだけ開く。どちらかが欠けていれば `404` を返す。
+  - トークンの比較: TypeScript は両方を SHA-256 にしてから `timingSafeEqual` で比べる（長さの違いで例外にならないようにするため）。Python は `hmac.compare_digest` で比べる。
+- **`wake` を呼ぶ場所:**
+  - `run()`: 戻るときに呼ぶ。`Suspended` で戻るときも、終わって戻るときも呼ぶ（`finally`）。
+  - `tick()`、`signal()`、`/callback`: 処理の後で呼ぶ。
+  - ワークフローを動かし直す内部の処理（`redrive`）では呼ばない。外から呼ばれた処理が戻るときに、1 回だけ呼ぶ。
+  - `wake` が例外を投げた場合は、そのまま呼び出し元に返す（予約に失敗したことを隠さない）。
+- **`nextWake()` の問い合わせ:** `SELECT MIN(at)` と `SELECT MIN(until)` の 2 本にした。PostgreSQL は `bigint` を文字列で返すことがあるので、数に直してから比べる。
+- **サービスごとの例:** 「SDK の README」とした置き場所は、SDK に README がまだないため、`docs/serverless.md` にした。Vercel（Next.js と Vercel Cron）、AWS Lambda と EventBridge Scheduler（`at()` の一度きりの予約と rate 式）、Python の ASGI（FastAPI へのマウント）、Cloud Tasks、QStash の例を載せた。
+- **テスト:** `sdk/ts/src/schedule.test.ts` と `sdk/python/tests/test_schedule.py`（それぞれ 3 件）。
+  - `/tick`: トークンなしと違うトークンは `401`。時刻の前に呼ぶと何もせず、同じ時刻を返す。時刻の後に呼ぶとワークフローが進み、`{"next": null}` を返す。`tickSecret` がなければ `404`。
+  - `nextWake()`: 何もなければ null。タイマーと借用の早い方を返し、借用が終われば次の時刻に戻る。PostgreSQL での動きも、両方の言語で手元で確かめた。
+  - `wake`: `sleep` を 2 回含むワークフローを、`wake` が知らせた時刻にだけ `tickHandler` を呼んで（毎回新しいプロセスとして）最後まで動かせる。起きた回数は 2 回。
