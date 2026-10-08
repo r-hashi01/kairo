@@ -443,15 +443,20 @@ export class Kairo {
 		await this.backend.cancel(id);
 	}
 
-	private async runAs(name: string, input: unknown, id: string, parent?: AbortSignal): Promise<unknown> {
+	private async runAs(name: string, input: unknown, id: string, parent?: AbortSignal, parentId?: string): Promise<unknown> {
 		const fn = this.workflows.get(name);
 		if (!fn) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
-		const started = await this.backend.run(PLAN_WORKFLOW, { workflow: name, input: input ?? null }, { runId: id, vars: { started_at: Date.now() } });
+		const started = await this.backend.run(
+			PLAN_WORKFLOW,
+			{ workflow: name, input: input ?? null },
+			{ runId: id, vars: { started_at: Date.now() }, ...(parentId ? { parent: parentId } : {}) },
+		);
 		const info = await this.backend.get(id);
 		if (finished(info)) return done(id, info);
-		if (started.existing) {
+		if (started.existing && !this.backend.keepsCalls) {
 			// Resuming: the calls' records must still be there (ADR 0049).
+			// (The embedded runtime keeps them while the workflow runs, ADR 0054.)
 			const at = Number((info.vars as { started_at?: number } | undefined)?.started_at ?? 0);
 			const ttl = this.opts.idempotencyTTL ?? 24 * 3600 * 1000;
 			if (at > 0 && Date.now() - at > ttl) {
@@ -489,9 +494,10 @@ export class Kairo {
 	}
 
 	/** One call: a run of its own, found again by its id. */
-	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, signal: AbortSignal): Promise<unknown> {
+	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, signal: AbortSignal, parent: string): Promise<unknown> {
 		if (root) await this.plan(plan, root);
-		await this.backend.run(plan, { in: input }, { runId });
+		// Kept and removed with the workflow that makes it (ADR 0054).
+		await this.backend.run(plan, { in: input }, { runId, parent });
 		let r: RunInfo;
 		if (this.suspend) {
 			// Whatever this process can do for the call is done once it is
@@ -515,8 +521,8 @@ export class Kairo {
 		return r.output;
 	}
 
-	async childWorkflow(name: string, input: unknown, id: string, signal: AbortSignal): Promise<unknown> {
-		return this.runAs(name, input, id, signal);
+	async childWorkflow(name: string, input: unknown, id: string, signal: AbortSignal, parent: string): Promise<unknown> {
+		return this.runAs(name, input, id, signal, parent);
 	}
 }
 
@@ -564,7 +570,7 @@ export class Context {
 	/** Runs action with input (once, however often the workflow runs again). */
 	async call<O = any>(action: string, input: unknown = null): Promise<O> {
 		const id = this.next(PLAN_CALL + action, input);
-		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this.signal)) as O;
+		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this.signal, this.id)) as O;
 	}
 
 	/** Runs the calls at once; their results in order. */
@@ -575,7 +581,7 @@ export class Context {
 	/** Waits for signal name (see Kairo.signal); returns its payload. */
 	async waitFor<P = any>(name: string): Promise<P> {
 		const id = this.next(PLAN_WAIT + name, null);
-		const out = (await this.k.callRun(PLAN_WAIT + name, waitRoot(name), null, id, this.signal)) as {
+		const out = (await this.k.callRun(PLAN_WAIT + name, waitRoot(name), null, id, this.signal, this.id)) as {
 			payload: P;
 		};
 		return out.payload;
@@ -599,6 +605,6 @@ export class Context {
 	/** Runs workflow name as a child of this one. */
 	async workflow<O = any>(name: string, input: unknown = null): Promise<O> {
 		const id = this.next('kairo.workflow/' + name, input);
-		return (await this.k.childWorkflow(name, input, id, this.signal)) as O;
+		return (await this.k.childWorkflow(name, input, id, this.signal, this.id)) as O;
 	}
 }

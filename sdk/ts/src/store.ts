@@ -19,6 +19,8 @@ export interface RunRow {
 	seq: number;
 	createdAt: number;
 	updatedAt: number;
+	/** The run that made this one (a workflow, of its calls): removed with it (ADR 0054). */
+	parent: string | null;
 }
 
 /** A step dispatched to a process, held while it runs (ADR 0051). */
@@ -68,6 +70,13 @@ export interface Store {
 	 * earliest lease to expire; null if neither.
 	 */
 	nextWake(): Promise<number | null>;
+	/**
+	 * Removes finished trees of runs (ADR 0054): a run with no parent (or
+	 * whose parent is gone) that finished before cutoff, with every run
+	 * under it, finished or not, and their events, timers and leases. One
+	 * transaction per tree; at most limit trees. Returns how many.
+	 */
+	removeFinished(cutoff: number, limit: number): Promise<number>;
 	/** Extends owner's leases to until. */
 	renewLeases(owner: string, until: number): Promise<void>;
 	/**
@@ -98,6 +107,28 @@ const DDL = (p: string, blob: string, big: string) => [
 	`CREATE INDEX IF NOT EXISTS ${p}lease_owner ON ${p}lease (owner)`,
 ];
 
+/** After the tables (and the parent column, added to older ones): the indexes for removal (ADR 0054). */
+const DDL_REMOVAL = (p: string) => [
+	`CREATE INDEX IF NOT EXISTS ${p}run_parent ON ${p}run (parent)`,
+	`CREATE INDEX IF NOT EXISTS ${p}run_done ON ${p}run (updated_at) WHERE status IN ${DONE_SQL}`,
+];
+
+const DONE_SQL = `('completed', 'failed', 'cancelled')`;
+
+/** Roots of finished trees: no parent, or its parent gone (oldest first). */
+const ROOTS = (p: string, at: string, lim: string) =>
+	`SELECT id FROM ${p}run r WHERE status IN ${DONE_SQL} AND updated_at < ${at}
+	 AND (parent IS NULL OR NOT EXISTS (SELECT 1 FROM ${p}run x WHERE x.id = r.parent)) ORDER BY updated_at LIMIT ${lim}`;
+
+/** Whether run id is (still) the root of a finished tree. */
+const IS_ROOT = (p: string, id: string, at: string) =>
+	`SELECT 1 AS ok FROM ${p}run r WHERE id = ${id} AND status IN ${DONE_SQL} AND updated_at < ${at}
+	 AND (parent IS NULL OR NOT EXISTS (SELECT 1 FROM ${p}run x WHERE x.id = r.parent))`;
+
+/** The ids of a tree: its root and every run under it. */
+const TREE = (p: string, root: string) =>
+	`WITH RECURSIVE tree(id) AS (SELECT ${root} UNION SELECT r.id FROM ${p}run r JOIN tree t ON r.parent = t.id) SELECT id FROM tree`;
+
 function checkPrefix(p: string): string {
 	if (!/^[a-z][a-z0-9_]{0,30}$/.test(p)) throw new Error(`table prefix ${p}: letters, digits and _ only`);
 	return p;
@@ -125,11 +156,14 @@ export class SQLiteStore implements Store {
 		if (this.path !== ':memory:') this.db.exec('PRAGMA journal_mode=WAL');
 		this.db.exec(`PRAGMA synchronous=${this.sync}`);
 		for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
+		const cols = this.db.prepare(`PRAGMA table_info(${this.p}run)`).all() as { name: string }[];
+		if (!cols.some((c) => c.name === 'parent')) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN parent TEXT`);
+		for (const q of DDL_REMOVAL(this.p)) this.db.exec(q);
 		const p = this.p;
 		this.q = {
 			get: this.db.prepare(`SELECT * FROM ${p}run WHERE id = ?`),
-			put: this.db.prepare(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status,
+			put: this.db.prepare(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status,
 				output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`),
 			event: this.db.prepare(`INSERT INTO ${p}event (run, seq, body) VALUES (?, ?, ?)`),
 			setTimer: this.db.prepare(`INSERT INTO ${p}timer (run, timer, act, at) VALUES (?, ?, ?, ?) ON CONFLICT (run, timer) DO UPDATE SET at = excluded.at`),
@@ -146,13 +180,39 @@ export class SQLiteStore implements Store {
 			nextTimer: this.db.prepare(`SELECT MIN(at) AS t FROM ${p}timer`),
 			nextLease: this.db.prepare(`SELECT MIN(until) AS t FROM ${p}lease`),
 			handOver: this.db.prepare(`UPDATE ${p}lease SET owner = ?, until = ? WHERE run = ? AND act = ? AND attempt = ?`),
+			roots: this.db.prepare(ROOTS(p, '?', '?')),
+			isRoot: this.db.prepare(IS_ROOT(p, '?', '?')),
+			rmEvents: this.db.prepare(`DELETE FROM ${p}event WHERE run IN (${TREE(p, '?')})`),
+			rmTimers: this.db.prepare(`DELETE FROM ${p}timer WHERE run IN (${TREE(p, '?')})`),
+			rmLeases: this.db.prepare(`DELETE FROM ${p}lease WHERE run IN (${TREE(p, '?')})`),
+			rmRuns: this.db.prepare(`DELETE FROM ${p}run WHERE id IN (${TREE(p, '?')})`),
 		};
 	}
 
 	private row(r: any): RunRow | undefined {
 		if (!r) return undefined;
 		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
-			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at) };
+			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null };
+	}
+
+	async removeFinished(cutoff: number, limit: number): Promise<number> {
+		let n = 0;
+		for (const { id } of this.q.roots.all(cutoff, limit) as { id: string }[]) {
+			this.db.exec('BEGIN IMMEDIATE');
+			try {
+				// Still a finished root (not resubmitted, not removed by another process)?
+				if (this.q.isRoot.get(id, cutoff)) {
+					// The tree's rows first, the runs (which the tree is found by) last.
+					for (const q of [this.q.rmEvents, this.q.rmTimers, this.q.rmLeases, this.q.rmRuns]) q.run(id);
+					n++;
+				}
+				this.db.exec('COMMIT');
+			} catch (e) {
+				this.db.exec('ROLLBACK');
+				throw e;
+			}
+		}
+		return n;
 	}
 
 	async withRun<T>(id: string, fn: (row: RunRow | undefined) => Changes<T>): Promise<T> {
@@ -166,7 +226,7 @@ export class SQLiteStore implements Store {
 			for (const ev of c.events) this.q.event.run(id, seq++, JSON.stringify(ev));
 			if (c.row) {
 				const r = c.row;
-				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt);
+				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent);
 			}
 			if (c.clearTimers) {
 				this.q.clearTimers.run(id);
@@ -252,12 +312,42 @@ export class PostgresStore implements Store {
 
 	async init(): Promise<void> {
 		for (const q of DDL(this.p, 'BYTEA', 'BIGINT')) await this.pool.query(q);
+		await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS parent TEXT`);
+		for (const q of DDL_REMOVAL(this.p)) await this.pool.query(q);
+	}
+
+	async removeFinished(cutoff: number, limit: number): Promise<number> {
+		const p = this.p;
+		const roots = await this.pool.query(ROOTS(p, '$1', '$2'), [cutoff, limit]);
+		let n = 0;
+		for (const { id } of roots.rows as { id: string }[]) {
+			const c = await this.pool.connect();
+			try {
+				await c.query('BEGIN');
+				// Lock the root, then check it is still a finished root (not
+				// resubmitted, not removed by another process).
+				await c.query(`SELECT 1 FROM ${p}run WHERE id = $1 FOR UPDATE`, [id]);
+				const still = await c.query(IS_ROOT(p, '$1', '$2'), [id, cutoff]);
+				if (still.rows.length) {
+					for (const t of ['event', 'timer', 'lease']) await c.query(`DELETE FROM ${p}${t} WHERE run IN (${TREE(p, '$1::text')})`, [id]);
+					await c.query(`DELETE FROM ${p}run WHERE id IN (${TREE(p, '$1::text')})`, [id]);
+					n++;
+				}
+				await c.query('COMMIT');
+			} catch (e) {
+				await c.query('ROLLBACK').catch(() => {});
+				throw e;
+			} finally {
+				c.release();
+			}
+		}
+		return n;
 	}
 
 	private row(r: any): RunRow | undefined {
 		if (!r) return undefined;
 		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
-			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at) };
+			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null };
 	}
 
 	async withRun<T>(id: string, fn: (row: RunRow | undefined) => Changes<T>): Promise<T> {
@@ -273,10 +363,10 @@ export class PostgresStore implements Store {
 				const r = ch.row;
 				// A new run's row: two submissions racing for one id insert it
 				// once; the loser's insert fails and its transaction rolls back.
-				await c.query(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET state = excluded.state,
+				await c.query(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET state = excluded.state,
 					status = excluded.status, output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`,
-					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt]);
+					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent]);
 			}
 			if (ch.clearTimers) {
 				await c.query(`DELETE FROM ${p}timer WHERE run = $1`, [id]);

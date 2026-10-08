@@ -471,18 +471,19 @@ class Kairo:
         (suspend mode: it stops when it is driven next)."""
         await self.backend.cancel(id)
 
-    async def _run_as(self, name: str, input: Any, id: str) -> Any:
+    async def _run_as(self, name: str, input: Any, id: str, parent: str | None = None) -> Any:
         fn = self._workflows.get(name)
         if fn is None:
             raise KeyError(f"no workflow {name}")
         await self._plan_workflow()
         started = await self.backend.run(
-            PLAN_WORKFLOW, {"workflow": name, "input": input}, run_id=id, vars={"started_at": int(time.time() * 1000)}
+            PLAN_WORKFLOW, {"workflow": name, "input": input}, run_id=id, vars={"started_at": int(time.time() * 1000)}, parent=parent
         )
         info = await self.backend.get(id)
         if finished(info):
             return _done(id, info)
-        if started.get("existing"):
+        # (The embedded runtime keeps the calls while the workflow runs, ADR 0054.)
+        if started.get("existing") and not getattr(self.backend, "keeps_calls", False):
             at = int((info.get("vars") or {}).get("started_at") or 0)
             if at and time.time() * 1000 - at > self._ttl * 1000:
                 raise ResultLostError(f"workflow {id} started more than {self._ttl}s ago: its calls' records may be gone")
@@ -521,10 +522,11 @@ class Kairo:
         await self.backend.signal(id, "done", {"ok": True, "value": value})
         return value
 
-    async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str) -> Any:
+    async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
         if root is not None:
             await self._plan(plan, root)
-        await self.backend.run(plan, {"in": input}, run_id=run_id)
+        # Kept and removed with the workflow that makes it (ADR 0054).
+        await self.backend.run(plan, {"in": input}, run_id=run_id, parent=parent)
         if self.suspend:
             # Whatever this process can do for the call is done once it is
             # idle; a call still going then waits for a timer or a signal.
@@ -609,7 +611,7 @@ class Context:
 
     async def _run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str) -> Any:
         try:
-            return await self._k._call_run(plan, root, input, run_id)
+            return await self._k._call_run(plan, root, input, run_id, self.id)
         except asyncio.CancelledError:
             # The workflow was cancelled: so is the call (unless this process
             # is stopping, and the call goes on in kairo).
@@ -644,4 +646,4 @@ class Context:
 
     async def workflow(self, name: str, input: Any = None) -> Any:
         """Runs workflow name as a child of this one."""
-        return await self._k._run_as(name, input, self._next("kairo.workflow/" + name, input))
+        return await self._k._run_as(name, input, self._next("kairo.workflow/" + name, input), self.id)

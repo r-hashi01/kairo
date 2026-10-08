@@ -39,6 +39,25 @@ export interface EmbeddedOptions {
 	 * stopped when it opens, without waiting for the leases to expire.
 	 */
 	owner?: string;
+	/**
+	 * How long a finished tree of runs is kept before tick removes it (ms;
+	 * ADR 0054). Infinity keeps it. Default: KAIRO_KEEP_FINISHED ("30m",
+	 * "24h", "7d", "forever"), or 24 hours.
+	 */
+	keepFinished?: number;
+}
+
+/** Finished trees removed per tick at most (ADR 0054); the rest next time. */
+const REMOVE_PER_TICK = 100;
+
+/** keepFinished from the options, or KAIRO_KEEP_FINISHED, or 24 hours (ADR 0054). */
+export function keepFinished(opt: number | undefined, env = process.env.KAIRO_KEEP_FINISHED): number {
+	if (opt !== undefined) return opt;
+	if (!env) return 24 * 3600 * 1000;
+	if (env === 'forever') return Infinity;
+	const m = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/.exec(env);
+	if (!m) throw new Error(`KAIRO_KEEP_FINISHED=${env}: a duration such as 30m, 24h, 7d, or forever`);
+	return Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as 'ms' | 's' | 'm' | 'h' | 'd'];
 }
 
 const DONE = new Set(['completed', 'failed', 'cancelled']);
@@ -62,6 +81,7 @@ export class Embedded {
 	private closed = false;
 	readonly owner: string;
 	private readonly leaseMs: number;
+	private readonly keepMs: number;
 	private renewal?: ReturnType<typeof setInterval>;
 	private lastSweep = 0;
 	private unlisten?: () => Promise<void>;
@@ -72,6 +92,7 @@ export class Embedded {
 		this.now = opts.now ?? Date.now;
 		this.owner = opts.owner ?? randomUUID();
 		this.leaseMs = opts.leaseMs ?? 30_000;
+		this.keepMs = keepFinished(opts.keepFinished);
 	}
 
 	static async open(opts: EmbeddedOptions): Promise<Embedded> {
@@ -119,14 +140,19 @@ export class Embedded {
 
 	/**
 	 * Starts a run of plan, or finds it: a run id is an idempotency key, and
-	 * a run that exists (running or finished) is not started again.
+	 * a run that exists (running or finished) is not started again. parent:
+	 * the run that makes this one, which it is kept and removed with (ADR 0054).
 	 */
-	async run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown> }): Promise<{ run_id: string; existing: boolean }> {
+	async run(
+		plan: string,
+		input: unknown,
+		opts: { runId: string; vars?: Record<string, unknown>; parent?: string },
+	): Promise<{ run_id: string; existing: boolean }> {
 		const p = this.plans.get(plan);
 		if (!p) throw new KairoError(404, `no plan ${plan}`);
 		const at = this.now();
 		const ev: CoreEvent = { kind: 'start', at, data: input ?? null, ...(opts.vars ? { vars: opts.vars } : {}) };
-		const existing = await this.process(opts.runId, [ev], { plan: p, at });
+		const existing = await this.process(opts.runId, [ev], { plan: p, at, parent: opts.parent });
 		return { run_id: opts.runId, existing };
 	}
 
@@ -180,6 +206,8 @@ export class Embedded {
 		this.lastSweep = this.now();
 		for (const l of await this.store.expiredLeases(this.now(), 1000)) await this.recover(l).catch(skipUnknownPlan);
 		for (const t of await this.store.dueTimers(this.now(), 1000)) await this.fire(t).catch(skipUnknownPlan);
+		// Finished trees past the time they are kept (ADR 0054).
+		if (Number.isFinite(this.keepMs)) await this.store.removeFinished(this.now() - this.keepMs, REMOVE_PER_TICK);
 	}
 
 	/** The process that ran l's step stopped: its outcome is unknown. */
@@ -227,7 +255,7 @@ export class Embedded {
 	 * commands. With start, a new run of that plan (or the existing one: the
 	 * answer says which).
 	 */
-	private async process(runId: string, events: CoreEvent[], start?: { plan: Compiled; at: number }): Promise<boolean> {
+	private async process(runId: string, events: CoreEvent[], start?: { plan: Compiled; at: number; parent?: string }): Promise<boolean> {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
@@ -268,6 +296,7 @@ export class Embedded {
 				seq: 0, // set by the store
 				createdAt: row?.createdAt ?? at,
 				updatedAt: at,
+				parent: row ? row.parent : (start?.parent ?? null),
 			};
 			const setTimers: TimerRow[] = [];
 			const deleteTimers: number[] = [];

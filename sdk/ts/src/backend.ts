@@ -12,7 +12,10 @@ export interface Backend {
 	start(specs: NodeSpec[], serve: ActionHandler): Promise<void>;
 	registerPlan(definition: { name: string; [k: string]: unknown }): Promise<void>;
 	/** Starts a run, or finds it: the run id is an idempotency key. Runs are durable. */
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown> }): Promise<{ run_id: string; existing: boolean }>;
+	/** parent: the run that makes this one (the embedded runtime keeps and removes them together, ADR 0054). */
+	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }): Promise<{ run_id: string; existing: boolean }>;
+	/** Keeps a workflow's calls while it runs, however long (the embedded runtime, ADR 0054). */
+	readonly keepsCalls?: boolean;
 	/** Throws KairoError 404 for a run that does not exist. */
 	get(runId: string): Promise<RunInfo>;
 	wait(runId: string, signal?: AbortSignal): Promise<RunInfo>;
@@ -78,7 +81,7 @@ export class HttpBackend implements Backend {
 		await this.client.registerPlan(definition);
 	}
 
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown> }) {
+	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }) {
 		return this.client.run(plan, input, { runId: opts.runId, tier: 'file', vars: opts.vars });
 	}
 
@@ -125,7 +128,9 @@ export class EmbeddedBackend implements Backend {
 		this.runtime.registerPlan(definition);
 	}
 
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown> }) {
+	readonly keepsCalls = true;
+
+	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }) {
 		return this.runtime.run(plan, input, opts);
 	}
 

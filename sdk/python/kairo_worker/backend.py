@@ -25,8 +25,12 @@ class Backend(Protocol):
 
     async def register_plan(self, definition: dict[str, Any]) -> None: ...
 
-    async def run(self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Starts a run, or finds it: the run id is an idempotency key. Runs are durable."""
+    async def run(
+        self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
+    ) -> dict[str, Any]:
+        """Starts a run, or finds it: the run id is an idempotency key. Runs are durable.
+        parent: the run that makes this one (the embedded runtime keeps and
+        removes them together, ADR 0054)."""
         ...
 
     async def get(self, run_id: str) -> dict[str, Any]:
@@ -77,7 +81,9 @@ class HttpBackend:
     async def register_plan(self, definition: dict[str, Any]) -> None:
         await asyncio.to_thread(self.client.register_plan, definition)
 
-    async def run(self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def run(
+        self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
+    ) -> dict[str, Any]:
         return await asyncio.to_thread(lambda: self.client.run(plan, input, run_id=run_id, tenant=self._tenant, tier="file", vars=vars))
 
     async def get(self, run_id: str) -> dict[str, Any]:
@@ -118,8 +124,13 @@ class EmbeddedBackend:
     async def register_plan(self, definition: dict[str, Any]) -> None:
         self.runtime.register_plan(definition)
 
-    async def run(self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None) -> dict[str, Any]:
-        return await self.runtime.run(plan, input, run_id=run_id, vars=vars)
+    #: Keeps a workflow's calls while it runs, however long (ADR 0054).
+    keeps_calls = True
+
+    async def run(
+        self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
+    ) -> dict[str, Any]:
+        return await self.runtime.run(plan, input, run_id=run_id, vars=vars, parent=parent)
 
     async def get(self, run_id: str) -> dict[str, Any]:
         return await self.runtime.get(run_id)

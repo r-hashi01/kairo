@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -37,6 +39,26 @@ ActionHandler = Callable[[Task, TaskContext], Result]
 DONE = {"completed", "failed", "cancelled"}
 SETTLED = DONE | {"blocked"}  # will not go on by itself
 OUTCOMES = {"step_ok", "step_err", "step_wait"}
+
+
+#: Finished trees removed per tick at most (ADR 0054); the rest next time.
+REMOVE_PER_TICK = 100
+
+
+def keep_finished_ms(opt: float | None | str = "env", env: str | None = None) -> float | None:
+    """keep_finished from the options ("env": not given), or KAIRO_KEEP_FINISHED,
+    or 24 hours (ADR 0054). None: kept for ever."""
+    if opt != "env":
+        return opt  # type: ignore[return-value]
+    env = os.environ.get("KAIRO_KEEP_FINISHED") if env is None else env
+    if not env:
+        return 24 * 3600 * 1000
+    if env == "forever":
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)", env)
+    if not m:
+        raise ValueError(f"KAIRO_KEEP_FINISHED={env}: a duration such as 30m, 24h, 7d, or forever")
+    return float(m.group(1)) * {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}[m.group(2)]
 
 
 def _ms() -> int:
@@ -64,11 +86,16 @@ class Embedded:
         now: Callable[[], int] = _ms,
         lease_ms: int = 30_000,
         owner: str | None = None,
+        keep_finished: float | None | str = "env",
     ) -> None:
+        """keep_finished: how long a finished tree of runs is kept before tick
+        removes it (ms; ADR 0054); None keeps it. Default: KAIRO_KEEP_FINISHED
+        ("30m", "24h", "7d", "forever"), or 24 hours."""
         self.core = Core(wasm)
         self.store = store
         self.now = now
         self.lease_ms = lease_ms
+        self.keep_ms = keep_finished_ms(keep_finished)
         self.owner = owner or str(uuid.uuid4())
         self._named = owner is not None
         self.plans: dict[str, dict[str, Any]] = {}
@@ -116,8 +143,12 @@ class Embedded:
                 return
             await asyncio.gather(*pending, return_exceptions=True)
 
-    async def run(self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Starts a run of plan, or finds it: a run id is an idempotency key."""
+    async def run(
+        self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
+    ) -> dict[str, Any]:
+        """Starts a run of plan, or finds it: a run id is an idempotency key.
+        parent: the run that makes this one, which it is kept and removed with
+        (ADR 0054)."""
         p = self.plans.get(plan)
         if p is None:
             raise KairoError(404, f"no plan {plan}")
@@ -125,7 +156,7 @@ class Embedded:
         ev: dict[str, Any] = {"kind": "start", "at": at, "data": input}
         if vars:
             ev["vars"] = vars
-        existing = await self._process(run_id, [ev], start=p)
+        existing = await self._process(run_id, [ev], start=p, parent=parent)
         return {"run_id": run_id, "existing": existing}
 
     async def get(self, run_id: str) -> dict[str, Any]:
@@ -166,6 +197,9 @@ class Embedded:
             await _skip_unknown_plan(self._recover(lease))
         for t in await self.store.due_timers(self.now(), 1000):
             await _skip_unknown_plan(self._fire(t))
+        # Finished trees past the time they are kept (ADR 0054).
+        if self.keep_ms is not None:
+            await self.store.remove_finished(self.now() - self.keep_ms, REMOVE_PER_TICK)
 
     async def close(self) -> None:
         """Stops, as a process that stops: no new step starts, timers are
@@ -249,7 +283,9 @@ class Embedded:
     async def _fire(self, t: TimerRow) -> None:
         await self._process(t.run, [{"kind": "timer", "at": self.now(), "act": t.act, "timer": t.timer}])
 
-    async def _process(self, run_id: str, events: list[dict[str, Any]], start: dict[str, Any] | None = None) -> bool:
+    async def _process(
+        self, run_id: str, events: list[dict[str, Any]], start: dict[str, Any] | None = None, parent: str | None = None
+    ) -> bool:
         """Applies events to run_id in one transaction, then carries out the commands."""
 
         def change(row: RunRow | None) -> Changes[dict[str, Any]]:
@@ -304,6 +340,7 @@ class Embedded:
                 seq=0,
                 created_at=row.created_at if row is not None else at,
                 updated_at=at,
+                parent=row.parent if row is not None else parent,
             )
             settled = res["status"] in SETTLED and res["status"] != (row.status if row else None)
             ch: Changes[dict[str, Any]] = Changes(

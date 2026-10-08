@@ -31,6 +31,7 @@ class RunRow:
     seq: int  # events recorded so far
     created_at: int
     updated_at: int
+    parent: str | None = None  # the run that made this one: removed with it (ADR 0054)
 
 
 @dataclass
@@ -73,6 +74,12 @@ class Store(Protocol):
     async def expired_leases(self, now: int, limit: int) -> list[LeaseRow]: ...
     async def renew_leases(self, owner: str, until: int) -> None: ...
     async def expire_leases(self, owner: str, now: int) -> None: ...
+    async def remove_finished(self, cutoff: int, limit: int) -> int:
+        """Removes finished trees of runs (ADR 0054): a run with no parent (or
+        whose parent is gone) that finished before cutoff, with every run under
+        it, finished or not, and their events, timers and leases. One
+        transaction per tree; at most limit trees. Returns how many."""
+        ...
     async def next_wake(self) -> int | None:
         """When something is next to do (ADR 0053): the earliest timer, or the
         earliest lease to expire; None if neither."""
@@ -110,13 +117,48 @@ def _ddl(p: str, blob: str, big: str) -> list[str]:
     ]
 
 
-_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at"
+_DONE_SQL = "('completed', 'failed', 'cancelled')"
+
+
+def _ddl_removal(p: str) -> list[str]:
+    """After the tables (and the parent column, added to older ones): the indexes for removal (ADR 0054)."""
+    return [
+        f"CREATE INDEX IF NOT EXISTS {p}run_parent ON {p}run (parent)",
+        f"CREATE INDEX IF NOT EXISTS {p}run_done ON {p}run (updated_at) WHERE status IN {_DONE_SQL}",
+    ]
+
+
+def _roots(p: str, ph: str) -> str:
+    """Roots of finished trees: no parent, or its parent gone (oldest first)."""
+    return (f"SELECT id FROM {p}run r WHERE status IN {_DONE_SQL} AND updated_at < {ph} "
+            f"AND (parent IS NULL OR NOT EXISTS (SELECT 1 FROM {p}run x WHERE x.id = r.parent)) ORDER BY updated_at LIMIT {ph}")
+
+
+def _is_root(p: str, ph: str) -> str:
+    """Whether a run (first parameter) is (still) the root of a finished tree."""
+    return (f"SELECT 1 FROM {p}run r WHERE id = {ph} AND status IN {_DONE_SQL} AND updated_at < {ph} "
+            f"AND (parent IS NULL OR NOT EXISTS (SELECT 1 FROM {p}run x WHERE x.id = r.parent))")
+
+
+def _tree(p: str, ph: str) -> str:
+    """The ids of a tree: its root and every run under it."""
+    return f"WITH RECURSIVE tree(id) AS (SELECT {ph} UNION SELECT r.id FROM {p}run r JOIN tree t ON r.parent = t.id) SELECT id FROM tree"
+
+
+def _removals(p: str, ph: str) -> list[str]:
+    """A tree's rows: the runs (which the tree is found by) last."""
+    return [f"DELETE FROM {p}{t} WHERE run IN ({_tree(p, ph)})" for t in ("event", "timer", "lease")] + [
+        f"DELETE FROM {p}run WHERE id IN ({_tree(p, ph)})"
+    ]
+
+
+_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent"
 
 
 def _row(r: Any) -> RunRow | None:
     if r is None:
         return None
-    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]))
+    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11])
 
 
 class SQLiteStore:
@@ -139,6 +181,29 @@ class SQLiteStore:
         self.db.execute(f"PRAGMA synchronous={self.sync}")
         for q in _ddl(self.p, "BLOB", "INTEGER"):
             self.db.execute(q)
+        cols = [c[1] for c in self.db.execute(f"PRAGMA table_info({self.p}run)").fetchall()]
+        if "parent" not in cols:
+            self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN parent TEXT")
+        for q in _ddl_removal(self.p):
+            self.db.execute(q)
+
+    async def remove_finished(self, cutoff: int, limit: int) -> int:
+        db, p = self.db, self.p
+        assert db is not None
+        n = 0
+        for (id,) in db.execute(_roots(p, "?"), (cutoff, limit)).fetchall():
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                # Still a finished root (not resubmitted, not removed by another process)?
+                if db.execute(_is_root(p, "?"), (id, cutoff)).fetchone():
+                    for q in _removals(p, "?"):
+                        db.execute(q, (id,))
+                    n += 1
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return n
 
     async def with_run(self, id: str, fn: Callable[[RunRow | None], Changes[T]]) -> T:
         db, p = self.db, self.p
@@ -154,10 +219,10 @@ class SQLiteStore:
             if c.row is not None:
                 r = c.row
                 db.execute(
-                    f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET
+                    f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET
                     state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
                     seq = excluded.seq, updated_at = excluded.updated_at""",
-                    (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at),
+                    (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent),
                 )
             if c.clear:
                 db.execute(f"DELETE FROM {p}timer WHERE run = ?", (id,))
@@ -241,6 +306,25 @@ class PostgresStore:
     async def init(self) -> None:
         for q in _ddl(self.p, "BYTEA", "BIGINT"):
             await self._exec(q)
+        await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS parent TEXT")
+        for q in _ddl_removal(self.p):
+            await self._exec(q)
+
+    async def remove_finished(self, cutoff: int, limit: int) -> int:
+        p = self.p
+        n = 0
+        for (id,) in await self._exec(_roots(p, "%s"), (cutoff, limit)):
+            async with self.pool.connection() as conn:
+                async with conn.transaction():
+                    # Lock the root, then check it is still a finished root (not
+                    # resubmitted, not removed by another process).
+                    await conn.execute(f"SELECT 1 FROM {p}run WHERE id = %s FOR UPDATE", (id,))
+                    cur = await conn.execute(_is_root(p, "%s"), (id, cutoff))
+                    if await cur.fetchone():
+                        for q in _removals(p, "%s::text"):
+                            await conn.execute(q, (id,))
+                        n += 1
+        return n
 
     async def with_run(self, id: str, fn: Callable[[RunRow | None], Changes[T]]) -> T:
         p = self.p
@@ -256,10 +340,10 @@ class PostgresStore:
                 if c.row is not None:
                     r = c.row
                     await conn.execute(
-                        f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET
+                        f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET
                         state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
                         seq = excluded.seq, updated_at = excluded.updated_at""",
-                        (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at),
+                        (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent),
                     )
                 if c.clear:
                     await conn.execute(f"DELETE FROM {p}timer WHERE run = %s", (id,))
