@@ -76,16 +76,3 @@ jobs:
           for m in . $(find store executor -name go.mod -exec dirname {} \;); do
             echo "== $m"; (cd "$m" && "$(go env GOPATH)/bin/govulncheck" ./...)
           done
-
-  bench:
-    # Shared CI runners are noisy; the budgets are reported, not enforced.
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: '**/go.sum'
-      - name: non-functional budgets
-        run: scripts/bench.sh

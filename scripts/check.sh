@@ -87,7 +87,7 @@ fi
 # deletion shows up here instead of silently dropping coverage.
 step "invariants"
 go test -count=1 ./core -run '^(TestCoreIsPure|TestParallelJoinAnyOrder|TestSequence)$' -v 2>&1 | grep -E '^(--- |ok|FAIL)'
-go test -count=1 ./engine -run '^(TestNoGoroutinePerRun|TestIdleEngineDoesNotWake|TestRealCommandWaitsForDurableIntent|TestWaitingRunMemory|TestHandoffLatency)$' -v 2>&1 | grep -E '^(--- |ok|FAIL)|heap per|latency'
+go test -count=1 ./engine -run '^(TestNoGoroutinePerRun|TestIdleEngineDoesNotWake|TestRealCommandWaitsForDurableIntent|TestWaitingRunMemory)$' -v 2>&1 | grep -E '^(--- |ok|FAIL)|heap per'
 go test -count=1 ./wal -run '^TestFileSinkAppendOnly$' -v 2>&1 | grep -E '^(--- |ok|FAIL)'
 
 if [ "$race" = 1 ]; then

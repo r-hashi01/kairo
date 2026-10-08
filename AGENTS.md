@@ -69,14 +69,15 @@ kairo は Go 製の LLM ワークフローランタイムです。目標は「�
 scripts/check.sh           # 完了の条件：gofmt・vet・build・全テスト・不変条件テスト
 scripts/check.sh --race    # 並行処理（engine / sched / wal / protocol / live / mpsc）に触ったら必須
 scripts/check.sh --quick   # hook が使う軽量版
-scripts/bench.sh           # 性能予算（NFR）の判定。予算を超えると失敗する
+scripts/bench.sh           # 性能予算（NFR）の計測。予算と並べて表示するだけで、判定しない（ADR 0056）
 scripts/check-backends.sh  # SQL の保存先を、Docker の実データベースでテストする（postgres mysql tidb oracle）
 make check | race | bench | quick
 ```
 
 - **完了の条件は `scripts/check.sh` が通ることです。** 通らない状態で終わるなら、何が失敗していて、なぜ直せないのかを明記してください。
 - ホットパス（`core/`、`engine/shard.go`、`sched/dispatcher.go`、`wal/`、`mpsc/`、`timerwheel/`）を変えたら、`scripts/bench.sh` の前後の値を報告してください。
-- テストの閾値を緩めて通してはいけません。予算（`docs/runtime.ja.md` の非機能要件）は要件そのものです。
+- テストの閾値を緩めて通してはいけません。
+- 時間の予算（`docs/runtime.ja.md` の非機能要件）は要件そのものですが、テストでも CI でも判定しません（ADR 0056）。決まったマシンで `scripts/bench.sh` を測り、変更の前後で比べて確かめます。時間で合否を決めるテストは足しません。足したくなったら、数えられる性質（起きた回数、確保の回数、goroutine の数）で表せないかを先に考えます。
 - **実行 1 回あたりのコストは、その実行に要る仕事（ノードの実行・状態の耐久化・結果の記録）だけにします（ADR 0041）。** Dify との統合の側（`compat/`、Dify のブランチ）も同じです。
   - まれなこと（停止・human-input・タイムアウト）のコストは、起きたときにだけ払います。全実行が払う常駐のスレッド、ポーリング、対応表の書き込みを足しません。
   - データ（kairo → ワーカー → DB）と制御（停止・送信は API から kairo へ直接）の経路を分け、どちらも 1 本にします。1 つの実行の ID は 1 つにします。
@@ -108,7 +109,7 @@ make check | race | bench | quick
 - LSN は記録ごとには保存していません。セグメントのファイル名がその先頭の LSN を持ち、セグメント内は通し番号で決まります（ADR 0016）。エンジンは起動時に `Sink.Next()` から番号を引き継ぎます。
 - `EvIntent` は、実の命令を解放する前にシャードが適用してログに書くイベントです。
 - ブロブ化した出力は、状態の中では `{"$blob":..., "fields":{...}}` の形で持ちます。宣言済みの型付きフィールドは常に中身ごと残ります（`list` 型はサイズによらず残る）。
-- `TestHandoffLatency` など時間を測るテストは、マシンの負荷が高いと予算を超えて落ちることがあります。落ちたら `uptime` で負荷を確認し、負荷が高ければ時間をおいて再実行します。それでも毎回落ちるときや、変更前後で比べて悪化しているときだけ、劣化として調べます。閾値は緩めません。
+- `scripts/bench.sh` の値は、マシンと負荷で大きく変わります（GitHub の 4 vCPU のランナーでは、受け渡しの p99 が 0.5〜2.7ms だった。ADR 0056）。比べるのは、同じマシンで、負荷の低いときに測った値どうしだけです。出力の先頭の `== machine` の行で、マシンと負荷を確かめます。
 - macOS の `File.Sync` は `F_FULLFSYNC` なので、耐久性 ack の遅延は Linux の値と比べられません。
 - ログの圧縮判定はログが伸びたときにだけ走ります（`CompactEvery`）。仕事が止まっている間は、退役も進みません。
 - `Submit` は、開始が耐久化するまで返りません（ADR 0023）。RunID は冪等キーで、最近終わった ID の再投入は既存の実行として扱います。テストで ID だけ欲しいときは、各パッケージの `submit` 補助関数を使います。
@@ -129,7 +130,7 @@ make check | race | bench | quick
 - スキル：`/verify`（全検証）、`/bench`（性能予算）、`/core-change`（コアを変えるときのチェックリスト）、`/adr`（ADR の起票）
 - サブエージェント：`invariant-reviewer`（差分を、不変条件と ADR の観点でレビューする。読み取り専用）
 - `scripts/check.sh` は `scripts/adr-lint.sh` も実行します（ADR の番号の重複、必須セクション、索引漏れを検査する）。
-- CI：`.github/workflows/ci.yml`（check と race。bench は参考値として実行）
+- CI：`.github/workflows/ci.yml`（check と race、SQL の保存先、脆弱性検査）。性能の計測は CI では行いません（ADR 0056）
 - git hook：`make hooks` で有効化すると、pre-commit で `check.sh --quick` を走らせます。
 
 hook やテストを無効化して回避しないでください。誤検出だと思ったら、hook 側を直す変更として提案してください。

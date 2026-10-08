@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
-# Measures the non-functional budgets of the requirements and fails if one
-# is exceeded. Numbers depend on the machine; budgets are the targets of
-# the requirements (32-core server), so a laptop passing them has headroom.
+# Measures the non-functional budgets of the requirements and shows each
+# value next to its budget (ADR 0056). It judges nothing: the numbers depend
+# on the machine, so they are compared before and after a change on the
+# same machine. It fails only when a measurement could not be taken.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 fail=0
 check() { # name value budget unit
   if [ -z "$2" ]; then
-    printf '  OVER  %-40s %10s     (no measurement: the test failed)\n' "$1" "-"; fail=1; return
+    printf '  FAIL  %-40s %10s     (no measurement: the test failed)\n' "$1" "-"; fail=1; return
   fi
   if awk -v v="$2" -v b="$3" 'BEGIN{exit !(v<=b)}'; then
     printf '  ok    %-40s %10s %s  (budget %s)\n' "$1" "$2" "$4" "$3"
   else
-    printf '  OVER  %-40s %10s %s  (budget %s)\n' "$1" "$2" "$4" "$3"; fail=1
+    printf '  over  %-40s %10s %s  (budget %s)\n' "$1" "$2" "$4" "$3"
   fi
 }
+
+# The machine, so that numbers are compared only with numbers from the same.
+if [ "$(uname)" = Darwin ]; then
+  cpu=$(sysctl -n machdep.cpu.brand_string); cores=$(sysctl -n hw.ncpu)
+else
+  cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//'); cores=$(nproc)
+fi
+echo "== machine: $cpu, $cores CPUs, $(go env GOVERSION), load $(uptime | sed 's/.*load averages*: //')"
 metric() { # output metric-name -> value
   awk -v m="$2" '{for(i=1;i<NF;i++) if($(i+1)==m){print $i; exit}}' <<<"$1"
 }
@@ -29,7 +38,7 @@ check "runtime CPU per 5-node run" "$(metric "$out" cpu-µs/run)" 1000 µs
 echo "  info  throughput: $(metric "$out" runs/s) runs/s"
 
 # Timing tests fail when over budget; keep going and report the value.
-out=$(go test -count=1 ./engine -run '^TestHandoffLatency$' -v || true)
+out=$(KAIRO_MEASURE=1 go test -count=1 ./engine -run '^TestHandoffLatency$' -v || true)
 p99=$(grep -o 'p99=[^ ]*' <<<"$out" | head -1 | cut -d= -f2 || true)
 us=$([ -n "$p99" ] && awk -v d="$p99" 'BEGIN{ if (d ~ /ms$/) {sub(/ms$/,"",d); print d*1000} else if (d ~ /µs$/) {sub(/µs$/,"",d); print d} else {sub(/s$/,"",d); print d*1e6} }' || true)
 check "node hand-off latency p99" "$us" 1000 µs

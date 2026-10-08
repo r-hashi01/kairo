@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -498,10 +499,12 @@ func BenchmarkFiveNodeRun(b *testing.B) {
 }
 
 // Hand-off latency between nodes: from an executor returning the result of
-// step k to the executor receiving step k+1 of the same run.
+// step k to the executor receiving step k+1 of the same run. A measurement,
+// not a check (ADR 0056): it depends on the machine, so it runs only for
+// scripts/bench.sh (KAIRO_MEASURE=1), which reports it against its budget.
 func TestHandoffLatency(t *testing.T) {
-	if testing.Short() {
-		t.Skip()
+	if os.Getenv("KAIRO_MEASURE") == "" {
+		t.Skip("a measurement: scripts/bench.sh runs it (KAIRO_MEASURE=1)")
 	}
 	e := newEngine(t, Config{Shards: 8})
 	defer e.Close()
@@ -538,9 +541,17 @@ func TestHandoffLatency(t *testing.T) {
 	slices.Sort(lats)
 	p50, p99 := lats[len(lats)/2], lats[len(lats)*99/100]
 	t.Logf("node hand-off latency over %d hand-offs: p50=%v p99=%v max=%v", len(lats), p50, p99, lats[len(lats)-1])
-	if p99 > time.Millisecond && !raceEnabled {
-		t.Errorf("p99 hand-off latency %v > 1ms", p99)
+	// The distribution: a slow machine shifts it all; a fixed delay on the
+	// path would show as a heap of its own.
+	bounds := []time.Duration{250 * time.Microsecond, 500 * time.Microsecond, 750 * time.Microsecond, time.Millisecond,
+		1250 * time.Microsecond, 1500 * time.Microsecond, 2 * time.Millisecond}
+	counts := make([]int, len(bounds)+1)
+	for _, l := range lats {
+		i, _ := slices.BinarySearch(bounds, l)
+		counts[i]++
 	}
+	t.Logf("hand-off latency histogram (GOMAXPROCS=%d): <=250µs %d, <=500µs %d, <=750µs %d, <=1ms %d, <=1.25ms %d, <=1.5ms %d, <=2ms %d, >2ms %d",
+		runtime.GOMAXPROCS(0), counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7])
 }
 
 // A burst of evictions to the file tier (thousands of snapshot writes at

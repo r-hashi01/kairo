@@ -120,7 +120,7 @@ curl -N localhost:8420/v1/runs/<id>/stream     # SSE でライブ出力を受け
 ```sh
 make check    # = scripts/check.sh：gofmt・vet・build・テスト・不変条件
 make race     # 上記に race 検出を加える
-make bench    # = scripts/bench.sh：非機能要件の予算判定（超えたら失敗）
+make bench    # = scripts/bench.sh：非機能要件の計測（予算と並べて表示する。判定はしない、ADR 0056）
 make hooks    # pre-commit で check --quick を走らせる
 ```
 

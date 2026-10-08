@@ -177,7 +177,7 @@ The embedded runtime needs nothing but a database. If you can run a resident pro
 | Python + WASM | ~111 µs | |
 | any of the three + PostgreSQL | | ~460–490 runs/s with 16 in flight: the database is the limit |
 
-**kairod** (`scripts/bench.sh`, Linux on GitHub Actions; each number is checked against a budget in CI)
+**kairod** (`scripts/bench.sh` on a GitHub Actions runner: 4 vCPU, Linux)
 
 | | measured | budget |
 |---|---:|---:|
@@ -187,6 +187,8 @@ The embedded runtime needs nothing but a database. If you can run a resident pro
 | node hand-off latency, p99 | 0.72 ms | ≤ 1 ms |
 | memory per waiting run | 2.0 KB | ≤ 20 KB |
 | durable ack, p99 (group commit, fsync) | 1.7 ms | ≤ 5 ms |
+
+Latency depends on the machine: on shared 4-vCPU runners the hand-off p99 ranged from 0.5 to 2.7 ms across CPU models. So budgets are measured, not tested: they are compared before and after a change on one machine, and CI checks only what does not depend on speed ([ADR 0056](docs/adr/0056-time-budgets-are-measured-not-tested.md)).
 
 ## Guarantees
 
@@ -236,7 +238,7 @@ go build -o kairod ./cmd/kairod && ./kairod -data ./data
 ```sh
 make check   # gofmt, vet, build, every test (Go, TypeScript, Python), the invariants
 make race    # the same with the race detector
-make bench   # the performance budgets: fails when one is exceeded
+make bench   # measure the performance budgets (reported, not judged)
 ```
 
 Contributors and coding agents start with [AGENTS.md](AGENTS.md): it covers how to work here, the invariants, and what each kind of change needs. A change that touches an invariant, a format or a dependency starts as an ADR.
