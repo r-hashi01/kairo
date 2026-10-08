@@ -1,11 +1,13 @@
 [project]
 name = "kairo-worker"
 version = "0.1.0"
-description = "Worker SDK for the kairo workflow runtime: the worker protocol, and running graphon (Dify) nodes as kairo tasks."
+description = "SDK for the kairo workflow runtime: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod; the worker protocol; graphon (Dify) nodes as kairo tasks."
 requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
+# The runtime embedded here (ADR 0051): the WASM core needs a WASM runtime.
+embedded = ["wasmtime"]
 # Running Dify's workflow nodes (ADR 0028).
 graphon = ["graphon==0.7.0"]
 
@@ -15,3 +17,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["kairo_worker"]
+
+# kairo.wasm, built from the repository before packaging:
+#   GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o sdk/python/kairo_worker/wasm/kairo.wasm ./cmd/kairo-wasm
+[tool.setuptools.package-data]
+kairo_worker = ["wasm/kairo.wasm"]

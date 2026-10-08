@@ -202,6 +202,7 @@ export class Embedded {
 		this.renew();
 		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
 		await this.unlisten?.();
+		await this.store.close();
 	}
 
 	/** Renews this process's leases while it runs steps; one timer for all of them. */

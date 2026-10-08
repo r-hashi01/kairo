@@ -7,12 +7,20 @@ on a pool of threads; ``kairo_worker.graphon`` runs Dify's workflow nodes
 API); ``Kairo`` declares actions and workflows written as code.
 """
 
+from .backend import Backend, EmbeddedBackend, HttpBackend
 from .client import Client, KairoError
 from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import Task, TaskContext, Worker
-from .workflow import Cancelled, Context, Kairo, ResultLostError
+from .store import PostgresStore, SQLiteStore
+from .workflow import Cancelled, Context, Kairo, ResultLostError, Suspended
 
 __all__ = [
+    "Backend",
+    "EmbeddedBackend",
+    "HttpBackend",
+    "PostgresStore",
+    "SQLiteStore",
+    "Suspended",
     "Cancel",
     "Cancelled",
     "Client",

@@ -1,5 +1,7 @@
-"""Workflows written as code (ADR 0049), against a real kairod built from
-this repository (needs go)."""
+"""Workflows written as code (ADR 0049), one suite against each backend:
+kairod (built from this repository) and the runtime embedded here with
+SQLite (ADR 0051; its WASM core built from this repository, and wasmtime).
+Needs go. Also the serverless mode (suspend)."""
 
 from __future__ import annotations
 
@@ -13,10 +15,26 @@ import time
 import unittest
 import urllib.request
 
-from kairo_worker.workflow import Cancelled, Kairo
+from kairo_worker.backend import EmbeddedBackend
+from kairo_worker.store import SQLiteStore
+from kairo_worker.workflow import Cancelled, Kairo, Suspended
+
+try:
+    import wasmtime  # noqa: F401
+
+    HAS_WASMTIME = True
+except ImportError:
+    HAS_WASMTIME = False
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 HAS_GO = shutil.which("go") is not None
+
+
+def build_wasm(dir: str) -> str:
+    wasm = os.path.join(dir, "kairo.wasm")
+    env = dict(os.environ, GOOS="wasip1", GOARCH="wasm")
+    subprocess.run(["go", "build", "-buildmode=c-shared", "-o", wasm, "./cmd/kairo-wasm"], cwd=REPO, check=True, env=env)
+    return wasm
 
 
 @unittest.skipUnless(HAS_GO, "go not found")
@@ -52,8 +70,12 @@ class WorkflowTest(unittest.TestCase):
         self.hang = True
         self.slow_cancelled = threading.Event()
 
-    def kairo(self) -> Kairo:
-        k = Kairo(self.url, worker=self.sock, concurrency=8)
+    async def backend(self):
+        return None  # kairod (the default)
+
+    async def kairo(self) -> Kairo:
+        b = await self.backend()
+        k = Kairo(self.url, worker=self.sock, concurrency=8) if b is None else Kairo(backend=b)
 
         @k.action("write")
         def write(input, ctx):
@@ -101,6 +123,7 @@ class WorkflowTest(unittest.TestCase):
         async def child(ctx, n):
             return (await ctx.call("llm", {"q": f"c{n}"}))["answer"]
 
+        await k.start()
         return k
 
     async def wait_until(self, cond) -> None:
@@ -112,8 +135,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_resumed_elsewhere_runs_nothing_twice(self) -> None:
         async def main() -> None:
-            k1 = self.kairo()
-            await k1.start()
+            k1 = await self.kairo()
             first = asyncio.ensure_future(k1.run("edit", {"files": ["a", "b", "c"]}, id="py-edit-1"))
             await self.wait_until(lambda: self.runs["write"] == 1)
             self.assertEqual(self.runs["llm"], 3)
@@ -122,8 +144,7 @@ class WorkflowTest(unittest.TestCase):
                 await first
 
             self.hang = False
-            k2 = self.kairo()
-            await k2.start()
+            k2 = await self.kairo()
             out = await k2.run("edit", {"files": ["a", "b", "c"]}, id="py-edit-1")
             self.assertEqual(
                 out,
@@ -140,8 +161,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_sleep_and_signal(self) -> None:
         async def main() -> None:
-            k = self.kairo()
-            await k.start()
+            k = await self.kairo()
             done = asyncio.ensure_future(k.run("timed", None, id="py-timed-1"))
             for _ in range(400):
                 try:
@@ -158,8 +178,7 @@ class WorkflowTest(unittest.TestCase):
 
     def test_cancel(self) -> None:
         async def main() -> None:
-            k = self.kairo()
-            await k.start()
+            k = await self.kairo()
             done = asyncio.ensure_future(k.run("long", None, id="py-long-1"))
             await self.wait_until(lambda: self.runs["slow"] == 1)
             await k.cancel("py-long-1")
@@ -167,6 +186,85 @@ class WorkflowTest(unittest.TestCase):
                 await done
             await asyncio.to_thread(self.slow_cancelled.wait, 10)
             self.assertTrue(self.slow_cancelled.is_set())
+            await k.close()
+
+        asyncio.run(main())
+
+
+@unittest.skipUnless(HAS_GO and HAS_WASMTIME, "go or wasmtime not found")
+class EmbeddedWorkflowTest(WorkflowTest):
+    """The same suite on the runtime embedded here, with SQLite (one file: a
+    new backend on it is a new process)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.wasm = build_wasm(cls.dir)
+        cls.db = os.path.join(cls.dir, "embedded.db")
+
+    async def backend(self):
+        return await EmbeddedBackend.open(SQLiteStore(self.db), wasm=self.wasm)
+
+
+@unittest.skipUnless(HAS_GO and HAS_WASMTIME, "go or wasmtime not found")
+class ServerlessTest(unittest.TestCase):
+    """Suspend mode: each invocation is a new process that goes as far as it
+    can and returns; a scheduler's tick and a signal drive the workflow on."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.dir = tempfile.mkdtemp(prefix="kairo-sdk-py-sl-")
+        cls.wasm = build_wasm(cls.dir)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_across_invocations(self) -> None:
+        path = os.path.join(self.dir, "serverless.db")
+        runs = {"llm": 0, "write": 0}
+
+        async def invocation() -> Kairo:
+            k = Kairo(backend=await EmbeddedBackend.open(SQLiteStore(path), wasm=self.wasm), mode="suspend")
+
+            @k.action("llm", effect="unprotected")
+            def llm(i, ctx):
+                runs["llm"] += 1
+                return i["q"].upper()
+
+            @k.action("write")
+            def write(i, ctx):
+                runs["write"] += 1
+                return f"wrote {i['v']}"
+
+            @k.workflow("job")
+            async def job(ctx, inp):
+                a = await ctx.call("llm", {"q": inp["q"]})
+                await ctx.sleep(0.3)
+                w = await ctx.call("write", {"v": a})
+                ok = await ctx.wait_for("approve")
+                return {"a": a, "w": w, "by": ok["by"]}
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            k = await invocation()
+            with self.assertRaises(Suspended):
+                await k.run("job", {"q": "hi"}, id="sl-1")
+            self.assertEqual(runs, {"llm": 1, "write": 0})
+            await k.close()
+
+            await asyncio.sleep(0.35)
+            k = await invocation()
+            await k.tick()
+            self.assertEqual(runs, {"llm": 1, "write": 1})
+            await k.close()
+
+            k = await invocation()
+            await k.signal("sl-1", "approve", {"by": "alice"})
+            self.assertEqual(await k.run("job", {"q": "hi"}, id="sl-1"), {"a": "HI", "w": "wrote HI", "by": "alice"})
+            self.assertEqual(runs, {"llm": 1, "write": 1}, "no call ran twice")
             await k.close()
 
         asyncio.run(main())

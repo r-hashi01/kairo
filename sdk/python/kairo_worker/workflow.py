@@ -4,6 +4,12 @@ A workflow is an ``async`` function that runs in this process; each call it
 makes (an action, a wait, a clock read) is a run of its own in kairo, whose
 id comes from the call: running the function again with the same workflow
 id returns the calls that finished, and runs nothing twice.
+
+The calls run on kairod (HttpBackend, the default) or on the runtime
+embedded in this process with a database (EmbeddedBackend, ADR 0051). With
+the embedded runtime, mode="suspend" serves hosts that do not stay up
+(serverless): a workflow goes as far as it can now, and tick() and signal()
+drive it on.
 """
 
 from __future__ import annotations
@@ -12,18 +18,17 @@ import asyncio
 import hashlib
 import inspect
 import json
-import os
 import random
-import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .client import Client, KairoError, finished
+from .backend import Backend, HttpBackend
+from .client import KairoError, finished
 from .protocol import Result
-from .worker import Task, TaskContext, Worker
+from .worker import Task, TaskContext
 
 PLAN_CALL = "kairo.call/"
 PLAN_WAIT = "kairo.wait/"
@@ -37,6 +42,10 @@ class ResultLostError(Exception):
 
 class Cancelled(Exception):
     """The workflow was cancelled."""
+
+
+class Suspended(Exception):
+    """The workflow waits (a timer, a signal): tick() or signal() drives it on."""
 
 
 @dataclass
@@ -57,8 +66,12 @@ def _call_id(workflow: str, kind: str, input: Any, n: int) -> str:
     return f"{workflow}/{h}.{n}"
 
 
+def _wait_root(name: str) -> dict[str, Any]:
+    return {"kind": "wait", "id": "w", "signal": name}
+
+
 class Kairo:
-    """Actions served on this process's worker, and workflows driven here."""
+    """Actions served here, and workflows driven here."""
 
     def __init__(
         self,
@@ -69,19 +82,25 @@ class Kairo:
         tenant: str = "default",
         idempotency_ttl: float = 24 * 3600,
         concurrency: int | None = None,
+        backend: Backend | None = None,
+        mode: str = "wait",
     ) -> None:
-        self.client = Client(url)
-        self._worker_addr = worker
-        self._token = token
-        self._tenant = tenant
+        self.backend: Any = backend or HttpBackend(url, worker=worker, token=token, tenant=tenant, concurrency=concurrency)
         self._ttl = idempotency_ttl
-        self._concurrency = concurrency
         self._actions: dict[str, _Action] = {}
         self._workflows: dict[str, Callable[..., Awaitable[Any]]] = {}
         self._planned: set[str] = set()
-        self._worker: Worker | None = None
         self._driving: set[asyncio.Task[Any]] = set()
         self._closing = False
+        if mode not in ("wait", "suspend"):
+            raise ValueError(f"mode {mode}: wait or suspend")
+        self.suspend = mode == "suspend"
+        if self.suspend and not hasattr(self.backend, "idle"):
+            raise ValueError("suspend mode needs the embedded backend")
+        self._driving_ids: set[str] = set()
+        self._again: set[str] = set()
+        self._redrives: set[asyncio.Future[Any]] = set()
+        self._stop_hook: Callable[[], None] | None = None
 
     def action(self, name: str, *, effect: str = "real", timeout: str | None = None, destination: str | None = None):
         """Declares an action: "real" (the default) acts outside and never runs
@@ -106,8 +125,7 @@ class Kairo:
         return register
 
     async def start(self) -> None:
-        """Registers the actions and their plans with kairod, and serves the
-        actions on its worker socket (if one was given)."""
+        """Registers the actions and their plans, and starts running the actions' steps."""
         specs: list[dict[str, Any]] = []
         for name, a in self._actions.items():
             s: dict[str, Any] = {"action": name, "effect": a.effect}
@@ -118,32 +136,78 @@ class Kairo:
             specs.append(s)
         for name in (NOW, RANDOM, SLEEP):
             specs.append({"action": name, "effect": "unprotected"})
-        await asyncio.to_thread(self.client.register_nodes, specs)
+        await self.backend.start(specs, self._serve)
         for s in specs:
             await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"], "input": {"in": "$input.in"}})
         await self._plan_workflow()
-        if self._worker_addr is not None:
-            self._worker = Worker(f"kairo-sdk-{os.getpid()}", [s["action"] for s in specs], self._serve, self._concurrency, token=self._token)
-            threading.Thread(target=self._serve_forever, args=(self._worker,), daemon=True).start()
+        if self.suspend:
+            # A call that settles drives its workflow on (its id is the
+            # workflow's id, "/", the call's key).
+            def settled(r: dict[str, Any]) -> None:
+                rid = r["run_id"]
+                i = rid.rfind("/")
+                if i > 0:
+                    self._redrive(rid[:i])
 
-    def _serve_forever(self, w: Worker) -> None:
-        while self._worker is w:
-            try:
-                w.run(self._worker_addr)  # type: ignore[arg-type]
-            except OSError:
-                pass  # kairod went away: connect again
-            if self._worker is w:
-                time.sleep(0.5)
+            self._stop_hook = self.backend.on_settled(settled)
 
     async def close(self) -> None:
         """Stops serving actions and driving workflows, as a process that stops
         does: the workflows it drove stay unfinished in kairo, to be resumed."""
         self._closing = True
+        if self._stop_hook is not None:
+            self._stop_hook()
         for t in list(self._driving):
             t.cancel()
-        w, self._worker = self._worker, None
-        if w is not None:
-            w.stop()
+        await self.backend.close()
+
+    async def tick(self) -> None:
+        """Suspend mode: takes up due timers and steps whose process stopped,
+        drives on the workflows whose calls settle, and returns once that is
+        done (call it from a scheduler)."""
+        await self.backend.tick()
+        await self._settle()
+
+    async def _settle(self) -> None:
+        """Returns once the work started here and the workflows driven on are done."""
+        while True:
+            await self.backend.idle()
+            # Finished ones are dropped here, whether or not their done
+            # callbacks ran yet.
+            self._redrives.difference_update([f for f in self._redrives if f.done()])
+            if not self._redrives:
+                await self.backend.idle()
+                self._redrives.difference_update([f for f in self._redrives if f.done()])
+                if not self._redrives:
+                    return
+            await asyncio.gather(*list(self._redrives), return_exceptions=True)
+
+    def _redrive(self, id: str) -> None:
+        """Suspend mode: drives workflow id on (again, if it is being driven now)."""
+        if id in self._driving_ids:
+            self._again.add(id)
+            return
+
+        async def drive() -> None:
+            while True:
+                self._again.discard(id)
+                try:
+                    info = await self.backend.get(id)
+                except KairoError:
+                    return
+                inp = info.get("input") or {}
+                if info.get("plan") != PLAN_WORKFLOW or finished(info) or not inp.get("workflow"):
+                    return
+                try:
+                    await self._run_as(inp["workflow"], inp.get("input"), id)
+                except Exception:
+                    pass  # suspended again, failed (recorded), or cancelled
+                if id not in self._again:
+                    return
+
+        fut = asyncio.ensure_future(drive())
+        self._redrives.add(fut)
+        fut.add_done_callback(self._redrives.discard)
 
     async def _plan(self, name: str, root: dict[str, Any], vars: dict[str, Any] | None = None) -> None:
         if name in self._planned:
@@ -151,7 +215,7 @@ class Kairo:
         d: dict[str, Any] = {"name": name, "root": root}
         if vars:
             d["vars"] = vars
-        await asyncio.to_thread(self.client.register_plan, d)
+        await self.backend.register_plan(d)
         self._planned.add(name)
 
     async def _plan_workflow(self) -> None:
@@ -176,16 +240,19 @@ class Kairo:
 
     async def run(self, name: str, input: Any = None, *, id: str | None = None) -> Any:
         """Runs workflow name as execution id, or resumes it: calls that
-        finished return their recorded results. Returns its result."""
+        finished return their recorded results. Returns its result (suspend
+        mode: raises Suspended when it waits)."""
         return await self._run_as(name, input, id or str(uuid.uuid4()))
 
     async def signal(self, id: str, name: str, payload: Any = None) -> None:
         """Sends a signal to the first wait for it in workflow id that has not received one."""
+        # The waits' plan, which this process may not have needed yet.
+        await self._plan(PLAN_WAIT + name, _wait_root(name))
         n = 0
         while True:
             run_id = _call_id(id, PLAN_WAIT + name, None, n)
             try:
-                r = await asyncio.to_thread(self.client.get, run_id)
+                r = await self.backend.get(run_id)
             except KairoError as e:
                 if e.status == 404:
                     raise LookupError(f"workflow {id} does not wait for {name}") from None
@@ -193,22 +260,25 @@ class Kairo:
             if finished(r):
                 n += 1
                 continue
-            await asyncio.to_thread(self.client.signal, run_id, name, payload)
+            await self.backend.signal(run_id, name, payload)
+            if self.suspend:
+                await self._settle()
             return
 
     async def cancel(self, id: str) -> None:
-        """Cancels workflow id: the calls it is waiting for are cancelled with it."""
-        await asyncio.to_thread(self.client.cancel, id)
+        """Cancels workflow id: the calls it is waiting for are cancelled with it
+        (suspend mode: it stops when it is driven next)."""
+        await self.backend.cancel(id)
 
     async def _run_as(self, name: str, input: Any, id: str) -> Any:
         fn = self._workflows.get(name)
         if fn is None:
             raise KeyError(f"no workflow {name}")
         await self._plan_workflow()
-        started = await asyncio.to_thread(
-            lambda: self.client.run(PLAN_WORKFLOW, {"workflow": name}, run_id=id, tenant=self._tenant, tier="file", vars={"started_at": int(time.time() * 1000)})
+        started = await self.backend.run(
+            PLAN_WORKFLOW, {"workflow": name, "input": input}, run_id=id, vars={"started_at": int(time.time() * 1000)}
         )
-        info = await asyncio.to_thread(self.client.get, id)
+        info = await self.backend.get(id)
         if finished(info):
             return _done(id, info)
         if started.get("existing"):
@@ -218,42 +288,51 @@ class Kairo:
         ctx = Context(self, id)
         body = asyncio.ensure_future(fn(ctx, input))
         self._driving.add(body)
+        self._driving_ids.add(id)
         cancelled = False
 
         async def watch() -> None:
             nonlocal cancelled
-            while not body.done():
-                r = await asyncio.to_thread(self.client.wait_once, id)
-                if r is not None:
-                    if r.get("status") == "cancelled":
-                        cancelled = True
-                        body.cancel()
-                    return
+            r = await self.backend.wait(id)
+            if r.get("status") == "cancelled" and not body.done():
+                cancelled = True
+                body.cancel()
 
-        watcher = asyncio.ensure_future(watch())
+        # The workflow's own run ends when it is cancelled: stop the calls.
+        # (Suspended, a cancelled workflow stops when it is driven next.)
+        watcher = None if self.suspend else asyncio.ensure_future(watch())
         try:
             value = await body
+        except Suspended:
+            raise  # goes on later
         except asyncio.CancelledError:
             if cancelled:
                 raise Cancelled(f"workflow {id} cancelled") from None
             raise
         except Exception as e:
-            await asyncio.to_thread(self.client.signal, id, "done", {"ok": False, "error": str(e)})
+            await self.backend.signal(id, "done", {"ok": False, "error": str(e)})
             raise
         finally:
             self._driving.discard(body)
-            watcher.cancel()
-        await asyncio.to_thread(self.client.signal, id, "done", {"ok": True, "value": value})
+            self._driving_ids.discard(id)
+            if watcher is not None:
+                watcher.cancel()
+        await self.backend.signal(id, "done", {"ok": True, "value": value})
         return value
 
     async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str) -> Any:
         if root is not None:
             await self._plan(plan, root)
-        await asyncio.to_thread(lambda: self.client.run(plan, {"in": input}, run_id=run_id, tenant=self._tenant, tier="file"))
-        while True:
-            r = await asyncio.to_thread(self.client.wait_once, run_id)
-            if r is not None:
-                break
+        await self.backend.run(plan, {"in": input}, run_id=run_id)
+        if self.suspend:
+            # Whatever this process can do for the call is done once it is
+            # idle; a call still going then waits for a timer or a signal.
+            await self.backend.idle()
+            r = await self.backend.get(run_id)
+            if not finished(r) and r.get("status") != "blocked":
+                raise Suspended(f"call {run_id} waits")
+        else:
+            r = await self.backend.wait(run_id)
         if r.get("trimmed"):
             raise ResultLostError(f"call {run_id} finished, but kairo no longer keeps its result")
         if r.get("status") != "completed":
@@ -300,7 +379,7 @@ class Context:
             # is stopping, and the call goes on in kairo).
             if not self._k._closing:
                 try:
-                    await asyncio.to_thread(self._k.client.cancel, run_id)
+                    await self._k.backend.cancel(run_id)
                 except Exception:
                     pass
             raise
@@ -312,7 +391,7 @@ class Context:
     async def wait_for(self, name: str) -> Any:
         """Waits for signal name (see Kairo.signal); returns its payload."""
         run_id = self._next(PLAN_WAIT + name, None)
-        out = await self._run(PLAN_WAIT + name, {"kind": "wait", "id": "w", "signal": name}, None, run_id)
+        out = await self._run(PLAN_WAIT + name, _wait_root(name), None, run_id)
         return out["payload"]
 
     async def sleep(self, seconds: float) -> None:
