@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"kairo/blob/blobtest"
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/store/sqlstore/sqltest"
-	"kairo/task"
-	"kairo/wal"
-	"kairo/wal/waltest"
+	"github.com/r-hashi01/kairo/blob/blobtest"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/store/sqlstore/sqltest"
+	"github.com/r-hashi01/kairo/task"
+	"github.com/r-hashi01/kairo/wal"
+	"github.com/r-hashi01/kairo/wal/waltest"
 )
 
 func TestSinkConformance(t *testing.T) {

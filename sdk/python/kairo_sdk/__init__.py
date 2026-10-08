@@ -2,7 +2,7 @@
 
 A worker connects to the runtime, announces the actions it serves and how
 many tasks it can hold, and pulls tasks. ``Worker`` runs a handler per task
-on a pool of threads; ``kairo_worker.graphon`` runs Dify's workflow nodes
+on a pool of threads; ``kairo_sdk.graphon`` runs Dify's workflow nodes
 (graphon) as such handlers. ``Client`` is the graph API (kairod's HTTP
 API); ``Kairo`` declares actions and workflows written as code.
 """

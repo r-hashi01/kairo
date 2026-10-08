@@ -1,10 +1,10 @@
-module kairo/store/sqlite
+module github.com/r-hashi01/kairo/store/sqlite
 
 go 1.27.1
 
 require (
-	kairo v0.0.0
-	kairo/store/sqlstore v0.0.0-00010101000000-000000000000
+	github.com/r-hashi01/kairo v0.0.0
+	github.com/r-hashi01/kairo/store/sqlstore v0.0.0-00010101000000-000000000000
 	modernc.org/sqlite v1.60.1
 )
 
@@ -21,6 +21,6 @@ require (
 )
 
 replace (
-	kairo => ../..
-	kairo/store/sqlstore => ../sqlstore
+	github.com/r-hashi01/kairo => ../..
+	github.com/r-hashi01/kairo/store/sqlstore => ../sqlstore
 )

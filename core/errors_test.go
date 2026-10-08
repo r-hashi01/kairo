@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // --- ADR 0030: per-node error handling and run limits ----------------------

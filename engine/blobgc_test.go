@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/blob"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/task"
 )
 
 const bigPlan = `{"name":"big","root":{"kind":"seq","nodes":[

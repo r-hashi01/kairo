@@ -20,9 +20,9 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"kairo/engine"
-	"kairo/store/sqlstore"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/store/sqlstore"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Dialect is the SQLite dialect.

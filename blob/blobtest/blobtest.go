@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"kairo/blob"
+	"github.com/r-hashi01/kairo/blob"
 )
 
 // Options select optional checks.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/task"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // A real command held until its intent is durable is not released if its

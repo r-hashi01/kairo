@@ -17,10 +17,10 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/store/postgres"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/store/postgres"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // The daemon against a real PostgreSQL: KAIRO_N8N_PG_DSN, e.g.

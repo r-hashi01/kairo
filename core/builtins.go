@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Built-in protected actions for the pure nodes of Dify workflows (ADR

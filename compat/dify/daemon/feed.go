@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"kairo/core"
-	"kairo/engine"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // The event partitions (ADR 0038). A partition is a shard of the engine:

@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Workflow is the "workflow" object of a Dify DSL document.

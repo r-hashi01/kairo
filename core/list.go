@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // kairo.list is Dify's list-operator (ADR 0028), ported from graphon 0.7.0

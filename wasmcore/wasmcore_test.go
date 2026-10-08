@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/core"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 const specs = `[{"action":"llm","effect":"unprotected"},{"action":"send","effect":"real"}]`

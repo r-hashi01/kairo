@@ -76,7 +76,7 @@ console.log(await k.run('refund', { order: 'o-42', amount: 250 }, { id: 'refund-
 
 ```python
 import asyncio
-from kairo_worker import EmbeddedBackend, Kairo, SQLiteStore
+from kairo_sdk import EmbeddedBackend, Kairo, SQLiteStore
 
 async def main():
     k = Kairo(backend=await EmbeddedBackend.open(SQLiteStore("kairo.db")))
@@ -226,7 +226,7 @@ cd sdk/ts && npm install && npm run build && npm pack      # → kairo-sdk-0.1.0
 
 # Python SDK
 GOOS=wasip1 GOARCH=wasm go build -trimpath -buildmode=c-shared \
-  -o sdk/python/kairo_worker/wasm/kairo.wasm ./cmd/kairo-wasm
+  -o sdk/python/kairo_sdk/wasm/kairo.wasm ./cmd/kairo-wasm
 pip install "./sdk/python[embedded]"
 
 # kairod

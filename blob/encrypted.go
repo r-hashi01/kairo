@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sync"
 
-	"kairo/seal"
+	"github.com/r-hashi01/kairo/seal"
 )
 
 // Encrypted wraps a store so objects are sealed (ADR 0021) and their names

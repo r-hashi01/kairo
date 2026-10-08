@@ -17,11 +17,11 @@ import (
 
 	jevapi "github.com/mattn/go-jev"
 
-	"kairo/engine"
-	"kairo/httpaction"
-	"kairo/ir"
-	"kairo/protocol"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/httpaction"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/protocol"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // asked is a request to the fake Jev API.

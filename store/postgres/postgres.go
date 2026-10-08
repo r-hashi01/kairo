@@ -18,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"kairo/store/sqlstore"
+	"github.com/r-hashi01/kairo/store/sqlstore"
 )
 
 // Dialect is the PostgreSQL dialect.

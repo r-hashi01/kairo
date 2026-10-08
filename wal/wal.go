@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"kairo/mpsc"
+	"github.com/r-hashi01/kairo/mpsc"
 )
 
 // Sink is the pluggable destination of a shard's log.

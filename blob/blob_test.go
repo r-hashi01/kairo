@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/blob"
-	"kairo/blob/blobtest"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/blob/blobtest"
 )
 
 func TestDirConformance(t *testing.T) {

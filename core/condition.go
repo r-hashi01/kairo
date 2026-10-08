@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // kairo.switch (ADR 0031): Dify's if-else conditions, ported from graphon

@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/protocol"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/protocol"
 )
 
 // End to end (ADR 0028): a Dify workflow converted to kairo, run by the
@@ -77,7 +77,7 @@ func TestGraphonWorkerEndToEnd(t *testing.T) {
 	}
 
 	sdk, _ := filepath.Abs("../../sdk/python")
-	cmd := exec.Command(py, "-m", "kairo_worker.serve", "--socket", sock,
+	cmd := exec.Command(py, "-m", "kairo_sdk.serve", "--socket", sock,
 		"--actions", "dify.template-transform,dify.http-request")
 	cmd.Dir = sdk
 	cmd.Env = append(os.Environ(), "PYTHONPATH="+sdk)

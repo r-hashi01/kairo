@@ -10,14 +10,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"kairo/core"
-	"kairo/ir"
-	"kairo/live"
-	"kairo/mpsc"
-	"kairo/obs"
-	"kairo/task"
-	"kairo/timerwheel"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/mpsc"
+	"github.com/r-hashi01/kairo/obs"
+	"github.com/r-hashi01/kairo/task"
+	"github.com/r-hashi01/kairo/timerwheel"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // A shard is one event loop that exclusively owns a subset of runs (chosen

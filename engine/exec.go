@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/blob"
-	"kairo/core"
-	"kairo/ir"
-	"kairo/sched"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // Executor runs tasks in-process. It is called from a bounded pool of

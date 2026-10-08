@@ -18,13 +18,13 @@ import (
 	"syscall"
 	"time"
 
-	"kairo/api"
-	"kairo/engine"
-	"kairo/executor/httpexec"
-	"kairo/ir"
-	"kairo/obs"
-	"kairo/protocol"
-	"kairo/sched"
+	"github.com/r-hashi01/kairo/api"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/executor/httpexec"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/obs"
+	"github.com/r-hashi01/kairo/protocol"
+	"github.com/r-hashi01/kairo/sched"
 )
 
 func main() {

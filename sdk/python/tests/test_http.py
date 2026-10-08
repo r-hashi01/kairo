@@ -17,10 +17,10 @@ import time
 import unittest
 from typing import Any
 
-from kairo_worker.backend import EmbeddedBackend
-from kairo_worker.http import check_url, post, sign
-from kairo_worker.store import SQLiteStore
-from kairo_worker.workflow import Kairo, Suspended
+from kairo_sdk.backend import EmbeddedBackend
+from kairo_sdk.http import check_url, post, sign
+from kairo_sdk.store import SQLiteStore
+from kairo_sdk.workflow import Kairo, Suspended
 
 from test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
 

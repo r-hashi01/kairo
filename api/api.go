@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/live"
-	"kairo/sched"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/sched"
 )
 
 type API struct {

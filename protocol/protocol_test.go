@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/task"
 )
 
 func setup(t *testing.T) (*engine.Engine, string) {

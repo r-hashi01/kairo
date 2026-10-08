@@ -16,8 +16,8 @@ import (
 	"errors"
 	"fmt"
 
-	"kairo/core"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // ABIVersion changes when the JSON or the exports change incompatibly.

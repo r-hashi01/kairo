@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // --- ADR 0029: graphs ------------------------------------------------------

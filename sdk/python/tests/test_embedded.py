@@ -12,9 +12,9 @@ import tempfile
 import threading
 import unittest
 
-from kairo_worker.embedded import Embedded
-from kairo_worker.protocol import Result
-from kairo_worker.store import SQLiteStore
+from kairo_sdk.embedded import Embedded
+from kairo_sdk.protocol import Result
+from kairo_sdk.store import SQLiteStore
 
 try:
     from .test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -200,7 +200,7 @@ class PostgresTest(unittest.TestCase):
     def test_settled_elsewhere_and_recovery(self) -> None:
         from psycopg_pool import AsyncConnectionPool
 
-        from kairo_worker.store import PostgresStore
+        from kairo_sdk.store import PostgresStore
 
         prefix = f"kp{os.getpid()}_"
 

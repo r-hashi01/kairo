@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Large payloads are kept out of the state as content-addressed blobs. In

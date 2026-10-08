@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 func TestSignAndVerify(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // A destination that refuses tasks beyond capacity: the dispatcher does

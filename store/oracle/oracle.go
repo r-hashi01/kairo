@@ -15,7 +15,7 @@ import (
 
 	goora "github.com/sijms/go-ora/v2"
 
-	"kairo/store/sqlstore"
+	"github.com/r-hashi01/kairo/store/sqlstore"
 )
 
 // Dialect is the Oracle dialect. Tables are created with a plain CREATE

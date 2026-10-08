@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"kairo/seal"
+	"github.com/r-hashi01/kairo/seal"
 )
 
 // Encrypted wraps a sink so every record is sealed (ADR 0021): encrypted,

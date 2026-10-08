@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strconv"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Graph execution (ADR 0029). A graph activation keeps one state per

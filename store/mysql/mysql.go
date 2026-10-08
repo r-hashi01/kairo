@@ -14,7 +14,7 @@ import (
 
 	driver "github.com/go-sql-driver/mysql"
 
-	"kairo/store/sqlstore"
+	"github.com/r-hashi01/kairo/store/sqlstore"
 )
 
 func limited(t, w string, n int) string {

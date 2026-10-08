@@ -5,7 +5,7 @@
 // written in Go (e.g. executor/jev's kairo-jev, ADR 0055).
 //
 // The signature, the request body and the result body are the same as the
-// SDKs' (sdk/ts/src/http.ts, sdk/python/kairo_worker/http.py):
+// SDKs' (sdk/ts/src/http.ts, sdk/python/kairo_sdk/http.py):
 //
 //	Kairo-Signature: t=<unix ms>,v1=<hex HMAC-SHA256(secret, t + "." + body)>
 //
@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // Tolerance is how old (or how far ahead) a signed request may be.

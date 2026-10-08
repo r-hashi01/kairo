@@ -13,9 +13,9 @@ import unittest
 import urllib.request
 from typing import Any
 
-from kairo_worker.backend import EmbeddedBackend
-from kairo_worker.store import LeaseRow, SQLiteStore, TimerRow, Changes
-from kairo_worker.workflow import Kairo, Suspended, tick_handler
+from kairo_sdk.backend import EmbeddedBackend
+from kairo_sdk.store import LeaseRow, SQLiteStore, TimerRow, Changes
+from kairo_sdk.workflow import Kairo, Suspended, tick_handler
 
 from test_http import run, serve
 from test_workflow import HAS_GO, HAS_WASMTIME, build_wasm

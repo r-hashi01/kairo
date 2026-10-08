@@ -14,7 +14,7 @@ package core
 import (
 	"encoding/json"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 type RunStatus uint8

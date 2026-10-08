@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // ErrIgnored is returned for events that do not apply to the current state

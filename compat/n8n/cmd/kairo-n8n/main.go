@@ -34,12 +34,12 @@ import (
 	"syscall"
 	"time"
 
-	n8n "kairo/compat/n8n"
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/protocol"
-	"kairo/seal"
-	"kairo/store/postgres"
+	n8n "github.com/r-hashi01/kairo/compat/n8n"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/protocol"
+	"github.com/r-hashi01/kairo/seal"
+	"github.com/r-hashi01/kairo/store/postgres"
 )
 
 func main() {

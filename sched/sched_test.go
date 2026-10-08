@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 func TestAdmissionFairnessAndLimits(t *testing.T) {

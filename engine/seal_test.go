@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"kairo/seal"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/seal"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 func frame(b, p []byte) []byte { return wal.Frame(b, p) }

@@ -7,7 +7,7 @@ import socket
 import threading
 import unittest
 
-from kairo_worker import MsgType, Result, Task, TaskContext, Worker, read_frame, write_frame
+from kairo_sdk import MsgType, Result, Task, TaskContext, Worker, read_frame, write_frame
 
 
 class FakeRuntime:

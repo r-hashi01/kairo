@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // The budgets of in-process executors (ADR 0039): how many of their tasks

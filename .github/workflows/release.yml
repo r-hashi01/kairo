@@ -1,0 +1,108 @@
+name: release
+
+# A tag vX.Y.Z builds, checks and publishes a release (ADR 0057): kairo-sdk
+# on npm (staged: a maintainer approves it there) and PyPI (Trusted
+# Publishing, no tokens for either), and a GitHub Release with
+# kairo.wasm, kairod, kairo-jev and SHA256SUMS. Run by hand, it builds and
+# checks only, and publishes nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version to build (nothing is published)
+        default: 0.0.0-dev
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - id: version
+        name: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v=${GITHUB_REF_NAME#v}; else v=${{ inputs.version }}; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: check (the SDKs' embedded runtime included)
+        run: |
+          python3 -m pip install wasmtime
+          scripts/check.sh
+      - name: build and check what ships
+        run: scripts/release.sh ${{ steps.version.outputs.version }} dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist
+
+  npm:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # Trusted Publishing and provenance
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+      # Staged publishing: the version waits on npm until a maintainer
+      # approves it with 2FA (npmjs.com, Staged Packages; or npm stage
+      # approve <id>). The trusted publisher allows nothing else.
+      - run: npm install -g npm@^11.15.0
+      - run: |
+          mkdir pkg && tar -xzf dist/npm/kairo-sdk-${{ needs.build.outputs.version }}.tgz -C pkg
+          cd pkg/package && npm stage publish --access public
+
+  pypi:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/python
+
+  github-release:
+    needs: [build, npm, pypi]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            dist/kairo.wasm dist/bin/* dist/SHA256SUMS

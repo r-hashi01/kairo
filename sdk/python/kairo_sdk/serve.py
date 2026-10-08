@@ -1,6 +1,6 @@
 """Serve Dify workflow nodes with graphon's DSL node factory.
 
-    python -m kairo_worker.serve --socket /path/to/worker.sock \\
+    python -m kairo_sdk.serve --socket /path/to/worker.sock \\
         --actions dify.template-transform,dify.http-request [--concurrency 8]
 
 The runtime's worker token, if it has one, is read from KAIRO_WORKER_TOKEN.

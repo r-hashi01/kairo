@@ -22,8 +22,8 @@ import (
 	"regexp"
 	"time"
 
-	"kairo/blob"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 type Options struct {

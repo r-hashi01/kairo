@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"kairo/compat/dify"
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/sched"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/compat/dify"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // A workflow with a worker step that streams, and a human input whose

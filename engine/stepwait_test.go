@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // A step whose result is a wait ends at its deadline, also when the

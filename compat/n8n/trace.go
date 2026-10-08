@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"kairo/core"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // stepID names the row of node's iteration of an execution: a UUID derived

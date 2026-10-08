@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Variables (ADR 0033), Dify-style loops and map element errors (ADR 0032).

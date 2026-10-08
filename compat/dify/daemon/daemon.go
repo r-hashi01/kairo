@@ -21,11 +21,11 @@ import (
 	"sync"
 	"time"
 
-	"kairo/compat/dify"
-	"kairo/core"
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/sched"
+	"github.com/r-hashi01/kairo/compat/dify"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/sched"
 )
 
 // FeedName is the event feed subscription the daemon consumes; the engine

@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Finished-run markers (ADR 0027). When a run of the file tier or above

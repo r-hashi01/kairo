@@ -3,8 +3,8 @@ package wal_test
 import (
 	"testing"
 
-	"kairo/wal"
-	"kairo/wal/waltest"
+	"github.com/r-hashi01/kairo/wal"
+	"github.com/r-hashi01/kairo/wal/waltest"
 )
 
 func TestFileSinkConformance(t *testing.T) {

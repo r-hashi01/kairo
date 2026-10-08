@@ -7,7 +7,7 @@ import (
 	"net"
 	"sync"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // Handler executes one task in a worker process.

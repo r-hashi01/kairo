@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // FeedName is the engine feed kairo-n8n reads (ADR 0034).

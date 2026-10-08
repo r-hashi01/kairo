@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // waitAt returns a's result as a wait until at, then held (ADR 0045).

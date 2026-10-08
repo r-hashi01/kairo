@@ -36,7 +36,7 @@ import (
 	"errors"
 	"io"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 type MsgType byte

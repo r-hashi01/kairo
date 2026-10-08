@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/store/sqlstore"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/store/sqlstore"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Measure logs ack latency and engine throughput on db (ADR 0020 asks for

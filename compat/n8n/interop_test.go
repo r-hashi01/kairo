@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/protocol"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/protocol"
 )
 
 // The TypeScript worker SDK (sdk/ts) against the runtime's protocol

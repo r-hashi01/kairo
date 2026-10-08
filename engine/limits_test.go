@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"kairo/core"
-	"kairo/ir"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // --- ADR 0030 ---------------------------------------------------------------

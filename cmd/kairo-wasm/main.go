@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"unsafe"
 
-	"kairo/wasmcore"
+	"github.com/r-hashi01/kairo/wasmcore"
 )
 
 var (

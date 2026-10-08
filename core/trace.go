@@ -3,7 +3,7 @@ package core
 import (
 	"encoding/json"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Traces (ADR 0034): what happened while an event was applied, for the

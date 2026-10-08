@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"kairo/mpsc"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/mpsc"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // DestLimits are the quotas of one destination (e.g. "openai/gpt-4o").

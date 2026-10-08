@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"kairo/seal"
-	"kairo/wal"
-	"kairo/wal/waltest"
+	"github.com/r-hashi01/kairo/seal"
+	"github.com/r-hashi01/kairo/wal"
+	"github.com/r-hashi01/kairo/wal/waltest"
 )
 
 func keys(t testing.TB) seal.Keys {

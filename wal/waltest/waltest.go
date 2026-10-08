@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Opener opens the sink stored in dir. Opening the same dir again must

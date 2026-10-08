@@ -7,3 +7,4 @@ bin/
 store/.certs/
 __pycache__/
 *.egg-info/
+/dist/

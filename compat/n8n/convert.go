@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // ConverterVersion is part of the plan names: plans of an older converter

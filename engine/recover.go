@@ -5,10 +5,10 @@ import (
 	"log"
 	"math"
 
-	"kairo/blob"
-	"kairo/core"
-	"kairo/seal"
-	"kairo/timerwheel"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/seal"
+	"github.com/r-hashi01/kairo/timerwheel"
 )
 
 type lsnEvent struct {

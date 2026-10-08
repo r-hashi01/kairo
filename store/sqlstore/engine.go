@@ -4,8 +4,8 @@ import (
 	"database/sql"
 	"fmt"
 
-	"kairo/engine"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Sinks returns an engine.Config.Sinks function storing each shard's file

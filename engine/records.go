@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"kairo/core"
+	"github.com/r-hashi01/kairo/core"
 )
 
 // Log records. The log of a shard is the concatenation of the events applied

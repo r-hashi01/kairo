@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/core"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // The differential harness (ADR 0028): Dify's workflow fixtures were run on

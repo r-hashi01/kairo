@@ -1,10 +1,10 @@
-module kairo/compat/n8n
+module github.com/r-hashi01/kairo/compat/n8n
 
 go 1.27.1
 
 require (
-	kairo v0.0.0
-	kairo/store/postgres v0.0.0-00010101000000-000000000000
+	github.com/r-hashi01/kairo v0.0.0
+	github.com/r-hashi01/kairo/store/postgres v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -14,11 +14,11 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	kairo/store/sqlstore v0.0.0 // indirect
+	github.com/r-hashi01/kairo/store/sqlstore v0.0.0 // indirect
 )
 
 replace (
-	kairo => ../..
-	kairo/store/postgres => ../../store/postgres
-	kairo/store/sqlstore => ../../store/sqlstore
+	github.com/r-hashi01/kairo => ../..
+	github.com/r-hashi01/kairo/store/postgres => ../../store/postgres
+	github.com/r-hashi01/kairo/store/sqlstore => ../../store/sqlstore
 )

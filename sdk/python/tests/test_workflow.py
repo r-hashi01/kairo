@@ -15,9 +15,9 @@ import time
 import unittest
 import urllib.request
 
-from kairo_worker.backend import EmbeddedBackend
-from kairo_worker.store import SQLiteStore
-from kairo_worker.workflow import Cancelled, Kairo, Suspended
+from kairo_sdk.backend import EmbeddedBackend
+from kairo_sdk.store import SQLiteStore
+from kairo_sdk.workflow import Cancelled, Kairo, Suspended
 
 try:
     import wasmtime  # noqa: F401

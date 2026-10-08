@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"kairo/compat/dify/daemon"
-	"kairo/engine"
+	"github.com/r-hashi01/kairo/compat/dify/daemon"
+	"github.com/r-hashi01/kairo/engine"
 )
 
 // logStatsOnSignal logs the engine's counters and the partitions

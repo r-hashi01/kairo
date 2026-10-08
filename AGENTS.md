@@ -96,7 +96,7 @@ make check | race | bench | quick
 
 ## コーディング規約
 
-- 本体モジュール（`kairo`）は標準ライブラリだけを使います。依存を足すなら利用者の了承が要ります（hook が確認を求めます）。依存のある実装は、`store/sqlite` のように別モジュールに置きます（ADR 0018）。本体から別モジュールを import してはいけません。
+- 本体モジュール（`github.com/r-hashi01/kairo`）は標準ライブラリだけを使います。依存を足すなら利用者の了承が要ります（hook が確認を求めます）。依存のある実装は、`store/sqlite` のように別モジュールに置きます（ADR 0018）。本体から別モジュールを import してはいけません。
 - 保存先の実装（`wal.Sink`、`blob.Store`）を足したり変えたりしたら、`wal/waltest` と `blob/blobtest` の共通テストを流します。SQL の製品なら `sqltest.Run` を使い、`scripts/check-backends.sh <製品>` で実際のデータベースに対して流します（Docker が要る）。
 - `store/sqlstore` で実行する SQL は、`buildQueries` が作る `queries` のフィールドだけです。値を連結した SQL を書くと、`TestOnlyPreparedQueriesAreExecuted` が落ちます（ADR 0020）。
 - 製品の `Open` は、検証付きの TLS 以外を拒否します。テストで平文を使うときは、`AllowInsecureTransport` を明示します。
@@ -131,6 +131,7 @@ make check | race | bench | quick
 - サブエージェント：`invariant-reviewer`（差分を、不変条件と ADR の観点でレビューする。読み取り専用）
 - `scripts/check.sh` は `scripts/adr-lint.sh` も実行します（ADR の番号の重複、必須セクション、索引漏れを検査する）。
 - CI：`.github/workflows/ci.yml`（check と race、SQL の保存先、脆弱性検査）。性能の計測は CI では行いません（ADR 0056）
+- リリース：`scripts/release.sh VERSION` が配るものを作って確かめ、`.github/workflows/release.yml` がタグ `vX.Y.Z` から公開します（ADR 0057）。手元から公開してはいけません。
 - git hook：`make hooks` で有効化すると、pre-commit で `check.sh --quick` を走らせます。
 
 hook やテストを無効化して回避しないでください。誤検出だと思ったら、hook 側を直す変更として提案してください。

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // --- ADR 0032: map element errors, element output, flatten -----------------

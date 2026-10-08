@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/core"
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Environment variables' values come with each run, never in the plan:

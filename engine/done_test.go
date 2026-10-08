@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // ADR 0027: a finished run is still recognized after a restart, once its

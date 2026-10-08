@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/store/sqlstore/sqltest"
+	"github.com/r-hashi01/kairo/store/sqlstore/sqltest"
 )
 
 func dsn(t *testing.T) string {

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"kairo/engine"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // TestCompareBackends measures the file and SQLite backends side by side

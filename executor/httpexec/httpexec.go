@@ -35,7 +35,7 @@ import (
 	"strings"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 type Executor struct {

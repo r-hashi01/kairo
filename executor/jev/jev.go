@@ -37,7 +37,7 @@ import (
 
 	jev "github.com/mattn/go-jev"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // Destination is the rate-limit key of the actions (ADR 0039).

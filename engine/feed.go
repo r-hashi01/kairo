@@ -10,9 +10,9 @@ import (
 	"slices"
 	"sync"
 
-	"kairo/core"
-	"kairo/live"
-	"kairo/mpsc"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/mpsc"
 )
 
 // The execution event feed (ADR 0034). Shards produce traces as they apply
@@ -80,6 +80,9 @@ type feedBuf struct {
 type feedMsg struct {
 	shard   int
 	entries []FeedEntry
+	// barrier, if set, is closed once what was pushed before it is in the
+	// buffers (Subscribe waits for it).
+	barrier chan struct{}
 }
 
 type feedHub struct {
@@ -184,7 +187,12 @@ func (h *feedHub) run() {
 		}
 		buf = h.q.Drain(buf)
 		h.mu.Lock()
+		var barriers []chan struct{}
 		for _, m := range buf {
+			if m.barrier != nil {
+				barriers = append(barriers, m.barrier)
+				continue
+			}
 			b := &h.bufs[m.shard]
 			b.entries = append(b.entries, m.entries...)
 			for _, en := range m.entries {
@@ -197,6 +205,9 @@ func (h *feedHub) run() {
 		h.checkLag()
 		h.notify()
 		h.mu.Unlock()
+		for _, b := range barriers {
+			close(b)
+		}
 		h.reconcile()
 	}
 }
@@ -406,6 +417,16 @@ func (e *Engine) Subscribe(name string) (*Feed, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	// What was published before this call (live chunks, on their way
+	// through h.q) must land before the line drawn below, or it would be
+	// delivered as if it came after the connection.
+	barrier := make(chan struct{})
+	h.q.Push(feedMsg{barrier: barrier})
+	select {
+	case <-barrier:
+	case <-h.stop:
+		return nil, ErrFeedClosed
 	}
 	h.mu.Lock()
 	for i := range h.bufs {

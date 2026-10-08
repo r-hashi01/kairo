@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"kairo/engine"
-	"kairo/sched"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // Server accepts worker connections for an engine.

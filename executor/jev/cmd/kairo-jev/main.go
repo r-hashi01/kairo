@@ -24,9 +24,9 @@ import (
 
 	jevapi "github.com/mattn/go-jev"
 
-	"kairo/executor/jev"
-	"kairo/httpaction"
-	"kairo/protocol"
+	"github.com/r-hashi01/kairo/executor/jev"
+	"github.com/r-hashi01/kairo/httpaction"
+	"github.com/r-hashi01/kairo/protocol"
 )
 
 func main() {

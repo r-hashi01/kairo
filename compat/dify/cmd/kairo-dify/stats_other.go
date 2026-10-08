@@ -3,8 +3,8 @@
 package main
 
 import (
-	"kairo/compat/dify/daemon"
-	"kairo/engine"
+	"github.com/r-hashi01/kairo/compat/dify/daemon"
+	"github.com/r-hashi01/kairo/engine"
 )
 
 func logStatsOnSignal(*engine.Engine, *daemon.Daemon) {}

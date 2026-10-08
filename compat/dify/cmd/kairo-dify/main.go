@@ -30,12 +30,12 @@ import (
 	"syscall"
 	"time"
 
-	"kairo/compat/dify/daemon"
-	"kairo/engine"
-	"kairo/ir"
-	"kairo/protocol"
-	"kairo/sched"
-	"kairo/seal"
+	"github.com/r-hashi01/kairo/compat/dify/daemon"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/protocol"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/seal"
 )
 
 func main() {

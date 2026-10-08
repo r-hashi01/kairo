@@ -6,7 +6,7 @@ package task
 import (
 	"encoding/json"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // Task is one command handed to an executor.

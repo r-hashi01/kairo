@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"kairo/ir"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/task"
 )
 
 const slowPlan = `{"name":"slow","root":{"kind":"step","id":"s","action":"slow"}}`

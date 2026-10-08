@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // recv returns which of ps got the next task, and the task.

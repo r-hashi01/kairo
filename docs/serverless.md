@@ -120,7 +120,7 @@ import os
 
 from fastapi import FastAPI
 from psycopg_pool import AsyncConnectionPool
-from kairo_worker import EmbeddedBackend, Kairo, PostgresStore
+from kairo_sdk import EmbeddedBackend, Kairo, PostgresStore
 
 pool = AsyncConnectionPool(os.environ["DATABASE_URL"], open=False)
 

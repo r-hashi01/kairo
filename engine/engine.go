@@ -21,16 +21,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"kairo/blob"
-	"kairo/core"
-	"kairo/ir"
-	"kairo/live"
-	"kairo/mpsc"
-	"kairo/obs"
-	"kairo/sched"
-	"kairo/seal"
-	"kairo/task"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/mpsc"
+	"github.com/r-hashi01/kairo/obs"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/seal"
+	"github.com/r-hashi01/kairo/task"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 // Tier is the durability tier of a run, chosen at admission.

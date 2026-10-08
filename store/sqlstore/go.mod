@@ -1,7 +1,7 @@
-module kairo/store/sqlstore
+module github.com/r-hashi01/kairo/store/sqlstore
 
 go 1.27.1
 
-require kairo v0.0.0
+require github.com/r-hashi01/kairo v0.0.0
 
-replace kairo => ../..
+replace github.com/r-hashi01/kairo => ../..

@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"kairo/core"
-	"kairo/ir"
-	"kairo/sched"
-	"kairo/task"
-	"kairo/wal"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
+	"github.com/r-hashi01/kairo/wal"
 )
 
 func testRegistry() *ir.Registry {

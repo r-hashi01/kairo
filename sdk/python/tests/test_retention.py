@@ -12,11 +12,11 @@ import tempfile
 import time
 import unittest
 
-from kairo_worker.backend import EmbeddedBackend
-from kairo_worker.embedded import Embedded, keep_finished_ms
-from kairo_worker.protocol import Result
-from kairo_worker.store import SQLiteStore
-from kairo_worker.workflow import Kairo, Suspended
+from kairo_sdk.backend import EmbeddedBackend
+from kairo_sdk.embedded import Embedded, keep_finished_ms
+from kairo_sdk.protocol import Result
+from kairo_sdk.store import SQLiteStore
+from kairo_sdk.workflow import Kairo, Suspended
 
 from test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
 

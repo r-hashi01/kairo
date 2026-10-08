@@ -15,7 +15,7 @@ import (
 func TestCoreIsPure(t *testing.T) {
 	allowed := map[string]bool{
 		"bytes": true, "encoding/json": true, "encoding/binary": true, "errors": true,
-		"slices": true, "strconv": true, "strings": true, "time": true, "kairo/ir": true,
+		"slices": true, "strconv": true, "strings": true, "time": true, "github.com/r-hashi01/kairo/ir": true,
 	}
 	forbiddenCalls := map[string]bool{
 		"time.Now": true, "time.Since": true, "time.Until": true, "time.Sleep": true,

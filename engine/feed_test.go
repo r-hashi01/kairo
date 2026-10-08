@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"kairo/core"
-	"kairo/task"
+	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/task"
 )
 
 // --- ADR 0034: the execution event feed -------------------------------------

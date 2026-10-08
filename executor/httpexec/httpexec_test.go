@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/task"
+	"github.com/r-hashi01/kairo/task"
 )
 
 func TestJSONAndClassification(t *testing.T) {

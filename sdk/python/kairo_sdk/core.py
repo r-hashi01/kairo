@@ -2,7 +2,7 @@
 
 Plans are compiled once, then events applied to a run's state given as
 bytes. No I/O happens here; the embedded runtime reads and writes the state.
-Needs wasmtime (``pip install kairo-worker[embedded]``).
+Needs wasmtime (``pip install "kairo-sdk[embedded]"``).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ class Core:
         try:
             from wasmtime import Engine, Linker, Module, Store, WasiConfig
         except ImportError as e:  # pragma: no cover - depends on the install
-            raise CoreError("the embedded runtime needs wasmtime: pip install kairo-worker[embedded]") from e
+            raise CoreError("the embedded runtime needs wasmtime: pip install 'kairo-sdk[embedded]'") from e
         engine = Engine()
         data = wasm if isinstance(wasm, bytes) else Path(wasm or DEFAULT_WASM).read_bytes()
         module = Module(engine, data)

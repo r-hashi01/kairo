@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"kairo/ir"
+	"github.com/r-hashi01/kairo/ir"
 )
 
 // --- ADR 0043: output ports and kairo.slice --------------------------------

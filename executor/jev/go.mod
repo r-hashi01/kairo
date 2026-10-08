@@ -1,10 +1,10 @@
-module kairo/executor/jev
+module github.com/r-hashi01/kairo/executor/jev
 
 go 1.27.1
 
 require (
 	github.com/mattn/go-jev v0.0.3
-	kairo v0.0.0
+	github.com/r-hashi01/kairo v0.0.0
 )
 
-replace kairo => ../..
+replace github.com/r-hashi01/kairo => ../..

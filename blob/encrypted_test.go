@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"kairo/blob"
-	"kairo/blob/blobtest"
-	"kairo/seal"
+	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/blob/blobtest"
+	"github.com/r-hashi01/kairo/seal"
 )
 
 func keys(t testing.TB) seal.Keys {

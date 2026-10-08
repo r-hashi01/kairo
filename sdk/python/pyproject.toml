@@ -17,9 +17,10 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["kairo_worker"]
+# kairo_sdk.wasm holds only kairo.wasm (package data of kairo_sdk).
+packages = ["kairo_sdk", "kairo_sdk.wasm"]
 
 # kairo.wasm, built from the repository before packaging:
-#   GOOS=wasip1 GOARCH=wasm go build -trimpath -buildmode=c-shared -o sdk/python/kairo_worker/wasm/kairo.wasm ./cmd/kairo-wasm
+#   GOOS=wasip1 GOARCH=wasm go build -trimpath -buildmode=c-shared -o sdk/python/kairo_sdk/wasm/kairo.wasm ./cmd/kairo-wasm
 [tool.setuptools.package-data]
-kairo_worker = ["wasm/kairo.wasm"]
+"kairo_sdk.wasm" = ["kairo.wasm"]
