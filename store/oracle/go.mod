@@ -1,8 +1,6 @@
 module kairo/store/oracle
 
-go 1.26.4
-
-toolchain go1.26.6
+go 1.27.1
 
 require kairo/store/sqlstore v0.0.0
 
