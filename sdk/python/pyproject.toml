@@ -1,10 +1,17 @@
 [project]
 name = "kairo-sdk"
 version = "0.1.0"
-description = "SDK for the kairo workflow runtime: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod; the worker protocol; graphon (Dify) nodes as kairo tasks."
+description = "Durable workflows that run inside your Python process: a WASM core and your database (SQLite or PostgreSQL). No workflow server."
 requires-python = ">=3.12"
 license = "MIT"
+readme = "README.md"
+keywords = ["workflow", "durable-execution", "workflow-engine", "serverless", "webassembly", "llm", "agents"]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/r-hashi01/kairo"
+Repository = "https://github.com/r-hashi01/kairo"
+Documentation = "https://github.com/r-hashi01/kairo/blob/main/sdk/python/README.md"
 
 [project.optional-dependencies]
 # The runtime embedded here (ADR 0051): the WASM core needs a WASM runtime.

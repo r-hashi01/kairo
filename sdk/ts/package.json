@@ -1,7 +1,7 @@
 {
   "name": "kairo-sdk",
   "version": "0.1.0",
-  "description": "kairo for Node.js: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod",
+  "description": "Durable workflows that run inside your Node process: a WASM core and your database (SQLite or PostgreSQL). No workflow server.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -32,5 +32,15 @@
     "type": "git",
     "url": "git+https://github.com/r-hashi01/kairo.git",
     "directory": "sdk/ts"
-  }
+  },
+  "homepage": "https://github.com/r-hashi01/kairo#readme",
+  "keywords": [
+    "workflow",
+    "durable-execution",
+    "workflow-engine",
+    "serverless",
+    "webassembly",
+    "llm",
+    "agents"
+  ]
 }
