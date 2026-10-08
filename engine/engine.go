@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -171,6 +172,12 @@ type SubmitRequest struct {
 	// Vars gives initial values to the plan's run variables (an object;
 	// e.g. a Dify conversation's variables, ADR 0033).
 	Vars json.RawMessage `json:"vars,omitempty"`
+	// KeepOutput keeps the run's output after it finishes, for
+	// IdempotencyTTL, across restarts: Get, Wait and Submit return it
+	// instead of a trimmed run (ADR 0050). For runs of the file tier or
+	// above; it costs one blob write when the run finishes and one delete
+	// when its marker expires.
+	KeepOutput bool `json:"keep_output,omitempty"`
 }
 
 // RunLimits bound one run (ADR 0030): the number of steps, waits and
@@ -646,7 +653,8 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 			lim.MaxDuration = l.MaxDuration
 		}
 	}
-	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, reply: reply}
+	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars,
+		keep: req.KeepOutput && tier >= TierFile, reply: reply}
 	sh := e.shardFor(id)
 	ticket, err := e.adm.Admit(req.Tenant, func() { sh.inbox.Push(msg{kind: mStart, start: sr}) })
 	if err != nil {
@@ -756,13 +764,46 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 	}
 }
 
-// trimmed describes a run known only by its finished-run marker.
+// trimmed describes a run known only by its finished-run marker: with its
+// output if it was kept (ADR 0050; read here, in the caller's goroutine),
+// else as trimmed.
 func (e *Engine) trimmed(runID string) (RunInfo, bool) {
 	en, ok := e.marker(runID)
 	if !ok {
 		return RunInfo{}, false
 	}
-	return RunInfo{RunID: runID, Status: en.status, Trimmed: true, FinishedAt: time.UnixMilli(en.at)}, true
+	ri := RunInfo{RunID: runID, Status: en.status, Trimmed: true, FinishedAt: time.UnixMilli(en.at)}
+	if en.kept {
+		if out, err := e.blobs.Get(keptKey(runID, en.gen)); err == nil {
+			ri.Output, ri.Trimmed = out, false
+		} else if !errors.Is(err, blob.ErrNotFound) {
+			log.Printf("kairo: run %s: reading its kept output: %v", runID, err)
+		}
+	}
+	return ri, true
+}
+
+// keepOutput durably puts a finished run's output (with its blob
+// references inlined) where trimmed finds it (ADR 0050). I/O: not from the
+// shard loop.
+func (e *Engine) keepOutput(runID string, gen uint64, out json.RawMessage) error {
+	if bytes.Contains(out, []byte(`"$blob"`)) {
+		var err error
+		if out, err = e.ResolveInput(out); err != nil {
+			return err
+		}
+	}
+	return e.blobs.Put(keptKey(runID, gen), out)
+}
+
+// deleteKept deletes a kept output (ADR 0050); one already gone is fine.
+// I/O: not from the shard loop.
+func (e *Engine) deleteKept(runID string, gen uint64) error {
+	if err := e.blobs.Delete(keptKey(runID, gen)); err != nil && !errors.Is(err, blob.ErrNotFound) {
+		log.Printf("kairo: run %s: deleting its kept output: %v", runID, err)
+		return err
+	}
+	return nil
 }
 
 // doneSinks opens the per-shard logs of finished-run markers (ADR 0027).

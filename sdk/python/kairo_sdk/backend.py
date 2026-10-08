@@ -84,7 +84,11 @@ class HttpBackend:
     async def run(
         self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(lambda: self.client.run(plan, input, run_id=run_id, tenant=self._tenant, tier="file", vars=vars))
+        # Kept after they finish (ADR 0050): a workflow resumed after kairod
+        # restarts still finds its finished calls' results.
+        return await asyncio.to_thread(
+            lambda: self.client.run(plan, input, run_id=run_id, tenant=self._tenant, tier="file", vars=vars, keep_output=True)
+        )
 
     async def get(self, run_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(self.client.get, run_id)

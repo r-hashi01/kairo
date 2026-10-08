@@ -26,6 +26,21 @@ type startMeta struct {
 	PlanHash string
 	Tenant   string
 	Tier     Tier
+	// Keep: the run's output is kept after it finishes, for IdempotencyTTL
+	// (SubmitRequest.KeepOutput, ADR 0050). Stored in the tier byte's high
+	// bit: records written before it read as false.
+	Keep bool
+}
+
+// keepBit marks startMeta.Keep in the tier byte (tiers are small numbers).
+const keepBit = 0x80
+
+func tierByte(m *startMeta) byte {
+	b := byte(m.Tier)
+	if m.Keep {
+		b |= keepBit
+	}
+	return b
 }
 
 func appendStr(b []byte, s string) []byte {
@@ -39,7 +54,7 @@ func encodeStart(b []byte, m *startMeta) []byte {
 	b = appendStr(b, m.Plan)
 	b = appendStr(b, m.PlanHash)
 	b = appendStr(b, m.Tenant)
-	return append(b, byte(m.Tier))
+	return append(b, tierByte(m))
 }
 
 // encodeCheckpoint records that the snapshot of m.RunID covering the log up
@@ -52,7 +67,7 @@ func encodeCheckpoint(b []byte, m *startMeta, snapLSN uint64) []byte {
 	b = appendStr(b, m.Plan)
 	b = appendStr(b, m.PlanHash)
 	b = appendStr(b, m.Tenant)
-	b = append(b, byte(m.Tier))
+	b = append(b, tierByte(m))
 	return binary.AppendUvarint(b, snapLSN)
 }
 
@@ -173,7 +188,8 @@ func decodeMeta(r *rdr) *startMeta {
 	m.Plan = r.str()
 	m.PlanHash = r.str()
 	m.Tenant = r.str()
-	m.Tier = Tier(r.byte1())
+	t := r.byte1()
+	m.Tier, m.Keep = Tier(t&^keepBit), t&keepBit != 0
 	return m
 }
 

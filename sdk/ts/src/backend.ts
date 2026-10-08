@@ -82,7 +82,9 @@ export class HttpBackend implements Backend {
 	}
 
 	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }) {
-		return this.client.run(plan, input, { runId: opts.runId, tier: 'file', vars: opts.vars });
+		// Kept after they finish (ADR 0050): a workflow resumed after kairod
+		// restarts still finds its finished calls' results.
+		return this.client.run(plan, input, { runId: opts.runId, tier: 'file', vars: opts.vars, keepOutput: true });
 	}
 
 	get(runId: string) {

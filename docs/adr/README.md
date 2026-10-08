@@ -54,7 +54,7 @@
 | [0047](0047-n8n-node-effects-by-type.md) | 外に作用しない n8n のノードは、「実」でなく「非保護」のステップにする | 承認 |
 | [0048](0048-distribution-as-bundled-binary.md) | kairo は、kairod のバイナリを同梱した言語ごとのパッケージとして配る | 0051 により置き換え |
 | [0049](0049-sdk-graph-and-code-apis.md) | SDK は、グラフの API と、コードで書くワークフローの API の 2 段で用意する | 承認 |
-| [0050](0050-keep-outputs-of-finished-runs.md) | kairod では、指定した実行は、終わった後も出力を冪等の期間のあいだ残す | 提案 |
+| [0050](0050-keep-outputs-of-finished-runs.md) | kairod では、指定した実行は、終わった後も出力を冪等の期間のあいだ残す | 承認 |
 | [0051](0051-no-resident-runtime.md) | kairo は常駐するサーバーを前提にしない: コアを利用者のプロセスに埋め込み、DB だけを使う | 承認 |
 | [0052](0052-http-actions.md) | アクションを HTTP(S) で呼べるようにする（結果はその場か、後からコールバックで受ける） | 承認 |
 | [0053](0053-scheduler-entry-points.md) | サーバーレスのランタイムを、スケジューラーの定期実行か、次の時刻を知らせる一度きりの予約で起こす | 承認 |

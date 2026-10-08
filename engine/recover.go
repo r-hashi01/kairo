@@ -175,7 +175,17 @@ func (s *shard) recover() error {
 					// TTL runs from when the run finished. An expired one
 					// is not written at all.
 					if at >= s.markerCut() {
-						unmarked = append(unmarked, marker{runID: id, at: at, status: st.Status.String()})
+						m := marker{runID: id, at: at, status: st.Status.String()}
+						if x.meta.Keep {
+							// Its output before its marker, as when it
+							// finished (ADR 0050). Its blobs are still here.
+							if err := s.e.keepOutput(id, last, st.Output); err != nil {
+								log.Printf("kairo: run %s: keeping its output: %v", id, err)
+							} else {
+								m.kept, m.gen = true, last
+							}
+						}
+						unmarked = append(unmarked, m)
 					} else if ok {
 						delete(d.idx.m, id)
 					}
@@ -207,7 +217,7 @@ func (s *shard) recover() error {
 			finished = append(finished, id)
 			continue
 		}
-		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, st: st, timers: map[uint32]timerwheel.Handle{},
+		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, keep: x.meta.Keep, st: st, timers: map[uint32]timerwheel.Handle{},
 			lastLSN: last, startLSN: x.startLSN, status: st.Status, started: true, feedLSN: feedLast}
 		if x.cpRec > 0 {
 			r.cpLSN, r.cpRec = x.cpLSN, x.cpRec

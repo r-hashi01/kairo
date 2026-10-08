@@ -93,6 +93,7 @@ type run struct {
 	plan    *ir.Plan
 	tenant  string
 	tier    Tier
+	keep    bool // keep the output after it finishes (ADR 0050)
 	st      *core.State
 	snap    []byte // encoded state while evicted (in memory, or pending write)
 	onDisk  bool   // evicted and the snapshot is in the snapshot store
@@ -141,6 +142,7 @@ type startReq struct {
 	limits RunLimits
 	depth  int
 	vars   json.RawMessage
+	keep   bool            // SubmitRequest.KeepOutput (ADR 0050)
 	reply  chan startReply // answered once the start is durable
 }
 
@@ -161,6 +163,8 @@ const (
 	mDoneAck
 	mFeedBound
 	mFeedStart
+	mKept
+	mKeptDeleted
 	mStop
 )
 
@@ -177,6 +181,8 @@ type msg struct {
 	reply chan queryReply
 	// mFeedStart
 	feedReply chan [tierCount]uint64
+	// mKept: the marker to add once the output is kept (ADR 0050)
+	after func()
 }
 
 type queryReply struct {
@@ -304,6 +310,12 @@ func (s *shard) handle(m *msg) {
 		s.ack(m.tier, m.lsn, m.err)
 	case mDoneAck:
 		s.doneAck(m.lsn, m.err)
+	case mKept:
+		// The output is durably kept (or could not be: then it is not, and
+		// the run reads as trimmed once forgotten): now the marker.
+		s.addMarker(m.runID, string(m.data), m.err == nil, m.lsn, m.after)
+	case mKeptDeleted:
+		delete(s.doneLog.deleting, m.lsn)
 	case mFeedBound:
 		s.feedBound[m.tier] = m.lsn
 		s.feedAdvanced()
@@ -434,7 +446,7 @@ func (s *shard) startRun(sr *startReq) {
 		old.starts = append(old.starts, sr)
 		return
 	}
-	r := &run{id: sr.runID, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
+	r := &run{id: sr.runID, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, keep: sr.keep, st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
 	s.forgetMarker(r.id) // an expired marker of an earlier run with this id
 	s.runs[r.id] = r
 	s.inMemory.Add(1)
@@ -461,7 +473,7 @@ func (s *shard) startRun(sr *startReq) {
 }
 
 func (s *shard) meta(r *run) *startMeta {
-	return &startMeta{RunID: r.id, Plan: r.plan.Name, PlanHash: r.plan.Hash, Tenant: r.tenant, Tier: r.tier}
+	return &startMeta{RunID: r.id, Plan: r.plan.Name, PlanHash: r.plan.Hash, Tenant: r.tenant, Tier: r.tier, Keep: r.keep}
 }
 
 func (s *shard) logFor(r *run) *shardLog {
@@ -850,7 +862,23 @@ func (s *shard) finish(r *run) {
 	}
 	// Clean up only once the marker is durable: until then the records
 	// are what tells a restart that the run finished (ADR 0027).
-	s.addMarker(id, ri.Status, start)
+	if !r.keep {
+		s.addMarker(id, ri.Status, false, 0, start)
+		return
+	}
+	// Its output first, then the marker that says it is there: a marker
+	// never points at an output that a crash lost (ADR 0050). A crash in
+	// between leaves the run's records: recovery finishes it again.
+	// Its generation: the log position of the event that finished it,
+	// which recovery finds again if it has to keep the output itself.
+	out, status, gen := ri.Output, ri.Status, r.lastLSN
+	s.e.doIO(func() {
+		err := s.e.keepOutput(id, gen, out)
+		if err != nil {
+			log.Printf("kairo: run %s: keeping its output: %v", id, err)
+		}
+		s.inbox.Push(msg{kind: mKept, runID: id, data: []byte(status), lsn: gen, err: err, after: start})
+	})
 }
 
 // maybeEvict snapshots a run that is only waiting (timers far away,

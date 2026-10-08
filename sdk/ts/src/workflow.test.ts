@@ -229,3 +229,85 @@ describe('serverless (suspend)', { skip: !hasGo }, () => {
 		await k.close();
 	});
 });
+
+// kairod restarts while a workflow waits (ADR 0050): its finished calls
+// were submitted with keep_output, so resuming it after the restart finds
+// their results, and the real call does not run again.
+describe('kairod restarts', { skip: !hasGo }, () => {
+	test('a workflow resumes after kairod restarts, its real call run once', { timeout: 60_000 }, async () => {
+		const t0 = Date.now();
+		const mark = (what: string) => console.log(`restart test: ${what} at ${Date.now() - t0}ms`);
+		const data = join(dir, 'restart-data');
+		const port2 = port + 1;
+		const url2 = `http://127.0.0.1:${port2}`;
+		const sock2 = join(dir, 'restart.sock');
+		async function startKairod(): Promise<ChildProcess> {
+			const p = spawn(join(dir, 'kairod'), ['-data', data, '-http', `127.0.0.1:${port2}`, '-socket', sock2, '-nosync'], { stdio: 'ignore' });
+			for (let i = 0; i < 200; i++) {
+				try {
+					if ((await fetch(url2 + '/v1/stats')).ok) return p;
+				} catch {}
+				await new Promise((r) => setTimeout(r, 50));
+			}
+			throw new Error('kairod did not start');
+		}
+		async function stop(p: ChildProcess): Promise<void> {
+			const exited = new Promise((r) => p.once('exit', r));
+			p.kill('SIGTERM');
+			await exited;
+		}
+		let writes = 0;
+		async function kairo(): Promise<Kairo> {
+			const k = new Kairo({ backend: new HttpBackend({ url: url2, worker: sock2, concurrency: 4 }) });
+			k.defineAction('write', { effect: 'real', handler: async (v: string) => (writes++, `wrote ${v}`) });
+			k.workflow('approve-then', async (ctx) => {
+				const w = await ctx.call<string>('write', 'x');
+				const ok = await ctx.waitFor<{ by: string }>('approve');
+				return `${w} for ${ok.by}`;
+			});
+			await k.start();
+			return k;
+		}
+
+		// Whatever happens, what this test started stops with it (a kairod
+		// or a worker left running would keep the test process alive).
+		const kairods: ChildProcess[] = [];
+		const clients: Kairo[] = [];
+		try {
+			kairods.push(await startKairod());
+			let k = await kairo();
+			clients.push(k);
+			mark('started');
+			const first = k.run('approve-then', null, { id: 'restart-1' }).catch(() => {});
+			await waitUntil(() => writes === 1);
+			mark('wrote');
+			await k.close();
+			await first;
+			mark('closed');
+			await stop(kairods[0]!);
+			mark('kairod stopped');
+
+			kairods.push(await startKairod());
+			k = await kairo();
+			clients.push(k);
+			mark('restarted');
+			// Resumed: the finished call returns its kept result, then it waits.
+			const resumed = k.run('approve-then', null, { id: 'restart-1' });
+			for (let i = 0; ; i++) {
+				try {
+					await k.signal('restart-1', 'approve', { by: 'alice' });
+					break;
+				} catch (e) {
+					if (i > 200) throw e;
+					await new Promise((r) => setTimeout(r, 25));
+				}
+			}
+			mark('signalled');
+			assert.equal(await resumed, 'wrote x for alice');
+			assert.equal(writes, 1, 'the real call did not run again');
+		} finally {
+			for (const c of clients) await c.close().catch(() => {});
+			for (const p of kairods) if (p.exitCode === null && p.signalCode === null) await stop(p);
+		}
+	});
+});

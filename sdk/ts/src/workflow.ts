@@ -168,6 +168,8 @@ export class Kairo {
 	private readonly again = new Set<string>();
 	private readonly redrives = new Set<Promise<void>>();
 	private stopHook?: () => void;
+	/** Closing: calls interrupted now go on in kairo, to be resumed (not cancelled). */
+	private closing = false;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
@@ -219,6 +221,7 @@ export class Kairo {
 	 * does: the workflows it drove stay unfinished in kairo, to be resumed.
 	 */
 	async close(): Promise<void> {
+		this.closing = true;
 		this.stopHook?.();
 		for (const a of this.driving) a.abort();
 		await this.backend.close();
@@ -510,7 +513,10 @@ export class Kairo {
 				r = await this.backend.wait(runId, signal);
 			} catch (e) {
 				if (signal.aborted) {
-					await this.backend.cancel(runId).catch(() => {});
+					// The workflow was cancelled: so is the call. Unless this
+					// process is closing: then the call goes on in kairo, and
+					// the workflow resumes it later.
+					if (!this.closing) await this.backend.cancel(runId).catch(() => {});
 					throw new CancelledError(`call ${runId} cancelled`);
 				}
 				throw e;

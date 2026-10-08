@@ -37,6 +37,8 @@ export interface RunOptions {
 	tier?: TierName;
 	/** Initial values of the plan's run variables. */
 	vars?: Record<string, unknown>;
+	/** Keep the output after the run finishes, across restarts, for the idempotency period (ADR 0050). */
+	keepOutput?: boolean;
 }
 
 export class KairoError extends Error {
@@ -97,6 +99,7 @@ export class Client {
 		if (opts.runId) body.run_id = opts.runId;
 		if (opts.tier) body.tier = opts.tier;
 		if (opts.vars) body.vars = opts.vars;
+		if (opts.keepOutput) body.keep_output = true;
 		const [status, data] = await this.call('POST', '/v1/runs', body);
 		if (status === 504) throw new KairoError(504, `run ${data.run_id}: start not confirmed`);
 		return data;

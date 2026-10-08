@@ -67,9 +67,12 @@ class Client:
         tenant: str = "default",
         tier: str = "",
         vars: dict[str, Any] | None = None,
+        keep_output: bool = False,
     ) -> dict[str, Any]:
         """Starts a run of plan once its start is durable. With a run id already
-        running or recently finished, nothing new starts ("existing")."""
+        running or recently finished, nothing new starts ("existing").
+        keep_output: its output stays after it finishes, across restarts, for
+        the idempotency period (ADR 0050)."""
         body: dict[str, Any] = {"plan": plan, "input": input, "tenant": tenant}
         if run_id:
             body["run_id"] = run_id
@@ -77,6 +80,8 @@ class Client:
             body["tier"] = tier
         if vars:
             body["vars"] = vars
+        if keep_output:
+            body["keep_output"] = True
         status, out = self._call("POST", "/v1/runs", body)
         if status == 504:
             raise KairoError(504, f"run {out.get('run_id')}: start not confirmed")
