@@ -19,15 +19,16 @@ jobs:
     env:
       KAIRO_SDK_PG_DSN: postgresql://postgres:kairo@127.0.0.1:5432/kairo_sdk
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
       # The TypeScript SDK runs its .ts sources directly (Node >= 22).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: SDK test dependencies (the embedded extra; the database drivers)
@@ -40,7 +41,7 @@ jobs:
       # The WASM core the SDKs embed (ADR 0051), as built and tested above.
       - name: kairo.wasm checksum
         run: (cd "$RUNNER_TEMP" && sha256sum kairo.wasm | tee kairo.wasm.sha256)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kairo-wasm
           path: |
@@ -51,10 +52,11 @@ jobs:
     # The SQL backends against real databases in Docker (ADR 0020).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
       - name: postgres, mysql, tidb, oracle
         run: scripts/check-backends.sh
 
@@ -62,10 +64,11 @@ jobs:
     # Known vulnerabilities in the code paths of every module (ADR 0020).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
           check-latest: true
       - name: govulncheck
         run: |
@@ -79,9 +82,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
       - name: non-functional budgets
         run: scripts/bench.sh
