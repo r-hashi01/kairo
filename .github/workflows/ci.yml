@@ -6,13 +6,46 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The SDKs' embedded runtime (ADR 0051) is also tested on PostgreSQL.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: kairo
+          POSTGRES_DB: kairo_sdk
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      KAIRO_SDK_PG_DSN: postgresql://postgres:kairo@127.0.0.1:5432/kairo_sdk
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # The TypeScript SDK runs its .ts sources directly (Node >= 22).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: SDK test dependencies (the embedded extra; the database drivers)
+        run: |
+          python3 -m pip install wasmtime "psycopg[binary,pool]"
+          mkdir -p "$RUNNER_TEMP/pg" && npm install --prefix "$RUNNER_TEMP/pg" pg
+          echo "KAIRO_SDK_PG_MODULE=$RUNNER_TEMP/pg" >> "$GITHUB_ENV"
       - name: check (fmt, vet, build, tests, invariants, race; all modules)
-        run: scripts/check.sh --race
+        run: KAIRO_WASM="$RUNNER_TEMP/kairo.wasm" scripts/check.sh --race
+      # The WASM core the SDKs embed (ADR 0051), as built and tested above.
+      - name: kairo.wasm checksum
+        run: (cd "$RUNNER_TEMP" && sha256sum kairo.wasm | tee kairo.wasm.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kairo-wasm
+          path: |
+            ${{ runner.temp }}/kairo.wasm
+            ${{ runner.temp }}/kairo.wasm.sha256
 
   backends:
     # The SQL backends against real databases in Docker (ADR 0020).

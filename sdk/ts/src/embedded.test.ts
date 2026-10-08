@@ -14,17 +14,20 @@ import { PostgresStore, SQLiteStore } from './store.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-embedded-'));
-const wasm = join(dir, 'kairo.wasm');
+// Built by scripts/check.sh (KAIRO_WASM), or here.
+const wasm = process.env.KAIRO_WASM || join(dir, 'kairo.wasm');
 const hasGo = spawnSync('go', ['version']).status === 0;
 
 before(() => {
 	if (!hasGo) return;
-	const r = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
-		cwd: repo,
-		stdio: 'inherit',
-		env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
-	});
-	assert.equal(r.status, 0, 'building kairo.wasm');
+	if (!process.env.KAIRO_WASM) {
+		const r = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
+			cwd: repo,
+			stdio: 'inherit',
+			env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
+		});
+		assert.equal(r.status, 0, 'building kairo.wasm');
+	}
 });
 
 after(() => rmSync(dir, { recursive: true, force: true }));

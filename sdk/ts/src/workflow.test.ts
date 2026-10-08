@@ -17,7 +17,8 @@ import { CancelledError, Kairo, Suspended } from './workflow.ts';
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-'));
 const hasGo = spawnSync('go', ['version']).status === 0;
-const wasm = join(dir, 'kairo.wasm');
+// Built by scripts/check.sh (KAIRO_WASM), or here.
+const wasm = process.env.KAIRO_WASM || join(dir, 'kairo.wasm');
 const port = 18420 + (process.pid % 1000);
 const url = `http://127.0.0.1:${port}`;
 const sock = join(dir, 'worker.sock');
@@ -25,12 +26,14 @@ let kairod: ChildProcess | undefined;
 
 before(async () => {
 	if (!hasGo) return;
-	const w = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
-		cwd: repo,
-		stdio: 'inherit',
-		env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
-	});
-	assert.equal(w.status, 0, 'building kairo.wasm');
+	if (!process.env.KAIRO_WASM) {
+		const w = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
+			cwd: repo,
+			stdio: 'inherit',
+			env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
+		});
+		assert.equal(w.status, 0, 'building kairo.wasm');
+	}
 	const bin = join(dir, 'kairod');
 	assert.equal(spawnSync('go', ['build', '-o', bin, './cmd/kairod'], { cwd: repo, stdio: 'inherit' }).status, 0, 'building kairod');
 	kairod = spawn(bin, ['-data', join(dir, 'data'), '-http', `127.0.0.1:${port}`, '-socket', sock, '-nosync'], { stdio: 'ignore' });

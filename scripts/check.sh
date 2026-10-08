@@ -36,7 +36,15 @@ go build ./...
 # The pure core as a WASM module for SDKs that embed it (ADR 0051).
 step "go vet + build (wasip1)"
 GOOS=wasip1 GOARCH=wasm go vet ./cmd/kairo-wasm ./wasmcore ./core ./ir
-GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o /dev/null ./cmd/kairo-wasm
+# Built once here; the SDK suites below take it from KAIRO_WASM instead of
+# building their own (CI keeps it as an artifact when KAIRO_WASM is set).
+if [ -z "${KAIRO_WASM:-}" ]; then
+  wasm_dir=$(mktemp -d)
+  trap 'rm -rf "$wasm_dir"' EXIT
+  KAIRO_WASM="$wasm_dir/kairo.wasm"
+fi
+export KAIRO_WASM
+GOOS=wasip1 GOARCH=wasm go build -trimpath -buildmode=c-shared -o "$KAIRO_WASM" ./cmd/kairo-wasm
 
 # Nested modules (optional backends with their own dependencies, ADR 0018).
 modules=$(find . -name go.mod -not -path ./go.mod -exec dirname {} \; | sort)

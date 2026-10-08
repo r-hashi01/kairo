@@ -31,6 +31,9 @@ HAS_GO = shutil.which("go") is not None
 
 
 def build_wasm(dir: str) -> str:
+    """kairo.wasm: the one scripts/check.sh built (KAIRO_WASM), or built here."""
+    if os.environ.get("KAIRO_WASM"):
+        return os.environ["KAIRO_WASM"]
     wasm = os.path.join(dir, "kairo.wasm")
     env = dict(os.environ, GOOS="wasip1", GOARCH="wasm")
     subprocess.run(["go", "build", "-buildmode=c-shared", "-o", wasm, "./cmd/kairo-wasm"], cwd=REPO, check=True, env=env)

@@ -21,18 +21,21 @@ const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-http-'));
 const hasGo = spawnSync('go', ['version']).status === 0;
 const hasOpenSSL = spawnSync('openssl', ['version']).status === 0;
-const wasm = join(dir, 'kairo.wasm');
+// Built by scripts/check.sh (KAIRO_WASM), or here.
+const wasm = process.env.KAIRO_WASM || join(dir, 'kairo.wasm');
 const secret = 'test-secret';
 const servers: Server[] = [];
 
 before(() => {
 	if (!hasGo) return;
-	const w = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
-		cwd: repo,
-		stdio: 'inherit',
-		env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
-	});
-	assert.equal(w.status, 0, 'building kairo.wasm');
+	if (!process.env.KAIRO_WASM) {
+		const w = spawnSync('go', ['build', '-buildmode=c-shared', '-o', wasm, './cmd/kairo-wasm'], {
+			cwd: repo,
+			stdio: 'inherit',
+			env: { ...process.env, GOOS: 'wasip1', GOARCH: 'wasm' },
+		});
+		assert.equal(w.status, 0, 'building kairo.wasm');
+	}
 });
 
 after(() => {
