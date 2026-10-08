@@ -19,6 +19,7 @@ import hashlib
 import inspect
 import json
 import random
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,7 @@ from typing import Any
 
 from .backend import Backend, HttpBackend
 from .client import KairoError, finished
+from .http import SignatureError, check_url, post, sign, verify
 from .protocol import Result
 from .worker import Task, TaskContext
 
@@ -54,6 +56,8 @@ class _Action:
     effect: str
     timeout: str | None
     destination: str | None
+    url: str | None = None
+    async_: bool = False
 
 
 def _canonical(v: Any) -> str:
@@ -84,7 +88,17 @@ class Kairo:
         concurrency: int | None = None,
         backend: Backend | None = None,
         mode: str = "wait",
+        secret: str | None = None,
+        callback_url: str | None = None,
+        ca: str | None = None,
+        allow_insecure: bool = False,
+        wait_until: Callable[[Awaitable[Any]], None] | None = None,
     ) -> None:
+        """Actions over HTTP(S) (ADR 0052): secret signs the calls and the
+        callbacks; callback_url is where this process takes outcomes (the
+        ASGI app's /callback); ca, certificates to trust (PEM) besides the
+        system's; allow_insecure allows plain http to other machines;
+        wait_until keeps the host running async actions after the answer."""
         self.backend: Any = backend or HttpBackend(url, worker=worker, token=token, tenant=tenant, concurrency=concurrency)
         self._ttl = idempotency_ttl
         self._actions: dict[str, _Action] = {}
@@ -101,16 +115,38 @@ class Kairo:
         self._again: set[str] = set()
         self._redrives: set[asyncio.Future[Any]] = set()
         self._stop_hook: Callable[[], None] | None = None
+        self._secret = secret
+        self._callback_url = callback_url
+        self._ca = ca
+        self._allow_insecure = allow_insecure
+        self._wait_until = wait_until
+        self._background: set[asyncio.Future[Any]] = set()
 
-    def action(self, name: str, *, effect: str = "real", timeout: str | None = None, destination: str | None = None):
+    def action(
+        self,
+        name: str,
+        *,
+        effect: str = "real",
+        timeout: str | None = None,
+        destination: str | None = None,
+        url: str | None = None,
+        async_: bool = False,
+        allow_insecure: bool | None = None,
+    ):
         """Declares an action: "real" (the default) acts outside and never runs
         twice; "unprotected" may run again. The handler takes the input and a
-        TaskContext; it may be a plain or an async function."""
+        TaskContext; it may be a plain or an async function.
+
+        url (ADR 0052): the action's steps are called over HTTP(S) there, and
+        the handler runs there (asgi_app). async_: where the URL serves it,
+        it answers at once (202) and sends the outcome to the callback."""
         if name.startswith("kairo."):
             raise ValueError(f'action {name}: names beginning with "kairo." are kairo\'s')
+        if url:
+            check_url(url, self._allow_insecure if allow_insecure is None else allow_insecure)
 
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._actions[name] = _Action(fn, effect, timeout, destination)
+            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_)
             return fn
 
         return register
@@ -136,6 +172,13 @@ class Kairo:
             specs.append(s)
         for name in (NOW, RANDOM, SLEEP):
             specs.append({"action": name, "effect": "unprotected"})
+        if any(a.url for a in self._actions.values()):
+            # Actions over HTTP(S) (ADR 0052) take their outcomes on the callback.
+            if not self._secret or not self._callback_url:
+                raise ValueError("actions with a url need secret and callback_url")
+            check_url(self._callback_url, self._allow_insecure)
+            if not hasattr(self.backend, "complete"):
+                raise ValueError("actions with a url need the embedded backend")
         await self.backend.start(specs, self._serve)
         for s in specs:
             await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"], "input": {"in": "$input.in"}})
@@ -233,10 +276,127 @@ class Kairo:
         a = self._actions.get(task.action)
         if a is None:
             return Result(error=f"no action {task.action} here")
+        if a.url:
+            return self._call_remote(task, a, input)
         out = a.handler(input, ctx)
         if inspect.isawaitable(out):
             out = asyncio.run(_await(out))
         return Result(output=out)
+
+    def _call_remote(self, task: Task, a: _Action, input: Any) -> Result:
+        """Calls an action over HTTP(S) (ADR 0052); on the step's thread."""
+        assert a.url and self._secret
+        body = json.dumps(
+            {
+                "run_id": task.run_id,
+                "step_id": task.step_id,
+                "act": task.act,
+                "attempt": task.attempt,
+                "action": task.action,
+                "input": input,
+                "idempotency_key": task.idempotency_key,
+                "callback": self._callback_url,
+            },
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        lease_ms = _duration_ms(a.timeout) or 15 * 60 * 1000
+        try:
+            r = post(
+                a.url,
+                body,
+                ca=self._ca,
+                timeout=min(lease_ms, 60_000) / 1000,
+                headers={"Idempotency-Key": task.idempotency_key, "Kairo-Signature": sign(self._secret, body)},
+            )
+        except OSError as e:
+            # It may have run: unknown (invariant 5).
+            return Result(error=f"calling {a.url}: {e}", unknown=True, retryable=True, error_type="http")
+        if r.status == 202:
+            return Result(pending={"owner": f"remote:{a.url}", "lease_ms": lease_ms})
+        if 200 <= r.status < 300:
+            try:
+                return _from_wire(json.loads(r.body))
+            except (ValueError, TypeError):
+                return Result(error=f"{a.url}: the answer is not JSON", unknown=True, retryable=True, error_type="http")
+        if 400 <= r.status < 500:
+            return Result(error=f"{a.url}: {r.status} {r.body[:200].decode(errors='replace')}", error_type=f"http_{r.status}")
+        return Result(error=f"{a.url}: {r.status}", unknown=True, retryable=True, error_type=f"http_{r.status}")
+
+    def asgi_app(self) -> Callable[..., Awaitable[None]]:
+        """Serves actions called over HTTP(S) and takes their outcomes (ADR
+        0052), as an ASGI app: POST <base>/action runs an action's handler
+        here; POST <base>/callback applies an outcome to its run. Both are
+        signed with secret."""
+
+        async def app(scope: dict[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+            if scope["type"] != "http":
+                return
+            body = b""
+            while True:
+                m = await receive()
+                body += m.get("body", b"")
+                if not m.get("more_body"):
+                    break
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
+            data = json.dumps(out).encode()
+            await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": data})
+
+        return app
+
+    async def _handle(self, method: str, path: str, signature: str | None, body: bytes) -> tuple[int, Any]:
+        if method != "POST":
+            return 405, {"error": "POST only"}
+        if not self._secret:
+            return 500, {"error": "no secret configured"}
+        try:
+            verify(self._secret, body, signature)
+        except SignatureError as e:
+            return 401, {"error": str(e)}
+        m = json.loads(body)
+        if path.endswith("/callback"):
+            if not hasattr(self.backend, "complete"):
+                return 501, {"error": "no embedded runtime here"}
+            await self.backend.complete(m["run_id"], m["act"], m["attempt"], _from_wire(m["result"]))
+            if self.suspend:
+                await self._settle()
+            return 200, {"ok": True}
+        if not path.endswith("/action"):
+            return 404, {"error": "no such path"}
+        a = self._actions.get(m.get("action", ""))
+        if a is None:
+            return 404, {"error": f"no action {m.get('action')} here"}
+
+        async def run() -> dict[str, Any]:
+            try:
+                out = await asyncio.to_thread(a.handler, m.get("input"), TaskContext(lambda _d: None))
+                if inspect.isawaitable(out):
+                    out = await out
+                return {"output": out}
+            except Exception as e:
+                return {"error": f"{type(e).__name__}: {e}", "error_type": type(e).__name__}
+
+        if not a.async_:
+            return 200, await run()
+
+        # Answer now; run after, and send the outcome to the callback.
+        async def work() -> None:
+            result = await run()
+            cb = json.dumps({"run_id": m["run_id"], "act": m["act"], "attempt": m["attempt"], "result": result}).encode()
+            try:
+                check_url(m["callback"], self._allow_insecure)
+                await asyncio.to_thread(post, m["callback"], cb, ca=self._ca, headers={"Kairo-Signature": sign(self._secret or "", cb)})
+            except (OSError, ValueError):
+                pass  # a lost callback: the lease expires and the step is taken up
+
+        fut = asyncio.ensure_future(work())
+        self._background.add(fut)
+        fut.add_done_callback(self._background.discard)
+        if self._wait_until is not None:
+            self._wait_until(fut)
+        return 202, {"accepted": True}
 
     async def run(self, name: str, input: Any = None, *, id: str | None = None) -> Any:
         """Runs workflow name as execution id, or resumes it: calls that
@@ -342,6 +502,25 @@ class Kairo:
 
 async def _await(a: Awaitable[Any]) -> Any:
     return await a
+
+
+def _from_wire(w: Any) -> Result:
+    """A result as actions over HTTP(S) send it (ADR 0052)."""
+    if not isinstance(w, dict):
+        raise TypeError("not a result")
+    if w.get("error") is not None:
+        return Result(error=str(w["error"]), retryable=bool(w.get("retryable")), error_type=w.get("error_type") or "")
+    if w.get("wait"):
+        return Result(wait={"until": int(w["wait"]["until"]), "output": w["wait"].get("output")})
+    return Result(output=w.get("output"))
+
+
+def _duration_ms(d: str | None) -> int | None:
+    """Milliseconds of a duration such as "300ms", "5s", "5m", "1h"."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m|h)", d or "")
+    if not m:
+        return None
+    return int(float(m.group(1)) * {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}[m.group(2)])
 
 
 def _done(id: str, info: dict[str, Any]) -> Any:

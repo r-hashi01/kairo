@@ -7,6 +7,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { HttpBackend, type Backend } from './backend.ts';
+import { SignatureError, checkURL, post, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
 import type { Result, Task } from './protocol.ts';
 import type { Address, TaskContext } from './worker.ts';
@@ -20,6 +21,18 @@ export interface ActionDef<I = any, O = any> {
 	timeout?: string;
 	/** The rate-limit key (default: the action). */
 	destination?: string;
+	/**
+	 * Where the action runs (ADR 0052): its steps are called over HTTP(S)
+	 * at this URL, and the handler runs there (fetchHandler). https, or
+	 * http to this machine, or http with allowInsecure.
+	 */
+	url?: string;
+	/**
+	 * Where the URL serves it: answer at once (202) and run the handler
+	 * after, sending its outcome to the callback. For long actions.
+	 */
+	async?: boolean;
+	allowInsecure?: boolean;
 }
 
 export type WorkflowFn<I = any, O = any> = (ctx: Context, input: I) => Promise<O>;
@@ -48,6 +61,19 @@ export interface KairoOptions {
 	 * workflows on when their calls settle (ADR 0051).
 	 */
 	mode?: 'wait' | 'suspend';
+	/** Actions over HTTP(S) (ADR 0052): the secret both sides sign with. */
+	secret?: string;
+	/** Actions over HTTP(S): where this process takes outcomes (fetchHandler's /callback). */
+	callbackUrl?: string;
+	/** Certificates to trust (PEM) for actions and callbacks over https, besides the system's. */
+	ca?: string | Buffer | Array<string | Buffer>;
+	/** Allows plain http to other machines (callbackUrl, and actions that do not say otherwise). */
+	allowInsecure?: boolean;
+	/**
+	 * Keeps the platform running work after a response (e.g. Vercel's or
+	 * Cloudflare's waitUntil): used for async actions served by fetchHandler.
+	 */
+	waitUntil?: (p: Promise<unknown>) => void;
 }
 
 /** The workflow ran into a call whose result kairo no longer keeps. */
@@ -61,6 +87,29 @@ const PLAN_CALL = 'kairo.call/';
 const PLAN_WAIT = 'kairo.wait/';
 const PLAN_WORKFLOW = 'kairo.workflow';
 const BUILTIN = { now: 'kairo.now', random: 'kairo.random', sleep: 'kairo.sleep' };
+
+/** A result as actions over HTTP(S) send it (ADR 0052). */
+interface Wire {
+	output?: unknown;
+	error?: string;
+	retryable?: boolean;
+	error_type?: string;
+	wait?: { until: number; output?: unknown };
+}
+
+function fromWire(w: Wire): Result {
+	if (typeof w !== 'object' || w === null) throw new Error('not a result');
+	if (w.error !== undefined) return { error: String(w.error), retryable: !!w.retryable, ...(w.error_type ? { errorType: w.error_type } : {}) };
+	if (w.wait) return { wait: { until: Number(w.wait.until), output: w.wait.output ?? null } };
+	return { output: w.output ?? null };
+}
+
+/** Milliseconds of a duration such as "300ms", "5s", "5m", "1h". */
+function durationMs(d: string | undefined): number | undefined {
+	const m = d ? /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(d) : null;
+	if (!m) return undefined;
+	return Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] as 'ms' | 's' | 'm' | 'h'];
+}
 
 /** JSON with object keys sorted: equal values, equal text. */
 function canonical(v: unknown): string {
@@ -95,6 +144,7 @@ export class Kairo {
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
 		if (name.startsWith('kairo.')) throw new Error(`action ${name}: names beginning with "kairo." are kairo's`);
+		if (def.url) checkURL(def.url, def.allowInsecure ?? this.opts.allowInsecure);
 		this.actions.set(name, def);
 	}
 
@@ -111,6 +161,12 @@ export class Kairo {
 			...(def.destination ? { destination: def.destination } : {}),
 		}));
 		for (const action of Object.values(BUILTIN)) specs.push({ action, effect: 'unprotected' });
+		if ([...this.actions.values()].some((d) => d.url)) {
+			// Actions over HTTP(S) (ADR 0052) take their outcomes on the callback.
+			if (!this.opts.secret || !this.opts.callbackUrl) throw new Error('actions with a url need secret and callbackUrl');
+			checkURL(this.opts.callbackUrl, this.opts.allowInsecure);
+			if (!this.backend.complete) throw new Error('actions with a url need the embedded backend');
+		}
 		await this.backend.start(specs, (task, ctx) => this.serve(task, ctx));
 		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action, input: { in: '$input.in' } });
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
@@ -203,7 +259,93 @@ export class Kairo {
 		}
 		const def = this.actions.get(task.action);
 		if (!def) return { error: `no action ${task.action} here` };
+		if (def.url) return this.callRemote(task, def, input);
 		return { output: (await def.handler(input, ctx)) ?? null };
+	}
+
+	/** Calls an action over HTTP(S) (ADR 0052). */
+	private async callRemote(task: Task, def: ActionDef, input: unknown): Promise<Result> {
+		const body = JSON.stringify({
+			run_id: task.run_id,
+			step_id: task.step_id,
+			act: task.act,
+			attempt: task.attempt,
+			action: task.action,
+			input: input ?? null,
+			idempotency_key: task.idempotency_key,
+			callback: this.opts.callbackUrl,
+		});
+		const leaseMs = durationMs(def.timeout) ?? 15 * 60 * 1000;
+		let res;
+		try {
+			res = await post(def.url!, body, {
+				ca: this.opts.ca,
+				timeoutMs: Math.min(leaseMs, 60_000),
+				headers: { 'idempotency-key': task.idempotency_key, 'kairo-signature': sign(this.opts.secret!, body) },
+			});
+		} catch (e) {
+			// It may have run: unknown (invariant 5).
+			return { error: `calling ${def.url}: ${(e as Error).message}`, unknown: true, retryable: true, errorType: 'http' };
+		}
+		if (res.status === 202) return { pending: { owner: `remote:${def.url}`, leaseMs } };
+		if (res.status >= 200 && res.status < 300) {
+			try {
+				return fromWire(JSON.parse(res.body));
+			} catch {
+				return { error: `${def.url}: the answer is not JSON`, unknown: true, retryable: true, errorType: 'http' };
+			}
+		}
+		if (res.status >= 400 && res.status < 500) return { error: `${def.url}: ${res.status} ${res.body.slice(0, 200)}`, errorType: `http_${res.status}` };
+		return { error: `${def.url}: ${res.status}`, unknown: true, retryable: true, errorType: `http_${res.status}` };
+	}
+
+	/**
+	 * Serves actions called over HTTP(S) and takes their outcomes (ADR
+	 * 0052), as a fetch-style handler: POST <base>/action runs an action's
+	 * handler here; POST <base>/callback applies an outcome to its run.
+	 * Both are signed with secret.
+	 */
+	fetchHandler(): (req: Request) => Promise<Response> {
+		const json = (status: number, v: unknown) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } });
+		return async (req) => {
+			if (req.method !== 'POST') return json(405, { error: 'POST only' });
+			if (!this.opts.secret) return json(500, { error: 'no secret configured' });
+			const body = await req.text();
+			try {
+				verify(this.opts.secret, body, req.headers.get('kairo-signature'));
+			} catch (e) {
+				if (e instanceof SignatureError) return json(401, { error: e.message });
+				throw e;
+			}
+			const path = new URL(req.url).pathname;
+			const m = JSON.parse(body);
+			if (path.endsWith('/callback')) {
+				if (!this.backend.complete) return json(501, { error: 'no embedded runtime here' });
+				await this.backend.complete(m.run_id, m.act, m.attempt, fromWire(m.result));
+				if (this.suspend) await this.settle();
+				return json(200, { ok: true });
+			}
+			if (!path.endsWith('/action')) return json(404, { error: 'no such path' });
+			const def = this.actions.get(m.action);
+			if (!def) return json(404, { error: `no action ${m.action} here` });
+			const run = async (): Promise<Wire> => {
+				try {
+					return { output: (await def.handler(m.input, { signal: new AbortController().signal, emit: () => {} })) ?? null };
+				} catch (e) {
+					return { error: String((e as Error)?.message ?? e), error_type: (e as Error)?.name };
+				}
+			};
+			if (!def.async) return json(200, await run());
+			// Answer now; run after, and send the outcome to the callback.
+			const work = (async () => {
+				const result = await run();
+				const cb = JSON.stringify({ run_id: m.run_id, act: m.act, attempt: m.attempt, result });
+				checkURL(m.callback, this.opts.allowInsecure);
+				await post(m.callback, cb, { ca: this.opts.ca, headers: { 'kairo-signature': sign(this.opts.secret!, cb) } });
+			})().catch(() => {}); // a lost callback: the lease expires and the step is taken up
+			this.opts.waitUntil?.(work);
+			return json(202, { accepted: true });
+		};
 	}
 
 	/**

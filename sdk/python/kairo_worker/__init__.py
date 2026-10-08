@@ -9,6 +9,7 @@ API); ``Kairo`` declares actions and workflows written as code.
 
 from .backend import Backend, EmbeddedBackend, HttpBackend
 from .client import Client, KairoError
+from .http import SignatureError
 from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import Task, TaskContext, Worker
 from .store import PostgresStore, SQLiteStore
@@ -34,6 +35,7 @@ __all__ = [
     "MsgType",
     "ProtocolError",
     "Result",
+    "SignatureError",
     "Task",
     "TaskContext",
     "Worker",

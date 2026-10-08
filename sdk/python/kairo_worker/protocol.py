@@ -71,6 +71,9 @@ class Result:
     # wait: {"until": <unix ms>, "output": ...}: the step waits until then
     # and ends with that output (ADR 0045).
     wait: dict[str, Any] | None = None
+    # Embedded runtime only (ADR 0052): the step runs elsewhere and its
+    # outcome comes later (Embedded.complete): {"owner": ..., "lease_ms": ...}.
+    pending: dict[str, Any] | None = None
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"seq": self.seq}

@@ -362,18 +362,30 @@ export class Embedded {
 			this.renew();
 		}
 		if (this.closed) return;
-		const at = this.now();
-		let ev: CoreEvent;
-		if (res.error !== undefined || res.unknown) {
-			ev = { kind: 'step_err', at, act: c.act, attempt: c.attempt, error: res.error || 'outcome unknown', retryable: !!res.retryable,
-				unknown: !!res.unknown, ...(res.errorType ? { error_type: res.errorType } : {}) };
-		} else if (res.wait) {
-			ev = { kind: 'step_wait', at, act: c.act, attempt: c.attempt, deadline: Math.floor(res.wait.until), data: res.wait.output ?? null };
-		} else {
-			ev = { kind: 'step_ok', at, act: c.act, attempt: c.attempt, data: res.output ?? null };
+		if (res.pending) {
+			// It runs elsewhere (ADR 0052): its lease goes there, until its
+			// outcome comes (complete) or the lease expires. An outcome that
+			// came first ended the lease; then nothing is handed over.
+			await this.store.handOver({ run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: res.pending.owner, until: this.now() + res.pending.leaseMs });
+			return;
 		}
-		await this.process(runId, [ev]);
+		await this.process(runId, [outcome(res, c.act!, c.attempt ?? 0, this.now())]);
 	}
+
+	/** Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored. */
+	async complete(runId: string, act: number, attempt: number, res: Result): Promise<void> {
+		await this.process(runId, [outcome(res, act, attempt, this.now())]);
+	}
+}
+
+/** The event of a step's outcome. */
+function outcome(res: Result, act: number, attempt: number, at: number): CoreEvent {
+	if (res.error !== undefined || res.unknown) {
+		return { kind: 'step_err', at, act, attempt, error: res.error || 'outcome unknown', retryable: !!res.retryable, unknown: !!res.unknown,
+			...(res.errorType ? { error_type: res.errorType } : {}) };
+	}
+	if (res.wait) return { kind: 'step_wait', at, act, attempt, deadline: Math.floor(res.wait.until), data: res.wait.output ?? null };
+	return { kind: 'step_ok', at, act, attempt, data: res.output ?? null };
 }
 
 /** A run whose plan this process does not have is another process's to take up. */

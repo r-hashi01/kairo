@@ -65,6 +65,11 @@ export interface Store {
 	expiredLeases(now: number, limit: number): Promise<LeaseRow[]>;
 	/** Extends owner's leases to until. */
 	renewLeases(owner: string, until: number): Promise<void>;
+	/**
+	 * Hands a step's lease to l.owner until l.until (ADR 0052: the step runs
+	 * elsewhere). Nothing if the lease is gone: its outcome is in already.
+	 */
+	handOver(l: LeaseRow): Promise<void>;
 	/** Ends owner's leases now (a process that knows its earlier self stopped). */
 	expireLeases(owner: string, now: number): Promise<void>;
 	/**
@@ -133,6 +138,7 @@ export class SQLiteStore implements Store {
 			expired: this.db.prepare(`SELECT run, act, attempt, owner, until FROM ${p}lease WHERE until < ? ORDER BY until LIMIT ?`),
 			renew: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
 			expire: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
+			handOver: this.db.prepare(`UPDATE ${p}lease SET owner = ?, until = ? WHERE run = ? AND act = ? AND attempt = ?`),
 		};
 	}
 
@@ -185,6 +191,10 @@ export class SQLiteStore implements Store {
 
 	async renewLeases(owner: string, until: number): Promise<void> {
 		this.q.renew.run(until, owner);
+	}
+
+	async handOver(l: LeaseRow): Promise<void> {
+		this.q.handOver.run(l.owner, l.until, l.run, l.act, l.attempt);
 	}
 
 	async expireLeases(owner: string, now: number): Promise<void> {
@@ -295,6 +305,10 @@ export class PostgresStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		await this.pool.query(`UPDATE ${this.p}lease SET until = $1 WHERE owner = $2`, [now - 1, owner]);
+	}
+
+	async handOver(l: LeaseRow): Promise<void> {
+		await this.pool.query(`UPDATE ${this.p}lease SET owner = $1, until = $2 WHERE run = $3 AND act = $4 AND attempt = $5`, [l.owner, l.until, l.run, l.act, l.attempt]);
 	}
 
 	/** One connection of the pool, kept to LISTEN for settled runs. */

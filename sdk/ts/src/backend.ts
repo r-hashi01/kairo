@@ -4,6 +4,7 @@
 
 import { Client, type NodeSpec, type RunInfo } from './client.ts';
 import { Embedded, type ActionHandler, type EmbeddedOptions } from './embedded.ts';
+import type { Result } from './protocol.ts';
 import { Worker, type Address } from './worker.ts';
 
 export interface Backend {
@@ -24,6 +25,8 @@ export interface Backend {
 	onSettled?(hook: (r: RunInfo) => void): () => void;
 	/** Embedded only: takes up due timers and steps whose process stopped. */
 	tick?(): Promise<void>;
+	/** Embedded only: the outcome of a step that ran elsewhere (ADR 0052). */
+	complete?(runId: string, act: number, attempt: number, result: Result): Promise<void>;
 }
 
 export interface HttpBackendOptions {
@@ -154,5 +157,9 @@ export class EmbeddedBackend implements Backend {
 
 	tick(): Promise<void> {
 		return this.runtime.tick();
+	}
+
+	complete(runId: string, act: number, attempt: number, result: Result): Promise<void> {
+		return this.runtime.complete(runId, act, attempt, result);
 	}
 }

@@ -61,6 +61,12 @@ export interface Result {
 	rateLimited?: boolean;
 	/** `until`: unix milliseconds (rounded down to an integer). */
 	wait?: { until: number; output?: unknown };
+	/**
+	 * Embedded runtime only (ADR 0052): the step runs elsewhere and its
+	 * outcome comes later (Embedded.complete). Its lease goes to owner for
+	 * leaseMs. Not sent over the worker protocol.
+	 */
+	pending?: { owner: string; leaseMs: number };
 }
 
 export class ProtocolError extends Error {}

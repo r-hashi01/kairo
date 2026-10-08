@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from .client import Client
 from .embedded import ActionHandler, Embedded
+from .protocol import Result
 from .store import Store
 from .worker import Worker
 
@@ -143,3 +144,6 @@ class EmbeddedBackend:
 
     async def tick(self) -> None:
         await self.runtime.tick()
+
+    async def complete(self, run_id: str, act: int, attempt: int, res: Result) -> None:
+        await self.runtime.complete(run_id, act, attempt, res)

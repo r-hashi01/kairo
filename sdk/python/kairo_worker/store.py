@@ -73,6 +73,10 @@ class Store(Protocol):
     async def expired_leases(self, now: int, limit: int) -> list[LeaseRow]: ...
     async def renew_leases(self, owner: str, until: int) -> None: ...
     async def expire_leases(self, owner: str, now: int) -> None: ...
+    async def hand_over(self, lease: LeaseRow) -> None:
+        """Hands a step's lease to lease.owner until lease.until (ADR 0052: the
+        step runs elsewhere). Nothing if the lease is gone: its outcome is in."""
+        ...
     async def close(self) -> None: ...
 
 
@@ -193,6 +197,13 @@ class SQLiteStore:
         assert self.db is not None
         self.db.execute(f"UPDATE {self.p}lease SET until = ? WHERE owner = ?", (now - 1, owner))
 
+    async def hand_over(self, lease: LeaseRow) -> None:
+        assert self.db is not None
+        self.db.execute(
+            f"UPDATE {self.p}lease SET owner = ?, until = ? WHERE run = ? AND act = ? AND attempt = ?",
+            (lease.owner, lease.until, lease.run, lease.act, lease.attempt),
+        )
+
     async def close(self) -> None:
         if self.db is not None:
             self.db.close()
@@ -273,6 +284,12 @@ class PostgresStore:
 
     async def expire_leases(self, owner: str, now: int) -> None:
         await self._exec(f"UPDATE {self.p}lease SET until = %s WHERE owner = %s", (now - 1, owner))
+
+    async def hand_over(self, lease: LeaseRow) -> None:
+        await self._exec(
+            f"UPDATE {self.p}lease SET owner = %s, until = %s WHERE run = %s AND act = %s AND attempt = %s",
+            (lease.owner, lease.until, lease.run, lease.act, lease.attempt),
+        )
 
     async def listen(self, settled: Callable[[str], None]) -> Callable[[], Any]:
         """Keeps one connection to LISTEN for runs settled in any process; returns how to stop."""

@@ -395,19 +395,31 @@ class Embedded:
             self._renew()
         if self._closed:
             return
-        at = self.now()
-        ev: dict[str, Any]
-        if res.error or res.unknown:
-            ev = {"kind": "step_err", "at": at, "act": c["act"], "attempt": c.get("attempt", 0), "error": res.error or "outcome unknown",
-                  "retryable": res.retryable, "unknown": res.unknown}
-            if res.error_type:
-                ev["error_type"] = res.error_type
-        elif res.wait is not None:
-            ev = {"kind": "step_wait", "at": at, "act": c["act"], "attempt": c.get("attempt", 0), "deadline": int(res.wait["until"]),
-                  "data": res.wait.get("output")}
-        else:
-            ev = {"kind": "step_ok", "at": at, "act": c["act"], "attempt": c.get("attempt", 0), "data": res.output}
-        await self._process(run_id, [ev])
+        if res.pending is not None:
+            # It runs elsewhere (ADR 0052): its lease goes there, until its
+            # outcome comes (complete) or the lease expires. An outcome that
+            # came first ended the lease; then nothing is handed over.
+            until = self.now() + int(res.pending["lease_ms"])
+            await self.store.hand_over(LeaseRow(run_id, c["act"], c.get("attempt", 0), res.pending["owner"], until))
+            return
+        await self._process(run_id, [_outcome(res, c["act"], c.get("attempt", 0), self.now())])
+
+    async def complete(self, run_id: str, act: int, attempt: int, res: Result) -> None:
+        """Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored."""
+        await self._process(run_id, [_outcome(res, act, attempt, self.now())])
+
+
+def _outcome(res: Result, act: int, attempt: int, at: int) -> dict[str, Any]:
+    """The event of a step's outcome."""
+    if res.error or res.unknown:
+        ev = {"kind": "step_err", "at": at, "act": act, "attempt": attempt, "error": res.error or "outcome unknown",
+              "retryable": res.retryable, "unknown": res.unknown}
+        if res.error_type:
+            ev["error_type"] = res.error_type
+        return ev
+    if res.wait is not None:
+        return {"kind": "step_wait", "at": at, "act": act, "attempt": attempt, "deadline": int(res.wait["until"]), "data": res.wait.get("output")}
+    return {"kind": "step_ok", "at": at, "act": act, "attempt": attempt, "data": res.output}
 
 
 async def _skip_unknown_plan(aw: Awaitable[Any]) -> None:

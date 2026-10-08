@@ -6,3 +6,4 @@ export * from './backend.ts';
 export * from './core.ts';
 export * from './embedded.ts';
 export * from './store.ts';
+export * from './http.ts';
