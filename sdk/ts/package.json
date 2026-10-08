@@ -1,5 +1,5 @@
 {
-  "name": "@kairo/worker",
+  "name": "kairo-sdk",
   "version": "0.1.0",
   "description": "kairo for Node.js: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod",
   "type": "module",
@@ -23,9 +23,14 @@
     "build": "npm run build:wasm && tsc -p tsconfig.json",
     "test": "node --test src/*.test.ts"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^6.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/r-hashi01/kairo.git",
+    "directory": "sdk/ts"
   }
 }

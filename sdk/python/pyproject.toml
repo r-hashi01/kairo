@@ -1,8 +1,9 @@
 [project]
-name = "kairo-worker"
+name = "kairo-sdk"
 version = "0.1.0"
 description = "SDK for the kairo workflow runtime: workflows written as code, run by the runtime embedded here (a WASM core and a database) or by kairod; the worker protocol; graphon (Dify) nodes as kairo tasks."
 requires-python = ">=3.12"
+license = "MIT"
 dependencies = []
 
 [project.optional-dependencies]
@@ -12,7 +13,7 @@ embedded = ["wasmtime"]
 graphon = ["graphon==0.7.0"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
