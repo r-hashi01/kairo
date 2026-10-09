@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -203,7 +202,7 @@ func (k *Kairo) Handler() http.Handler {
 			if k.mode == Suspend {
 				k.settle()
 				if err := k.wakeUp(r.Context()); err != nil {
-					log.Printf("kairo: wake: %v", err)
+					k.rt.logger.Warn("kairo: wake", "err", err)
 				}
 			}
 			answer(http.StatusOK, map[string]bool{"ok": true})
@@ -248,7 +247,7 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 			return // no callback: the caller's lease expires and the step is taken up
 		}
 		if err := checkURL(req.Callback, k.http.AllowInsecure); err != nil {
-			log.Printf("kairo: action %s: %v", req.Action, err)
+			k.rt.logger.Warn("kairo: serving an action", "action", req.Action, "err", err)
 			return
 		}
 		cb, _ := json.Marshal(map[string]any{"run_id": req.RunID, "act": req.Act, "attempt": req.Attempt, "result": res})
@@ -261,7 +260,8 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 		if resp, err := k.client.Do(hreq); err == nil {
 			resp.Body.Close()
 		} else {
-			log.Printf("kairo: action %s: its callback: %v", req.Action, err) // the lease expires and the step is taken up
+			// The lease expires and the step is taken up.
+			k.rt.logger.Warn("kairo: an action's callback", "action", req.Action, "err", err)
 		}
 	}()
 	answer(http.StatusAccepted, map[string]bool{"accepted": true})

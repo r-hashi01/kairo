@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import os
 import shutil
 import sqlite3
@@ -17,6 +18,7 @@ import unittest
 from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
+from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, STEP_FINISHED, STEP_STARTED, Observation
 from kairo_sdk.store import SQLiteStore
 from kairo_sdk.workflow import CallError, Cancelled, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError
 
@@ -338,11 +340,15 @@ class DrivingTest(unittest.TestCase):
                 return sum(out[:6])
 
             await k.start()
+            began = time.monotonic()
             self.assertEqual(await k.run("w", None, id="limits-1"), 15)
             self.assertLessEqual(seen["most"], 2, f"{seen['most']} steps of slow at once")
             starts.sort()
-            for a, b in zip(starts, starts[1:]):
-                self.assertGreaterEqual(b - a, 0.09, f"paced started {(b - a) * 1000:.0f}ms apart")
+            # The i-th start is not before its turn: i spacings after the
+            # workflow began (a start that comes late on its thread does not
+            # fail this); 1ms for timers that fire early by their rounding.
+            for i, s in enumerate(starts):
+                self.assertGreaterEqual(s - began, i * 0.1 - 0.001, f"paced start {i} came {(s - began) * 1000:.0f}ms after the workflow began")
             await k.close()
 
         asyncio.run(main())
@@ -430,6 +436,76 @@ class DrivingTest(unittest.TestCase):
             self.assertEqual(runs["flaky"], 5)
             self.assertEqual(runs["broken"], 2, "a failure not retryable: once each")
             await k.close()
+
+        asyncio.run(main())
+
+    def test_observe(self) -> None:
+        """observe is told of runs that start and settle and of steps'
+        attempts; an observer that raises does not stop the runtime."""
+
+        async def main() -> None:
+            seen: list[Observation] = []
+
+            def observer(o: Observation) -> None:
+                seen.append(o)
+                if o.kind == STEP_STARTED and o.action == "boom":
+                    raise RuntimeError("an observer that raises does not stop the runtime")
+
+            logger = logging.getLogger("kairo_sdk.test_observe")
+            k = await self.open(self.path("observe.db"), logger=logger, observe=observer)
+            flaky_runs = [0]
+
+            @k.action("flaky", effect="unprotected", backoff="1ms")
+            def flaky(_, ctx):
+                flaky_runs[0] += 1
+                if flaky_runs[0] == 1:
+                    raise RetryableError("busy")
+                return "ok"
+
+            @k.action("boom", effect="unprotected")
+            def boom(_, ctx):
+                return "b"
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                return await ctx.call("flaky") + await ctx.call("boom")
+
+            await k.start()
+            with self.assertLogs(logger, level="ERROR") as logs:
+                self.assertEqual(await k.run("w", None, id="obs-1"), "okb")
+            await k.close()
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn("the observer raised", logs.records[0].getMessage())
+            got = []
+            for o in seen:
+                self.assertGreater(o.at, 0, f"no time: {o}")
+                if o.kind == RUN_STARTED:
+                    got.append(f"start {o.plan} {o.workflow}")
+                elif o.kind == RUN_SETTLED:
+                    got.append(f"settled {o.plan} {o.status}")
+                elif o.kind == STEP_STARTED:
+                    got.append(f"step {o.action} {o.attempt}")
+                elif o.kind == STEP_FINISHED:
+                    self.assertIsNotNone(o.duration)
+                    got.append(f"step {o.action} {o.attempt} {o.status} {o.error}")
+            self.assertEqual(
+                got,
+                [
+                    "start kairo.workflow w",
+                    "start kairo.call/flaky ",
+                    "step flaky 1",
+                    # The error as recorded: the Python SDK records the exception's type with it.
+                    "step flaky 1 retryable RetryableError: busy",
+                    "step flaky 2",
+                    "step flaky 2 ok ",
+                    "settled kairo.call/flaky completed",
+                    "start kairo.call/boom ",
+                    "step boom 1",
+                    "step boom 1 ok ",
+                    "settled kairo.call/boom completed",
+                    "settled kairo.workflow completed",
+                ],
+            )
 
         asyncio.run(main())
 

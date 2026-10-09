@@ -92,6 +92,25 @@ A process that drives a workflow holds a lease on it. If the process stops, anot
 
 Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.
 
+### Logging and observing
+
+What goes wrong in the runtime's background work (lease renewals, sweeps, timers, workflows driven in the background, callbacks) is logged to `logging.getLogger("kairo_sdk")`, or to `Kairo(..., logger=...)`.
+
+`Kairo(..., observe=fn)` gives `fn` an `Observation` (a dataclass) as each thing happens, to count, time and trace runs (metrics, OpenTelemetry) without kairo depending on either. It is called inside the runtime, so it must not block; one that raises is logged and the runtime goes on.
+
+```python
+k = Kairo(backend=backend, observe=lambda o: metrics.record(o))
+```
+
+| `kind` | When | With |
+|---|---|---|
+| `RUN_STARTED` (`"run.started"`) | This process made a new run | `run_id`, `plan`, `parent`, `workflow` |
+| `RUN_SETTLED` (`"run.settled"`) | A run completed, failed, was cancelled, or stopped for review (`blocked`) | `status`, `error` |
+| `STEP_STARTED` (`"step.started"`) | A step's handler is about to run | `action`, `step_id`, `attempt` |
+| `STEP_FINISHED` (`"step.finished"`) | It returned; also when an outcome comes on the callback (`duration` None) | `status` (`STEP_OK`, `STEP_RETRYABLE`, `STEP_FAILED`, `STEP_UNKNOWN`, `STEP_WAITING`, `STEP_PENDING`), `error`, `duration` (seconds) |
+
+With kairod (`HttpBackend`), only `STEP_STARTED` and `STEP_FINISHED` of the steps this process's worker runs are observed (on the worker's threads): runs are kairod's.
+
 ## Storage
 
 ```python

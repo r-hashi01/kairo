@@ -10,6 +10,20 @@ API); ``Kairo`` declares actions and workflows written as code.
 from .backend import Backend, EmbeddedBackend, HttpBackend
 from .client import Client, KairoError
 from .http import SignatureError
+from .observe import (
+    RUN_SETTLED,
+    RUN_STARTED,
+    STEP_FAILED,
+    STEP_FINISHED,
+    STEP_OK,
+    STEP_PENDING,
+    STEP_RETRYABLE,
+    STEP_STARTED,
+    STEP_UNKNOWN,
+    STEP_WAITING,
+    Observation,
+    Observer,
+)
 from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import Task, TaskContext, Worker
 from .store import PostgresStore, SQLiteStore
@@ -44,6 +58,18 @@ __all__ = [
     "Context",
     "Kairo",
     "KairoError",
+    "Observation",
+    "Observer",
+    "RUN_SETTLED",
+    "RUN_STARTED",
+    "STEP_FAILED",
+    "STEP_FINISHED",
+    "STEP_OK",
+    "STEP_PENDING",
+    "STEP_RETRYABLE",
+    "STEP_STARTED",
+    "STEP_UNKNOWN",
+    "STEP_WAITING",
     "ResultLostError",
     "RetryableError",
     "StoppedError",

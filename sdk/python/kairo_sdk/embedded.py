@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -30,6 +31,7 @@ from typing import Any
 
 from .client import KairoError
 from .core import Core
+from .observe import LOGGER, RUN_SETTLED, RUN_STARTED, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
 from .store import Changes, LeaseRow, RunRow, Store, TimerRow
 from .worker import Task, TaskContext
@@ -110,10 +112,19 @@ class Embedded:
         lease_ms: int = 30_000,
         owner: str | None = None,
         keep_finished: float | None | str = "env",
+        logger: logging.Logger | None = None,
+        observe: Observer | None = None,
     ) -> None:
         """keep_finished: how long a finished tree of runs is kept before tick
         removes it (ms; ADR 0054); None keeps it. Default: KAIRO_KEEP_FINISHED
-        ("30m", "24h", "7d", "forever"), or 24 hours."""
+        ("30m", "24h", "7d", "forever"), or 24 hours.
+
+        logger takes what goes wrong in the runtime's background work (lease
+        renewals, sweeps, timers, steps' outcomes; default
+        logging.getLogger("kairo_sdk")). observe, if given, is given each
+        Observation as it happens, on the event loop: it must not block."""
+        self.logger = logger or LOGGER
+        self.observer = observe
         self.core = Core(wasm)
         self.store = store
         self.now = now
@@ -337,6 +348,21 @@ class Embedded:
         self._busy.add(fut)
         fut.add_done_callback(self._busy.discard)
 
+    def _background(self, aw: Awaitable[Any], msg: str, *args: Any) -> None:
+        """Tracks background work aw, logging what goes wrong in it (but a
+        run whose plan is another process's)."""
+
+        async def run() -> None:
+            try:
+                await _skip_unknown_plan(aw)
+            except Exception as e:
+                self.logger.warning(msg + ": %s", *args, e)
+
+        self._track(run())
+
+    def _observe(self, o: Observation) -> None:
+        observe(self.observer, self.logger, self.now, o)
+
     def _settled_elsewhere(self, run_id: str) -> None:
         if not self._waiters.get(run_id):
             return
@@ -366,8 +392,9 @@ class Embedded:
                             return
                         try:
                             await self.store.renew_leases(self.owner, self.now() + self.lease_ms)
-                        except Exception:
-                            pass  # next time; past their expiry the leases are taken up
+                        except Exception as e:
+                            # Next time; past their expiry the leases are taken up.
+                            self.logger.warning("kairo: renewing leases: %s", e)
 
                 task = asyncio.ensure_future(loop())
                 self._renewal = task
@@ -412,9 +439,9 @@ class Embedded:
             # A step's outcome ends its lease, applied or not (a stale one).
             end_leases = [e["act"] for e in events if e["kind"] in OUTCOMES and e.get("act") is not None]
             if row is not None and start is not None:
-                return Changes({"existing": True, "settled": False, "commands": [], "row": row})
+                return Changes({"existing": True, "started": False, "settled": False, "commands": [], "row": row})
             if row is None and start is None:
-                return Changes({"existing": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
+                return Changes({"existing": False, "started": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
             plan = start if start is not None else self._plan(row.plan)  # type: ignore[union-attr]
             if plan is None:
                 raise KairoError(404, f"run {run_id}: plan {row.plan} is not registered here")  # type: ignore[union-attr]
@@ -446,7 +473,7 @@ class Embedded:
             for ev in events:
                 apply(ev)
             if not recorded:
-                return Changes({"existing": False, "settled": False, "commands": commands, "row": row}, end_leases=end_leases)
+                return Changes({"existing": False, "started": False, "settled": False, "commands": commands, "row": row}, end_leases=end_leases)
             at = self.now()
             nxt = RunRow(
                 id=run_id,
@@ -466,7 +493,7 @@ class Embedded:
             )
             settled = res["status"] in SETTLED and res["status"] != (row.status if row else None)
             ch: Changes[dict[str, Any]] = Changes(
-                {"existing": False, "settled": settled, "commands": commands, "row": nxt},
+                {"existing": False, "started": row is None, "settled": settled, "commands": commands, "row": nxt},
                 events=recorded,
                 row=nxt,
                 clear=res["status"] in DONE,
@@ -494,11 +521,25 @@ class Embedded:
         out = await self.store.with_run(run_id, change)
         if self._closed:
             return out["existing"]
+        row = out["row"]
+        if out["started"] and row is not None:
+            self._observe(Observation(RUN_STARTED, run_id=run_id, parent=row.parent or "", plan=row.plan, workflow=row.workflow or ""))
         for c in out["commands"]:
             self._carry_out(run_id, c)
         # Settled by this transaction (not a run found settled already).
-        if out["settled"] and out["row"] is not None:
-            r = info(out["row"])
+        if out["settled"] and row is not None:
+            self._observe(
+                Observation(
+                    RUN_SETTLED,
+                    run_id=run_id,
+                    parent=row.parent or "",
+                    plan=row.plan,
+                    workflow=row.workflow or "",
+                    status=row.status,
+                    error=row.error or "",
+                )
+            )
+            r = info(row)
             for f in list(self._waiters.get(run_id, ())):
                 if not f.done():
                     f.set_result(r)
@@ -506,13 +547,13 @@ class Embedded:
                 h(r)
         # Along the way: what no process is doing (at most once a lease period).
         if self.now() - self._last_sweep >= self.lease_ms:
-            self._track(self.tick())
+            self._background(self.tick(), "kairo: sweeping")
         return out["existing"]
 
     def _carry_out(self, run_id: str, c: dict[str, Any]) -> None:
         kind = c["kind"]
         if kind == "dispatch":
-            self._track(self._dispatch(run_id, c))
+            self._background(self._dispatch(run_id, c), "kairo: run %s: applying a step's outcome", run_id)
         elif kind == "timer":
             key = f"{run_id}\0t{c['timer']}"
             old = self._timers.pop(key, None)
@@ -523,7 +564,7 @@ class Embedded:
             def due() -> None:
                 self._timers.pop(key, None)
                 if not self._closed:
-                    self._track(_skip_unknown_plan(self._fire(t)))
+                    self._background(self._fire(t), "kairo: run %s: firing a timer", run_id)
 
             delay = max(0, c["at"] - self.now()) / 1000
             self._timers[key] = asyncio.get_running_loop().call_later(delay, due)
@@ -553,7 +594,9 @@ class Embedded:
             action=c.get("action", ""),
             input=c.get("input"),
         )
+        step = {"run_id": run_id, "action": task.action, "step_id": task.step_id, "attempt": task.attempt}
         release: Callable[[], None] | None = None
+        began = 0.0
         try:
             # Over a limit, the step waits here for a slot, leased (ADR 0059).
             got = await self.admit(task, ctx) if self.admit is not None else None
@@ -561,6 +604,8 @@ class Embedded:
                 res = got
             else:
                 release = got
+                self._observe(Observation(STEP_STARTED, **step))
+                began = time.monotonic()
                 res = await asyncio.to_thread(self.handler, task, ctx)
         except Exception as e:  # a handler bug is the step's definite failure
             res = Result(error=f"{type(e).__name__}: {e}", error_type=type(e).__name__)
@@ -569,6 +614,9 @@ class Embedded:
                 release()
             self._running.pop(key, None)
             self._renew()
+        if began:
+            # It ran (not stopped waiting for a slot).
+            self._observe(Observation(STEP_FINISHED, **step, status=step_status(res), error=res.error, duration=time.monotonic() - began))
         if self._closed:
             return
         if res.pending is not None:
@@ -576,7 +624,10 @@ class Embedded:
             # outcome comes (complete) or the lease expires. An outcome that
             # came first ended the lease; then nothing is handed over.
             until = self.now() + int(res.pending["lease_ms"])
-            await self.store.hand_over(LeaseRow(run_id, c["act"], c.get("attempt", 0), res.pending["owner"], until))
+            try:
+                await self.store.hand_over(LeaseRow(run_id, c["act"], c.get("attempt", 0), res.pending["owner"], until))
+            except Exception as e:
+                self.logger.warning("kairo: run %s: handing over a lease: %s", run_id, e)
             return
         await self._process(run_id, [_outcome(res, c["act"], c.get("attempt", 0), self.now())])
 
@@ -586,6 +637,7 @@ class Embedded:
 
     async def complete(self, run_id: str, act: int, attempt: int, res: Result) -> None:
         """Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored."""
+        self._observe(Observation(STEP_FINISHED, run_id=run_id, attempt=attempt, status=step_status(res), error=res.error))
         await self._process(run_id, [_outcome(res, act, attempt, self.now())])
 
 

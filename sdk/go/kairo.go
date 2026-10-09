@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	mrand "math/rand/v2"
 	"net/http"
@@ -148,6 +148,13 @@ type Options struct {
 	// Concurrency: at most this many steps of actions run here at once
 	// (default: no limit). Steps over it wait, leased, for a slot.
 	Concurrency int
+	// Logger takes what goes wrong in the runtime's background work (lease
+	// renewals, sweeps, callbacks; default slog.Default()).
+	Logger *slog.Logger
+	// Observe, if set, is given each Observation as it happens: runs that
+	// start and settle, steps' attempts that start and finish. It is called
+	// on the runtime's goroutines: it must not block.
+	Observe func(Observation)
 	// HTTP configures actions over HTTP(S) and /tick (ADR 0052, 0053).
 	HTTP HTTPOptions
 	// Now is the clock (tests).
@@ -231,6 +238,10 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 		keepMs = keep.Milliseconds()
 	}
 	rt := newRuntime(opts.Store, func() int64 { return nowFn().UnixMilli() }, owner, lease.Milliseconds(), keepMs)
+	if opts.Logger != nil {
+		rt.logger = opts.Logger
+	}
+	rt.observer = opts.Observe
 	if err := rt.open(ctx, opts.Owner != ""); err != nil {
 		return nil, err
 	}
@@ -486,7 +497,7 @@ func (k *Kairo) Start(ctx context.Context) error {
 		defer t.Stop()
 		for {
 			if err := k.rt.tick(k.bgCtx); err != nil && k.bgCtx.Err() == nil {
-				log.Printf("kairo: sweeping: %v", err)
+				k.rt.logger.Warn("kairo: sweeping", "err", err)
 			}
 			k.rt.recheck(k.bgCtx)
 			select {
@@ -780,7 +791,7 @@ func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, 
 	if err != nil {
 		resume := !errors.Is(err, ErrSuspended)
 		if eerr := k.rt.store.EndDrive(context.Background(), id, k.rt.owner, token, k.rt.now(), resume); eerr != nil {
-			log.Printf("kairo: workflow %s: ending its drive lease: %v", id, eerr)
+			k.rt.logger.Warn("kairo: ending a drive lease", "workflow", id, "err", eerr)
 		}
 	}
 	return res, err
@@ -806,7 +817,7 @@ func (k *Kairo) driveBackground(id, name string, in json.RawMessage, parent stri
 		}()
 		if _, err := k.drive(k.bgCtx, id, name, in, parent, token); err != nil && !errors.Is(err, errDrivenElsewhere) &&
 			!errors.Is(err, ErrStopped) && !errors.Is(err, ErrCancelled) {
-			log.Printf("kairo: workflow %s: %v", id, err)
+			k.rt.logger.Warn("kairo: driving a workflow", "workflow", id, "err", err)
 		}
 	}()
 }

@@ -13,6 +13,7 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
 import { PostgresStore, SQLiteStore, type Store } from './store.ts';
+import { ObservationKind, type Observation } from './observe.ts';
 import { CallError, CancelledError, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError, type KairoOptions } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
@@ -271,10 +272,14 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 			return out.slice(0, 6).reduce((a, b) => a + b, 0);
 		});
 		await k.start();
+		const began = performance.now();
 		assert.equal(await k.run('w', null, { id: 'limits-1' }), 15);
 		assert.ok(most <= 2, `${most} steps of slow at once`);
 		starts.sort((a, b) => a - b);
-		for (let i = 1; i < starts.length; i++) assert.ok(starts[i]! - starts[i - 1]! >= 90, `paced started ${starts[i]! - starts[i - 1]!}ms apart`);
+		// The i-th start is not before its turn: i spacings after the workflow
+		// began (a start that comes late does not fail this); 1ms for timers
+		// that fire early by their rounding.
+		starts.forEach((s, i) => assert.ok(s - began >= i * 100 - 1, `paced start ${i} came ${s - began}ms after the workflow began`));
 		await k.close();
 	});
 
@@ -346,6 +351,62 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		assert.equal(runs.flaky, 5);
 		assert.equal(runs.broken, 2, 'a failure not retryable: once each');
 		await k.close();
+	});
+
+	// observe is told of runs that start and settle and of steps' attempts;
+	// an observer that throws does not stop the runtime.
+	test('observe', async () => {
+		const seen: Observation[] = [];
+		const logged: string[] = [];
+		const k = await open(join(dir, 'observe.db'), {
+			logger: { warn: (msg) => logged.push(msg), error: (msg) => logged.push(msg) },
+			observe: (o) => {
+				seen.push(o);
+				if (o.kind === ObservationKind.stepStarted && o.action === 'boom') throw new Error('an observer that throws does not stop the runtime');
+			},
+		});
+		let flaky = 0;
+		k.defineAction('flaky', {
+			effect: 'unprotected',
+			backoff: '1ms',
+			handler: async () => {
+				if (++flaky === 1) throw new RetryableError('busy');
+				return 'ok';
+			},
+		});
+		k.defineAction('boom', { effect: 'unprotected', handler: async () => 'b' });
+		k.workflow('w', async (ctx) => (await ctx.call<string>('flaky')) + (await ctx.call<string>('boom')));
+		await k.start();
+		assert.equal(await k.run('w', null, { id: 'obs-1' }), 'okb');
+		await k.close();
+		const got = seen.map((o) => {
+			assert.ok(o.at > 0, `no time: ${JSON.stringify(o)}`);
+			switch (o.kind) {
+				case ObservationKind.runStarted:
+					return `start ${o.plan} ${o.workflow ?? ''}`;
+				case ObservationKind.runSettled:
+					return `settled ${o.plan} ${o.status}`;
+				case ObservationKind.stepStarted:
+					return `step ${o.action} ${o.attempt}`;
+				case ObservationKind.stepFinished:
+					return `step ${o.action} ${o.attempt} ${o.status} ${o.error ?? ''}`;
+			}
+		});
+		assert.deepEqual(got, [
+			'start kairo.workflow w',
+			'start kairo.call/flaky ',
+			'step flaky 1',
+			'step flaky 1 retryable busy',
+			'step flaky 2',
+			'step flaky 2 ok ',
+			'settled kairo.call/flaky completed',
+			'start kairo.call/boom ',
+			'step boom 1',
+			'step boom 1 ok ',
+			'settled kairo.call/boom completed',
+			'settled kairo.workflow completed',
+		]);
+		assert.deepEqual(logged, ['kairo: the observer threw']);
 	});
 });
 

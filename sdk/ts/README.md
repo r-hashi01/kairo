@@ -92,6 +92,25 @@ A process that drives a workflow holds a lease on it. If the process stops, anot
 
 Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.
 
+### Logging and observing
+
+What goes wrong in the runtime's background work (lease renewals, sweeps, timers, workflows driven in the background, callbacks) goes to `logger` on `Kairo`: an object with `warn(msg, attrs?)` and `error(msg, attrs?)`, the console by default.
+
+`observe` on `Kairo` is given an `Observation` as each thing happens, to count, time and trace runs (metrics, OpenTelemetry) without kairo depending on either. It is called inside the runtime, so it must not block; one that throws is logged and the runtime goes on.
+
+```ts
+const k = new Kairo({ backend, observe: (o) => metrics.record(o) });
+```
+
+| `kind` (`ObservationKind`) | When | With |
+|---|---|---|
+| `run.started` | This process made a new run | `runId`, `plan`, `parent`, `workflow` |
+| `run.settled` | A run completed, failed, was cancelled, or stopped for review (`blocked`) | `status`, `error` |
+| `step.started` | A step's handler is about to run | `action`, `stepId`, `attempt` |
+| `step.finished` | It returned; also when an outcome comes on the callback (no `duration`) | `status` (`StepStatus`: `ok`, `retryable`, `failed`, `unknown`, `waiting`, `pending`), `error`, `duration` (ms) |
+
+With kairod (`HttpBackend`), only `step.started` and `step.finished` of the steps this process's worker runs are observed: runs are kairod's.
+
 ## Storage
 
 ```ts

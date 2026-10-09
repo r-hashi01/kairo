@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -133,6 +133,8 @@ type runtime struct {
 	// lease whose owner stopped; missingPlan registers a plan on demand.
 	drives       int
 	leaseParents bool
+	logger       *slog.Logger
+	observer     func(Observation)
 	lostDrive    func(ctx context.Context, l LeaseRow) error
 	missingPlan  func(name string) bool
 }
@@ -149,6 +151,7 @@ func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int
 		plans: map[string]wasmcore.Compiled{}, waiters: map[string]map[chan RunInfo]struct{}{}, hooks: map[int]func(RunInfo){},
 		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, subs: map[int]*subscription{}}
 	r.busyCond = sync.NewCond(&r.busyMu)
+	r.logger = slog.Default()
 	return r
 }
 
@@ -588,7 +591,7 @@ func (r *runtime) renew() {
 						return
 					case <-t.C:
 						if err := r.store.RenewLeases(context.Background(), r.owner, r.now()+r.leaseMs); err != nil {
-							log.Printf("kairo: renewing leases: %v", err)
+							r.logger.Warn("kairo: renewing leases", "err", err)
 						}
 					}
 				}
@@ -736,11 +739,16 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 	if r.isClosed() {
 		return existing, nil
 	}
+	if start != nil && !existing && newRow != nil {
+		r.observe(Observation{Kind: ObsRunStarted, RunID: runID, Parent: newRow.Parent, Plan: newRow.Plan, Workflow: newRow.Workflow})
+	}
 	for _, c := range commands {
 		r.carryOut(runID, c)
 	}
 	// Settled by this transaction (not a run found settled already).
 	if settled && newRow != nil {
+		r.observe(Observation{Kind: ObsRunSettled, RunID: runID, Parent: newRow.Parent, Plan: newRow.Plan, Workflow: newRow.Workflow,
+			Status: newRow.Status, Error: newRow.Error})
 		r.wake(info(newRow))
 	}
 	// Along the way: what no process is doing (at most once a lease period).
@@ -748,7 +756,7 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 		r.lastSweep.Store(r.now())
 		r.track(func() {
 			if err := r.tick(context.Background()); err != nil {
-				log.Printf("kairo: sweeping: %v", err)
+				r.logger.Warn("kairo: sweeping", "err", err)
 			}
 		})
 	}
@@ -774,7 +782,7 @@ func (r *runtime) carryOut(runID string, c wasmcore.Command) {
 			if !closed {
 				r.track(func() {
 					if err := skipUnknownPlan(r.fire(context.Background(), t)); err != nil {
-						log.Printf("kairo: run %s: timer: %v", runID, err)
+						r.logger.Warn("kairo: firing a timer", "run", runID, "err", err)
 					}
 				})
 			}
@@ -811,7 +819,11 @@ func (r *runtime) dispatch(runID string, c wasmcore.Command) {
 	r.mu.Unlock()
 	r.renew()
 	t := task{RunID: runID, StepID: c.StepID, Act: c.Act, Attempt: c.Attempt, IdemKey: c.IdemKey, Action: c.Action, Input: c.Input}
+	r.observe(Observation{Kind: ObsStepStarted, RunID: runID, Action: c.Action, StepID: c.StepID, Attempt: c.Attempt})
+	began := time.Now()
 	res := r.call(ctx, h, t)
+	r.observe(Observation{Kind: ObsStepFinished, RunID: runID, Action: c.Action, StepID: c.StepID, Attempt: c.Attempt,
+		Status: stepStatus(res), Error: res.Err, Duration: time.Since(began)})
 	r.mu.Lock()
 	delete(r.running, key)
 	r.mu.Unlock()
@@ -825,12 +837,12 @@ func (r *runtime) dispatch(runID string, c wasmcore.Command) {
 		// outcome comes (complete) or the lease expires.
 		if err := r.store.HandOver(context.Background(), LeaseRow{Run: runID, Act: c.Act, Attempt: c.Attempt,
 			Owner: res.Pending.Owner, Until: r.now() + res.Pending.LeaseMs}); err != nil {
-			log.Printf("kairo: run %s: handing over a lease: %v", runID, err)
+			r.logger.Warn("kairo: handing over a lease", "run", runID, "err", err)
 		}
 		return
 	}
 	if _, err := r.process(context.Background(), runID, []wasmcore.Event{outcome(res, c.Act, c.Attempt, r.now())}, nil); err != nil {
-		log.Printf("kairo: run %s: applying a step's outcome: %v", runID, err)
+		r.logger.Warn("kairo: applying a step's outcome", "run", runID, "err", err)
 	}
 }
 
@@ -846,6 +858,7 @@ func (r *runtime) call(ctx context.Context, h handlerFunc, t task) (res result) 
 
 // complete applies the outcome of a step that ran elsewhere (ADR 0052).
 func (r *runtime) complete(ctx context.Context, runID string, act uint32, attempt int32, res result) error {
+	r.observe(Observation{Kind: ObsStepFinished, RunID: runID, Attempt: attempt, Status: stepStatus(res), Error: res.Err})
 	_, err := r.process(ctx, runID, []wasmcore.Event{outcome(res, act, attempt, r.now())}, nil)
 	return err
 }

@@ -11,6 +11,7 @@ import { SignatureError, checkURL, post, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
 import { Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
+import { consoleLogger, observe, stepStatus, type Logger, type Observer } from './observe.ts';
 import type { LeaseRow } from './store.ts';
 import type { Address, TaskContext } from './worker.ts';
 
@@ -103,6 +104,19 @@ export interface KairoOptions {
 	 * call of /tick (or tick()) then, instead of polling.
 	 */
 	wake?: (at: number) => Promise<void>;
+	/**
+	 * Takes what goes wrong in the runtime's background work: lease
+	 * renewals, sweeps, timers, steps' outcomes, workflows driven in the
+	 * background, callbacks (default: the console).
+	 */
+	logger?: Logger;
+	/**
+	 * Given each Observation as it happens: runs that start and settle,
+	 * steps' attempts that start and finish (to count, time and trace them).
+	 * It is called in the runtime, as it works: it must not block. With
+	 * kairod (HttpBackend), only the steps this process's worker runs.
+	 */
+	observe?: Observer;
 }
 
 /** The workflow ran into a call whose result kairo no longer keeps. */
@@ -295,6 +309,7 @@ export class Kairo {
 	/** Limits (ADR 0059): steps at once in this process (embedded), and by destination. */
 	private slots?: Slots;
 	private readonly limits = new Map<string, Limiter>();
+	private readonly logger: Logger;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
@@ -302,7 +317,12 @@ export class Kairo {
 		this.suspend = opts.mode === 'suspend';
 		if (this.suspend && !this.backend.idle) throw new Error('suspend mode needs the embedded backend');
 		const rt = (this.backend as { runtime?: unknown }).runtime;
-		if (rt instanceof Embedded) this.rt = rt;
+		if (rt instanceof Embedded) {
+			this.rt = rt;
+			if (opts.logger) rt.logger = opts.logger;
+			if (opts.observe) rt.observer = opts.observe;
+		}
+		this.logger = opts.logger ?? this.rt?.logger ?? consoleLogger;
 	}
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
@@ -342,7 +362,9 @@ export class Kairo {
 		}
 		// kairod's worker limits its own tasks.
 		if (this.rt && this.opts.concurrency) this.slots = new Slots(this.opts.concurrency);
-		await this.backend.start(specs, (task, ctx) => this.serve(task, ctx));
+		// The embedded runtime observes the steps it runs; with kairod, the worker's are observed here.
+		const observer = this.rt ? undefined : this.opts.observe;
+		await this.backend.start(specs, observer ? (task, ctx) => this.serveObserved(observer, task, ctx) : (task, ctx) => this.serve(task, ctx));
 		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action, input: { in: '$input.in' } });
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
 		const rt = this.rt;
@@ -369,8 +391,9 @@ export class Kairo {
 					try {
 						await rt.tick();
 						await rt.recheck();
-					} catch {
-						// Next time.
+					} catch (e) {
+						// Again next time.
+						if (!this.closing) this.logger.warn('kairo: sweeping', { err: e });
 					} finally {
 						this.sweeping = undefined;
 					}
@@ -462,6 +485,22 @@ export class Kairo {
 		if (this.planned.has(name)) return;
 		await this.backend.registerPlan({ name, root, ...(vars ? { vars } : {}) });
 		this.planned.add(name);
+	}
+
+	/** serve, observed (kairod's worker). */
+	private async serveObserved(observer: Observer, task: Task, ctx: TaskContext): Promise<Result> {
+		const step = { runId: task.run_id, action: task.action, stepId: task.step_id, attempt: task.attempt };
+		observe(observer, this.logger, Date.now, { kind: 'step.started', ...step });
+		const began = performance.now();
+		const res = await this.serve(task, ctx);
+		observe(observer, this.logger, Date.now, {
+			kind: 'step.finished',
+			...step,
+			status: stepStatus(res),
+			...(res.error ? { error: res.error } : {}),
+			duration: performance.now() - began,
+		});
+		return res;
 	}
 
 	private async serve(task: Task, ctx: TaskContext): Promise<Result> {
@@ -622,7 +661,10 @@ export class Kairo {
 				const cb = JSON.stringify({ run_id: m.run_id, act: m.act, attempt: m.attempt, result });
 				checkURL(m.callback, this.opts.allowInsecure);
 				await post(m.callback, cb, { ca: this.opts.ca, headers: { 'kairo-signature': sign(this.opts.secret!, cb) } });
-			})().catch(() => {}); // a lost callback: the lease expires and the step is taken up
+			})().catch((e) => {
+				// A lost callback: the lease expires and the step is taken up.
+				this.logger.warn("kairo: an action's callback", { action: m.action, err: e });
+			});
 			this.opts.waitUntil?.(work);
 			return json(202, { accepted: true });
 		};
@@ -747,7 +789,7 @@ export class Kairo {
 		try {
 			return await this.runAs(name, input, id, parent ? { id: parent } : undefined);
 		} catch (e) {
-			if (rt) await rt.endDrive(id, token, !(e instanceof Suspended)).catch(() => {});
+			if (rt) await rt.endDrive(id, token, !(e instanceof Suspended)).catch((err) => this.logger.warn('kairo: ending a drive lease', { workflow: id, err }));
 			throw e;
 		} finally {
 			rt?.driving(false);
@@ -761,9 +803,10 @@ export class Kairo {
 		const p: Promise<void> = this.drive(id, name, input, parent, token)
 			.then(
 				() => {},
-				() => {
-					// Its failure is recorded (result reports it); stopped,
-					// cancelled or driven elsewhere: nothing to do here.
+				(e) => {
+					// Stopped, cancelled or driven elsewhere: nothing to do here.
+					if (e instanceof DrivenElsewhere || e instanceof StoppedError || e instanceof CancelledError) return;
+					this.logger.warn('kairo: driving a workflow', { workflow: id, err: e });
 				},
 			)
 			.finally(() => {

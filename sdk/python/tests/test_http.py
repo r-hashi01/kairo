@@ -260,9 +260,13 @@ class HttpActionTest(unittest.TestCase):
                 if out is not None:
                     break
             self.assertIsNotNone(out, "the workflow ended")
-            self.assertEqual(out["a"], "attempt 2")
+            # Retried at least once; more if a process closed while a retry
+            # it had started was still out (its outcome is dropped, as a
+            # process that stops drops it, and the lease expires again).
+            self.assertGreaterEqual(calls["idem"], 2)
+            self.assertEqual(out["a"], f"attempt {calls['idem']}")
             self.assertIn("blocked", out["real"])
-            self.assertEqual(calls, {"idem": 2, "real": 1}, "the real action is not called again")
+            self.assertEqual(calls["real"], 1, "the real action is not called again")
 
         run(main)
 

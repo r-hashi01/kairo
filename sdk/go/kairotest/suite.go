@@ -42,6 +42,7 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"Limits":                           testLimits,
 		"SubmitAwaitAndList":               testSubmitAwaitAndList,
 		"RetriesAndTypedErrors":            testRetriesAndTypedErrors,
+		"Observe":                          testObserve,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
 	}
@@ -790,6 +791,7 @@ func testLimits(t *testing.T, open Opener) {
 		return sum, kairo.Parallel(ctx, fns...)
 	})
 	k.Start(context.Background())
+	began := time.Now()
 	out, err := kairo.Run[int](context.Background(), k, "w", nil, kairo.WithID("limits-1"))
 	if err != nil || out != 15 {
 		t.Fatalf("%d %v", out, err)
@@ -798,9 +800,11 @@ func testLimits(t *testing.T, open Opener) {
 		t.Fatalf("%d steps of slow at once", most)
 	}
 	sort.Slice(starts, func(i, j int) bool { return starts[i].Before(starts[j]) })
-	for i := 1; i < len(starts); i++ {
-		if gap := starts[i].Sub(starts[i-1]); gap < 90*time.Millisecond {
-			t.Fatalf("paced started %v apart", gap)
+	// The i-th start is not before its turn: i spacings after the workflow
+	// began (a start that comes late on its thread does not fail this).
+	for i, s := range starts {
+		if after := s.Sub(began); after < time.Duration(i)*100*time.Millisecond {
+			t.Fatalf("paced start %d came %v after the workflow began", i, after)
 		}
 	}
 }
@@ -895,5 +899,74 @@ func testRetriesAndTypedErrors(t *testing.T, open Opener) {
 	}
 	if runs.get("broken") != 2 { // a failure not retryable: once each
 		t.Fatalf("broken ran %d times", runs.get("broken"))
+	}
+}
+
+// Observe is told of runs that start and settle and of steps' attempts.
+func testObserve(t *testing.T, open Opener) {
+	var mu sync.Mutex
+	var seen []kairo.Observation
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Observe: func(o kairo.Observation) {
+		mu.Lock()
+		seen = append(seen, o)
+		mu.Unlock()
+		if o.Kind == kairo.ObsStepStarted && o.Action == "boom" {
+			panic("an observer that panics does not stop the runtime")
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	kairo.Action(k, "flaky", kairo.Unprotected, func(tc *kairo.TaskContext, _ any) (string, error) {
+		if tc.Attempt == 1 {
+			return "", kairo.Retryable(errors.New("busy"))
+		}
+		return "ok", nil
+	}, kairo.Backoff(time.Millisecond))
+	kairo.Action(k, "boom", kairo.Unprotected, func(*kairo.TaskContext, any) (string, error) { return "b", nil })
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+		a, err := kairo.Call[string](ctx, "flaky", nil)
+		if err != nil {
+			return "", err
+		}
+		b, err := kairo.Call[string](ctx, "boom", nil)
+		return a + b, err
+	})
+	k.Start(context.Background())
+	if out, err := kairo.Run[string](context.Background(), k, "w", nil, kairo.WithID("obs-1")); err != nil || out != "okb" {
+		t.Fatalf("%q %v", out, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var got []string
+	for _, o := range seen {
+		if o.At.IsZero() {
+			t.Fatalf("no time: %+v", o)
+		}
+		switch o.Kind {
+		case kairo.ObsRunStarted:
+			got = append(got, "start "+o.Plan+" "+o.Workflow)
+		case kairo.ObsRunSettled:
+			got = append(got, "settled "+o.Plan+" "+o.Status)
+		case kairo.ObsStepStarted:
+			got = append(got, fmt.Sprintf("step %s %d", o.Action, o.Attempt))
+		case kairo.ObsStepFinished:
+			got = append(got, fmt.Sprintf("step %s %d %s %s", o.Action, o.Attempt, o.Status, o.Error))
+		}
+	}
+	want := []string{
+		"start kairo.workflow w",
+		"start kairo.call/flaky ",
+		"step flaky 1", "step flaky 1 retryable busy",
+		"step flaky 2", "step flaky 2 ok ",
+		"settled kairo.call/flaky completed",
+		"start kairo.call/boom ",
+		"step boom 1", "step boom 1 ok ",
+		"settled kairo.call/boom completed",
+		"settled kairo.workflow completed",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("observed:\n%s", strings.Join(got, "\n"))
 	}
 }

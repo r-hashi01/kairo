@@ -186,9 +186,13 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 			await k.close();
 		}
 		assert.ok(out, 'the workflow ended');
-		assert.equal(out.a, 'attempt 2');
+		// Retried at least once; more if a process closed while a retry it
+		// had started was still out (its outcome is dropped, as a process
+		// that stops drops it, and the lease expires again).
+		assert.ok(calls.idem >= 2, `idem called ${calls.idem} times`);
+		assert.equal(out.a, `attempt ${calls.idem}`);
 		assert.match(out.real, /blocked/);
-		assert.deepEqual(calls, { idem: 2, real: 1 }, 'the real action is not called again');
+		assert.equal(calls.real, 1, 'the real action is not called again');
 	});
 
 	test("the serving side sends a handler's RetryableError as retryable, its UnknownOutcomeError as 502", async () => {

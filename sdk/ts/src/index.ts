@@ -5,6 +5,7 @@ export * from './workflow.ts';
 export * from './backend.ts';
 export * from './core.ts';
 export * from './embedded.ts';
+export * from './observe.ts';
 export * from './store.ts';
 export * from './http.ts';
 export * from './version.ts';

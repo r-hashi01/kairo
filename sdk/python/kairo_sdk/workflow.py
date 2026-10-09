@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 import random
 import re
@@ -40,6 +41,7 @@ from .backend import Backend, HttpBackend
 from .client import KairoError, finished
 from .embedded import Embedded, new_token
 from .http import SignatureError, check_url, post, sign, verify
+from .observe import LOGGER, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
 from .store import LeaseRow
 from .worker import Task, TaskContext
@@ -120,6 +122,10 @@ class WorkflowError(RuntimeError):
         super().__init__(f"workflow {id} failed: {message}")
         self.id = id
         self.message = message
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _failure(e: BaseException) -> Result:
@@ -316,6 +322,8 @@ class Kairo:
         wait_until: Callable[[Awaitable[Any]], None] | None = None,
         tick_secret: str | None = None,
         wake: Callable[[int], Awaitable[None]] | None = None,
+        logger: logging.Logger | None = None,
+        observe: Observer | None = None,
     ) -> None:
         """concurrency: steps at once in this process, on kairod's worker or
         in the embedded runtime (ADR 0059; kairo.now, kairo.random and
@@ -332,7 +340,16 @@ class Kairo:
         calls the ASGI app's /tick with (without it, /tick is not served);
         wake is told, before run, tick, signal and callbacks return, when
         something is next to do (unix ms): schedule a one-off tick then,
-        instead of polling."""
+        instead of polling.
+
+        logger takes what goes wrong in the runtime's background work: lease
+        renewals, sweeps, timers, steps' outcomes, workflows driven in the
+        background, callbacks (default: logging.getLogger("kairo_sdk")).
+        observe, if given, is given each Observation as it happens: runs that
+        start and settle, steps' attempts that start and finish (to count,
+        time and trace them). It is called in the runtime, as it works (on
+        the event loop; with kairod, on the worker's threads, and only for
+        the steps it runs here): it must not block."""
         self.backend: Any = backend or HttpBackend(url, worker=worker, token=token, tenant=tenant, concurrency=concurrency)
         self._ttl = idempotency_ttl
         self._concurrency = concurrency
@@ -364,6 +381,15 @@ class Kairo:
         # The embedded runtime, when that is the backend (drive leases, ADR 0059).
         rt = getattr(self.backend, "runtime", None)
         self._rt: Embedded | None = rt if isinstance(rt, Embedded) else None
+        if self._rt is not None:
+            if logger is not None:
+                self._rt.logger = logger
+            if observe is not None:
+                self._rt.observer = observe
+        self._logger = logger or (self._rt.logger if self._rt is not None else LOGGER)
+        # With kairod, the steps its worker runs here are observed here (the
+        # embedded runtime observes its own).
+        self._observer = observe if self._rt is None else None
         # Wait mode: workflows driven in the background here (by id), and their drives.
         self._owned: set[str] = set()
         self._drives: set[asyncio.Future[Any]] = set()
@@ -467,7 +493,7 @@ class Kairo:
         if rt is not None and (self._slots or self._limits):
             # Steps wait for their slots on the event loop, before their thread.
             rt.admit = self._admit_step
-        await self.backend.start(specs, self._serve)
+        await self.backend.start(specs, self._serve_observed if self._observer is not None else self._serve)
         for s in specs:
             await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"], "input": {"in": "$input.in"}})
         await self._plan_workflow()
@@ -497,8 +523,10 @@ class Kairo:
             try:
                 await rt.tick()
                 await rt.recheck()
-            except Exception:
-                pass  # next time
+            except Exception as e:
+                # Again next time.
+                if not self._closing:
+                    self._logger.warning("kairo: sweeping: %s", e)
             if self._closing:
                 return
             await asyncio.wait({life}, timeout=rt.lease / 1000)
@@ -651,6 +679,16 @@ class Kairo:
             return await self._admit(task.action, ctx)
         except _StepStopped:
             return _stopped_waiting(task.action)
+
+    def _serve_observed(self, task: Task, ctx: TaskContext) -> Result:
+        """_serve, observed (kairod's worker; on its thread)."""
+        step = {"run_id": task.run_id, "action": task.action, "step_id": task.step_id, "attempt": task.attempt}
+        observe(self._observer, self._logger, _now_ms, Observation(STEP_STARTED, **step))
+        began = time.monotonic()
+        res = self._serve(task, ctx)
+        duration = time.monotonic() - began
+        observe(self._observer, self._logger, _now_ms, Observation(STEP_FINISHED, **step, status=step_status(res), error=res.error, duration=duration))
+        return res
 
     def _serve(self, task: Task, ctx: TaskContext) -> Result:
         input = (task.input or {}).get("in") if isinstance(task.input, dict) else None
@@ -810,8 +848,9 @@ class Kairo:
             try:
                 check_url(m["callback"], self._allow_insecure)
                 await asyncio.to_thread(post, m["callback"], cb, ca=self._ca, headers={"Kairo-Signature": sign(self._secret or "", cb)})
-            except (OSError, ValueError):
-                pass  # a lost callback: the lease expires and the step is taken up
+            except (OSError, ValueError) as e:
+                # A lost callback: the lease expires and the step is taken up.
+                self._logger.warning("kairo: action %s: its callback: %s", m.get("action"), e)
 
         fut = asyncio.ensure_future(work())
         self._background.add(fut)
@@ -953,8 +992,8 @@ class Kairo:
             if rt is not None:
                 try:
                     await rt.end_drive(id, token, not isinstance(e, Suspended))
-                except Exception:
-                    pass
+                except Exception as ee:
+                    self._logger.warning("kairo: workflow %s: ending its drive lease: %s", id, ee)
             raise
         finally:
             if rt is not None:
@@ -969,10 +1008,10 @@ class Kairo:
         async def go() -> None:
             try:
                 await self._drive(id, name, input, parent, token)
-            except Exception:
-                # Its failure is recorded (result reports it); stopped,
-                # cancelled or driven elsewhere: nothing to do here.
-                pass
+            except (_DrivenElsewhere, StoppedError, Cancelled):
+                pass  # stopped, cancelled or driven elsewhere: nothing to do here
+            except Exception as e:
+                self._logger.warning("kairo: workflow %s: %s", id, e)
             finally:
                 self._owned.discard(id)
 

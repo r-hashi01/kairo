@@ -20,6 +20,7 @@ import { KairoError, type NodeSpec, type RunInfo } from './client.ts';
 import type { Result, Task } from './protocol.ts';
 import { randomInt, randomUUID } from 'node:crypto';
 
+import { consoleLogger, observe, stepStatus, type Logger, type Observation, type Observer } from './observe.ts';
 import type { LeaseRow, ListFilter, RunRow, Store, TimerRow } from './store.ts';
 import type { TaskContext } from './worker.ts';
 
@@ -45,6 +46,14 @@ export interface EmbeddedOptions {
 	 * "24h", "7d", "forever"), or 24 hours.
 	 */
 	keepFinished?: number;
+	/** Takes what goes wrong in the runtime's background work (lease renewals, sweeps, timers; default: the console). */
+	logger?: Logger;
+	/**
+	 * Given each Observation as it happens: runs that start and settle,
+	 * steps' attempts that start and finish. Called in the runtime, as it
+	 * works: it must not block.
+	 */
+	observe?: Observer;
 }
 
 /** Finished trees removed per tick at most (ADR 0054); the rest next time. */
@@ -96,6 +105,9 @@ export class Embedded {
 	leaseParents = false;
 	lostDrive?: (l: LeaseRow) => Promise<void>;
 	planFor?: (name: string) => { name: string; [k: string]: unknown } | undefined;
+	/** Set by Kairo when given (KairoOptions.logger, observe). */
+	logger: Logger;
+	observer?: Observer;
 
 	private constructor(core: Core, opts: EmbeddedOptions) {
 		this.core = core;
@@ -104,6 +116,23 @@ export class Embedded {
 		this.owner = opts.owner ?? randomUUID();
 		this.leaseMs = opts.leaseMs ?? 30_000;
 		this.keepMs = keepFinished(opts.keepFinished);
+		this.logger = opts.logger ?? consoleLogger;
+		this.observer = opts.observe;
+	}
+
+	private observe(o: Omit<Observation, 'at'>): void {
+		observe(this.observer, this.logger, this.now, o);
+	}
+
+	/** Tracks background work p, logging what goes wrong in it (but a run whose plan is another process's). */
+	private background(p: Promise<unknown>, msg: string, attrs: Record<string, unknown> = {}): void {
+		this.track(p.catch((e) => {
+			try {
+				skipUnknownPlan(e);
+			} catch {
+				this.logger.warn(msg, { ...attrs, err: e });
+			}
+		}));
 	}
 
 	static async open(opts: EmbeddedOptions): Promise<Embedded> {
@@ -300,7 +329,7 @@ export class Embedded {
 	private renew(): void {
 		if ((this.running.size > 0 || this.drives > 0) && !this.closed) {
 			this.renewal ??= setInterval(() => {
-				this.track(this.store.renewLeases(this.owner, this.now() + this.leaseMs));
+				this.background(this.store.renewLeases(this.owner, this.now() + this.leaseMs), 'kairo: renewing leases');
 			}, Math.max(this.leaseMs / 3, 10));
 			return;
 		}
@@ -322,9 +351,9 @@ export class Embedded {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
-			if (row && start) return { events: [], result: { existing: true, settled: false, commands: [] as CoreCommand[], row } };
+			if (row && start) return { events: [], result: { existing: true, started: false, settled: false, commands: [] as CoreCommand[], row } };
 			if (!row && !start)
-				return { events: [], endLeases, result: { existing: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
+				return { events: [], endLeases, result: { existing: false, started: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plan(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
 			if (row && row.hash !== plan.hash) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
@@ -345,7 +374,7 @@ export class Embedded {
 				}
 			};
 			for (const ev of events) apply(ev);
-			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, settled: false, commands, row } };
+			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, started: false, settled: false, commands, row } };
 			const at = start?.at ?? this.now();
 			const next: RunRow = {
 				id: runId,
@@ -389,19 +418,22 @@ export class Embedded {
 				clearTimers: done,
 				endLeases,
 				setLeases,
-				result: { existing: false, settled, commands, row: next },
+				result: { existing: false, started: !row, settled, commands, row: next },
 			};
 		});
 		if (this.closed) return out.existing;
+		const row = out.row;
+		if (out.started && row) this.observe({ kind: 'run.started', runId, ...runAttrs(row) });
 		for (const c of out.commands) this.carryOut(runId, c);
 		// Settled by this transaction (not a run found settled already).
-		if (out.settled && out.row) {
-			const r = info(out.row);
+		if (out.settled && row) {
+			this.observe({ kind: 'run.settled', runId, ...runAttrs(row), status: row.status, ...(row.error ? { error: row.error } : {}) });
+			const r = info(row);
 			for (const w of this.waiters.get(runId) ?? []) w(r);
 			for (const h of this.settledHooks) h(r);
 		}
 		// Along the way: what no process is doing (at most once a lease period).
-		if (this.now() - this.lastSweep >= this.leaseMs) this.track(this.tick());
+		if (this.now() - this.lastSweep >= this.leaseMs) this.background(this.tick(), 'kairo: sweeping');
 		return out.existing;
 	}
 
@@ -409,7 +441,7 @@ export class Embedded {
 		const key = `${runId}\0${c.act ?? 0}`;
 		switch (c.kind) {
 			case 'dispatch':
-				this.track(this.dispatch(runId, c));
+				this.background(this.dispatch(runId, c), "kairo: applying a step's outcome", { run: runId });
 				return;
 			case 'timer': {
 				const tk = `${runId}\0t${c.timer}`;
@@ -417,7 +449,7 @@ export class Embedded {
 				const t: TimerRow = { run: runId, timer: c.timer!, act: c.act ?? 0, at: c.at! };
 				this.timers.set(tk, setTimeout(() => {
 					this.timers.delete(tk);
-					if (!this.closed) this.track(this.fire(t));
+					if (!this.closed) this.background(this.fire(t), 'kairo: firing a timer', { run: runId });
 				}, Math.max(0, c.at! - this.now())));
 				return;
 			}
@@ -453,6 +485,9 @@ export class Embedded {
 			action: c.action ?? '',
 			input: c.input ?? null,
 		} as Task;
+		const step = { runId, action: task.action, stepId: task.step_id, attempt: task.attempt };
+		this.observe({ kind: 'step.started', ...step });
+		const began = performance.now();
 		let res: Result;
 		try {
 			res = await this.handler(task, { signal: abort.signal, emit: () => {} });
@@ -462,12 +497,14 @@ export class Embedded {
 			this.running.delete(key);
 			this.renew();
 		}
+		this.observe({ kind: 'step.finished', ...step, status: stepStatus(res), ...(res.error ? { error: res.error } : {}), duration: performance.now() - began });
 		if (this.closed) return;
 		if (res.pending) {
 			// It runs elsewhere (ADR 0052): its lease goes there, until its
 			// outcome comes (complete) or the lease expires. An outcome that
 			// came first ended the lease; then nothing is handed over.
-			await this.store.handOver({ run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: res.pending.owner, until: this.now() + res.pending.leaseMs });
+			const lease = { run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: res.pending.owner, until: this.now() + res.pending.leaseMs };
+			await this.store.handOver(lease).catch((e) => this.logger.warn('kairo: handing over a lease', { run: runId, err: e }));
 			return;
 		}
 		await this.process(runId, [outcome(res, c.act!, c.attempt ?? 0, this.now())]);
@@ -480,6 +517,7 @@ export class Embedded {
 
 	/** Applies the outcome of a step that ran elsewhere (ADR 0052). A stale one is ignored. */
 	async complete(runId: string, act: number, attempt: number, res: Result): Promise<void> {
+		this.observe({ kind: 'step.finished', runId, attempt, status: stepStatus(res), ...(res.error ? { error: res.error } : {}) });
 		await this.process(runId, [outcome(res, act, attempt, this.now())]);
 	}
 }
@@ -492,6 +530,11 @@ function outcome(res: Result, act: number, attempt: number, at: number): CoreEve
 	}
 	if (res.wait) return { kind: 'step_wait', at, act, attempt, deadline: Math.floor(res.wait.until), data: res.wait.output ?? null };
 	return { kind: 'step_ok', at, act, attempt, data: res.output ?? null };
+}
+
+/** What observations of a run say of it. */
+function runAttrs(row: RunRow): { parent?: string; plan: string; workflow?: string } {
+	return { plan: row.plan, ...(row.parent ? { parent: row.parent } : {}), ...(row.workflow ? { workflow: row.workflow } : {}) };
 }
 
 /** What a new run starts with, besides its plan and input. */
