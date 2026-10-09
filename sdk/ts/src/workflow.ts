@@ -9,7 +9,9 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { HttpBackend, type Backend } from './backend.ts';
 import { SignatureError, checkURL, post, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
+import { Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
+import type { LeaseRow } from './store.ts';
 import type { Address, TaskContext } from './worker.ts';
 
 /** An action: what a step of a workflow runs, on this process's worker. */
@@ -19,8 +21,12 @@ export interface ActionDef<I = any, O = any> {
 	handler: (input: I, ctx: TaskContext) => Promise<O>;
 	/** How long a call may run before its outcome is unknown (e.g. "5m"). */
 	timeout?: string;
-	/** The rate-limit key (default: the action). */
+	/** The rate-limit key (default: the action). Actions of one destination share limit and rate: the strictest. */
 	destination?: string;
+	/** At most this many steps of the action (of its destination) run in this process at once (ADR 0059). */
+	limit?: number;
+	/** At most this many steps of the action (of its destination) start in this process a minute, spaced evenly (ADR 0059). */
+	rate?: number;
 	/**
 	 * Where the action runs (ADR 0052): its steps are called over HTTP(S)
 	 * at this URL, and the handler runs there (fetchHandler). https, or
@@ -51,7 +57,11 @@ export interface KairoOptions {
 	tenant?: string;
 	/** kairod's -idempotency-ttl: a workflow older than this is not resumed. */
 	idempotencyTTL?: number;
-	/** Tasks at once on this process's worker. */
+	/**
+	 * Steps at once in this process: on kairod's worker, or in the embedded
+	 * runtime (ADR 0059; kairo.now, kairo.random and kairo.sleep are not
+	 * counted). Steps over it wait, leased, for a slot. Default: no limit.
+	 */
 	concurrency?: number;
 	/**
 	 * "wait" (the default): run() drives a workflow to its end, waiting in
@@ -93,6 +103,25 @@ export class ResultLostError extends Error {}
 export class CancelledError extends Error {}
 /** The workflow waits (a timer, a signal): tick() or signal() drives it on. */
 export class Suspended extends Error {}
+/**
+ * The caller stopped waiting (its signal aborted), or the process is
+ * closing. The workflow is not cancelled: it goes on (ADR 0059).
+ */
+export class StoppedError extends Error {}
+/** A wait's timeout came before its signal (waitFor's timeout, ADR 0059). */
+export class TimedOutError extends Error {}
+/** Another process holds the workflow's drive lease (ADR 0059). */
+class DrivenElsewhere extends Error {}
+
+/** What list selects (ADR 0059): workflows of workflow, in status, created in [since, until), after the run after, at most limit. */
+export interface ListOptions {
+	workflow?: string;
+	status?: string;
+	since?: number | Date;
+	until?: number | Date;
+	after?: string;
+	limit?: number;
+}
 
 const PLAN_CALL = 'kairo.call/';
 const PLAN_WAIT = 'kairo.wait/';
@@ -170,12 +199,27 @@ export class Kairo {
 	private stopHook?: () => void;
 	/** Closing: calls interrupted now go on in kairo, to be resumed (not cancelled). */
 	private closing = false;
+	/** The embedded runtime, when that is the backend (drive leases, ADR 0059). */
+	private readonly rt?: Embedded;
+	/** Wait mode: workflows driven in the background here (by id), and their drives. */
+	private readonly owned = new Set<string>();
+	private readonly background = new Set<Promise<void>>();
+	/** Ends with the process (close): what waits in it stops. */
+	private readonly life = new AbortController();
+	/** Wait mode: the sweep, once a lease period, of what stopped processes left (ADR 0059). */
+	private sweepTimer?: ReturnType<typeof setInterval>;
+	private sweeping?: Promise<void>;
+	/** Limits (ADR 0059): steps at once in this process (embedded), and by destination. */
+	private slots?: Slots;
+	private readonly limits = new Map<string, Limiter>();
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
 		this.backend = opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
 		this.suspend = opts.mode === 'suspend';
 		if (this.suspend && !this.backend.idle) throw new Error('suspend mode needs the embedded backend');
+		const rt = (this.backend as { runtime?: unknown }).runtime;
+		if (rt instanceof Embedded) this.rt = rt;
 	}
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
@@ -203,9 +247,25 @@ export class Kairo {
 			checkURL(this.opts.callbackUrl, this.opts.allowInsecure);
 			if (!this.backend.complete) throw new Error('actions with a url need the embedded backend');
 		}
+		for (const [name, def] of this.actions) {
+			if (!def.limit && !def.rate) continue;
+			// Actions of one destination share its limits: the strictest.
+			const key = def.destination || name;
+			let l = this.limits.get(key);
+			if (!l) this.limits.set(key, (l = new Limiter()));
+			l.tighten(def.limit ?? 0, def.rate ?? 0);
+		}
+		// kairod's worker limits its own tasks.
+		if (this.rt && this.opts.concurrency) this.slots = new Slots(this.opts.concurrency);
 		await this.backend.start(specs, (task, ctx) => this.serve(task, ctx));
 		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action, input: { in: '$input.in' } });
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		const rt = this.rt;
+		if (rt) {
+			rt.lostDrive = (l) => this.lostDrive(l);
+			rt.planFor = waitPlan;
+			rt.leaseParents = this.suspend;
+		}
 		if (this.suspend) {
 			// A call that settles drives its workflow on (its id is the
 			// workflow's id, "/", the call's key).
@@ -213,6 +273,27 @@ export class Kairo {
 				const i = r.run_id.lastIndexOf('/');
 				if (i > 0) this.redrive(r.run_id.slice(0, i));
 			});
+		} else if (rt) {
+			// Wait mode: a resident process takes up, once a lease period, what
+			// processes that stopped left (ADR 0059): their workflows, steps and
+			// timers. One timer for the process, not one for each run; it does
+			// not keep the process alive by itself.
+			const sweep = () => {
+				if (this.sweeping || this.closing) return;
+				this.sweeping = (async () => {
+					try {
+						await rt.tick();
+						await rt.recheck();
+					} catch {
+						// Next time.
+					} finally {
+						this.sweeping = undefined;
+					}
+				})();
+			};
+			sweep();
+			this.sweepTimer = setInterval(sweep, rt.lease);
+			this.sweepTimer.unref?.();
 		}
 	}
 
@@ -223,7 +304,12 @@ export class Kairo {
 	async close(): Promise<void> {
 		this.closing = true;
 		this.stopHook?.();
+		clearInterval(this.sweepTimer);
+		this.life.abort();
 		for (const a of this.driving) a.abort();
+		// The drives here end; their leases are left expired, for another
+		// process to take up (ADR 0059).
+		await Promise.allSettled([...this.background, ...this.redrives, this.sweeping]);
 		await this.backend.close();
 	}
 
@@ -277,9 +363,9 @@ export class Kairo {
 				const input = info.input as { workflow?: string; input?: unknown } | undefined;
 				if (info.plan !== PLAN_WORKFLOW || finished(info) || !input?.workflow) return;
 				try {
-					await this.runAs(input.workflow, input.input, id);
+					await this.drive(id, input.workflow, input.input, info.parent, 0);
 				} catch {
-					// Suspended again, failed (recorded), or cancelled.
+					// Suspended again, failed (recorded), cancelled, or driven elsewhere.
 				}
 			} while (this.again.has(id));
 		})();
@@ -306,8 +392,52 @@ export class Kairo {
 		}
 		const def = this.actions.get(task.action);
 		if (!def) return { error: `no action ${task.action} here` };
-		if (def.url) return this.callRemote(task, def, input);
-		return { output: (await def.handler(input, ctx)) ?? null };
+		// Over a limit, the step waits here for a slot, leased (ADR 0059).
+		let release: () => void;
+		try {
+			release = await this.admit(task.action, def, ctx.signal);
+		} catch {
+			return { error: `step of ${task.action} stopped waiting for a slot`, retryable: true, errorType: 'cancelled' };
+		}
+		try {
+			if (def.url) return await this.callRemote(task, def, input);
+			return { output: (await def.handler(input, ctx)) ?? null };
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * Waits for a step of action to be let run (ADR 0059): its
+	 * destination's slot and turn, then the process's slot. Returns what
+	 * gives the slots back.
+	 */
+	private async admit(action: string, def: ActionDef, signal: AbortSignal): Promise<() => void> {
+		const held: Slots[] = [];
+		const release = () => {
+			for (const s of held.splice(0)) s.give();
+		};
+		try {
+			const l = this.limits.get(def.destination || action);
+			if (l?.slots) {
+				await l.slots.take(signal);
+				held.push(l.slots);
+			}
+			if (l && l.every > 0) {
+				const now = Date.now();
+				const at = Math.max(l.next, now);
+				l.next = at + l.every;
+				if (at > now) await delay(at - now, signal);
+			}
+			if (this.slots) {
+				await this.slots.take(signal);
+				held.push(this.slots);
+			}
+			return release;
+		} catch (e) {
+			release();
+			throw e;
+		}
 	}
 
 	/** Calls an action over HTTP(S) (ADR 0052). */
@@ -408,17 +538,179 @@ export class Kairo {
 
 	/**
 	 * Runs workflow name as execution id, or resumes it: calls that
-	 * finished return their recorded results. Returns its result.
+	 * finished return their recorded results. Returns its result. In wait
+	 * mode, with the embedded runtime, the workflow is driven in the
+	 * background, by this process or by whichever process drives it now
+	 * (ADR 0059): a signal that aborts throws StoppedError, and the
+	 * workflow goes on. In suspend mode it is driven here until it waits:
+	 * Suspended. meta is kept with a new workflow (RunInfo.meta, list).
 	 */
-	async run<O = any>(name: string, input: unknown, opts: { id?: string } = {}): Promise<O> {
+	async run<O = any>(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown>; signal?: AbortSignal } = {}): Promise<O> {
+		const id = opts.id ?? randomUUID();
 		try {
-			return (await this.runAs(name, input, opts.id ?? randomUUID())) as O;
+			const token = await this.begin(name, input, id, opts.meta);
+			if (this.suspend) {
+				try {
+					return (await this.drive(id, name, input, undefined, token)) as O;
+				} catch (e) {
+					if (e instanceof DrivenElsewhere) throw new Suspended(e.message);
+					throw e;
+				}
+			}
+			// kairod: driven here, as the caller waits.
+			if (!this.rt) return (await this.drive(id, name, input, undefined, 0)) as O;
+			this.driveBackground(id, name, input, undefined, token);
+			return await this.result<O>(id, { signal: opts.signal });
 		} finally {
 			await this.wakeUp();
 		}
 	}
 
-	/** Sends a signal to the first wait for it in workflow id that has not received one. */
+	/**
+	 * Starts workflow name and returns its id once the start is recorded,
+	 * without waiting for it (ADR 0059): result(id) gives its result, from
+	 * any process. In wait mode it is driven in the background; in suspend
+	 * mode it is driven here until it waits (what it comes to is recorded:
+	 * nothing is thrown). The id is an idempotency key, as in run.
+	 */
+	async submit(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown> } = {}): Promise<string> {
+		const id = opts.id ?? randomUUID();
+		const token = await this.begin(name, input, id, opts.meta);
+		if (!this.suspend) {
+			this.driveBackground(id, name, input, undefined, token);
+			return id;
+		}
+		await this.drive(id, name, input, undefined, token).catch(() => {});
+		await this.wakeUp();
+		return id;
+	}
+
+	/**
+	 * Workflow id's result once it has finished. In wait mode it waits; a
+	 * signal that aborts, or the process closing, throws StoppedError (the
+	 * workflow goes on). In suspend mode it does not wait: Suspended while
+	 * the workflow has not finished.
+	 */
+	async result<O = any>(id: string, opts: { signal?: AbortSignal } = {}): Promise<O> {
+		if (this.suspend) {
+			const info = await this.backend.get(id);
+			if (!finished(info)) throw new Suspended(`workflow ${id} has not finished`);
+			return done(id, info) as O;
+		}
+		const signal = opts.signal ? AbortSignal.any([opts.signal, this.life.signal]) : this.life.signal;
+		let info: RunInfo;
+		try {
+			info = await this.backend.wait(id, signal);
+		} catch (e) {
+			if (signal.aborted) throw new StoppedError(`workflow ${id}: stopped waiting for it`);
+			throw e;
+		}
+		return done(id, info) as O;
+	}
+
+	/**
+	 * Workflows started here or elsewhere (root runs: not child workflows,
+	 * not calls), in the order they were created (ADR 0059). The embedded
+	 * runtime only.
+	 */
+	async list(opts: ListOptions = {}): Promise<RunInfo[]> {
+		if (!this.rt) throw new Error('list needs the embedded backend');
+		const ms = (t: number | Date | undefined) => (t instanceof Date ? t.getTime() : t);
+		return this.rt.list({ ...opts, since: ms(opts.since), until: ms(opts.until) });
+	}
+
+	/**
+	 * Makes workflow name's run as id (or finds it). A new one is leased to
+	 * this process to drive, in the same transaction: its token (0: it
+	 * existed, or no leases here).
+	 */
+	private async begin(name: string, input: unknown, id: string, meta?: Record<string, unknown>): Promise<number> {
+		if (!this.workflows.has(name)) throw new Error(`no workflow ${name}`);
+		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		const token = this.rt ? newToken() : 0;
+		const started = await this.backend.run(
+			PLAN_WORKFLOW,
+			{ workflow: name, input: input ?? null },
+			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(meta ? { meta } : {}), ...(token ? { drive: token } : {}) },
+		);
+		return started.existing ? 0 : token;
+	}
+
+	/**
+	 * Runs workflow id's function here, holding its drive lease (ADR 0059):
+	 * token is the lease set with its start, or 0 to claim it now. What it
+	 * leaves: nothing when it finished (the lease ends with it), no lease
+	 * when it waits (suspend mode: what it waits for drives it on), an
+	 * expired lease when it stopped otherwise (a tick takes it up).
+	 */
+	private async drive(id: string, name: string, input: unknown, parent: string | undefined, token: number): Promise<unknown> {
+		const rt = this.rt;
+		if (rt && token === 0) {
+			const info = await this.backend.get(id);
+			if (finished(info)) return done(id, info);
+			token = newToken();
+			if (!(await rt.claimDrive(id, token))) throw new DrivenElsewhere(`workflow ${id} is driven by another process`);
+		}
+		rt?.driving(true);
+		try {
+			return await this.runAs(name, input, id, parent ? { id: parent } : undefined);
+		} catch (e) {
+			if (rt) await rt.endDrive(id, token, !(e instanceof Suspended)).catch(() => {});
+			throw e;
+		} finally {
+			rt?.driving(false);
+		}
+	}
+
+	/** Wait mode: drives workflow id in the background, unless this process drives it already. */
+	private driveBackground(id: string, name: string, input: unknown, parent: string | undefined, token: number): void {
+		if (this.owned.has(id) || this.closing) return;
+		this.owned.add(id);
+		const p: Promise<void> = this.drive(id, name, input, parent, token)
+			.then(
+				() => {},
+				() => {
+					// Its failure is recorded (result reports it); stopped,
+					// cancelled or driven elsewhere: nothing to do here.
+				},
+			)
+			.finally(() => {
+				this.owned.delete(id);
+				this.background.delete(p);
+			});
+		this.background.add(p);
+	}
+
+	/** Takes up workflow l.run, whose driver stopped: its drive lease expired (ADR 0059). */
+	private async lostDrive(l: LeaseRow): Promise<void> {
+		const rt = this.rt!;
+		let info: RunInfo | undefined;
+		try {
+			info = await this.backend.get(l.run);
+		} catch (e) {
+			if (!(e instanceof KairoError && e.status === 404)) throw e;
+		}
+		if (!info || info.plan !== PLAN_WORKFLOW || finished(info)) {
+			// Nothing left to drive.
+			await rt.endDrive(l.run, l.attempt, false, l.owner);
+			return;
+		}
+		const input = info.input as { workflow?: string; input?: unknown } | undefined;
+		if (!input?.workflow) return;
+		if (!this.workflows.has(input.workflow)) throw new KairoError(404, `workflow ${input.workflow} is not registered here`); // another process's
+		if (this.suspend) {
+			this.redrive(l.run);
+			return;
+		}
+		this.driveBackground(l.run, input.workflow, input.input, info.parent, 0);
+	}
+
+	/**
+	 * Sends a signal to the first wait for it in workflow id that has not
+	 * received one. With the embedded runtime, a wait the workflow has not
+	 * reached yet receives it when it does (ADR 0059): signals of one name
+	 * go to its waits in order.
+	 */
 	async signal(id: string, name: string, payload: unknown = null): Promise<void> {
 		// The waits' plan, which this process may not have needed yet.
 		await this.plan(PLAN_WAIT + name, waitRoot(name));
@@ -428,17 +720,35 @@ export class Kairo {
 			try {
 				r = await this.backend.get(runId);
 			} catch (e) {
-				if (e instanceof KairoError && e.status === 404) throw new Error(`workflow ${id} does not wait for ${name}`);
-				throw e;
+				if (!(e instanceof KairoError && e.status === 404)) throw e;
+				if (!this.rt) throw new Error(`workflow ${id} does not wait for ${name}`);
+				if (await this.signalAhead(id, name, runId, payload)) break;
+				n--; // the workflow made the wait meanwhile: signal it
+				continue;
 			}
 			if (finished(r)) continue;
 			await this.backend.signal(runId, name, payload);
-			if (this.suspend) {
-				await this.settle();
-				await this.wakeUp();
-			}
-			return;
+			break;
 		}
+		if (this.suspend) {
+			await this.settle();
+			await this.wakeUp();
+		}
+	}
+
+	/** Makes wait runId of workflow id, as the workflow will when it reaches it, with the signal applied in the same transaction. */
+	private async signalAhead(id: string, name: string, runId: string, payload: unknown): Promise<boolean> {
+		let wf: RunInfo;
+		try {
+			wf = await this.backend.get(id);
+		} catch (e) {
+			if (e instanceof KairoError && e.status === 404) throw new Error(`no workflow ${id}`);
+			throw e;
+		}
+		if (wf.plan !== PLAN_WORKFLOW) throw new Error(`no workflow ${id}`);
+		if (finished(wf)) throw new Error(`workflow ${id} has finished`);
+		const r = await this.backend.run(PLAN_WAIT + name, { in: null }, { runId, parent: id, then: [{ kind: 'signal', name, data: payload ?? null }] });
+		return !r.existing;
 	}
 
 	/** Cancels workflow id: the calls it is waiting for are cancelled with it. */
@@ -446,14 +756,23 @@ export class Kairo {
 		await this.backend.cancel(id);
 	}
 
-	private async runAs(name: string, input: unknown, id: string, parent?: AbortSignal, parentId?: string): Promise<unknown> {
+	/**
+	 * Drives workflow id here. parent: the workflow that made it, if any;
+	 * with signal and cancelled when it runs inside it (a child workflow).
+	 */
+	private async runAs(
+		name: string,
+		input: unknown,
+		id: string,
+		parent?: { id: string; signal?: AbortSignal; cancelled?: () => boolean },
+	): Promise<unknown> {
 		const fn = this.workflows.get(name);
 		if (!fn) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
 			{ workflow: name, input: input ?? null },
-			{ runId: id, vars: { started_at: Date.now() }, ...(parentId ? { parent: parentId } : {}) },
+			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
 		);
 		const info = await this.backend.get(id);
 		if (finished(info)) return done(id, info);
@@ -469,38 +788,59 @@ export class Kairo {
 		const abort = new AbortController();
 		this.driving.add(abort);
 		const stop = () => abort.abort();
-		parent?.addEventListener('abort', stop);
+		parent?.signal?.addEventListener('abort', stop);
+		if (parent?.signal?.aborted) abort.abort();
+		// Cancelled in kairo (its run, or a workflow above it): only then
+		// are its calls cancelled. Otherwise an abort only stops the driving
+		// here (the process closes), and the workflow goes on later.
+		let self = false;
+		const cancelled = () => self || (parent?.cancelled?.() ?? false);
 		if (!this.suspend) {
 			// The workflow's own run ends when it is cancelled: stop the calls.
 			// (Suspended, a cancelled workflow stops when it is driven next.)
 			void this.backend.wait(id, abort.signal).then((r) => {
-				if (r.status === 'cancelled') abort.abort();
+				if (r.status === 'cancelled') {
+					self = true;
+					abort.abort();
+				}
 			}, () => {});
 		}
 		this.drivingIds.add(id);
-		const ctx = new Context(this, id, abort.signal);
+		const ctx = new Context(this, id, abort.signal, cancelled);
 		try {
-			const value = await fn(ctx, input);
+			// A function that throws, at once or later, fails the workflow; one
+			// that does not stop when the workflow is cancelled or the process
+			// closes is left behind.
+			const running = Promise.resolve().then(() => fn(ctx, input));
+			running.catch(() => {});
+			const value = await Promise.race([running, aborted(abort.signal)]);
 			await this.backend.signal(id, 'done', { ok: true, value: value ?? null });
 			return value;
 		} catch (e) {
 			if (e instanceof Suspended) throw e; // goes on later
-			if (abort.signal.aborted) throw new CancelledError(`workflow ${id} cancelled`);
+			if (abort.signal.aborted) {
+				if (cancelled()) {
+					// Cancelled with the workflow above it: so is its run.
+					if (!self) await this.backend.cancel(id).catch(() => {});
+					throw new CancelledError(`workflow ${id} cancelled`);
+				}
+				throw new StoppedError(`workflow ${id}: not driven here any more`);
+			}
 			await this.backend.signal(id, 'done', { ok: false, error: String((e as Error)?.message ?? e) }).catch(() => {});
 			throw e;
 		} finally {
-			parent?.removeEventListener('abort', stop);
+			parent?.signal?.removeEventListener('abort', stop);
 			this.driving.delete(abort);
 			this.drivingIds.delete(id);
 			abort.abort();
 		}
 	}
 
-	/** One call: a run of its own, found again by its id. */
-	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, signal: AbortSignal, parent: string): Promise<unknown> {
+	/** One call of workflow ctx: a run of its own, found again by its id. */
+	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
 		if (root) await this.plan(plan, root);
 		// Kept and removed with the workflow that makes it (ADR 0054).
-		await this.backend.run(plan, { in: input }, { runId, parent });
+		await this.backend.run(plan, { in: input }, { runId, parent: ctx.id });
 		let r: RunInfo;
 		if (this.suspend) {
 			// Whatever this process can do for the call is done once it is
@@ -510,14 +850,17 @@ export class Kairo {
 			if (!finished(r) && r.status !== 'blocked') throw new Suspended(`call ${runId} waits`);
 		} else {
 			try {
-				r = await this.backend.wait(runId, signal);
+				r = await this.backend.wait(runId, ctx.signal);
 			} catch (e) {
-				if (signal.aborted) {
-					// The workflow was cancelled: so is the call. Unless this
-					// process is closing: then the call goes on in kairo, and
-					// the workflow resumes it later.
-					if (!this.closing) await this.backend.cancel(runId).catch(() => {});
-					throw new CancelledError(`call ${runId} cancelled`);
+				if (ctx.signal.aborted) {
+					// The workflow was cancelled in kairo: so is the call. If not,
+					// the workflow is only no longer driven here: the call goes on
+					// in kairo, and the workflow resumes it later.
+					if (ctx.cancelled()) {
+						await this.backend.cancel(runId).catch(() => {});
+						throw new CancelledError(`call ${runId} cancelled`);
+					}
+					throw new StoppedError(`call ${runId}: stopped waiting for it`);
 				}
 				throw e;
 			}
@@ -527,14 +870,102 @@ export class Kairo {
 		return r.output;
 	}
 
-	async childWorkflow(name: string, input: unknown, id: string, signal: AbortSignal, parent: string): Promise<unknown> {
-		return this.runAs(name, input, id, signal, parent);
+	async childWorkflow(name: string, input: unknown, id: string, ctx: Context): Promise<unknown> {
+		return this.runAs(name, input, id, { id: ctx.id, signal: ctx.signal, cancelled: ctx.cancelled });
 	}
 }
 
-/** The plan of a wait for signal name. */
-function waitRoot(name: string) {
-	return { kind: 'wait', id: 'w', signal: name };
+/** The plan of a wait for signal name, with a timeout (ms; 0: none). */
+function waitRoot(name: string, timeoutMs = 0) {
+	return { kind: 'wait', id: 'w', signal: name, ...(timeoutMs > 0 ? { timeout: `${timeoutMs}ms` } : {}) };
+}
+
+/** A wait's plan from its name (kairo.wait/<signal>[@<ms>]): one made by another process (ADR 0059). */
+function waitPlan(name: string): { name: string; root: unknown } | undefined {
+	if (!name.startsWith(PLAN_WAIT)) return undefined;
+	const rest = name.slice(PLAN_WAIT.length);
+	const i = rest.lastIndexOf('@');
+	if (i >= 0 && /^\d+$/.test(rest.slice(i + 1)) && Number(rest.slice(i + 1)) > 0) {
+		return { name, root: waitRoot(rest.slice(0, i), Number(rest.slice(i + 1))) };
+	}
+	return { name, root: waitRoot(rest) };
+}
+
+/** Rejects when signal aborts. */
+function aborted(signal: AbortSignal): Promise<never> {
+	return new Promise((_, rej) => {
+		if (signal.aborted) return rej(signal.reason);
+		signal.addEventListener('abort', () => rej(signal.reason), { once: true });
+	});
+}
+
+/** Resolves after ms, or rejects when signal aborts first. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((res, rej) => {
+		if (signal.aborted) return rej(signal.reason);
+		const stop = () => {
+			clearTimeout(t);
+			rej(signal.reason);
+		};
+		const t = setTimeout(() => {
+			signal.removeEventListener('abort', stop);
+			res();
+		}, ms);
+		signal.addEventListener('abort', stop, { once: true });
+	});
+}
+
+/** Slots taken and given back; a slot given back goes to the step waiting longest (no polling). */
+class Slots {
+	private free: number;
+	private readonly queue: Array<() => void> = [];
+	readonly size: number;
+
+	constructor(size: number) {
+		this.size = size;
+		this.free = size;
+	}
+
+	/** Takes a slot, waiting for one; rejects when signal aborts first. */
+	take(signal: AbortSignal): Promise<void> {
+		if (this.free > 0 && this.queue.length === 0) {
+			this.free--;
+			return Promise.resolve();
+		}
+		return new Promise((res, rej) => {
+			if (signal.aborted) return rej(signal.reason);
+			const go = () => {
+				signal.removeEventListener('abort', stop);
+				res();
+			};
+			const stop = () => {
+				const i = this.queue.indexOf(go);
+				if (i >= 0) this.queue.splice(i, 1);
+				rej(signal.reason);
+			};
+			this.queue.push(go);
+			signal.addEventListener('abort', stop, { once: true });
+		});
+	}
+
+	give(): void {
+		const next = this.queue.shift();
+		if (next) next();
+		else this.free++;
+	}
+}
+
+/** The limits of one destination (ADR 0059): steps at once, and the spacing of their starts (ms). */
+class Limiter {
+	slots?: Slots;
+	every = 0;
+	/** When the next step may start (unix ms). */
+	next = 0;
+
+	tighten(limit: number, perMinute: number): void {
+		if (limit > 0 && (!this.slots || limit < this.slots.size)) this.slots = new Slots(limit);
+		if (perMinute > 0) this.every = Math.max(this.every, 60_000 / perMinute);
+	}
 }
 
 /** The result of a finished workflow run. */
@@ -556,14 +987,18 @@ function callId(workflow: string, kind: string, input: unknown, n: number): stri
 /** What a workflow function calls. */
 export class Context {
 	readonly id: string;
+	/** Aborts when the workflow is cancelled, and when it stops being driven here (the process closes). */
 	readonly signal: AbortSignal;
+	/** Whether the workflow (or one above it) was cancelled in kairo: only then are its calls cancelled. */
+	readonly cancelled: () => boolean;
 	private readonly k: Kairo;
 	private readonly seen = new Map<string, number>();
 
-	constructor(k: Kairo, id: string, signal: AbortSignal) {
+	constructor(k: Kairo, id: string, signal: AbortSignal, cancelled: () => boolean = () => false) {
 		this.k = k;
 		this.id = id;
 		this.signal = signal;
+		this.cancelled = cancelled;
 	}
 
 	private next(kind: string, input: unknown): string {
@@ -576,7 +1011,7 @@ export class Context {
 	/** Runs action with input (once, however often the workflow runs again). */
 	async call<O = any>(action: string, input: unknown = null): Promise<O> {
 		const id = this.next(PLAN_CALL + action, input);
-		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this.signal, this.id)) as O;
+		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this)) as O;
 	}
 
 	/** Runs the calls at once; their results in order. */
@@ -584,12 +1019,19 @@ export class Context {
 		return Promise.all(fns.map((f) => f())) as any;
 	}
 
-	/** Waits for signal name (see Kairo.signal); returns its payload. */
-	async waitFor<P = any>(name: string): Promise<P> {
+	/**
+	 * Waits for signal name (see Kairo.signal); returns its payload. With
+	 * timeout (ms), throws TimedOutError if no signal comes in time; the
+	 * timeout is kept in kairo (ADR 0059).
+	 */
+	async waitFor<P = any>(name: string, opts: { timeout?: number } = {}): Promise<P> {
+		// The timeout is the plan's, not the call's: the id is the same with
+		// or without one, so a signal sent ahead finds it (ADR 0059).
 		const id = this.next(PLAN_WAIT + name, null);
-		const out = (await this.k.callRun(PLAN_WAIT + name, waitRoot(name), null, id, this.signal, this.id)) as {
-			payload: P;
-		};
+		const ms = Math.floor(opts.timeout ?? 0);
+		const plan = ms > 0 ? `${PLAN_WAIT}${name}@${ms}` : PLAN_WAIT + name;
+		const out = (await this.k.callRun(plan, waitRoot(name, ms), null, id, this)) as { timed_out?: boolean; payload: P };
+		if (out.timed_out) throw new TimedOutError(`wait for ${name} timed out`);
 		return out.payload;
 	}
 
@@ -611,6 +1053,6 @@ export class Context {
 	/** Runs workflow name as a child of this one. */
 	async workflow<O = any>(name: string, input: unknown = null): Promise<O> {
 		const id = this.next('kairo.workflow/' + name, input);
-		return (await this.k.childWorkflow(name, input, id, this.signal, this.id)) as O;
+		return (await this.k.childWorkflow(name, input, id, this)) as O;
 	}
 }

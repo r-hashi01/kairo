@@ -18,9 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { Core, type Compiled, type CoreCommand, type CoreEvent } from './core.ts';
 import { KairoError, type NodeSpec, type RunInfo } from './client.ts';
 import type { Result, Task } from './protocol.ts';
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 
-import type { LeaseRow, RunRow, Store, TimerRow } from './store.ts';
+import type { LeaseRow, ListFilter, RunRow, Store, TimerRow } from './store.ts';
 import type { TaskContext } from './worker.ts';
 
 /** Runs the actions of dispatched steps in this process. */
@@ -85,6 +85,17 @@ export class Embedded {
 	private renewal?: ReturnType<typeof setInterval>;
 	private lastSweep = 0;
 	private unlisten?: () => Promise<void>;
+	/** Workflows driven by this process now: their drive leases are renewed with its steps' (ADR 0059). */
+	private drives = 0;
+	/**
+	 * Set by Kairo (ADR 0059). leaseParents: a run that settles leases its
+	 * parent workflow to this process, to be driven on (suspend mode).
+	 * lostDrive takes up a drive lease whose owner stopped. planFor gives
+	 * the definition of a plan not registered here (a wait made elsewhere).
+	 */
+	leaseParents = false;
+	lostDrive?: (l: LeaseRow) => Promise<void>;
+	planFor?: (name: string) => { name: string; [k: string]: unknown } | undefined;
 
 	private constructor(core: Core, opts: EmbeddedOptions) {
 		this.core = core;
@@ -138,22 +149,69 @@ export class Embedded {
 		return c;
 	}
 
+	/** Plan name, registered here, or made now from planFor. */
+	private plan(name: string): Compiled | undefined {
+		const c = this.plans.get(name);
+		if (c || !this.planFor) return c;
+		const def = this.planFor(name);
+		return def ? this.registerPlan(def) : undefined;
+	}
+
+	/** The lease period (ms). */
+	get lease(): number {
+		return this.leaseMs;
+	}
+
 	/**
 	 * Starts a run of plan, or finds it: a run id is an idempotency key, and
 	 * a run that exists (running or finished) is not started again. parent:
 	 * the run that makes this one, which it is kept and removed with (ADR 0054).
 	 */
-	async run(
-		plan: string,
-		input: unknown,
-		opts: { runId: string; vars?: Record<string, unknown>; parent?: string },
-	): Promise<{ run_id: string; existing: boolean }> {
-		const p = this.plans.get(plan);
+	async run(plan: string, input: unknown, opts: RunStart): Promise<{ run_id: string; existing: boolean }> {
+		const p = this.plan(plan);
 		if (!p) throw new KairoError(404, `no plan ${plan}`);
 		const at = this.now();
 		const ev: CoreEvent = { kind: 'start', at, data: input ?? null, ...(opts.vars ? { vars: opts.vars } : {}) };
-		const existing = await this.process(opts.runId, [ev], { plan: p, at, parent: opts.parent });
-		return { run_id: opts.runId, existing };
+		const then = (opts.then ?? []).map((e) => ({ ...e, at }) as CoreEvent);
+		try {
+			const existing = await this.process(opts.runId, [ev, ...then], { ...opts, plan: p, at });
+			return { run_id: opts.runId, existing };
+		} catch (e) {
+			// Two processes starting one id at once: the one that lost finds it.
+			if (await this.store.get(opts.runId).catch(() => undefined)) return { run_id: opts.runId, existing: true };
+			throw e;
+		}
+	}
+
+	/** Claims workflow run's drive lease with token for this process (ADR 0059): whether no other process holds it. */
+	claimDrive(run: string, token: number): Promise<boolean> {
+		const now = this.now();
+		return this.store.claimDrive({ run, act: 0, attempt: token, owner: this.owner, until: now + this.leaseMs }, now);
+	}
+
+	/** Ends a drive lease (this process's, unless owner is given): removed, or (resume) left expired. */
+	endDrive(run: string, token: number, resume: boolean, owner = this.owner): Promise<void> {
+		return this.store.endDrive(run, owner, token, this.now(), resume);
+	}
+
+	/** Counts a workflow driven here (its lease renewed) while it is. */
+	driving(on: boolean): void {
+		this.drives += on ? 1 : -1;
+		this.renew();
+	}
+
+	/** Root runs in creation order (ADR 0059). */
+	async list(f: ListFilter): Promise<RunInfo[]> {
+		return (await this.store.list(f)).map(info);
+	}
+
+	/** Without listen, reads the runs waited for here: one may have settled in another process (ADR 0059). */
+	async recheck(): Promise<void> {
+		if (this.store.listen) return;
+		for (const id of [...this.waiters.keys()]) {
+			const r = await this.get(id).catch(() => undefined);
+			if (r && SETTLED.has(r.status)) for (const w of this.waiters.get(id) ?? []) w(r);
+		}
 	}
 
 	async get(runId: string): Promise<RunInfo> {
@@ -204,7 +262,12 @@ export class Embedded {
 	 */
 	async tick(): Promise<void> {
 		this.lastSweep = this.now();
-		for (const l of await this.store.expiredLeases(this.now(), 1000)) await this.recover(l).catch(skipUnknownPlan);
+		for (const l of await this.store.expiredLeases(this.now(), 1000)) {
+			// A workflow's driver stopped (ADR 0059).
+			if (l.act === 0) {
+				if (this.lostDrive) await this.lostDrive(l).catch(skipUnknownPlan);
+			} else await this.recover(l).catch(skipUnknownPlan);
+		}
 		for (const t of await this.store.dueTimers(this.now(), 1000)) await this.fire(t).catch(skipUnknownPlan);
 		// Finished trees past the time they are kept (ADR 0054).
 		if (Number.isFinite(this.keepMs)) await this.store.removeFinished(this.now() - this.keepMs, REMOVE_PER_TICK);
@@ -235,7 +298,7 @@ export class Embedded {
 
 	/** Renews this process's leases while it runs steps; one timer for all of them. */
 	private renew(): void {
-		if (this.running.size > 0 && !this.closed) {
+		if ((this.running.size > 0 || this.drives > 0) && !this.closed) {
 			this.renewal ??= setInterval(() => {
 				this.track(this.store.renewLeases(this.owner, this.now() + this.leaseMs));
 			}, Math.max(this.leaseMs / 3, 10));
@@ -255,14 +318,14 @@ export class Embedded {
 	 * commands. With start, a new run of that plan (or the existing one: the
 	 * answer says which).
 	 */
-	private async process(runId: string, events: CoreEvent[], start?: { plan: Compiled; at: number; parent?: string }): Promise<boolean> {
+	private async process(runId: string, events: CoreEvent[], start?: RunStart & { plan: Compiled; at: number }): Promise<boolean> {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
 			if (row && start) return { events: [], result: { existing: true, settled: false, commands: [] as CoreCommand[], row } };
 			if (!row && !start)
 				return { events: [], endLeases, result: { existing: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
-			const plan = start ? start.plan : this.plans.get(row!.plan);
+			const plan = start ? start.plan : this.plan(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
 			if (row && row.hash !== plan.hash) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
 			let state = row?.state ?? new Uint8Array();
@@ -297,6 +360,8 @@ export class Embedded {
 				createdAt: row?.createdAt ?? at,
 				updatedAt: at,
 				parent: row ? row.parent : (start?.parent ?? null),
+				workflow: row ? row.workflow : (start?.workflow ?? null),
+				meta: row ? row.meta : start?.meta !== undefined ? JSON.stringify(start.meta) : null,
 			};
 			const setTimers: TimerRow[] = [];
 			const deleteTimers: number[] = [];
@@ -308,8 +373,15 @@ export class Embedded {
 				if (c.kind === 'dispatch') setLeases.push({ run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: this.owner, until: at + this.leaseMs });
 			}
 			const done = DONE.has(res.status);
+			// Driven by this process from its start (ADR 0059).
+			if (!row && start?.drive && !done) setLeases.push({ run: runId, act: 0, attempt: start.drive, owner: this.owner, until: at + this.leaseMs });
+			const settled = SETTLED.has(res.status) && res.status !== row?.status;
+			// Its workflow is to be driven on: by this process, or, if it
+			// stops first, by whichever takes the lease up (ADR 0059).
+			if (settled && next.parent && this.leaseParents)
+				setLeases.push({ run: next.parent, act: 0, attempt: newToken(), owner: this.owner, until: at + this.leaseMs });
 			return {
-				notify: SETTLED.has(res.status) && res.status !== row?.status,
+				notify: settled,
 				events: recorded,
 				row: next,
 				setTimers,
@@ -317,7 +389,7 @@ export class Embedded {
 				clearTimers: done,
 				endLeases,
 				setLeases,
-				result: { existing: false, settled: SETTLED.has(res.status) && res.status !== row?.status, commands, row: next },
+				result: { existing: false, settled, commands, row: next },
 			};
 		});
 		if (this.closed) return out.existing;
@@ -422,6 +494,29 @@ function outcome(res: Result, act: number, attempt: number, at: number): CoreEve
 	return { kind: 'step_ok', at, act, attempt, data: res.output ?? null };
 }
 
+/** What a new run starts with, besides its plan and input. */
+export interface RunStart {
+	runId: string;
+	vars?: Record<string, unknown>;
+	/** The run that makes this one: kept and removed with it (ADR 0054). */
+	parent?: string;
+	/** A workflow run's workflow, and what the application gave it (ADR 0059). Set once. */
+	workflow?: string;
+	meta?: Record<string, unknown>;
+	/** A workflow run: its drive lease for this process, set with its start (a token; ADR 0059). */
+	drive?: number;
+	/** Events applied in the start's transaction (a signal received before its wait, ADR 0059). */
+	then?: Array<Omit<CoreEvent, 'at'>>;
+}
+
+/** A drive lease's token: a nonzero int32 (ADR 0059). */
+export function newToken(): number {
+	for (;;) {
+		const t = randomInt(-0x80000000, 0x80000000);
+		if (t !== 0) return t;
+	}
+}
+
 /** A run whose plan this process does not have is another process's to take up. */
 function skipUnknownPlan(e: unknown): void {
 	if (!(e instanceof KairoError && e.status === 404)) throw e;
@@ -436,5 +531,10 @@ function info(row: RunRow): RunInfo {
 		...(row.input !== null ? { input: JSON.parse(row.input) } : {}),
 		...(row.output !== null ? { output: JSON.parse(row.output) } : {}),
 		...(row.error ? { error: row.error } : {}),
+		...(row.parent ? { parent: row.parent } : {}),
+		...(row.workflow ? { workflow: row.workflow } : {}),
+		...(row.meta !== null ? { meta: JSON.parse(row.meta) } : {}),
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
 	};
 }

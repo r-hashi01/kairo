@@ -17,7 +17,7 @@ import urllib.request
 
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.store import SQLiteStore
-from kairo_sdk.workflow import Cancelled, Kairo, Suspended
+from kairo_sdk.workflow import Cancelled, Kairo, StoppedError, Suspended
 
 try:
     import wasmtime  # noqa: F401
@@ -143,7 +143,7 @@ class WorkflowTest(unittest.TestCase):
             await self.wait_until(lambda: self.runs["write"] == 1)
             self.assertEqual(self.runs["llm"], 3)
             await k1.close()  # the first process "stops"
-            with self.assertRaises(asyncio.CancelledError):
+            with self.assertRaises(StoppedError):  # not cancelled: it goes on elsewhere (ADR 0059)
                 await first
 
             self.hang = False

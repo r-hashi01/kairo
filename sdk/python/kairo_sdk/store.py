@@ -32,6 +32,8 @@ class RunRow:
     created_at: int
     updated_at: int
     parent: str | None = None  # the run that made this one: removed with it (ADR 0054)
+    workflow: str | None = None  # a workflow run's workflow (None for a call; ADR 0059)
+    meta: str | None = None  # JSON: what the application started it with (ADR 0059)
 
 
 @dataclass
@@ -44,6 +46,10 @@ class TimerRow:
 
 @dataclass
 class LeaseRow:
+    """A step dispatched to a process, held while it runs (ADR 0051). Act 0
+    (no step has it) is a workflow's drive lease (ADR 0059): the process
+    that runs the workflow's function, with a token in attempt."""
+
     run: str
     act: int
     attempt: int
@@ -88,6 +94,19 @@ class Store(Protocol):
         """Hands a step's lease to lease.owner until lease.until (ADR 0052: the
         step runs elsewhere). Nothing if the lease is gone: its outcome is in."""
         ...
+    async def claim_drive(self, lease: LeaseRow, now: int) -> bool:
+        """Sets the drive lease (act 0) unless another owner holds it
+        unexpired at now; whether it did (ADR 0059)."""
+        ...
+    async def end_drive(self, run: str, owner: str, token: int, now: int, resume: bool) -> None:
+        """Ends run's drive lease held by owner with token: removed, or
+        (resume) left expired and ownerless at now, for a tick to take up."""
+        ...
+    async def list(self, *, workflow: str | None = None, status: str | None = None, since: int | None = None,
+                   until: int | None = None, after: str | None = None, limit: int | None = None) -> list[RunRow]:
+        """Root runs (no parent) in creation order (ADR 0059): of workflow, in
+        status, created in [since, until), after the run after, at most limit."""
+        ...
     async def close(self) -> None: ...
 
 
@@ -120,11 +139,17 @@ def _ddl(p: str, blob: str, big: str) -> list[str]:
 _DONE_SQL = "('completed', 'failed', 'cancelled')"
 
 
+#: Columns added to tables made before them: parent (ADR 0054), workflow and meta (ADR 0059).
+_ADDED = ("parent", "workflow", "meta")
+
+
 def _ddl_removal(p: str) -> list[str]:
-    """After the tables (and the parent column, added to older ones): the indexes for removal (ADR 0054)."""
+    """After the tables (and the columns added to older ones): the indexes for
+    removal (ADR 0054) and listing (ADR 0059)."""
     return [
         f"CREATE INDEX IF NOT EXISTS {p}run_parent ON {p}run (parent)",
         f"CREATE INDEX IF NOT EXISTS {p}run_done ON {p}run (updated_at) WHERE status IN {_DONE_SQL}",
+        f"CREATE INDEX IF NOT EXISTS {p}run_roots ON {p}run (created_at, id) WHERE parent IS NULL",
     ]
 
 
@@ -152,13 +177,53 @@ def _removals(p: str, ph: str) -> list[str]:
     ]
 
 
-_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent"
+_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta"
+
+
+def _put(p: str, ph: str) -> str:
+    """A new run's row, or the changes to it: workflow and meta are set once (ADR 0059)."""
+    return (f"INSERT INTO {p}run ({_RUN_COLS}) VALUES ({', '.join([ph] * 14)}) ON CONFLICT (id) DO UPDATE SET "
+            "state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error, "
+            "seq = excluded.seq, updated_at = excluded.updated_at")
+
+
+def _put_args(r: RunRow, seq: int) -> tuple[Any, ...]:
+    return (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent, r.workflow, r.meta)
+
+
+def _claim(p: str, ph: str) -> str:
+    """One statement: of two processes claiming at once, one wins (ADR 0059)."""
+    return (f"INSERT INTO {p}lease (run, act, attempt, owner, until) VALUES ({ph}, 0, {ph}, {ph}, {ph}) "
+            "ON CONFLICT (run, act) DO UPDATE SET attempt = excluded.attempt, owner = excluded.owner, until = excluded.until "
+            f"WHERE {p}lease.owner = excluded.owner OR {p}lease.until < {ph}")
+
+
+def _end_drive(p: str, ph: str, resume: bool) -> str:
+    where = f"WHERE run = {ph} AND act = 0 AND owner = {ph} AND attempt = {ph}"
+    return f"UPDATE {p}lease SET until = {ph}, owner = '' {where}" if resume else f"DELETE FROM {p}lease {where}"
+
+
+def _list_query(p: str, ph: str, workflow: str | None, status: str | None, since: int | None, until: int | None,
+                after: str | None, limit: int | None) -> tuple[str, tuple[Any, ...]]:
+    """The query of list, and its parameters."""
+    q = f"SELECT {_RUN_COLS} FROM {p}run WHERE parent IS NULL"
+    args: list[Any] = []
+    for cond, v in (("workflow = {}", workflow), ("status = {}", status), ("created_at >= {}", since), ("created_at < {}", until),
+                    (f"(created_at, id) > (SELECT created_at, id FROM {p}run WHERE id = {{}})", after)):
+        if v:
+            q += " AND " + cond.format(ph)
+            args.append(v)
+    q += " ORDER BY created_at, id"
+    if limit and limit > 0:
+        q += f" LIMIT {ph}"
+        args.append(limit)
+    return q, tuple(args)
 
 
 def _row(r: Any) -> RunRow | None:
     if r is None:
         return None
-    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11])
+    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11], r[12], r[13])
 
 
 class SQLiteStore:
@@ -182,8 +247,9 @@ class SQLiteStore:
         for q in _ddl(self.p, "BLOB", "INTEGER"):
             self.db.execute(q)
         cols = [c[1] for c in self.db.execute(f"PRAGMA table_info({self.p}run)").fetchall()]
-        if "parent" not in cols:
-            self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN parent TEXT")
+        for col in _ADDED:
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN {col} TEXT")
         for q in _ddl_removal(self.p):
             self.db.execute(q)
 
@@ -218,12 +284,7 @@ class SQLiteStore:
                 seq += 1
             if c.row is not None:
                 r = c.row
-                db.execute(
-                    f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET
-                    state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
-                    seq = excluded.seq, updated_at = excluded.updated_at""",
-                    (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent),
-                )
+                db.execute(_put(p, "?"), _put_args(r, seq))
             if c.clear:
                 db.execute(f"DELETE FROM {p}timer WHERE run = ?", (id,))
                 db.execute(f"DELETE FROM {p}lease WHERE run = ?", (id,))
@@ -285,6 +346,21 @@ class SQLiteStore:
             (lease.owner, lease.until, lease.run, lease.act, lease.attempt),
         )
 
+    async def claim_drive(self, lease: LeaseRow, now: int) -> bool:
+        assert self.db is not None
+        cur = self.db.execute(_claim(self.p, "?"), (lease.run, lease.attempt, lease.owner, lease.until, now))
+        return cur.rowcount > 0
+
+    async def end_drive(self, run: str, owner: str, token: int, now: int, resume: bool) -> None:
+        assert self.db is not None
+        self.db.execute(_end_drive(self.p, "?", resume), ((now - 1,) if resume else ()) + (run, owner, token))
+
+    async def list(self, *, workflow: str | None = None, status: str | None = None, since: int | None = None,
+                   until: int | None = None, after: str | None = None, limit: int | None = None) -> list[RunRow]:
+        assert self.db is not None
+        q, args = _list_query(self.p, "?", workflow, status, since, until, after, limit)
+        return [_row(r) for r in self.db.execute(q, args).fetchall()]  # type: ignore[misc]
+
     async def close(self) -> None:
         if self.db is not None:
             self.db.close()
@@ -306,7 +382,8 @@ class PostgresStore:
     async def init(self) -> None:
         for q in _ddl(self.p, "BYTEA", "BIGINT"):
             await self._exec(q)
-        await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS parent TEXT")
+        for col in _ADDED:
+            await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS {col} TEXT")
         for q in _ddl_removal(self.p):
             await self._exec(q)
 
@@ -339,12 +416,7 @@ class PostgresStore:
                     seq += 1
                 if c.row is not None:
                     r = c.row
-                    await conn.execute(
-                        f"""INSERT INTO {p}run ({_RUN_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET
-                        state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
-                        seq = excluded.seq, updated_at = excluded.updated_at""",
-                        (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent),
-                    )
+                    await conn.execute(_put(p, "%s"), _put_args(r, seq))
                 if c.clear:
                     await conn.execute(f"DELETE FROM {p}timer WHERE run = %s", (id,))
                     await conn.execute(f"DELETE FROM {p}lease WHERE run = %s", (id,))
@@ -395,6 +467,18 @@ class PostgresStore:
             f"UPDATE {self.p}lease SET owner = %s, until = %s WHERE run = %s AND act = %s AND attempt = %s",
             (lease.owner, lease.until, lease.run, lease.act, lease.attempt),
         )
+
+    async def claim_drive(self, lease: LeaseRow, now: int) -> bool:
+        rows = await self._exec(_claim(self.p, "%s") + " RETURNING run", (lease.run, lease.attempt, lease.owner, lease.until, now))
+        return len(rows) > 0
+
+    async def end_drive(self, run: str, owner: str, token: int, now: int, resume: bool) -> None:
+        await self._exec(_end_drive(self.p, "%s", resume), ((now - 1,) if resume else ()) + (run, owner, token))
+
+    async def list(self, *, workflow: str | None = None, status: str | None = None, since: int | None = None,
+                   until: int | None = None, after: str | None = None, limit: int | None = None) -> list[RunRow]:
+        q, args = _list_query(self.p, "%s", workflow, status, since, until, after, limit)
+        return [_row(r) for r in await self._exec(q, args)]  # type: ignore[misc]
 
     async def listen(self, settled: Callable[[str], None]) -> Callable[[], Any]:
         """Keeps one connection to LISTEN for runs settled in any process; returns how to stop."""

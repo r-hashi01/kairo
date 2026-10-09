@@ -27,6 +27,12 @@ export interface RunInfo {
 	error?: string;
 	/** Only the finished-run marker is left: the output is gone (ADR 0027). */
 	trimmed?: boolean;
+	/** The embedded runtime (ADR 0059): the run that made this one, a workflow run's workflow and meta, when it started and last changed (unix ms). */
+	parent?: string;
+	workflow?: string;
+	meta?: Record<string, unknown>;
+	createdAt?: number;
+	updatedAt?: number;
 	[key: string]: unknown;
 }
 

@@ -62,5 +62,7 @@
 | [0055](0055-jev-typed-decisions.md) | 型付きの判断（TypeSafe Jev）を、別モジュールのアクションとして、kairod と埋め込みの両方から使えるようにする | 承認 |
 | [0056](0056-time-budgets-are-measured-not-tested.md) | 時間の予算は、テストでも CI でも判定しない: 決まったマシンで測り、変更の前後で比べる | 承認 |
 | [0057](0057-distribution-and-releases.md) | 配布の形: SDK は kairo-sdk として npm と PyPI に、kairo.wasm を同梱し、タグからの 1 本のリリースで出す | 承認 |
+| [0058](0058-go-sdk.md) | Go の SDK を用意する: コアを WASM なしで埋め込み、TypeScript・Python と同じ表と同じ取り決めで動かす | 承認 |
+| [0059](0059-embedded-runtime-gaps.md) | 埋め込みのランタイムの不足を埋める: 動かす側の借用で再開し、先に来たシグナルを受け、上限・待ちの期限・一覧・投げっぱなしの開始を足す | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

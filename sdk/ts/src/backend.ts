@@ -3,7 +3,7 @@
 // process with a database.
 
 import { Client, type NodeSpec, type RunInfo } from './client.ts';
-import { Embedded, type ActionHandler, type EmbeddedOptions } from './embedded.ts';
+import { Embedded, type ActionHandler, type EmbeddedOptions, type RunStart } from './embedded.ts';
 import type { Result } from './protocol.ts';
 import { Worker, type Address } from './worker.ts';
 
@@ -13,7 +13,8 @@ export interface Backend {
 	registerPlan(definition: { name: string; [k: string]: unknown }): Promise<void>;
 	/** Starts a run, or finds it: the run id is an idempotency key. Runs are durable. */
 	/** parent: the run that makes this one (the embedded runtime keeps and removes them together, ADR 0054). */
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }): Promise<{ run_id: string; existing: boolean }>;
+	/** workflow, meta, drive and then: the embedded runtime only (ADR 0059); kairod ignores them. */
+	run(plan: string, input: unknown, opts: RunStart): Promise<{ run_id: string; existing: boolean }>;
 	/** Keeps a workflow's calls while it runs, however long (the embedded runtime, ADR 0054). */
 	readonly keepsCalls?: boolean;
 	/** Throws KairoError 404 for a run that does not exist. */
@@ -81,7 +82,7 @@ export class HttpBackend implements Backend {
 		await this.client.registerPlan(definition);
 	}
 
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }) {
+	run(plan: string, input: unknown, opts: RunStart) {
 		// Kept after they finish (ADR 0050): a workflow resumed after kairod
 		// restarts still finds its finished calls' results.
 		return this.client.run(plan, input, { runId: opts.runId, tier: 'file', vars: opts.vars, keepOutput: true });
@@ -132,7 +133,7 @@ export class EmbeddedBackend implements Backend {
 
 	readonly keepsCalls = true;
 
-	run(plan: string, input: unknown, opts: { runId: string; vars?: Record<string, unknown>; parent?: string }) {
+	run(plan: string, input: unknown, opts: RunStart) {
 		return this.runtime.run(plan, input, opts);
 	}
 

@@ -1,0 +1,19 @@
+{"input":null,"canonical":"null","id":"wf-1/fe2dee0203d39ba8ff2710e4.2"}
+{"input":true,"canonical":"true","id":"wf-1/51f370122a50adf5b432d108.2"}
+{"input":0,"canonical":"0","id":"wf-1/582e99a5ca45cc1d5e8c4e39.2"}
+{"input":0,"canonical":"0","id":"wf-1/582e99a5ca45cc1d5e8c4e39.2"}
+{"input":1,"canonical":"1","id":"wf-1/02e92a67c0956ace19a94d22.2"}
+{"input":1.5,"canonical":"1.5","id":"wf-1/7667cbcdec83aa554b9f8705.2"}
+{"input":1e+21,"canonical":"1e+21","id":"wf-1/b06784d9f707da7b57787e6a.2"}
+{"input":1e-7,"canonical":"1e-7","id":"wf-1/0c413dccf88fab3ffb433a66.2"}
+{"input":0.1,"canonical":"0.1","id":"wf-1/9f2d8203f9ae0693620d9f54.2"}
+{"input":123456789012345680000,"canonical":"123456789012345680000","id":"wf-1/b62fef85a379225d126ab0e0.2"}
+{"input":"plain","canonical":"\"plain\"","id":"wf-1/53dac3455b4616b3e459e77d.2"}
+{"input":"<a href=\"x\">&amp;</a>","canonical":"\"<a href=\\\"x\\\">&amp;</a>\"","id":"wf-1/3aa6ee911553319194e9f82c.2"}
+{"input":"line sep x","canonical":"\"line sep x\"","id":"wf-1/8ae4bce0dbc93bf0a6360b41.2"}
+{"input":"tab\tnl\nctl\u0001","canonical":"\"tab\\tnl\\nctl\\u0001\"","id":"wf-1/12824f5315d3ddae753e7cdb.2"}
+{"input":"日本語と😀","canonical":"\"日本語と😀\"","id":"wf-1/f2fb9fc669b14af0dd3faeea.2"}
+{"input":{"b":1,"a":[1,{"d":null,"c":"x"}]},"canonical":"{\"a\":[1,{\"c\":\"x\",\"d\":null}],\"b\":1}","id":"wf-1/fe04d98365ec185dcdeea10c.2"}
+{"input":{"｡":1,"😀":2,"a":3,"B":4},"canonical":"{\"B\":4,\"a\":3,\"😀\":2,\"｡\":1}","id":"wf-1/e7a9f00b4efda049ead0ad66.2"}
+{"input":[[],{},[null]],"canonical":"[[],{},[null]]","id":"wf-1/284db5064a398ac81195ae41.2"}
+{"input":{"q":"hi","n":3},"canonical":"{\"n\":3,\"q\":\"hi\"}","id":"wf-1/eb0940e834e2b5dc65a56728.2"}

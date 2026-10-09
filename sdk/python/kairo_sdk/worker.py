@@ -48,12 +48,47 @@ class Task:
         return self.step_id.split("[", 1)[0]
 
 
+class Flag(threading.Event):
+    """A threading.Event that also tells hooks when it is set: a step
+    waiting for a slot on the event loop stops then (ADR 0059)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._hooks: list[Callable[[], None]] = []
+        self._hlock = threading.Lock()
+
+    def set(self) -> None:
+        super().set()
+        with self._hlock:
+            hooks, self._hooks = self._hooks, []
+        for h in hooks:
+            try:
+                h()
+            except Exception:
+                logger.exception("a hook of a cancelled flag failed")
+
+    def on_set(self, hook: Callable[[], None]) -> Callable[[], None]:
+        """Calls hook once when the flag is set (now, if it is); returns how to stop."""
+        with self._hlock:
+            if not self.is_set():
+                self._hooks.append(hook)
+
+                def off() -> None:
+                    with self._hlock:
+                        if hook in self._hooks:
+                            self._hooks.remove(hook)
+
+                return off
+        hook()
+        return lambda: None
+
+
 class TaskContext:
     """What a handler gets besides the task: whether the step was abandoned
     (timeout, run cancelled; ADR 0026) and a way to stream output."""
 
     def __init__(self, emit: Callable[[bytes], None]) -> None:
-        self.cancelled = threading.Event()
+        self.cancelled = Flag()
         self._emit = emit
 
     def emit(self, data: bytes | str) -> None:

@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -35,6 +36,10 @@ from .worker import Task, TaskContext
 
 #: Runs the action of a dispatched step here (it may block: it runs on a thread).
 ActionHandler = Callable[[Task, TaskContext], Result]
+
+#: Lets a dispatched step run (ADR 0059: limits): waits, on the event loop, and
+#: returns what gives its slots back, or a Result if it stopped waiting.
+Admit = Callable[[Task, TaskContext], Awaitable["Callable[[], None] | Result"]]
 
 DONE = {"completed", "failed", "cancelled"}
 SETTLED = DONE | {"blocked"}  # will not go on by itself
@@ -74,7 +79,25 @@ def info(row: RunRow) -> dict[str, Any]:
         r["output"] = json.loads(row.output)
     if row.error:
         r["error"] = row.error
+    # The run that made this one, a workflow run's workflow and meta, when it
+    # started and last changed (unix ms; ADR 0059).
+    if row.parent:
+        r["parent"] = row.parent
+    if row.workflow:
+        r["workflow"] = row.workflow
+    if row.meta is not None:
+        r["meta"] = json.loads(row.meta)
+    r["created_at"] = row.created_at
+    r["updated_at"] = row.updated_at
     return r
+
+
+def new_token() -> int:
+    """A drive lease's token: a nonzero int32 (ADR 0059)."""
+    while True:
+        t = secrets.randbelow(1 << 32) - (1 << 31)
+        if t != 0:
+            return t
 
 
 class Embedded:
@@ -109,6 +132,18 @@ class Embedded:
         self._last_sweep = 0
         self._unlisten: Callable[[], Awaitable[None]] | None = None
         self._closed = False
+        # Workflows driven by this process now: their drive leases are
+        # renewed with its steps' (ADR 0059).
+        self._drives = 0
+        # Set by Kairo (ADR 0059). lease_parents: a run that settles leases
+        # its parent workflow to this process, to be driven on (suspend
+        # mode). lost_drive takes up a drive lease whose owner stopped.
+        # plan_for gives the definition of a plan not registered here (a
+        # wait made elsewhere). admit lets a dispatched step run (limits).
+        self.lease_parents = False
+        self.lost_drive: Callable[[LeaseRow], Awaitable[None]] | None = None
+        self.plan_for: Callable[[str], dict[str, Any] | None] | None = None
+        self.admit: Admit | None = None
 
     async def open(self) -> Embedded:
         await self.store.init()
@@ -143,21 +178,93 @@ class Embedded:
                 return
             await asyncio.gather(*pending, return_exceptions=True)
 
+    def _plan(self, name: str) -> dict[str, Any] | None:
+        """Plan name, registered here, or made now from plan_for."""
+        c = self.plans.get(name)
+        if c is not None or self.plan_for is None:
+            return c
+        d = self.plan_for(name)
+        return self.register_plan(d) if d is not None else None
+
     async def run(
-        self, plan: str, input: Any, *, run_id: str, vars: dict[str, Any] | None = None, parent: str | None = None
+        self,
+        plan: str,
+        input: Any,
+        *,
+        run_id: str,
+        vars: dict[str, Any] | None = None,
+        parent: str | None = None,
+        workflow: str | None = None,
+        meta: dict[str, Any] | None = None,
+        drive: int = 0,
+        then: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Starts a run of plan, or finds it: a run id is an idempotency key.
         parent: the run that makes this one, which it is kept and removed with
-        (ADR 0054)."""
-        p = self.plans.get(plan)
+        (ADR 0054). ADR 0059: workflow and meta, a workflow run's workflow and
+        what the application gave it (set once); drive, its drive lease for
+        this process (a token), set with its start; then, events applied in
+        the start's transaction (a signal received before its wait)."""
+        p = self._plan(plan)
         if p is None:
             raise KairoError(404, f"no plan {plan}")
         at = self.now()
         ev: dict[str, Any] = {"kind": "start", "at": at, "data": input}
         if vars:
             ev["vars"] = vars
-        existing = await self._process(run_id, [ev], start=p, parent=parent)
+        begin = {"plan": p, "parent": parent, "workflow": workflow, "meta": None if meta is None else json.dumps(meta), "drive": drive}
+        try:
+            existing = await self._process(run_id, [ev] + [dict(e, at=at) for e in then or ()], begin=begin)
+        except Exception:
+            # Two processes starting one id at once: the one that lost finds it.
+            try:
+                found = await self.store.get(run_id)
+            except Exception:
+                found = None
+            if found is None:
+                raise
+            existing = True
         return {"run_id": run_id, "existing": existing}
+
+    @property
+    def lease(self) -> int:
+        """The lease period (ms)."""
+        return self.lease_ms
+
+    async def claim_drive(self, run: str, token: int) -> bool:
+        """Claims workflow run's drive lease with token for this process (ADR
+        0059): whether no other process holds it."""
+        now = self.now()
+        return await self.store.claim_drive(LeaseRow(run, 0, token, self.owner, now + self.lease_ms), now)
+
+    async def end_drive(self, run: str, token: int, resume: bool, owner: str | None = None) -> None:
+        """Ends a drive lease (this process's, unless owner is given): removed,
+        or (resume) left expired, for a tick to take up."""
+        await self.store.end_drive(run, self.owner if owner is None else owner, token, self.now(), resume)
+
+    def driving(self, on: bool) -> None:
+        """Counts a workflow driven here (its lease renewed) while it is."""
+        self._drives += 1 if on else -1
+        self._renew()
+
+    async def list(self, **f: Any) -> list[dict[str, Any]]:
+        """Root runs in creation order (ADR 0059)."""
+        return [info(r) for r in await self.store.list(**f)]
+
+    async def recheck(self) -> None:
+        """Without listen, reads the runs waited for here: one may have settled
+        in another process (ADR 0059)."""
+        if getattr(self.store, "listen", None) is not None:
+            return
+        for id in list(self._waiters):
+            try:
+                r = await self.get(id)
+            except KairoError:
+                continue
+            if r["status"] in SETTLED:
+                for f in list(self._waiters.get(id, ())):
+                    if not f.done():
+                        f.set_result(r)
 
     async def get(self, run_id: str) -> dict[str, Any]:
         row = await self.store.get(run_id)
@@ -194,7 +301,12 @@ class Embedded:
         timers that are due. Runs whose plan is not registered here are left alone."""
         self._last_sweep = self.now()
         for lease in await self.store.expired_leases(self.now(), 1000):
-            await _skip_unknown_plan(self._recover(lease))
+            if lease.act == 0:
+                # A workflow's driver stopped (ADR 0059).
+                if self.lost_drive is not None:
+                    await _skip_unknown_plan(self.lost_drive(lease))
+            else:
+                await _skip_unknown_plan(self._recover(lease))
         for t in await self.store.due_timers(self.now(), 1000):
             await _skip_unknown_plan(self._fire(t))
         # Finished trees past the time they are kept (ADR 0054).
@@ -238,17 +350,24 @@ class Embedded:
 
         self._track(wake())
 
+    def _leasing(self) -> bool:
+        return bool(self._running or self._drives > 0) and not self._closed
+
     def _renew(self) -> None:
-        """Renews this process's leases while it runs steps: one task for all of them."""
-        if self._running and not self._closed:
+        """Renews this process's leases while it runs steps or drives
+        workflows: one task for all of them."""
+        if self._leasing():
             if self._renewal is None:
 
                 async def loop() -> None:
-                    while self._running and not self._closed:
+                    while self._leasing():
                         await asyncio.sleep(max(self.lease_ms / 3, 10) / 1000)
-                        if not self._running or self._closed:
+                        if not self._leasing():
                             return
-                        await self.store.renew_leases(self.owner, self.now() + self.lease_ms)
+                        try:
+                            await self.store.renew_leases(self.owner, self.now() + self.lease_ms)
+                        except Exception:
+                            pass  # next time; past their expiry the leases are taken up
 
                 task = asyncio.ensure_future(loop())
                 self._renewal = task
@@ -283,10 +402,11 @@ class Embedded:
     async def _fire(self, t: TimerRow) -> None:
         await self._process(t.run, [{"kind": "timer", "at": self.now(), "act": t.act, "timer": t.timer}])
 
-    async def _process(
-        self, run_id: str, events: list[dict[str, Any]], start: dict[str, Any] | None = None, parent: str | None = None
-    ) -> bool:
-        """Applies events to run_id in one transaction, then carries out the commands."""
+    async def _process(self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None) -> bool:
+        """Applies events to run_id in one transaction, then carries out the
+        commands. With begin, a new run of its plan (or the existing one: the
+        answer says which)."""
+        start = begin["plan"] if begin is not None else None
 
         def change(row: RunRow | None) -> Changes[dict[str, Any]]:
             # A step's outcome ends its lease, applied or not (a stale one).
@@ -295,7 +415,7 @@ class Embedded:
                 return Changes({"existing": True, "settled": False, "commands": [], "row": row})
             if row is None and start is None:
                 return Changes({"existing": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
-            plan = start if start is not None else self.plans.get(row.plan)  # type: ignore[union-attr]
+            plan = start if start is not None else self._plan(row.plan)  # type: ignore[union-attr]
             if plan is None:
                 raise KairoError(404, f"run {run_id}: plan {row.plan} is not registered here")  # type: ignore[union-attr]
             if row is not None and row.hash != plan["hash"]:
@@ -340,7 +460,9 @@ class Embedded:
                 seq=0,
                 created_at=row.created_at if row is not None else at,
                 updated_at=at,
-                parent=row.parent if row is not None else parent,
+                parent=row.parent if row is not None else begin["parent"],  # type: ignore[index]
+                workflow=row.workflow if row is not None else begin["workflow"],  # type: ignore[index]
+                meta=row.meta if row is not None else begin["meta"],  # type: ignore[index]
             )
             settled = res["status"] in SETTLED and res["status"] != (row.status if row else None)
             ch: Changes[dict[str, Any]] = Changes(
@@ -359,6 +481,14 @@ class Embedded:
                 elif c["kind"] == "dispatch":
                     # Dispatched to this process: leased to it while it runs.
                     ch.set_leases.append(LeaseRow(run_id, c["act"], c.get("attempt", 0), self.owner, at + self.lease_ms))
+            done = res["status"] in DONE
+            # Driven by this process from its start (ADR 0059).
+            if row is None and begin is not None and begin["drive"] and not done:
+                ch.set_leases.append(LeaseRow(run_id, 0, begin["drive"], self.owner, at + self.lease_ms))
+            # Its workflow is to be driven on: by this process, or, if it
+            # stops first, by whichever takes the lease up (ADR 0059).
+            if settled and nxt.parent and self.lease_parents:
+                ch.set_leases.append(LeaseRow(nxt.parent, 0, new_token(), self.owner, at + self.lease_ms))
             return ch
 
         out = await self.store.with_run(run_id, change)
@@ -423,11 +553,20 @@ class Embedded:
             action=c.get("action", ""),
             input=c.get("input"),
         )
+        release: Callable[[], None] | None = None
         try:
-            res = await asyncio.to_thread(self.handler, task, ctx)
+            # Over a limit, the step waits here for a slot, leased (ADR 0059).
+            got = await self.admit(task, ctx) if self.admit is not None else None
+            if isinstance(got, Result):
+                res = got
+            else:
+                release = got
+                res = await asyncio.to_thread(self.handler, task, ctx)
         except Exception as e:  # a handler bug is the step's definite failure
             res = Result(error=f"{type(e).__name__}: {e}", error_type=type(e).__name__)
         finally:
+            if release is not None:
+                release()
             self._running.pop(key, None)
             self._renew()
         if self._closed:

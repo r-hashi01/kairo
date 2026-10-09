@@ -21,9 +21,26 @@ export interface RunRow {
 	updatedAt: number;
 	/** The run that made this one (a workflow, of its calls): removed with it (ADR 0054). */
 	parent: string | null;
+	/** The workflow of a workflow run (null for a call), and what it was started with (JSON; ADR 0059). */
+	workflow: string | null;
+	meta: string | null;
 }
 
-/** A step dispatched to a process, held while it runs (ADR 0051). */
+/** Root runs for list (ADR 0059): of workflow, in status, created in [since, until), after the run after, at most limit. */
+export interface ListFilter {
+	workflow?: string;
+	status?: string;
+	since?: number;
+	until?: number;
+	after?: string;
+	limit?: number;
+}
+
+/**
+ * A step dispatched to a process, held while it runs (ADR 0051). Act 0 (no
+ * step has it) is a workflow's drive lease (ADR 0059): the process that
+ * runs the workflow's function, with a token in attempt.
+ */
 export interface LeaseRow {
 	run: string;
 	act: number;
@@ -92,6 +109,15 @@ export interface Store {
 	 * runs settled in other processes are not heard of.
 	 */
 	listen?(settled: (runId: string) => void): Promise<() => Promise<void>>;
+	/** Sets the drive lease l (act 0) unless another owner holds it unexpired at now; whether it did (ADR 0059). */
+	claimDrive(l: LeaseRow, now: number): Promise<boolean>;
+	/**
+	 * Ends run's drive lease held by owner with token: removed, or (resume)
+	 * left expired and ownerless at now, for a tick to take up.
+	 */
+	endDrive(run: string, owner: string, token: number, now: number, resume: boolean): Promise<void>;
+	/** Root runs (no parent) in creation order (ADR 0059). */
+	list(f: ListFilter): Promise<RunRow[]>;
 	close(): Promise<void>;
 }
 
@@ -107,11 +133,63 @@ const DDL = (p: string, blob: string, big: string) => [
 	`CREATE INDEX IF NOT EXISTS ${p}lease_owner ON ${p}lease (owner)`,
 ];
 
-/** After the tables (and the parent column, added to older ones): the indexes for removal (ADR 0054). */
+/** Columns added to tables made before them: parent (ADR 0054), workflow and meta (ADR 0059). */
+const ADDED = ['parent', 'workflow', 'meta'];
+
+/** After the tables (and the columns added to older ones): the indexes for removal (ADR 0054) and listing (ADR 0059). */
 const DDL_REMOVAL = (p: string) => [
 	`CREATE INDEX IF NOT EXISTS ${p}run_parent ON ${p}run (parent)`,
 	`CREATE INDEX IF NOT EXISTS ${p}run_done ON ${p}run (updated_at) WHERE status IN ${DONE_SQL}`,
+	`CREATE INDEX IF NOT EXISTS ${p}run_roots ON ${p}run (created_at, id) WHERE parent IS NULL`,
 ];
+
+const RUN_COLS = 'id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta';
+
+/** A new run's row, or the changes to it: workflow and meta are set once (ADR 0059). */
+const PUT = (p: string, ph: (i: number) => string) =>
+	`INSERT INTO ${p}run (${RUN_COLS}) VALUES (${Array.from({ length: 14 }, (_, i) => ph(i + 1)).join(', ')})
+	 ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
+	 seq = excluded.seq, updated_at = excluded.updated_at`;
+
+/** One statement: of two processes claiming at once, one wins. */
+const CLAIM = (p: string, ph: (i: number) => string) =>
+	`INSERT INTO ${p}lease (run, act, attempt, owner, until) VALUES (${ph(1)}, 0, ${ph(2)}, ${ph(3)}, ${ph(4)})
+	 ON CONFLICT (run, act) DO UPDATE SET attempt = excluded.attempt, owner = excluded.owner, until = excluded.until
+	 WHERE ${p}lease.owner = excluded.owner OR ${p}lease.until < ${ph(5)}`;
+
+const DRIVE_WHERE = (ph: (i: number) => string, from: number) => `WHERE run = ${ph(from)} AND act = 0 AND owner = ${ph(from + 1)} AND attempt = ${ph(from + 2)}`;
+
+/** The query of list, and its parameters. */
+function listQuery(p: string, f: ListFilter, ph: (i: number) => string): [string, unknown[]] {
+	let q = `SELECT ${RUN_COLS} FROM ${p}run WHERE parent IS NULL`;
+	const args: unknown[] = [];
+	const add = (cond: (x: string) => string, v: unknown) => {
+		args.push(v);
+		q += ` AND ${cond(ph(args.length))}`;
+	};
+	if (f.workflow) add((x) => `workflow = ${x}`, f.workflow);
+	if (f.status) add((x) => `status = ${x}`, f.status);
+	if (f.since) add((x) => `created_at >= ${x}`, f.since);
+	if (f.until) add((x) => `created_at < ${x}`, f.until);
+	if (f.after) add((x) => `(created_at, id) > (SELECT created_at, id FROM ${p}run WHERE id = ${x})`, f.after);
+	q += ' ORDER BY created_at, id';
+	if (f.limit && f.limit > 0) {
+		args.push(f.limit);
+		q += ` LIMIT ${ph(args.length)}`;
+	}
+	return [q, args];
+}
+
+const qmark = () => '?';
+const dollar = (i: number) => `$${i}`;
+
+/** A run row as the database gives it. */
+function runRow(r: any): RunRow | undefined {
+	if (!r) return undefined;
+	return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
+		seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null,
+		workflow: r.workflow ?? null, meta: r.meta ?? null };
+}
 
 const DONE_SQL = `('completed', 'failed', 'cancelled')`;
 
@@ -157,14 +235,15 @@ export class SQLiteStore implements Store {
 		this.db.exec(`PRAGMA synchronous=${this.sync}`);
 		for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
 		const cols = this.db.prepare(`PRAGMA table_info(${this.p}run)`).all() as { name: string }[];
-		if (!cols.some((c) => c.name === 'parent')) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN parent TEXT`);
+		for (const col of ADDED) if (!cols.some((c) => c.name === col)) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN ${col} TEXT`);
 		for (const q of DDL_REMOVAL(this.p)) this.db.exec(q);
 		const p = this.p;
 		this.q = {
-			get: this.db.prepare(`SELECT * FROM ${p}run WHERE id = ?`),
-			put: this.db.prepare(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status,
-				output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`),
+			get: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = ?`),
+			put: this.db.prepare(PUT(p, qmark)),
+			claim: this.db.prepare(CLAIM(p, qmark)),
+			endDrive: this.db.prepare(`DELETE FROM ${p}lease ${DRIVE_WHERE(qmark, 1)}`),
+			resumeDrive: this.db.prepare(`UPDATE ${p}lease SET until = ?, owner = '' ${DRIVE_WHERE(qmark, 2)}`),
 			event: this.db.prepare(`INSERT INTO ${p}event (run, seq, body) VALUES (?, ?, ?)`),
 			setTimer: this.db.prepare(`INSERT INTO ${p}timer (run, timer, act, at) VALUES (?, ?, ?, ?) ON CONFLICT (run, timer) DO UPDATE SET at = excluded.at`),
 			delTimer: this.db.prepare(`DELETE FROM ${p}timer WHERE run = ? AND timer = ?`),
@@ -190,9 +269,7 @@ export class SQLiteStore implements Store {
 	}
 
 	private row(r: any): RunRow | undefined {
-		if (!r) return undefined;
-		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
-			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null };
+		return runRow(r);
 	}
 
 	async removeFinished(cutoff: number, limit: number): Promise<number> {
@@ -226,7 +303,7 @@ export class SQLiteStore implements Store {
 			for (const ev of c.events) this.q.event.run(id, seq++, JSON.stringify(ev));
 			if (c.row) {
 				const r = c.row;
-				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent);
+				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta);
 			}
 			if (c.clearTimers) {
 				this.q.clearTimers.run(id);
@@ -272,6 +349,20 @@ export class SQLiteStore implements Store {
 		this.q.expire.run(now - 1, owner);
 	}
 
+	async claimDrive(l: LeaseRow, now: number): Promise<boolean> {
+		return Number(this.q.claim.run(l.run, l.attempt, l.owner, l.until, now).changes) > 0;
+	}
+
+	async endDrive(run: string, owner: string, token: number, now: number, resume: boolean): Promise<void> {
+		if (resume) this.q.resumeDrive.run(now - 1, run, owner, token);
+		else this.q.endDrive.run(run, owner, token);
+	}
+
+	async list(f: ListFilter): Promise<RunRow[]> {
+		const [q, args] = listQuery(this.p, f, qmark);
+		return this.db.prepare(q).all(...args).map((r: any) => runRow(r)!);
+	}
+
 	async close(): Promise<void> {
 		this.db?.close();
 	}
@@ -312,7 +403,7 @@ export class PostgresStore implements Store {
 
 	async init(): Promise<void> {
 		for (const q of DDL(this.p, 'BYTEA', 'BIGINT')) await this.pool.query(q);
-		await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS parent TEXT`);
+		for (const col of ADDED) await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS ${col} TEXT`);
 		for (const q of DDL_REMOVAL(this.p)) await this.pool.query(q);
 	}
 
@@ -345,9 +436,7 @@ export class PostgresStore implements Store {
 	}
 
 	private row(r: any): RunRow | undefined {
-		if (!r) return undefined;
-		return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
-			seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null };
+		return runRow(r);
 	}
 
 	async withRun<T>(id: string, fn: (row: RunRow | undefined) => Changes<T>): Promise<T> {
@@ -355,7 +444,7 @@ export class PostgresStore implements Store {
 		const p = this.p;
 		try {
 			await c.query('BEGIN');
-			const before = this.row((await c.query(`SELECT * FROM ${p}run WHERE id = $1 FOR UPDATE`, [id])).rows[0]);
+			const before = this.row((await c.query(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = $1 FOR UPDATE`, [id])).rows[0]);
 			const ch = fn(before);
 			let seq = before?.seq ?? 0;
 			for (const ev of ch.events) await c.query(`INSERT INTO ${p}event (run, seq, body) VALUES ($1, $2, $3)`, [id, seq++, JSON.stringify(ev)]);
@@ -363,10 +452,8 @@ export class PostgresStore implements Store {
 				const r = ch.row;
 				// A new run's row: two submissions racing for one id insert it
 				// once; the loser's insert fails and its transaction rolls back.
-				await c.query(`INSERT INTO ${p}run (id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET state = excluded.state,
-					status = excluded.status, output = excluded.output, error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`,
-					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent]);
+				await c.query(PUT(p, dollar),
+					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta]);
 			}
 			if (ch.clearTimers) {
 				await c.query(`DELETE FROM ${p}timer WHERE run = $1`, [id]);
@@ -393,7 +480,7 @@ export class PostgresStore implements Store {
 	}
 
 	async get(id: string): Promise<RunRow | undefined> {
-		return this.row((await this.pool.query(`SELECT * FROM ${this.p}run WHERE id = $1`, [id])).rows[0]);
+		return this.row((await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE id = $1`, [id])).rows[0]);
 	}
 
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {
@@ -412,6 +499,21 @@ export class PostgresStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		await this.pool.query(`UPDATE ${this.p}lease SET until = $1 WHERE owner = $2`, [now - 1, owner]);
+	}
+
+	async claimDrive(l: LeaseRow, now: number): Promise<boolean> {
+		const r = await this.pool.query(`${CLAIM(this.p, dollar)} RETURNING run`, [l.run, l.attempt, l.owner, l.until, now]);
+		return r.rows.length > 0;
+	}
+
+	async endDrive(run: string, owner: string, token: number, now: number, resume: boolean): Promise<void> {
+		if (resume) await this.pool.query(`UPDATE ${this.p}lease SET until = $1, owner = '' ${DRIVE_WHERE(dollar, 2)}`, [now - 1, run, owner, token]);
+		else await this.pool.query(`DELETE FROM ${this.p}lease ${DRIVE_WHERE(dollar, 1)}`, [run, owner, token]);
+	}
+
+	async list(f: ListFilter): Promise<RunRow[]> {
+		const [q, args] = listQuery(this.p, f, dollar);
+		return (await this.pool.query(q, args)).rows.map((r: any) => runRow(r)!);
 	}
 
 	async nextWake(): Promise<number | null> {

@@ -62,7 +62,7 @@ A real step is dispatched only after its intent is committed to the database. Op
 | `await ctx.call(action, input)` | Runs an action once, however often the workflow runs again |
 | `await asyncio.gather(ctx.call(...), ...)` | Runs calls at once |
 | `await ctx.sleep(seconds)` | Waits in the database, not in memory: the process may stop meanwhile |
-| `await ctx.wait_for(signal)` | Waits for `k.signal(id, signal, payload)` and returns the payload |
+| `await ctx.wait_for(signal, timeout=None)` | Waits for `k.signal(id, signal, payload)` and returns the payload; past `timeout` (seconds) it raises `TimedOutError` |
 | `await ctx.now()`, `await ctx.random()` | The time and a random number, the same each time the workflow runs again |
 | `await ctx.workflow(name, input)` | Runs a child workflow |
 
@@ -72,9 +72,16 @@ A workflow must be deterministic between its calls: read the clock and randomnes
 
 | | |
 |---|---|
-| `await k.run(name, input, id=...)` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key |
-| `await k.signal(id, name, payload)` | Delivers a signal to the first wait for it |
+| `await k.run(name, input, id=..., meta=None)` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key. A caller that stops waiting (its task cancelled, or timed out) gets `StoppedError`; the workflow goes on |
+| `await k.submit(name, input, id=..., meta=None)` | Starts workflow `id` and returns its id once the start is durable, without waiting |
+| `await k.result(id)` | The result of workflow `id`, from any process, once it has finished |
+| `await k.signal(id, name, payload)` | Delivers a signal to the first wait for it; a wait the workflow has not reached yet receives it when it does |
 | `await k.cancel(id)` | Cancels the workflow and the calls it waits for |
+| `await k.list(workflow=, status=, since=, until=, after=, limit=)` | Workflows (not child workflows or calls), oldest first, with `meta`, `created_at` and `updated_at` |
+
+A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
+
+Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.
 
 ## Storage
 
