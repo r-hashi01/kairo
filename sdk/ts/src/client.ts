@@ -30,6 +30,8 @@ export interface RunInfo {
 	/** The embedded runtime (ADR 0059): the run that made this one, a workflow run's workflow and meta, when it started and last changed (unix ms). */
 	parent?: string;
 	workflow?: string;
+	/** A workflow run's version (ADR 0060). */
+	version?: string;
 	meta?: Record<string, unknown>;
 	createdAt?: number;
 	updatedAt?: number;

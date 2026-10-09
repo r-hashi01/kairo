@@ -52,6 +52,46 @@ export interface ActionDef<I = any, O = any> {
 
 export type WorkflowFn<I = any, O = any> = (ctx: Context, input: I) => Promise<O>;
 
+/** A workflow's version (ADR 0060). */
+export interface WorkflowOptions {
+	/**
+	 * This function's version of the workflow. A run is driven by the
+	 * version it started with, to its end: a process drives only the runs
+	 * whose version it has. Default "": none.
+	 */
+	version?: string;
+	/** This version only finishes the runs that started with it; new runs start with the current one (the one not draining). */
+	draining?: boolean;
+}
+
+/** A workflow's versions (ADR 0060): the current one starts new runs; the others only finish the runs they started. */
+interface WorkflowDef {
+	versions: Map<string, WorkflowFn>;
+	current: string;
+	currents: number;
+}
+
+/** A workflow run's input: the workflow, its version (when it has one) and the input it was given. */
+function workflowInput(name: string, version: string, input: unknown): Record<string, unknown> {
+	return { workflow: name, input: input ?? null, ...(version ? { version } : {}) };
+}
+
+/** Reads a workflow run's input. */
+function workflowOf(input: unknown): { name: string; version: string; input: unknown } | undefined {
+	const w = input as { workflow?: unknown; version?: unknown; input?: unknown } | null | undefined;
+	if (!w || typeof w.workflow !== 'string' || !w.workflow) return undefined;
+	return { name: w.workflow, version: typeof w.version === 'string' ? w.version : '', input: w.input };
+}
+
+/** A workflow run whose version this process does not have (another process's to drive). */
+class NotHereError extends KairoError {
+	override name = 'NotHereError';
+}
+
+function notHere(name: string, version: string): NotHereError {
+	return new NotHereError(404, `workflow ${name} version ${JSON.stringify(version)} is not registered here`);
+}
+
 export interface KairoOptions {
 	/**
 	 * Where calls run: kairod (HttpBackend, the default, from url and
@@ -285,7 +325,7 @@ export class Kairo {
 	readonly backend: Backend;
 	private readonly opts: KairoOptions;
 	private readonly actions = new Map<string, ActionDef>();
-	private readonly workflows = new Map<string, WorkflowFn>();
+	private readonly workflows = new Map<string, WorkflowDef>();
 	private readonly planned = new Set<string>();
 	private readonly driving = new Set<AbortController>();
 	readonly suspend: boolean;
@@ -331,12 +371,34 @@ export class Kairo {
 		this.actions.set(name, def);
 	}
 
-	workflow<I, O>(name: string, fn: WorkflowFn<I, O>): void {
-		this.workflows.set(name, fn);
+	/** Declares a workflow, or one of its versions (ADR 0060). */
+	workflow<I, O>(name: string, fn: WorkflowFn<I, O>, opts: WorkflowOptions = {}): void {
+		let d = this.workflows.get(name);
+		if (!d) this.workflows.set(name, (d = { versions: new Map(), current: '', currents: 0 }));
+		const version = opts.version ?? '';
+		if (!opts.draining) {
+			d.current = version;
+			d.currents++;
+		}
+		d.versions.set(version, fn);
+	}
+
+	/** Workflow name's function at version (undefined: not here). */
+	private fnFor(name: string, version: string): WorkflowFn | undefined {
+		return this.workflows.get(name)?.versions.get(version);
+	}
+
+	/** The version new runs of workflow name start with (undefined: no such workflow). */
+	private currentVersion(name: string): string | undefined {
+		const d = this.workflows.get(name);
+		return d && d.currents > 0 ? d.current : undefined;
 	}
 
 	/** Registers the actions and their plans, and starts running the actions' steps. */
 	async start(): Promise<void> {
+		for (const [name, d] of this.workflows) {
+			if (d.currents !== 1) throw new Error(`workflow ${name}: ${d.currents} current versions (one, the others draining)`);
+		}
 		const specs: NodeSpec[] = [...this.actions].map(([action, def]) => ({
 			action,
 			effect: def.effect ?? 'real',
@@ -468,12 +530,13 @@ export class Kairo {
 				} catch {
 					return;
 				}
-				const input = info.input as { workflow?: string; input?: unknown } | undefined;
-				if (info.plan !== PLAN_WORKFLOW || finished(info) || !input?.workflow) return;
+				const w = workflowOf(info.input);
+				if (info.plan !== PLAN_WORKFLOW || finished(info) || !w) return;
 				try {
-					await this.drive(id, input.workflow, input.input, info.parent, 0);
+					await this.drive(id, w.name, w.input, info.parent, 0);
 				} catch {
-					// Suspended again, failed (recorded), cancelled, or driven elsewhere.
+					// Suspended again, failed (recorded), cancelled, driven
+					// elsewhere, or of a version not here.
 				}
 			} while (this.again.has(id));
 		})();
@@ -759,12 +822,13 @@ export class Kairo {
 	 * existed, or no leases here).
 	 */
 	private async begin(name: string, input: unknown, id: string, meta?: Record<string, unknown>): Promise<number> {
-		if (!this.workflows.has(name)) throw new Error(`no workflow ${name}`);
+		const version = this.currentVersion(name);
+		if (version === undefined) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
 		const token = this.rt ? newToken() : 0;
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
-			{ workflow: name, input: input ?? null },
+			workflowInput(name, version, input),
 			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(meta ? { meta } : {}), ...(token ? { drive: token } : {}) },
 		);
 		return started.existing ? 0 : token;
@@ -782,6 +846,8 @@ export class Kairo {
 		if (rt && token === 0) {
 			const info = await this.backend.get(id);
 			if (finished(info)) return done(id, info);
+			const w = workflowOf(info.input);
+			if (w && !this.fnFor(name, w.version)) throw notHere(name, w.version); // not claimed: another process's
 			token = newToken();
 			if (!(await rt.claimDrive(id, token))) throw new DrivenElsewhere(`workflow ${id} is driven by another process`);
 		}
@@ -804,8 +870,10 @@ export class Kairo {
 			.then(
 				() => {},
 				(e) => {
-					// Stopped, cancelled or driven elsewhere: nothing to do here.
+					// Stopped, cancelled, driven elsewhere, or of a version not
+					// here: nothing to do here.
 					if (e instanceof DrivenElsewhere || e instanceof StoppedError || e instanceof CancelledError) return;
+					if (e instanceof KairoError && e.status === 404) return;
 					this.logger.warn('kairo: driving a workflow', { workflow: id, err: e });
 				},
 			)
@@ -830,14 +898,14 @@ export class Kairo {
 			await rt.endDrive(l.run, l.attempt, false, l.owner);
 			return;
 		}
-		const input = info.input as { workflow?: string; input?: unknown } | undefined;
-		if (!input?.workflow) return;
-		if (!this.workflows.has(input.workflow)) throw new KairoError(404, `workflow ${input.workflow} is not registered here`); // another process's
+		const w = workflowOf(info.input);
+		if (!w) return;
+		if (!this.fnFor(w.name, w.version)) throw notHere(w.name, w.version); // another process's
 		if (this.suspend) {
 			this.redrive(l.run);
 			return;
 		}
-		this.driveBackground(l.run, input.workflow, input.input, info.parent, 0);
+		this.driveBackground(l.run, w.name, w.input, info.parent, 0);
 	}
 
 	/**
@@ -892,6 +960,30 @@ export class Kairo {
 	}
 
 	/**
+	 * Settles call callId, stopped for review (blocked: a real step whose
+	 * outcome was unknown) or with a real attempt out that cannot go on (its
+	 * action is no longer real, ADR 0060), with the output it had: it did
+	 * take effect. The embedded runtime only.
+	 */
+	async resolve(callId: string, output: unknown = null): Promise<void> {
+		await this.settleCall(callId, output, undefined);
+	}
+
+	/** Settles call callId as resolve does, as not done: it failed with message. */
+	async resolveFailed(callId: string, message = 'resolved as failed'): Promise<void> {
+		await this.settleCall(callId, null, message || 'resolved as failed');
+	}
+
+	private async settleCall(callId: string, output: unknown, error: string | undefined): Promise<void> {
+		if (!this.backend.resolve) throw new Error('resolve needs the embedded backend');
+		await this.backend.resolve(callId, output, error);
+		if (this.suspend) {
+			await this.settle();
+			await this.wakeUp();
+		}
+	}
+
+	/**
 	 * Drives workflow id here. parent: the workflow that made it, if any;
 	 * with signal and cancelled when it runs inside it (a child workflow).
 	 */
@@ -901,16 +993,22 @@ export class Kairo {
 		id: string,
 		parent?: { id: string; signal?: AbortSignal; cancelled?: () => boolean },
 	): Promise<unknown> {
-		const fn = this.workflows.get(name);
-		if (!fn) throw new Error(`no workflow ${name}`);
+		const current = this.currentVersion(name);
+		if (current === undefined) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		// A new run starts with the current version; one that exists goes on
+		// with the version it started with (ADR 0060).
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
-			{ workflow: name, input: input ?? null },
+			workflowInput(name, current, input),
 			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
 		);
 		const info = await this.backend.get(id);
 		if (finished(info)) return done(id, info);
+		// kairod does not report a run's input: there, the current version.
+		const version = 'input' in info ? (workflowOf(info.input)?.version ?? '') : current;
+		const fn = this.fnFor(name, version);
+		if (!fn) throw notHere(name, version);
 		if (started.existing && !this.backend.keepsCalls) {
 			// Resuming: the calls' records must still be there (ADR 0049).
 			// (The embedded runtime keeps them while the workflow runs, ADR 0054.)
@@ -953,6 +1051,9 @@ export class Kairo {
 			return value;
 		} catch (e) {
 			if (e instanceof Suspended) throw e; // goes on later
+			// A child workflow whose version is not here: this one is left
+			// to another process, not failed (ADR 0060).
+			if (e instanceof NotHereError) throw e;
 			if (abort.signal.aborted) {
 				if (cancelled()) {
 					// Cancelled with the workflow above it: so is its run.

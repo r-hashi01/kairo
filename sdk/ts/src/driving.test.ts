@@ -12,9 +12,11 @@ import { join, resolve } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
+import { finished } from './client.ts';
 import { PostgresStore, SQLiteStore, type Store } from './store.ts';
 import { ObservationKind, type Observation } from './observe.ts';
-import { CallError, CancelledError, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError, type KairoOptions } from './workflow.ts';
+import { CallError, CancelledError, Kairo, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions } from './workflow.ts';
+import { EFFECT_WEAKENED } from './embedded.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-driving-'));
@@ -407,6 +409,199 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 			'settled kairo.workflow completed',
 		]);
 		assert.deepEqual(logged, ['kairo: the observer threw']);
+	});
+
+	// A run goes on with the version it started with; new runs start with
+	// the current one; a process without a run's version leaves it (ADR 0060).
+	test('versions are pinned', async () => {
+		const path = join(dir, 'versions.db');
+		const runs: Record<string, number> = {};
+		const start = async (...versions: string[]) => {
+			const k = await open(path, { leaseMs: 100 });
+			versions.forEach((v, i) =>
+				k.workflow(
+					'w',
+					async (ctx) => {
+						runs[v] = (runs[v] ?? 0) + 1;
+						return `${v}:${await ctx.waitFor<string>('go')}`;
+					},
+					{ version: v, draining: i < versions.length - 1 },
+				),
+			);
+			await k.start();
+			return k;
+		};
+		const k1 = await start('1');
+		await k1.submit('w', null, { id: 'ver-1' });
+		await waitUntil(() => runs['1'] === 1);
+		await k1.close(); // its drive lease is left expired
+
+		// Only version 2 here: it does not drive ver-1.
+		const k2 = await start('2');
+		await k2.tick(); // takes up ver-1's lease, as a sweep does
+		assert.equal(runs['2'] ?? 0, 0, 'version 2 drove a version 1 run');
+		await k2.close();
+
+		const k3 = await start('1', '2');
+		await k3.signal('ver-1', 'go', 'x');
+		assert.equal(await k3.result('ver-1', { signal: AbortSignal.timeout(10_000) }), '1:x');
+		await k3.submit('w', null, { id: 'ver-2' });
+		await k3.signal('ver-2', 'go', 'y');
+		assert.equal(await k3.result('ver-2', { signal: AbortSignal.timeout(10_000) }), '2:y');
+		assert.equal((await k3.backend.get('ver-1')).version, '1');
+		assert.equal((await k3.backend.get('ver-2')).version, '2');
+		await k3.close();
+
+		const bad = await open(join(dir, 'versions-bad.db'));
+		bad.workflow('w', async () => null, { version: '1' });
+		bad.workflow('w', async () => null, { version: '2' });
+		await assert.rejects(bad.start(), /2 current versions/);
+		await bad.close();
+	});
+
+	// An action's settings change while a call of it waits to retry: the
+	// call goes on under the new ones (it used to stop for good).
+	test('settings change under a call', async () => {
+		const path = join(dir, 'settings.db');
+		let attempts = 0;
+		const start = async (timeout?: string) => {
+			const k = await open(path, { mode: 'suspend' });
+			k.workflow('w', async (ctx) => ctx.call<string>('a'));
+			k.defineAction('a', {
+				effect: 'unprotected',
+				backoff: '50ms',
+				...(timeout ? { timeout } : {}),
+				handler: async () => {
+					if (++attempts === 1) throw new RetryableError('busy');
+					return 'ok';
+				},
+			});
+			await k.start();
+			return k;
+		};
+		let k = await start();
+		await assert.rejects(k.run('w', null, { id: 'set-1' }), Suspended);
+		await k.close();
+		k = await start('1m'); // a deploy changed its settings
+		await waitUntil(async () => {
+			await k.tick();
+			return finished(await k.backend.get('set-1'));
+		});
+		assert.equal(await k.run('w', null, { id: 'set-1' }), 'ok');
+		await k.close();
+	});
+
+	// A real attempt is out when its action is changed to unprotected: the
+	// call does not go on under the new settings (it would be retried on its
+	// unknown outcome); tick goes on with the others; resolveFailed settles it.
+	test('an effect is not weakened', async () => {
+		const path = join(dir, 'weakened.db');
+		const stuck: string[] = [];
+		const start = async (mode: 'wait' | 'suspend', effect: 'real' | 'unprotected') => {
+			const k = await open(path, {
+				mode,
+				leaseMs: 100,
+				logger: { warn: () => {}, error: () => {} },
+				observe: (o) => {
+					if (o.kind === ObservationKind.runStuck) stuck.push(o.error ?? '');
+				},
+			});
+			k.defineAction('pay', {
+				effect,
+				handler: async (_i, ctx) => {
+					// The process stops while it runs.
+					await new Promise((res) => ctx.signal.addEventListener('abort', res, { once: true }));
+					throw new Error('stopped');
+				},
+			});
+			k.workflow('w', async (ctx) => {
+				try {
+					await ctx.call<string>('pay');
+					return 'paid';
+				} catch (e) {
+					if (e instanceof CallError) return `resolved: ${e.error}`;
+					throw e;
+				}
+			});
+			k.workflow('nap', async (ctx) => {
+				await ctx.sleep(200);
+				return 'rested';
+			});
+			await k.start();
+			return k;
+		};
+		// A resident process: pay's real attempt is out (its intent recorded)
+		// when it stops; nap's timer is in the store.
+		let k = await start('wait', 'real');
+		for (const w of ['w', 'nap']) await k.submit(w, null, { id: `${w}-1` });
+		let call = '';
+		await waitUntil(async () => {
+			call = (await children(path, 'w-1'))[0] ?? '';
+			const nap = (await children(path, 'nap-1'))[0];
+			return call !== '' && !!nap && (await query(path, 'SELECT 1 FROM kairo_timer WHERE run = ?', nap)).length > 0;
+		});
+		await k.close();
+
+		k = await start('suspend', 'unprotected'); // a deploy made pay unprotected
+		// Ticks, as a scheduler's, until nap's timer has fired and nap has
+		// finished, and pay's call (its lease expired) was found stuck.
+		await waitUntil(async () => {
+			await k.tick();
+			return finished(await k.backend.get('nap-1')) && stuck.some((e) => e.includes(EFFECT_WEAKENED));
+		});
+		assert.equal(await k.run('nap', null, { id: 'nap-1' }), 'rested', 'the other run did not go on');
+		assert.ok(stuck.some((e) => e.includes(EFFECT_WEAKENED)), `stuck: ${stuck}`);
+		assert.ok(!finished(await k.backend.get(call)), 'the call went on');
+		await k.resolveFailed(call, 'not paid');
+		assert.match(await k.run('w', null, { id: 'w-1' }), /not paid/);
+		await k.close();
+	});
+
+	// A child workflow goes on with the version it started with: a process
+	// that has its parent's version but not the child's leaves both, without
+	// failing the parent; one with both finishes them (ADR 0060).
+	test("a child's version not here", async () => {
+		const path = join(dir, 'child-version.db');
+		const runs: Record<string, number> = {};
+		const add = (k: string) => (runs[k] = (runs[k] ?? 0) + 1);
+		const start = async (...childVersions: string[]) => {
+			const k = await open(path, { leaseMs: 100 });
+			k.workflow('parent', async (ctx) => {
+				add('parent');
+				return ctx.workflow<string>('child', null);
+			});
+			childVersions.forEach((v, i) =>
+				k.workflow(
+					'child',
+					async (ctx) => {
+						add(`child ${v}`);
+						return `${v}:${await ctx.waitFor<string>('go')}`;
+					},
+					{ version: v, draining: i < childVersions.length - 1 },
+				),
+			);
+			await k.start();
+			return k;
+		};
+		let k = await start('1');
+		await k.submit('parent', null, { id: 'fam-1' });
+		let child = '';
+		await waitUntil(async () => {
+			child = (await children(path, 'fam-1'))[0] ?? '';
+			return child !== '' && runs['child 1'] === 1;
+		});
+		await k.close();
+
+		k = await start('2'); // the parent's version, not the child's
+		await waitUntil(() => (runs.parent ?? 0) >= 2); // it took the parent up
+		assert.ok(!finished(await k.backend.get('fam-1')), 'the parent ended without its child\'s version');
+		assert.equal(runs['child 2'] ?? 0, 0, 'version 2 drove a version 1 child');
+		await k.close();
+
+		k = await start('1', '2');
+		await k.signal(child, 'go', 'x');
+		assert.equal(await k.result('fam-1', { signal: AbortSignal.timeout(10_000) }), '1:x');
+		await k.close();
 	});
 });
 

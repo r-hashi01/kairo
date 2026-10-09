@@ -18,9 +18,10 @@ import unittest
 from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
-from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, STEP_FINISHED, STEP_STARTED, Observation
+from kairo_sdk.embedded import EFFECT_WEAKENED
+from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation
 from kairo_sdk.store import SQLiteStore
-from kairo_sdk.workflow import CallError, Cancelled, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError
+from kairo_sdk.workflow import CallError, Cancelled, Kairo, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError
 
 try:
     from .test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -506,6 +507,226 @@ class DrivingTest(unittest.TestCase):
                     "settled kairo.workflow completed",
                 ],
             )
+
+        asyncio.run(main())
+
+    def test_versions_are_pinned(self) -> None:
+        """A run goes on with the version it started with; new runs start with
+        the current one; a process without a run's version leaves it (ADR 0060)."""
+        path = self.path("versions.db")
+        runs: dict[str, int] = {}
+
+        async def start(*versions: str) -> Kairo:
+            k = await self.open(path, lease_ms=100)
+            for i, v in enumerate(versions):
+
+                async def w(ctx, _, v=v):
+                    runs[v] = runs.get(v, 0) + 1
+                    return f"{v}:{await ctx.wait_for('go')}"
+
+                k.workflow("w", version=v, draining=i < len(versions) - 1)(w)
+            await k.start()
+            return k
+
+        async def main() -> None:
+            k1 = await start("1")
+            await k1.submit("w", None, id="ver-1")
+            await wait_until(lambda: runs.get("1") == 1)
+            await k1.close()  # its drive lease is left expired
+
+            # Only version 2 here: it does not drive ver-1.
+            k2 = await start("2")
+            await k2.tick()  # takes up ver-1's lease, as a sweep does
+            self.assertEqual(runs.get("2", 0), 0, "version 2 drove a version 1 run")
+            await k2.close()
+
+            k3 = await start("1", "2")
+            await k3.signal("ver-1", "go", "x")
+            self.assertEqual(await asyncio.wait_for(k3.result("ver-1"), 10), "1:x")
+            await k3.submit("w", None, id="ver-2")
+            await k3.signal("ver-2", "go", "y")
+            self.assertEqual(await asyncio.wait_for(k3.result("ver-2"), 10), "2:y")
+            self.assertEqual((await k3.backend.get("ver-1")).get("version"), "1")
+            self.assertEqual((await k3.backend.get("ver-2")).get("version"), "2")
+            await k3.close()
+
+            bad = await self.open(self.path("versions-bad.db"))
+            for v in ("1", "2"):
+
+                async def f(ctx, _):
+                    return None
+
+                bad.workflow("w", version=v)(f)
+            with self.assertRaisesRegex(ValueError, "2 current versions"):
+                await bad.start()
+            await bad.close()
+
+        asyncio.run(main())
+
+    def test_settings_change_under_a_call(self) -> None:
+        """An action's settings change while a call of it waits to retry: the
+        call goes on under the new ones (it used to stop for good)."""
+        path = self.path("settings.db")
+        attempts = [0]
+
+        async def start(timeout: str | None = None) -> Kairo:
+            k = await self.open(path, mode="suspend")
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                return await ctx.call("a")
+
+            @k.action("a", effect="unprotected", backoff="50ms", timeout=timeout)
+            def a(_, ctx):
+                attempts[0] += 1
+                if attempts[0] == 1:
+                    raise RetryableError("busy")
+                return "ok"
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            k = await start()
+            with self.assertRaises(Suspended):
+                await k.run("w", None, id="set-1")
+            await k.close()
+            k = await start("1m")  # a deploy changed its settings
+            for _ in range(400):
+                await k.tick()
+                if (await k.backend.get("set-1"))["status"] in DONE:
+                    break
+                await asyncio.sleep(0.025)
+            self.assertEqual(await k.run("w", None, id="set-1"), "ok")
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_an_effect_is_not_weakened(self) -> None:
+        """A real attempt is out when its action is changed to unprotected: the
+        call does not go on under the new settings (it would be retried on its
+        unknown outcome); tick goes on with the others; resolve_failed settles it."""
+        path = self.path("weakened.db")
+        stuck: list[str] = []
+        quiet = logging.getLogger("kairo_sdk.test_weakened")
+        quiet.addHandler(logging.NullHandler())
+        quiet.propagate = False
+
+        def observer(o: Observation) -> None:
+            if o.kind == RUN_STUCK:
+                stuck.append(o.error)
+
+        async def start(mode: str, effect: str) -> Kairo:
+            k = await self.open(path, lease_ms=100, mode=mode, logger=quiet, observe=observer)
+
+            @k.action("pay", effect=effect)
+            def pay(_, ctx):
+                ctx.cancelled.wait()  # the process stops while it runs
+                raise RuntimeError("stopped")
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                try:
+                    await ctx.call("pay")
+                    return "paid"
+                except CallError as e:
+                    return f"resolved: {e.message}"
+
+            @k.workflow("nap")
+            async def nap(ctx, _):
+                await ctx.sleep(0.2)
+                return "rested"
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            # A resident process: pay's real attempt is out (its intent
+            # recorded) when it stops; nap's timer is in the store.
+            k = await start("wait", "real")
+            for w in ("w", "nap"):
+                await k.submit(w, None, id=f"{w}-1")
+            found: dict[str, str] = {}
+
+            def out() -> bool:
+                pay, nap = children(path, "w-1"), children(path, "nap-1")
+                if pay:
+                    found["call"] = pay[0]
+                return bool(pay) and bool(nap) and bool(query(path, "SELECT 1 FROM kairo_timer WHERE run = ?", nap[0]))
+
+            await wait_until(out)
+            await k.close()
+
+            k = await start("suspend", "unprotected")  # a deploy made pay unprotected
+            # Ticks, as a scheduler's, until nap's timer has fired and nap has
+            # finished, and pay's call (its lease expired) was found stuck.
+            for _ in range(400):
+                await k.tick()
+                if self.status(path, "nap-1") in DONE and any(EFFECT_WEAKENED in e for e in stuck):
+                    break
+                await asyncio.sleep(0.025)
+            self.assertEqual(await k.run("nap", None, id="nap-1"), "rested", "the other run did not go on")
+            self.assertTrue(any(EFFECT_WEAKENED in e for e in stuck), f"stuck: {stuck}")
+            self.assertNotIn(self.status(path, found["call"]), DONE, "the call went on")
+            await k.resolve_failed(found["call"], "not paid")
+            self.assertIn("not paid", await k.run("w", None, id="w-1"))
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_a_childs_version_not_here(self) -> None:
+        """A child workflow goes on with the version it started with: a process
+        that has its parent's version but not the child's leaves both, without
+        failing the parent; one with both finishes them (ADR 0060)."""
+        path = self.path("child-version.db")
+        runs: dict[str, int] = {}
+
+        def add(k: str) -> None:
+            runs[k] = runs.get(k, 0) + 1
+
+        async def start(*child_versions: str) -> Kairo:
+            k = await self.open(path, lease_ms=100)
+
+            @k.workflow("parent")
+            async def parent(ctx, _):
+                add("parent")
+                return await ctx.workflow("child")
+
+            for i, v in enumerate(child_versions):
+
+                async def child(ctx, _, v=v):
+                    add(f"child {v}")
+                    return f"{v}:{await ctx.wait_for('go')}"
+
+                k.workflow("child", version=v, draining=i < len(child_versions) - 1)(child)
+            await k.start()
+            return k
+
+        async def main() -> None:
+            k = await start("1")
+            await k.submit("parent", None, id="fam-1")
+            found: list[str] = []
+
+            def child_runs() -> bool:
+                kids = children(path, "fam-1")
+                if kids and runs.get("child 1") == 1:
+                    found.append(kids[0])
+                    return True
+                return False
+
+            await wait_until(child_runs)
+            await k.close()
+
+            k = await start("2")  # the parent's version, not the child's
+            await wait_until(lambda: runs.get("parent", 0) >= 2)  # it took the parent up
+            self.assertNotIn(self.status(path, "fam-1"), DONE, "the parent ended without its child's version")
+            self.assertEqual(runs.get("child 2", 0), 0, "version 2 drove a version 1 child")
+            await k.close()
+
+            k = await start("1", "2")
+            await k.signal(found[0], "go", "x")
+            self.assertEqual(await asyncio.wait_for(k.result("fam-1"), 10), "1:x")
+            await k.close()
 
         asyncio.run(main())
 

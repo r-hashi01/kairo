@@ -75,6 +75,15 @@ k.workflow('name', async (ctx, input) => { ... });
 
 A workflow must be deterministic between its calls: read the clock and randomness through `ctx.now()` and `ctx.random()`, and do I/O in actions.
 
+To change a workflow's function while runs of it are under way, give it a version. A run keeps the version it started with to its end, and a process drives only the runs whose version it has. New runs start with the current version; keep the old one, `draining`, until no run of it is left (`version` in `get` and `list`).
+
+```ts
+k.workflow('refund', refundV1, { version: '1', draining: true }); // finishes the runs that started with it
+k.workflow('refund', refundV2, { version: '2' });                 // new runs; one current version per name
+```
+
+A change to an action's settings (timeout, retries, backoff) applies to its calls already under way. One exception: while a real call's attempt is out, the call does not go on under settings that are no longer real (it could run twice). The tick reports it as `run.stuck`; restore the action, or settle the call with `k.resolve`, `k.resolveFailed` or `k.cancel`.
+
 A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status`: `'failed'` or `'cancelled'`, `error`: the failure as recorded); a cancelled one has a `CancelledError` as its `cause`. A workflow whose function throws fails: `run` and `result` throw `WorkflowError` (`id`, `error`; `cause` is what the function threw, when it failed in this process).
 
 ### Running
@@ -86,6 +95,7 @@ A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status
 | `k.result(id, { signal? })` | The result of workflow `id`, from any process, once it has finished |
 | `k.signal(id, name, payload)` | Delivers a signal to the first wait for it; a wait the workflow has not reached yet receives it when it does |
 | `k.cancel(id)` | Cancels the workflow and the calls it waits for |
+| `k.resolve(callId, output)`, `k.resolveFailed(callId, message)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above: it took effect with `output`, or it failed. The embedded runtime only |
 | `k.list({ workflow?, status?, since?, until?, after?, limit? })` | Workflows (not child workflows or calls), oldest first, with `meta`, `createdAt` and `updatedAt` |
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
@@ -108,6 +118,7 @@ const k = new Kairo({ backend, observe: (o) => metrics.record(o) });
 | `run.settled` | A run completed, failed, was cancelled, or stopped for review (`blocked`) | `status`, `error` |
 | `step.started` | A step's handler is about to run | `action`, `stepId`, `attempt` |
 | `step.finished` | It returned; also when an outcome comes on the callback (no `duration`) | `status` (`StepStatus`: `ok`, `retryable`, `failed`, `unknown`, `waiting`, `pending`), `error`, `duration` (ms) |
+| `run.stuck` | A tick could not take a run on (its event waits a lease period; the other runs go on) | `error` |
 
 With kairod (`HttpBackend`), only `step.started` and `step.finished` of the steps this process's worker runs are observed: runs are kairod's.
 

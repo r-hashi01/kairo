@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/wasmcore"
 )
 
@@ -26,6 +25,11 @@ import (
 // errUnknownPlan: a run whose plan this process does not have (another
 // process's to take up).
 var errUnknownPlan = errors.New("kairo: plan not registered here")
+
+// ErrEffectWeakened: a call's action is no longer real while a real
+// attempt of it is out (ADR 0060). The call waits: restore the action, or
+// settle the call with Resolve, ResolveFailed or Cancel.
+var ErrEffectWeakened = errors.New("kairo: a real attempt is out and its action is no longer real")
 
 // ErrUnknownRun: no such run.
 var ErrUnknownRun = errors.New("kairo: no such run")
@@ -43,6 +47,7 @@ type RunInfo struct {
 	// with (WithMeta). Created and Updated: when the run started and last
 	// changed (ADR 0059).
 	Workflow string          `json:"workflow,omitempty"`
+	Version  string          `json:"version,omitempty"` // a workflow run's version (ADR 0060)
 	Meta     json.RawMessage `json:"meta,omitempty"`
 	Created  time.Time       `json:"created_at"`
 	Updated  time.Time       `json:"updated_at"`
@@ -53,7 +58,11 @@ type RunInfo struct {
 func (r RunInfo) Finished() bool { return doneStatus[r.Status] }
 
 func info(row *RunRow) RunInfo {
-	return RunInfo{RunID: row.ID, Plan: row.Plan, Status: row.Status, Input: row.Input, Output: row.Output, Error: row.Error, Parent: row.Parent,
+	var version string
+	if row.Plan == planWorkflow {
+		_, version, _, _ = workflowOf(row.Input)
+	}
+	return RunInfo{Version: version, RunID: row.ID, Plan: row.Plan, Status: row.Status, Input: row.Input, Output: row.Output, Error: row.Error, Parent: row.Parent,
 		Workflow: row.Workflow, Meta: row.Meta, Created: time.UnixMilli(row.CreatedAt), Updated: time.UnixMilli(row.UpdatedAt)}
 }
 
@@ -425,21 +434,24 @@ func (r *runtime) resolve(ctx context.Context, runID string, output any, errMsg 
 	if row == nil {
 		return fmt.Errorf("%w: %s", ErrUnknownRun, runID)
 	}
-	st, err := core.DecodeState(row.State)
+	in, err := wasmcore.Inspect(row.State)
 	if err != nil {
 		return err
 	}
-	var acts []uint32
-	for id, a := range st.Acts {
-		if a.NeedsReview() {
-			acts = append(acts, id)
+	// Stopped for review; or a real attempt out that cannot go on because
+	// its action is no longer real (ADR 0060): only then, not one out as
+	// usual.
+	acts, out := in.Review, false
+	if len(acts) == 0 && len(in.Intents) > 0 {
+		if p, ok := r.plan(row.Plan); ok && p.Hash != row.Hash &&
+			errors.Is(adoptable(p, row, []wasmcore.Event{{Kind: "step_err"}}), ErrEffectWeakened) {
+			acts, out = in.Intents, true
 		}
 	}
 	if len(acts) == 0 {
 		return fmt.Errorf("kairo: run %s has no step stopped for review", runID)
 	}
-	sort.Slice(acts, func(i, j int) bool { return acts[i] < acts[j] })
-	ev := wasmcore.Event{Kind: "resolve", At: r.now(), Act: acts[0], Err: errMsg}
+	ev := wasmcore.Event{Kind: "resolve", At: r.now(), Act: acts[0], Err: errMsg, Unknown: out}
 	if errMsg == "" {
 		if ev.Data, err = json.Marshal(output); err != nil {
 			return err
@@ -457,18 +469,28 @@ func (r *runtime) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// One run that cannot go on does not stop the others (ADR 0060): it is
+	// logged, and put off a lease period, so that it does not stay first of
+	// what each tick takes up.
 	for _, l := range leases {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var err error
 		if l.Act == 0 {
 			// A workflow's driver stopped (ADR 0059).
 			if r.lostDrive != nil {
-				if err := skipUnknownPlan(r.lostDrive(ctx, l)); err != nil {
-					return err
-				}
+				err = skipUnknownPlan(r.lostDrive(ctx, l))
 			}
-			continue
+		} else {
+			err = skipUnknownPlan(r.recover(ctx, l))
 		}
-		if err := skipUnknownPlan(r.recover(ctx, l)); err != nil {
-			return err
+		if err != nil && ctx.Err() == nil {
+			r.stuck(l.Run, err)
+			l.Owner, l.Until = "", r.now()+r.leaseMs
+			if herr := r.store.HandOver(ctx, l); herr != nil {
+				r.logger.Warn("kairo: putting off a lease", "run", l.Run, "err", herr)
+			}
 		}
 	}
 	timers, err := r.store.DueTimers(ctx, r.now(), 1000)
@@ -476,8 +498,20 @@ func (r *runtime) tick(ctx context.Context) error {
 		return err
 	}
 	for _, t := range timers {
-		if err := skipUnknownPlan(r.fire(ctx, t)); err != nil {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := skipUnknownPlan(r.fire(ctx, t)); err != nil && ctx.Err() == nil {
+			r.stuck(t.Run, err)
+			t.At = r.now() + r.leaseMs
+			if serr := r.store.WithRun(ctx, t.Run, func(row *RunRow) (*Changes, error) {
+				if row == nil {
+					return nil, nil
+				}
+				return &Changes{SetTimers: []TimerRow{t}}, nil
+			}); serr != nil {
+				r.logger.Warn("kairo: putting off a timer", "run", t.Run, "err", serr)
+			}
 		}
 	}
 	if r.keepMs >= 0 {
@@ -517,6 +551,60 @@ func (r *runtime) driving(on bool) {
 	}
 	r.mu.Unlock()
 	r.renew()
+}
+
+// stuck logs and observes a run that could not go on now (err nil: it
+// could).
+func (r *runtime) stuck(runID string, err error) {
+	if err == nil {
+		return
+	}
+	r.logger.Warn("kairo: a run cannot go on", "run", runID, "err", err)
+	r.observe(Observation{Kind: ObsRunStuck, RunID: runID, Error: err.Error()})
+}
+
+// adoptable says whether run row, which started under another version of
+// plan, may go on under the current one (ADR 0060). Only the SDK's own
+// plans (one node each) may; and not while a real attempt is out whose
+// action the current plan does not treat as real (it would be retried on
+// an unknown outcome, invariant 5), unless the events settle the call
+// (cancel, resolve).
+func adoptable(plan wasmcore.Compiled, row *RunRow, events []wasmcore.Event) error {
+	if plan.Name != planWorkflow && !strings.HasPrefix(plan.Name, planCall) && !strings.HasPrefix(plan.Name, planWait) {
+		return fmt.Errorf("plan %s changed since it started", row.Plan)
+	}
+	// Events that cannot make a retry of an outcome unknown: a cancel, a
+	// resolve, an attempt's definite success or wait.
+	settles := len(events) > 0
+	for _, e := range events {
+		switch e.Kind {
+		case "cancel", "resolve", "step_ok", "step_wait":
+		default:
+			settles = false
+		}
+	}
+	if settles || strictlyReal(plan) {
+		return nil
+	}
+	in, err := wasmcore.Inspect(row.State)
+	if err != nil {
+		return err
+	}
+	if in.IntentDurable {
+		return fmt.Errorf("%w (%s)", ErrEffectWeakened, row.Plan)
+	}
+	return nil
+}
+
+// strictlyReal: every action of plan is real and not retried on an unknown
+// outcome.
+func strictlyReal(plan wasmcore.Compiled) bool {
+	for a, e := range plan.Effects {
+		if e != "real" || plan.Idempotent[a] {
+			return false
+		}
+	}
+	return len(plan.Effects) > 0
 }
 
 func skipUnknownPlan(err error) error {
@@ -641,7 +729,10 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 			plan = p
 		}
 		if row != nil && row.Hash != plan.Hash {
-			return nil, fmt.Errorf("kairo: run %s: plan %s changed since it started", runID, row.Plan)
+			if err := adoptable(plan, row, events); err != nil {
+				return nil, fmt.Errorf("kairo: run %s: %w", runID, err)
+			}
+			// Goes on under the current plan (ADR 0060): next has its hash.
 		}
 		var state []byte
 		status, output, errMsg := "running", json.RawMessage(nil), ""

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/ir"
@@ -53,6 +54,8 @@ type Compiled struct {
 	Hash    string            `json:"hash"`
 	HasReal bool              `json:"has_real"`
 	Effects map[string]string `json:"effects"`
+	// Idempotent: the actions declared IdempotentRetry (ADR 0060).
+	Idempotent map[string]bool `json:"idempotent,omitempty"`
 }
 
 // Compile compiles a workflow definition (ir.Definition as JSON).
@@ -67,10 +70,53 @@ func (c *Core) Compile(defJSON []byte) (Compiled, error) {
 	}
 	c.plans = append(c.plans, p)
 	effects := map[string]string{}
+	var idempotent map[string]bool
 	for _, s := range p.Specs() {
 		effects[s.Action] = s.Effect.String()
+		if s.IdempotentRetry {
+			if idempotent == nil {
+				idempotent = map[string]bool{}
+			}
+			idempotent[s.Action] = true
+		}
 	}
-	return Compiled{Plan: len(c.plans) - 1, Name: p.Name, Hash: p.Hash, HasReal: p.HasReal, Effects: effects}, nil
+	return Compiled{Plan: len(c.plans) - 1, Name: p.Name, Hash: p.Hash, HasReal: p.HasReal, Effects: effects, Idempotent: idempotent}, nil
+}
+
+// Inspection is what a run's state tells its host (ADR 0060).
+type Inspection struct {
+	// IntentDurable: a real attempt is out with its intent durable (it may
+	// have taken effect; its outcome is not in).
+	IntentDurable bool `json:"intent_durable"`
+	// Review: the activations stopped for review, in order; Intents: those
+	// with a real attempt out and its intent durable. EvResolve settles
+	// either (ADR 0060).
+	Review  []uint32 `json:"review,omitempty"`
+	Intents []uint32 `json:"intents,omitempty"`
+}
+
+// Inspect reads a run's state (the core's encoding).
+func Inspect(state []byte) (Inspection, error) {
+	var in Inspection
+	if len(state) == 0 {
+		return in, nil
+	}
+	s, err := core.DecodeState(state)
+	if err != nil {
+		return in, err
+	}
+	for id, a := range s.Acts {
+		if a.IntentDurable() {
+			in.IntentDurable = true
+			in.Intents = append(in.Intents, id)
+		}
+		if a.NeedsReview() {
+			in.Review = append(in.Review, id)
+		}
+	}
+	sort.Slice(in.Review, func(i, j int) bool { return in.Review[i] < in.Review[j] })
+	sort.Slice(in.Intents, func(i, j int) bool { return in.Intents[i] < in.Intents[j] })
+	return in, nil
 }
 
 // Event is an input to a run (core.Event).

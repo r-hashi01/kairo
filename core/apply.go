@@ -192,11 +192,26 @@ func (m *machine) apply(ev *Event) error {
 
 	case EvResolve:
 		a := s.Acts[ev.Act]
-		if a == nil || a.Flags&fReview == 0 {
+		if a == nil {
 			return ErrIgnored
 		}
-		a.Flags &^= fReview
-		m.refreshBlocked()
+		switch {
+		case a.Flags&fReview != 0:
+			a.Flags &^= fReview
+			m.refreshBlocked()
+		case ev.Unknown && a.IntentDurable():
+			// Asked for (Unknown): a real attempt out that cannot be let go
+			// on (its action is no longer real, ADR 0060), settled by hand
+			// as one stopped for review. The attempt is aborted; its own
+			// outcome, if it comes, finds it settled.
+			m.out = append(m.out, Command{Kind: CmdAbort, Act: ev.Act, Node: a.Node, Attempt: a.Attempt})
+			if a.Timer != 0 {
+				m.cancelTimer(a)
+			}
+			m.undispatch(a)
+		default:
+			return ErrIgnored
+		}
 		if ev.Err != "" {
 			m.fail(StatusFailed, "step "+m.p.Nodes[a.Node].ID+" resolved as failed: "+ev.Err)
 			return nil

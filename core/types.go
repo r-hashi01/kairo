@@ -213,3 +213,10 @@ func Dispatched(s *State, act uint32, attempt int32) bool {
 // NeedsReview reports whether the activation is a real step stopped with an
 // unknown outcome.
 func (a *Act) NeedsReview() bool { return a.Flags&fReview != 0 }
+
+// IntentDurable reports whether the activation is a step with an attempt
+// out whose intent is durable: a real attempt that may have taken effect,
+// its outcome not in yet (ADR 0060). EvResolve with Unknown settles it, as
+// it does one stopped for review. (In the engine the intent is durable once
+// its log record is; the flag is set when it is applied.)
+func (a *Act) IntentDurable() bool { return a.Flags&fDispatched != 0 && a.Flags&fIntent != 0 }

@@ -44,6 +44,7 @@ class Core:
         self._register = ex["kairo_register"]
         self._compile = ex["kairo_compile"]
         self._apply = ex["kairo_apply"]
+        self._inspect = ex["kairo_inspect"]
         v = ex["kairo_abi_version"](self._store)
         if v != ABI_VERSION:
             raise CoreError(f"kairo.wasm speaks ABI {v}, this SDK {ABI_VERSION}")
@@ -81,8 +82,15 @@ class Core:
         self._call(self._register, json.dumps(specs).encode())
 
     def compile(self, definition: dict[str, Any]) -> dict[str, Any]:
-        """Compiles a workflow definition (ir.Definition): {plan, name, hash, has_real, effects}."""
+        """Compiles a workflow definition (ir.Definition): {plan, name, hash, has_real, effects,
+        idempotent}."""
         return json.loads(self._call(self._compile, json.dumps(definition).encode()))
+
+    def inspect(self, state: bytes) -> dict[str, Any]:
+        """Reads a run's state (wasmcore.Inspection, ADR 0060): {intent_durable,
+        review, intents}. review: the activations stopped for review; intents:
+        those with a real attempt out and its intent durable (in order)."""
+        return json.loads(self._call(self._inspect, state))
 
     def apply(self, plan: int, run_id: str, state: bytes, event: dict[str, Any], traced: bool = False) -> tuple[bytes, dict[str, Any]]:
         """Applies event (wasmcore.Event) to a run's state (empty for a new run)."""

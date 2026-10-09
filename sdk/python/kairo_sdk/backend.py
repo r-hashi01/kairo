@@ -157,6 +157,11 @@ class EmbeddedBackend:
     async def cancel(self, run_id: str) -> None:
         await self.runtime.cancel(run_id)
 
+    async def resolve(self, run_id: str, output: Any, error: str | None = None) -> None:
+        """Settles a step stopped for review, or a real attempt out that cannot
+        go on (ADR 0060)."""
+        await self.runtime.resolve(run_id, output, error)
+
     async def close(self) -> None:
         await self.runtime.close()
 

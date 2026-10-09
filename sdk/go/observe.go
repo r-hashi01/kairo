@@ -36,6 +36,9 @@ const (
 	ObsRunSettled   = "run.settled"
 	ObsStepStarted  = "step.started"
 	ObsStepFinished = "step.finished"
+	// ObsRunStuck: a run could not go on now (Error says why): its event
+	// waits, and the others went on (ADR 0060).
+	ObsRunStuck = "run.stuck"
 )
 
 // How a step's attempt ended (Observation.Status of ObsStepFinished).

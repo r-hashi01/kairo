@@ -22,6 +22,8 @@ export interface Backend {
 	wait(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	signal(runId: string, name: string, payload: unknown): Promise<void>;
 	cancel(runId: string): Promise<void>;
+	/** Embedded only: settles a step stopped for review, or a real attempt out that cannot go on (ADR 0060). */
+	resolve?(runId: string, output: unknown, error?: string): Promise<void>;
 	close(): Promise<void>;
 	/** Embedded only: once the work started here is done. */
 	idle?(): Promise<void>;
@@ -151,6 +153,10 @@ export class EmbeddedBackend implements Backend {
 
 	cancel(runId: string) {
 		return this.runtime.cancel(runId);
+	}
+
+	resolve(runId: string, output: unknown, error?: string) {
+		return this.runtime.resolve(runId, output, error);
 	}
 
 	close(): Promise<void> {

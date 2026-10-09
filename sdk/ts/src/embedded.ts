@@ -74,6 +74,23 @@ const DONE = new Set(['completed', 'failed', 'cancelled']);
 const SETTLED = new Set([...DONE, 'blocked']);
 const OUTCOMES = new Set(['step_ok', 'step_err', 'step_wait']);
 
+/**
+ * A call's action is no longer real while a real attempt of it is out (ADR
+ * 0060). The call waits: restore the action, or settle the call with
+ * resolve, resolveFailed or cancel.
+ */
+export class EffectWeakenedError extends KairoError {
+	override name = 'EffectWeakenedError';
+	constructor(message: string) {
+		super(409, message);
+	}
+}
+
+/** EffectWeakenedError's message, without the run. */
+export const EFFECT_WEAKENED = 'a real attempt is out and its action is no longer real';
+
+const PLAN_WORKFLOW = 'kairo.workflow';
+
 export class Embedded {
 	private readonly core: Core;
 	private readonly store: Store;
@@ -285,21 +302,82 @@ export class Embedded {
 	}
 
 	/**
+	 * Settles a step stopped for review (ADR 0058), or a real attempt out
+	 * that cannot go on (its action is no longer real, ADR 0060): it took
+	 * effect (with output), or it did not (error; the run fails).
+	 */
+	async resolve(runId: string, output: unknown, error?: string): Promise<void> {
+		const row = await this.store.get(runId);
+		if (!row) throw new KairoError(404, `no run ${runId}`);
+		const ins = this.core.inspect(row.state);
+		// Stopped for review; or a real attempt out that cannot go on because
+		// its action is no longer real (ADR 0060): only then, not one out as
+		// usual (unknown marks it so to the core).
+		let acts = ins.review ?? [];
+		let out = false;
+		if (acts.length === 0 && ins.intents?.length) {
+			const plan = this.plan(row.plan);
+			if (plan && row.hash !== plan.hash && this.effectWeakened(plan, row)) [acts, out] = [ins.intents, true];
+		}
+		if (acts.length === 0) throw new KairoError(409, `run ${runId} has no step stopped for review`);
+		const ev: CoreEvent = {
+			kind: 'resolve',
+			at: this.now(),
+			act: acts[0],
+			...(out ? { unknown: true } : {}),
+			...(error !== undefined ? { error } : { data: output ?? null }),
+		};
+		await this.process(runId, [ev]);
+	}
+
+	/**
 	 * Takes up what no process is doing: steps whose lease expired (their
 	 * process stopped) and timers that are due (also those armed by other
-	 * processes). Runs whose plan is not registered here are left alone.
+	 * processes). Runs whose plan is not registered here are left alone. One
+	 * run that cannot go on does not stop the others (ADR 0060): it is
+	 * logged and observed (run.stuck), and put off a lease period, so that it
+	 * does not stay first of what each tick takes up. Throws only when the
+	 * store fails.
 	 */
 	async tick(): Promise<void> {
 		this.lastSweep = this.now();
 		for (const l of await this.store.expiredLeases(this.now(), 1000)) {
+			if (this.closed) return;
 			// A workflow's driver stopped (ADR 0059).
-			if (l.act === 0) {
-				if (this.lostDrive) await this.lostDrive(l).catch(skipUnknownPlan);
-			} else await this.recover(l).catch(skipUnknownPlan);
+			const p = l.act === 0 ? this.lostDrive?.(l) : this.recover(l);
+			if (await this.stuck(l.run, p))
+				await this.store.handOver({ ...l, owner: '', until: this.now() + this.leaseMs }).catch((e) => this.logger.warn('kairo: putting off a lease', { run: l.run, err: e }));
 		}
-		for (const t of await this.store.dueTimers(this.now(), 1000)) await this.fire(t).catch(skipUnknownPlan);
+		for (const t of await this.store.dueTimers(this.now(), 1000)) {
+			if (this.closed) return;
+			if (!(await this.stuck(t.run, this.fire(t)))) continue;
+			const later: TimerRow = { ...t, at: this.now() + this.leaseMs };
+			await this.store
+				.withRun(t.run, (row) => (row ? { events: [], setTimers: [later], result: undefined } : { events: [], result: undefined }))
+				.catch((e) => this.logger.warn('kairo: putting off a timer', { run: t.run, err: e }));
+		}
 		// Finished trees past the time they are kept (ADR 0054).
 		if (Number.isFinite(this.keepMs)) await this.store.removeFinished(this.now() - this.keepMs, REMOVE_PER_TICK);
+	}
+
+	/**
+	 * Awaits p; logs and observes the run if it could not go on now (but one
+	 * whose plan is another process's): whether it could not.
+	 */
+	private async stuck(runId: string, p: Promise<unknown> | undefined): Promise<boolean> {
+		try {
+			await p;
+			return false;
+		} catch (e) {
+			try {
+				skipUnknownPlan(e);
+				return false;
+			} catch {
+				this.logger.warn('kairo: a run cannot go on', { run: runId, err: e });
+				this.observe({ kind: 'run.stuck', runId, error: String((e as Error)?.message ?? e) });
+				return true;
+			}
+		}
 	}
 
 	/** The process that ran l's step stopped: its outcome is unknown. */
@@ -356,7 +434,8 @@ export class Embedded {
 				return { events: [], endLeases, result: { existing: false, started: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plan(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
-			if (row && row.hash !== plan.hash) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
+			// Goes on under the current plan, if it may (ADR 0060): next has its hash.
+			if (row && row.hash !== plan.hash) this.adoptable(runId, plan, row, events);
 			let state = row?.state ?? new Uint8Array();
 			const recorded: CoreEvent[] = [];
 			const commands: CoreCommand[] = [];
@@ -435,6 +514,25 @@ export class Embedded {
 		// Along the way: what no process is doing (at most once a lease period).
 		if (this.now() - this.lastSweep >= this.leaseMs) this.background(this.tick(), 'kairo: sweeping');
 		return out.existing;
+	}
+
+	/**
+	 * Throws unless run row, which started under another version of plan,
+	 * may go on under the current one (ADR 0060). Only the SDK's own plans
+	 * (one node each) may; and not while a real attempt is out whose action
+	 * the current plan does not treat as real (it would be retried on an
+	 * unknown outcome, invariant 5), unless the events are safe under any
+	 * settings (an outcome that is in, cancel, resolve).
+	 */
+	private adoptable(runId: string, plan: Compiled, row: RunRow, events: CoreEvent[]): void {
+		if (!sdkPlan(plan.name)) throw new KairoError(409, `run ${runId}: plan ${row.plan} changed since it started`);
+		if (events.length > 0 && events.every((e) => SAFE.has(e.kind))) return;
+		if (this.effectWeakened(plan, row)) throw new EffectWeakenedError(`run ${runId}: ${EFFECT_WEAKENED} (${row.plan})`);
+	}
+
+	/** Run row, of an SDK plan, has a real attempt out whose action plan does not treat as real (ADR 0060). */
+	private effectWeakened(plan: Compiled, row: RunRow): boolean {
+		return sdkPlan(plan.name) && !strictlyReal(plan) && this.core.inspect(row.state).intent_durable;
 	}
 
 	private carryOut(runId: string, c: CoreCommand): void {
@@ -560,12 +658,28 @@ export function newToken(): number {
 	}
 }
 
+/** Events applied under the current plan whatever it is (ADR 0060): an outcome that is in, cancel, resolve. */
+const SAFE = new Set(['cancel', 'resolve', 'step_ok', 'step_wait']);
+
+/** The SDK's own plans (one node each), which go on under the current version (ADR 0060). */
+function sdkPlan(name: string): boolean {
+	return name === PLAN_WORKFLOW || name.startsWith('kairo.call/') || name.startsWith('kairo.wait/');
+}
+
+/** Every action of plan is real and not retried on an unknown outcome (ADR 0060). */
+function strictlyReal(plan: Compiled): boolean {
+	const effects = Object.entries(plan.effects ?? {});
+	return effects.length > 0 && effects.every(([a, e]) => e === 'real' && !plan.idempotent?.[a]);
+}
+
 /** A run whose plan this process does not have is another process's to take up. */
 function skipUnknownPlan(e: unknown): void {
 	if (!(e instanceof KairoError && e.status === 404)) throw e;
 }
 
 function info(row: RunRow): RunInfo {
+	// A workflow run's version (ADR 0060).
+	const version = row.plan === PLAN_WORKFLOW && row.input !== null ? (JSON.parse(row.input) as { version?: unknown } | null)?.version : undefined;
 	return {
 		run_id: row.id,
 		plan: row.plan,
@@ -576,6 +690,7 @@ function info(row: RunRow): RunInfo {
 		...(row.error ? { error: row.error } : {}),
 		...(row.parent ? { parent: row.parent } : {}),
 		...(row.workflow ? { workflow: row.workflow } : {}),
+		...(typeof version === 'string' && version ? { version } : {}),
 		...(row.meta !== null ? { meta: JSON.parse(row.meta) } : {}),
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,

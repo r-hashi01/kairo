@@ -58,6 +58,18 @@ export interface Compiled {
 	hash: string;
 	has_real: boolean;
 	effects: Record<string, string>;
+	/** The actions declared idempotent_retry (ADR 0060). */
+	idempotent?: Record<string, boolean>;
+}
+
+/** What a run's state tells its host (wasmcore.Inspection, ADR 0060). */
+export interface Inspection {
+	/** A real attempt is out with its intent durable (it may have taken effect; its outcome is not in). */
+	intent_durable: boolean;
+	/** The activations stopped for review, in order. */
+	review?: number[];
+	/** The activations with a real attempt out and its intent durable, in order. A resolve event settles either. */
+	intents?: number[];
 }
 
 export class CoreError extends Error {}
@@ -118,6 +130,11 @@ export class Core {
 	/** Compiles a workflow definition (ir.Definition). */
 	compile(definition: unknown): Compiled {
 		return JSON.parse(this.dec.decode(this.call('kairo_compile', this.enc.encode(JSON.stringify(definition)))));
+	}
+
+	/** Reads a run's state (ADR 0060). */
+	inspect(state: Uint8Array): Inspection {
+		return JSON.parse(this.dec.decode(this.call('kairo_inspect', state)));
 	}
 
 	/** Applies event to a run's state (empty for a new run). */

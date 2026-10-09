@@ -173,7 +173,7 @@ type Kairo struct {
 
 	mu         sync.Mutex
 	actions    map[string]*actionDef
-	workflows  map[string]workflowFn
+	workflows  map[string]*workflowDef
 	planned    map[string]bool
 	driving    map[*drive]struct{}
 	drivingIDs map[string]bool
@@ -201,6 +201,81 @@ type Kairo struct {
 type drive struct{ cancel context.CancelFunc }
 
 type workflowFn func(ctx *Context, in json.RawMessage) (any, error)
+
+// workflowDef is a workflow's versions (ADR 0060): the current one starts
+// new runs; the others only finish the runs they started.
+type workflowDef struct {
+	versions map[string]workflowFn
+	current  string
+	currents int
+}
+
+// WorkflowOption configures Workflow.
+type WorkflowOption func(*workflowOpts)
+
+type workflowOpts struct {
+	version  string
+	draining bool
+}
+
+// WorkflowVersion names this function's version of the workflow (ADR
+// 0060). A run is driven by the version it started with, to its end: a
+// process drives only the runs whose version it has. Default "": none.
+func WorkflowVersion(v string) WorkflowOption { return func(o *workflowOpts) { o.version = v } }
+
+// Draining: this version only finishes the runs that started with it; new
+// runs start with the workflow's current version (the one not Draining).
+func Draining() WorkflowOption { return func(o *workflowOpts) { o.draining = true } }
+
+// workflowInput is a workflow run's input: the workflow, its version (when
+// it has one) and the input it was given.
+func workflowInput(name, version string, in json.RawMessage) map[string]any {
+	m := map[string]any{"workflow": name, "input": in}
+	if version != "" {
+		m["version"] = version
+	}
+	return m
+}
+
+// workflowOf reads a workflow run's input.
+func workflowOf(input json.RawMessage) (name, version string, in json.RawMessage, ok bool) {
+	var w struct {
+		Workflow string          `json:"workflow"`
+		Version  string          `json:"version"`
+		Input    json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(input, &w) != nil || w.Workflow == "" {
+		return "", "", nil, false
+	}
+	return w.Workflow, w.Version, w.Input, true
+}
+
+// fnFor is workflow name's function at version (nil: not here).
+func (k *Kairo) fnFor(name, version string) workflowFn {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if d := k.workflows[name]; d != nil {
+		return d.versions[version]
+	}
+	return nil
+}
+
+// currentVersion is the version new runs of workflow name start with.
+func (k *Kairo) currentVersion(name string) (string, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	d := k.workflows[name]
+	if d == nil || d.currents == 0 {
+		return "", false
+	}
+	return d.current, true
+}
+
+// notHere: a workflow run whose version this process does not have
+// (another process's to drive).
+func notHere(name, version string) error {
+	return fmt.Errorf("%w: workflow %s version %q", errUnknownPlan, name, version)
+}
 
 type actionDef struct {
 	spec    map[string]any
@@ -245,7 +320,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	if err := rt.open(ctx, opts.Owner != ""); err != nil {
 		return nil, err
 	}
-	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]workflowFn{},
+	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}}
 	k.bgCtx, k.bgCancel = context.WithCancel(context.Background())
@@ -398,11 +473,25 @@ func Action[I, O any](k *Kairo, name string, effect Effect, fn func(t *TaskConte
 	}}
 }
 
-// Workflow declares a workflow.
-func Workflow[I, O any](k *Kairo, name string, fn func(ctx *Context, in I) (O, error)) {
+// Workflow declares a workflow, or one of its versions (WorkflowVersion,
+// Draining).
+func Workflow[I, O any](k *Kairo, name string, fn func(ctx *Context, in I) (O, error), opts ...WorkflowOption) {
+	var o workflowOpts
+	for _, f := range opts {
+		f(&o)
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.workflows[name] = func(ctx *Context, raw json.RawMessage) (any, error) {
+	d := k.workflows[name]
+	if d == nil {
+		d = &workflowDef{versions: map[string]workflowFn{}}
+		k.workflows[name] = d
+	}
+	if !o.draining {
+		d.current = o.version
+		d.currents++
+	}
+	d.versions[o.version] = func(ctx *Context, raw json.RawMessage) (any, error) {
 		var in I
 		if len(raw) > 0 && string(raw) != "null" {
 			if err := json.Unmarshal(raw, &in); err != nil {
@@ -417,6 +506,12 @@ func Workflow[I, O any](k *Kairo, name string, fn func(ctx *Context, in I) (O, e
 // actions' steps.
 func (k *Kairo) Start(ctx context.Context) error {
 	k.mu.Lock()
+	for name, d := range k.workflows {
+		if d.currents != 1 {
+			k.mu.Unlock()
+			return fmt.Errorf("kairo: workflow %s: %d current versions (one, the others Draining)", name, d.currents)
+		}
+	}
 	specs := make([]map[string]any, 0, len(k.actions)+3)
 	remote := false
 	if k.concurrency > 0 {
@@ -731,10 +826,8 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 	if o.id == "" {
 		o.id = newID()
 	}
-	k.mu.Lock()
-	fn := k.workflows[name]
-	k.mu.Unlock()
-	if fn == nil {
+	version, ok := k.currentVersion(name)
+	if !ok {
 		return "", 0, nil, fmt.Errorf("kairo: no workflow %s", name)
 	}
 	if raw, err = json.Marshal(in); err != nil {
@@ -750,7 +843,7 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 		return "", 0, nil, err
 	}
 	token = newToken()
-	existing, err := k.rt.run(ctx, planWorkflow, map[string]any{"workflow": name, "input": raw}, o.id, runSpec{
+	existing, err := k.rt.run(ctx, planWorkflow, workflowInput(name, version, raw), o.id, runSpec{
 		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, workflow: name, meta: meta, drive: token})
 	if err != nil {
 		return "", 0, nil, err
@@ -774,6 +867,9 @@ func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, 
 		}
 		if ri.Finished() {
 			return done(id, ri)
+		}
+		if _, version, _, ok := workflowOf(ri.Input); ok && k.fnFor(name, version) == nil {
+			return nil, notHere(name, version) // not claimed: another process's
 		}
 		token = newToken()
 		now := k.rt.now()
@@ -815,7 +911,7 @@ func (k *Kairo) driveBackground(id, name string, in json.RawMessage, parent stri
 			delete(k.owned, id)
 			k.mu.Unlock()
 		}()
-		if _, err := k.drive(k.bgCtx, id, name, in, parent, token); err != nil && !errors.Is(err, errDrivenElsewhere) &&
+		if _, err := k.drive(k.bgCtx, id, name, in, parent, token); err != nil && !errors.Is(err, errDrivenElsewhere) && !errors.Is(err, errUnknownPlan) &&
 			!errors.Is(err, ErrStopped) && !errors.Is(err, ErrCancelled) {
 			k.rt.logger.Warn("kairo: driving a workflow", "workflow", id, "err", err)
 		}
@@ -833,41 +929,34 @@ func (k *Kairo) lostDrive(ctx context.Context, l LeaseRow) error {
 	if err != nil {
 		return err
 	}
-	var in struct {
-		Workflow string          `json:"workflow"`
-		Input    json.RawMessage `json:"input"`
-	}
-	if json.Unmarshal(ri.Input, &in) != nil || in.Workflow == "" {
+	name, version, input, ok := workflowOf(ri.Input)
+	if !ok {
 		return nil
 	}
-	k.mu.Lock()
-	fn := k.workflows[in.Workflow]
-	k.mu.Unlock()
-	if fn == nil {
-		return fmt.Errorf("%w: workflow %s", errUnknownPlan, in.Workflow) // another process's
+	if k.fnFor(name, version) == nil {
+		return notHere(name, version) // another process's
 	}
 	if k.mode == Suspend {
 		k.redrive(l.Run)
 		return nil
 	}
-	k.driveBackground(l.Run, in.Workflow, in.Input, ri.Parent, 0)
+	k.driveBackground(l.Run, name, input, ri.Parent, 0)
 	return nil
 }
 
 // runAs drives workflow id. parentCancelled reports whether the workflow
 // that made this one was cancelled in kairo (nil for a top-level one).
 func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, parent string, parentCancelled func() bool) (json.RawMessage, error) {
-	k.mu.Lock()
-	fn := k.workflows[name]
-	k.mu.Unlock()
-	if fn == nil {
+	current, ok := k.currentVersion(name)
+	if !ok {
 		return nil, fmt.Errorf("kairo: no workflow %s", name)
 	}
 	if err := k.planWorkflow(); err != nil {
 		return nil, err
 	}
-	wfIn := map[string]any{"workflow": name, "input": in}
-	if _, err := k.rt.run(ctx, planWorkflow, wfIn, id, runSpec{vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, workflow: name}); err != nil {
+	// A new run starts with the current version; one that exists goes on
+	// with the version it started with (ADR 0060).
+	if _, err := k.rt.run(ctx, planWorkflow, workflowInput(name, current, in), id, runSpec{vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, workflow: name}); err != nil {
 		return nil, err
 	}
 	ri, err := k.rt.get(ctx, id)
@@ -876,6 +965,11 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	}
 	if ri.Finished() {
 		return done(id, ri)
+	}
+	_, version, _, _ := workflowOf(ri.Input)
+	fn := k.fnFor(name, version)
+	if fn == nil {
+		return nil, notHere(name, version)
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -909,6 +1003,10 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 		switch {
 		case errors.Is(err, ErrSuspended):
 			return nil, ErrSuspended // goes on later
+		case errors.Is(err, errUnknownPlan):
+			// A child workflow of a version not here (ADR 0060): not this
+			// workflow's failure; a process with both versions drives it.
+			return nil, err
 		case cancelled():
 			if !self.Load() {
 				// Cancelled with the workflow above it: so is its run.
@@ -1240,15 +1338,13 @@ func (k *Kairo) redrive(id string) {
 			if err != nil || ri.Plan != planWorkflow || ri.Finished() {
 				return
 			}
-			var in struct {
-				Workflow string          `json:"workflow"`
-				Input    json.RawMessage `json:"input"`
-			}
-			if json.Unmarshal(ri.Input, &in) != nil || in.Workflow == "" {
+			name, _, input, ok := workflowOf(ri.Input)
+			if !ok {
 				return
 			}
-			// Suspended again, failed (recorded), cancelled, or driven elsewhere.
-			_, _ = k.drive(context.Background(), id, in.Workflow, in.Input, ri.Parent, 0)
+			// Suspended again, failed (recorded), cancelled, driven
+			// elsewhere, or of a version not here.
+			_, _ = k.drive(context.Background(), id, name, input, ri.Parent, 0)
 			k.mu.Lock()
 			more := k.again[id]
 			k.mu.Unlock()

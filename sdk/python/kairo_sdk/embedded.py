@@ -31,7 +31,7 @@ from typing import Any
 
 from .client import KairoError
 from .core import Core
-from .observe import LOGGER, RUN_SETTLED, RUN_STARTED, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
+from .observe import LOGGER, RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
 from .store import Changes, LeaseRow, RunRow, Store, TimerRow
 from .worker import Task, TaskContext
@@ -46,6 +46,36 @@ Admit = Callable[[Task, TaskContext], Awaitable["Callable[[], None] | Result"]]
 DONE = {"completed", "failed", "cancelled"}
 SETTLED = DONE | {"blocked"}  # will not go on by itself
 OUTCOMES = {"step_ok", "step_err", "step_wait"}
+#: Events applied under the current plan whatever it is (ADR 0060): an
+#: outcome that is in, cancel, resolve.
+SAFE = {"cancel", "resolve", "step_ok", "step_wait"}
+
+PLAN_WORKFLOW = "kairo.workflow"
+
+#: EffectWeakenedError's message, without the run.
+EFFECT_WEAKENED = "a real attempt is out and its action is no longer real"
+
+
+class EffectWeakenedError(KairoError):
+    """A call's action is no longer real while a real attempt of it is out
+    (ADR 0060). The call waits: restore the action, or settle the call with
+    resolve, resolve_failed or cancel."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(409, message)
+
+
+def _sdk_plan(name: str) -> bool:
+    """The SDK's own plans (one node each), which go on under the current
+    version (ADR 0060)."""
+    return name == PLAN_WORKFLOW or name.startswith("kairo.call/") or name.startswith("kairo.wait/")
+
+
+def _strictly_real(plan: dict[str, Any]) -> bool:
+    """Every action of plan is real and not retried on an unknown outcome."""
+    effects = plan.get("effects") or {}
+    idempotent = plan.get("idempotent") or {}
+    return bool(effects) and all(e == "real" and not idempotent.get(a) for a, e in effects.items())
 
 
 #: Finished trees removed per tick at most (ADR 0054); the rest next time.
@@ -87,6 +117,9 @@ def info(row: RunRow) -> dict[str, Any]:
         r["parent"] = row.parent
     if row.workflow:
         r["workflow"] = row.workflow
+    # A workflow run's version (ADR 0060).
+    if row.plan == PLAN_WORKFLOW and isinstance(r.get("input"), dict) and isinstance(r["input"].get("version"), str) and r["input"]["version"]:
+        r["version"] = r["input"]["version"]
     if row.meta is not None:
         r["meta"] = json.loads(row.meta)
     r["created_at"] = row.created_at
@@ -307,19 +340,69 @@ class Embedded:
     async def cancel(self, run_id: str) -> None:
         await self._process(run_id, [{"kind": "cancel", "at": self.now(), "error": "cancelled"}])
 
+    async def resolve(self, run_id: str, output: Any, error: str | None = None) -> None:
+        """Settles a step stopped for review (ADR 0058), or a real attempt out
+        that cannot go on (its action is no longer real, ADR 0060): it took
+        effect (with output), or it did not (error; the run fails)."""
+        row = await self.store.get(run_id)
+        if row is None:
+            raise KairoError(404, f"no run {run_id}")
+        ins = self.core.inspect(row.state)
+        # Stopped for review; or a real attempt out that cannot go on because
+        # its action is no longer real (ADR 0060): only then, not one out as
+        # usual (unknown marks it so to the core).
+        acts = ins.get("review") or []
+        out = False
+        if not acts and ins.get("intents"):
+            plan = self._plan(row.plan)
+            if plan is not None and row.hash != plan["hash"] and self._effect_weakened(plan, row):
+                acts, out = ins["intents"], True
+        if not acts:
+            raise KairoError(409, f"run {run_id} has no step stopped for review")
+        ev: dict[str, Any] = {"kind": "resolve", "at": self.now(), "act": acts[0]}
+        if out:
+            ev["unknown"] = True
+        if error is not None:
+            ev["error"] = error
+        else:
+            ev["data"] = output
+        await self._process(run_id, [ev])
+
     async def tick(self) -> None:
         """Takes up what no process is doing: steps whose lease expired and
-        timers that are due. Runs whose plan is not registered here are left alone."""
+        timers that are due. Runs whose plan is not registered here are left
+        alone. One run that cannot go on does not stop the others (ADR 0060):
+        it is logged and observed (RUN_STUCK), and put off a lease period, so
+        that it does not stay first of what each tick takes up. Raises only
+        when the store fails."""
         self._last_sweep = self.now()
         for lease in await self.store.expired_leases(self.now(), 1000):
-            if lease.act == 0:
-                # A workflow's driver stopped (ADR 0059).
-                if self.lost_drive is not None:
-                    await _skip_unknown_plan(self.lost_drive(lease))
-            else:
-                await _skip_unknown_plan(self._recover(lease))
+            if self._closed:
+                return
+            # A workflow's driver stopped (ADR 0059).
+            aw = self._recover(lease) if lease.act else (self.lost_drive(lease) if self.lost_drive is not None else None)
+            if aw is not None and await self._stuck(lease.run, aw):
+                try:
+                    await self.store.hand_over(LeaseRow(lease.run, lease.act, lease.attempt, "", self.now() + self.lease_ms))
+                except Exception as e:
+                    self.logger.warning("kairo: run %s: putting off a lease: %s", lease.run, e)
         for t in await self.store.due_timers(self.now(), 1000):
-            await _skip_unknown_plan(self._fire(t))
+            if self._closed:
+                return
+            if not await self._stuck(t.run, self._fire(t)):
+                continue
+            later = TimerRow(t.run, t.timer, t.act, self.now() + self.lease_ms)
+
+            def put_off(row: RunRow | None, later: TimerRow = later) -> Changes[None]:
+                ch: Changes[None] = Changes(None)
+                if row is not None:
+                    ch.set_timers.append(later)
+                return ch
+
+            try:
+                await self.store.with_run(t.run, put_off)
+            except Exception as e:
+                self.logger.warning("kairo: run %s: putting off a timer: %s", t.run, e)
         # Finished trees past the time they are kept (ADR 0054).
         if self.keep_ms is not None:
             await self.store.remove_finished(self.now() - self.keep_ms, REMOVE_PER_TICK)
@@ -409,6 +492,36 @@ class Embedded:
             self._renewal.cancel()
             self._renewal = None
 
+    async def _stuck(self, run_id: str, aw: Awaitable[Any]) -> bool:
+        """Awaits aw; logs and observes the run if it could not go on now (but
+        one whose plan is another process's): whether it could not."""
+        try:
+            await _skip_unknown_plan(aw)
+            return False
+        except Exception as e:
+            self.logger.warning("kairo: run %s cannot go on: %s", run_id, e)
+            self._observe(Observation(RUN_STUCK, run_id=run_id, error=str(e)))
+            return True
+
+    def _adoptable(self, run_id: str, plan: dict[str, Any], row: RunRow, events: list[dict[str, Any]]) -> None:
+        """Raises unless run row, which started under another version of plan,
+        may go on under the current one (ADR 0060). Only the SDK's own plans
+        (one node each) may; and not while a real attempt is out whose action
+        the current plan does not treat as real (it would be retried on an
+        unknown outcome, invariant 5), unless the events are safe under any
+        settings (an outcome that is in, cancel, resolve)."""
+        if not _sdk_plan(plan["name"]):
+            raise KairoError(409, f"run {run_id}: plan {row.plan} changed since it started")
+        if events and all(e["kind"] in SAFE for e in events):
+            return
+        if self._effect_weakened(plan, row):
+            raise EffectWeakenedError(f"run {run_id}: {EFFECT_WEAKENED} ({row.plan})")
+
+    def _effect_weakened(self, plan: dict[str, Any], row: RunRow) -> bool:
+        """Run row, of an SDK plan, has a real attempt out whose action plan
+        does not treat as real (ADR 0060)."""
+        return _sdk_plan(plan["name"]) and not _strictly_real(plan) and bool(self.core.inspect(row.state).get("intent_durable"))
+
     def _recover(self, lease: LeaseRow) -> Awaitable[bool]:
         return self._process(
             lease.run,
@@ -445,8 +558,9 @@ class Embedded:
             plan = start if start is not None else self._plan(row.plan)  # type: ignore[union-attr]
             if plan is None:
                 raise KairoError(404, f"run {run_id}: plan {row.plan} is not registered here")  # type: ignore[union-attr]
+            # Goes on under the current plan, if it may (ADR 0060): nxt has its hash.
             if row is not None and row.hash != plan["hash"]:
-                raise KairoError(409, f"run {run_id}: plan {row.plan} changed since it started")
+                self._adoptable(run_id, plan, row, events)
             state = row.state if row is not None else b""
             recorded: list[dict[str, Any]] = []
             commands: list[dict[str, Any]] = []

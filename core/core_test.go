@@ -428,6 +428,59 @@ func TestRealUnknownOutcomeNeedsReview(t *testing.T) {
 	x.checkReplay()
 }
 
+// IntentDurable: a real attempt out with its intent durable, until its
+// outcome; not an unprotected one, not before the intent (ADR 0060).
+func TestIntentDurable(t *testing.T) {
+	p := compile(t, `{"name":"i","root":{"kind":"par","nodes":[
+	  {"kind":"step","id":"send","action":"send"},{"kind":"step","id":"read","action":"llm"}]}}`)
+	x := newSim(t, p)
+	x.apply(Event{Kind: EvStart})
+	byID := map[string]Command{}
+	for _, c := range x.pending {
+		byID[p.Nodes[c.Node].ID] = c
+	}
+	durable := func(id string) bool { return x.s.Acts[byID[id].Act].IntentDurable() }
+	if durable("send") || durable("read") {
+		t.Fatal("durable before the intent")
+	}
+	x.apply(Event{Kind: EvIntent, Act: byID["send"].Act, Attempt: byID["send"].Attempt})
+	if !durable("send") || durable("read") {
+		t.Fatal("send's intent is durable; read has none")
+	}
+	x.apply(Event{Kind: EvStepOK, Act: byID["send"].Act, Attempt: byID["send"].Attempt, Data: json.RawMessage(`"sent"`)})
+	if a := x.s.Acts[byID["send"].Act]; a != nil && a.IntentDurable() {
+		t.Fatal("durable after its outcome")
+	}
+	x.checkReplay()
+}
+
+// A real attempt out with its intent durable is settled by EvResolve with
+// Unknown (only), as one stopped for review; its own outcome, coming after,
+// is ignored; an attempt without a durable intent is not resolved (ADR
+// 0060).
+func TestResolveRealAttemptOut(t *testing.T) {
+	p := compile(t, `{"name":"i","root":{"kind":"seq","nodes":[
+	  {"kind":"step","id":"send","action":"send"},{"kind":"step","id":"after","action":"llm"}]}}`)
+	x := newSim(t, p)
+	x.apply(Event{Kind: EvStart})
+	send := x.pending[0]
+	if _, err := Apply(p, x.s, &Event{Kind: EvResolve, Act: send.Act, Data: json.RawMessage(`1`)}, nil); err != ErrIgnored {
+		t.Fatalf("resolved before its intent: %v", err)
+	}
+	x.apply(Event{Kind: EvIntent, Act: send.Act, Attempt: send.Attempt})
+	if _, err := Apply(p, x.s, &Event{Kind: EvResolve, Act: send.Act, Data: json.RawMessage(`1`)}, nil); err != ErrIgnored {
+		t.Fatalf("resolved without asking for an attempt out (Unknown): %v", err)
+	}
+	x.apply(Event{Kind: EvResolve, Act: send.Act, Unknown: true, Data: json.RawMessage(`{"sent":true}`)})
+	if _, err := Apply(p, x.s, &Event{Kind: EvStepOK, Act: send.Act, Attempt: send.Attempt, Data: json.RawMessage(`"late"`)}, nil); err != ErrIgnored {
+		t.Fatalf("its late outcome: %v", err)
+	}
+	if x.s.Inflight != 1 || x.s.Status != StatusRunning {
+		t.Fatalf("inflight %d status %v (after should run)", x.s.Inflight, x.s.Status)
+	}
+	x.checkReplay()
+}
+
 func TestRealIdempotentRetriesOnUnknown(t *testing.T) {
 	x := newSim(t, compile(t, `{"name":"r","root":{"kind":"step","id":"pay","action":"pay"}}`))
 	n := 0

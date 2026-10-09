@@ -9,10 +9,12 @@ API); ``Kairo`` declares actions and workflows written as code.
 
 from .backend import Backend, EmbeddedBackend, HttpBackend
 from .client import Client, KairoError
+from .embedded import EFFECT_WEAKENED, EffectWeakenedError
 from .http import SignatureError
 from .observe import (
     RUN_SETTLED,
     RUN_STARTED,
+    RUN_STUCK,
     STEP_FAILED,
     STEP_FINISHED,
     STEP_OK,
@@ -62,6 +64,9 @@ __all__ = [
     "Observer",
     "RUN_SETTLED",
     "RUN_STARTED",
+    "RUN_STUCK",
+    "EFFECT_WEAKENED",
+    "EffectWeakenedError",
     "STEP_FAILED",
     "STEP_FINISHED",
     "STEP_OK",

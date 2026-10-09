@@ -23,6 +23,9 @@ RUN_STARTED = "run.started"
 RUN_SETTLED = "run.settled"
 STEP_STARTED = "step.started"
 STEP_FINISHED = "step.finished"
+#: A run could not go on now (error says why): its event waits, and the
+#: others went on (ADR 0060).
+RUN_STUCK = "run.stuck"
 
 # How a step's attempt ended (Observation.status of STEP_FINISHED).
 STEP_OK = "ok"
@@ -44,7 +47,7 @@ class Observation:
     STEP_PENDING). duration: how long the handler ran here (seconds; None
     for an outcome that came on the callback)."""
 
-    kind: str  # RUN_STARTED, RUN_SETTLED, STEP_STARTED, STEP_FINISHED
+    kind: str  # RUN_STARTED, RUN_SETTLED, STEP_STARTED, STEP_FINISHED, RUN_STUCK
     at: int = 0  # unix ms
     run_id: str = ""
     parent: str = ""  # the run that made it (a workflow, of its calls)

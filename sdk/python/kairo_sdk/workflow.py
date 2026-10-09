@@ -151,6 +151,41 @@ def _to_wire(r: Result) -> tuple[dict[str, Any], bool]:
     return {"output": r.output}, False
 
 
+class _NotHere(KairoError):
+    """A workflow run whose version this process does not have (another
+    process's to drive, ADR 0060)."""
+
+    def __init__(self, name: str, version: str) -> None:
+        super().__init__(404, f"workflow {name} version {json.dumps(version)} is not registered here")
+
+
+class _WorkflowDef:
+    """A workflow's versions (ADR 0060): the current one starts new runs; the
+    others only finish the runs they started."""
+
+    def __init__(self) -> None:
+        self.versions: dict[str, Callable[..., Awaitable[Any]]] = {}
+        self.current = ""
+        self.currents = 0
+
+
+def _workflow_input(name: str, version: str, input: Any) -> dict[str, Any]:
+    """A workflow run's input: the workflow, its version (when it has one)
+    and the input it was given."""
+    w: dict[str, Any] = {"workflow": name, "input": input}
+    if version:
+        w["version"] = version
+    return w
+
+
+def _workflow_of(input: Any) -> tuple[str, str, Any] | None:
+    """Reads a workflow run's input: its workflow, version and input."""
+    if not isinstance(input, dict) or not isinstance(input.get("workflow"), str) or not input["workflow"]:
+        return None
+    v = input.get("version")
+    return input["workflow"], v if isinstance(v, str) else "", input.get("input")
+
+
 class _DrivenElsewhere(Exception):
     """Another process holds the workflow's drive lease (ADR 0059)."""
 
@@ -354,7 +389,7 @@ class Kairo:
         self._ttl = idempotency_ttl
         self._concurrency = concurrency
         self._actions: dict[str, _Action] = {}
-        self._workflows: dict[str, Callable[..., Awaitable[Any]]] = {}
+        self._workflows: dict[str, _WorkflowDef] = {}
         self._planned: set[str] = set()
         # The stops of the workflows driven here: set when the process closes.
         self._stops: set[asyncio.Future[None]] = set()
@@ -446,17 +481,38 @@ class Kairo:
 
         return register
 
-    def workflow(self, name: str):
-        """Declares a workflow: ``async def fn(ctx, input)``."""
+    def workflow(self, name: str, *, version: str = "", draining: bool = False):
+        """Declares a workflow: ``async def fn(ctx, input)``; or one of its
+        versions (ADR 0060). A run is driven by the version it started with,
+        to its end: a process drives only the runs whose version it has.
+        draining: this version only finishes the runs that started with it;
+        new runs start with the current one (the one not draining)."""
 
         def register(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-            self._workflows[name] = fn
+            d = self._workflows.setdefault(name, _WorkflowDef())
+            if not draining:
+                d.current = version
+                d.currents += 1
+            d.versions[version] = fn
             return fn
 
         return register
 
+    def _fn_for(self, name: str, version: str) -> Callable[..., Awaitable[Any]] | None:
+        """Workflow name's function at version (None: not here)."""
+        d = self._workflows.get(name)
+        return d.versions.get(version) if d is not None else None
+
+    def _current_version(self, name: str) -> str | None:
+        """The version new runs of workflow name start with (None: no such workflow)."""
+        d = self._workflows.get(name)
+        return d.current if d is not None and d.currents > 0 else None
+
     async def start(self) -> None:
         """Registers the actions and their plans, and starts running the actions' steps."""
+        for name, d in self._workflows.items():
+            if d.currents != 1:
+                raise ValueError(f"workflow {name}: {d.currents} current versions (one, the others draining)")
         self._loop = asyncio.get_running_loop()
         self._life_future()
         specs: list[dict[str, Any]] = []
@@ -599,13 +655,15 @@ class Kairo:
                     info = await self.backend.get(id)
                 except KairoError:
                     return
-                inp = info.get("input") or {}
-                if info.get("plan") != PLAN_WORKFLOW or finished(info) or not inp.get("workflow"):
+                w = _workflow_of(info.get("input"))
+                if info.get("plan") != PLAN_WORKFLOW or finished(info) or w is None:
                     return
                 try:
-                    await self._drive(id, inp["workflow"], inp.get("input"), info.get("parent"), 0)
+                    await self._drive(id, w[0], w[2], info.get("parent"), 0)
                 except Exception:
-                    pass  # suspended again, failed (recorded), cancelled, or driven elsewhere
+                    # Suspended again, failed (recorded), cancelled, driven
+                    # elsewhere, or of a version not here.
+                    pass
                 if id not in self._again:
                     return
 
@@ -955,13 +1013,14 @@ class Kairo:
         """Makes workflow name's run as id (or finds it). A new one is leased to
         this process to drive, in the same transaction: its token (0: it
         existed, or no leases here)."""
-        if name not in self._workflows:
+        version = self._current_version(name)
+        if version is None:
             raise KeyError(f"no workflow {name}")
         await self._plan_workflow()
         token = new_token() if self._rt is not None else 0
         started = await self.backend.run(
             PLAN_WORKFLOW,
-            {"workflow": name, "input": input},
+            _workflow_input(name, version, input),
             run_id=id,
             vars={"started_at": int(time.time() * 1000)},
             workflow=name,
@@ -981,6 +1040,9 @@ class Kairo:
             info = await self.backend.get(id)
             if finished(info):
                 return _done(id, info)
+            w = _workflow_of(info.get("input"))
+            if w is not None and self._fn_for(name, w[1]) is None:
+                raise _NotHere(name, w[1])  # not claimed: another process's
             token = new_token()
             if not await rt.claim_drive(id, token):
                 raise _DrivenElsewhere(f"workflow {id} is driven by another process")
@@ -1008,8 +1070,8 @@ class Kairo:
         async def go() -> None:
             try:
                 await self._drive(id, name, input, parent, token)
-            except (_DrivenElsewhere, StoppedError, Cancelled):
-                pass  # stopped, cancelled or driven elsewhere: nothing to do here
+            except (_DrivenElsewhere, StoppedError, Cancelled, _NotHere):
+                pass  # stopped, cancelled, driven elsewhere, or of a version not here: nothing to do here
             except Exception as e:
                 self._logger.warning("kairo: workflow %s: %s", id, e)
             finally:
@@ -1033,15 +1095,15 @@ class Kairo:
             # Nothing left to drive.
             await rt.end_drive(lease.run, lease.attempt, False, lease.owner)
             return
-        inp = info.get("input") or {}
-        if not inp.get("workflow"):
+        w = _workflow_of(info.get("input"))
+        if w is None:
             return
-        if inp["workflow"] not in self._workflows:
-            raise KairoError(404, f"workflow {inp['workflow']} is not registered here")  # another process's
+        if self._fn_for(w[0], w[1]) is None:
+            raise _NotHere(w[0], w[1])  # another process's
         if self.suspend:
             self._redrive(lease.run)
             return
-        self._drive_background(lease.run, inp["workflow"], inp.get("input"), info.get("parent"), 0)
+        self._drive_background(lease.run, w[0], w[2], info.get("parent"), 0)
 
     async def signal(self, id: str, name: str, payload: Any = None) -> None:
         """Sends a signal to the first wait for it in workflow id that has not
@@ -1096,16 +1158,38 @@ class Kairo:
         (suspend mode: it stops when it is driven next)."""
         await self.backend.cancel(id)
 
+    async def resolve(self, call_id: str, output: Any = None) -> None:
+        """Settles call call_id, stopped for review (blocked: a real step whose
+        outcome was unknown) or with a real attempt out that cannot go on (its
+        action is no longer real, ADR 0060), with the output it had: it did
+        take effect. The embedded runtime only."""
+        await self._settle_call(call_id, output, None)
+
+    async def resolve_failed(self, call_id: str, message: str = "resolved as failed") -> None:
+        """Settles call call_id as resolve does, as not done: it failed with message."""
+        await self._settle_call(call_id, None, message or "resolved as failed")
+
+    async def _settle_call(self, call_id: str, output: Any, error: str | None) -> None:
+        resolve = getattr(self.backend, "resolve", None)
+        if resolve is None:
+            raise RuntimeError("resolve needs the embedded backend")
+        await resolve(call_id, output, error)
+        if self.suspend:
+            await self._settle()
+            await self._wake_up()
+
     async def _run_as(self, name: str, input: Any, id: str, parent: str | None = None, up: Context | None = None) -> Any:
         """Drives workflow id here. parent: the workflow that made it, if any;
         up, its context when it runs inside it (a child workflow)."""
-        fn = self._workflows.get(name)
-        if fn is None:
+        current = self._current_version(name)
+        if current is None:
             raise KeyError(f"no workflow {name}")
         await self._plan_workflow()
+        # A new run starts with the current version; one that exists goes on
+        # with the version it started with (ADR 0060).
         started = await self.backend.run(
             PLAN_WORKFLOW,
-            {"workflow": name, "input": input},
+            _workflow_input(name, current, input),
             run_id=id,
             vars={"started_at": int(time.time() * 1000)},
             parent=parent,
@@ -1114,6 +1198,12 @@ class Kairo:
         info = await self.backend.get(id)
         if finished(info):
             return _done(id, info)
+        # kairod does not report a run's input: there, the current version.
+        w = _workflow_of(info.get("input")) if "input" in info else None
+        version = w[1] if w is not None else ("" if "input" in info else current)
+        fn = self._fn_for(name, version)
+        if fn is None:
+            raise _NotHere(name, version)
         # (The embedded runtime keeps the calls while the workflow runs, ADR 0054.)
         if started.get("existing") and not getattr(self.backend, "keeps_calls", False):
             at = int((info.get("vars") or {}).get("started_at") or 0)
@@ -1185,6 +1275,10 @@ class Kairo:
                 value = body.result()
             except Suspended:
                 raise  # goes on later
+            except _NotHere:
+                # A child workflow whose version is not here: this one is left
+                # to another process, not failed (ADR 0060).
+                raise
             except (Exception, asyncio.CancelledError) as e:
                 # (A CancelledError here is not this driver's: the function's own.)
                 error = str(e) or type(e).__name__

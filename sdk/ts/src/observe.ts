@@ -23,6 +23,8 @@ export const ObservationKind = {
 	runSettled: 'run.settled',
 	stepStarted: 'step.started',
 	stepFinished: 'step.finished',
+	/** A run could not go on now (error says why): its event waits, and the others went on (ADR 0060). */
+	runStuck: 'run.stuck',
 } as const;
 export type ObservationKind = (typeof ObservationKind)[keyof typeof ObservationKind];
 
@@ -62,7 +64,7 @@ export interface Observation {
 	 * (StepStatus).
 	 */
 	status?: string;
-	/** run.settled, step.finished: the error, if any. */
+	/** run.settled, step.finished: the error, if any. run.stuck: why it cannot go on. */
 	error?: string;
 	stepId?: string;
 	attempt?: number;

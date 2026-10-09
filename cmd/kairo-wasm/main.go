@@ -78,6 +78,17 @@ func compile(p, n uint32) int32 {
 	return int32(len(out))
 }
 
+//go:wasmexport kairo_inspect
+func inspect(sp, sn uint32) int32 {
+	r, err := wasmcore.Inspect(bytesAt(sp, sn))
+	if err != nil {
+		return fail(err)
+	}
+	b, _ := json.Marshal(r)
+	out = append(out[:0], b...)
+	return int32(len(out))
+}
+
 //go:wasmexport kairo_apply
 func apply(plan int32, rp, rn, sp, sn, ep, en uint32, traced int32) int32 {
 	state, r, err := c.Apply(int(plan), string(bytesAt(rp, rn)), bytesAt(sp, sn), bytesAt(ep, en), traced != 0)

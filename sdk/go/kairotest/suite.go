@@ -43,6 +43,10 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"SubmitAwaitAndList":               testSubmitAwaitAndList,
 		"RetriesAndTypedErrors":            testRetriesAndTypedErrors,
 		"Observe":                          testObserve,
+		"VersionsArePinned":                testVersionsArePinned,
+		"SettingsChangeUnderACall":         testSettingsChangeUnderACall,
+		"EffectIsNotWeakened":              testEffectIsNotWeakened,
+		"ChildVersionNotHere":              testChildVersionNotHere,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
 	}
@@ -968,5 +972,274 @@ func testObserve(t *testing.T, open Opener) {
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("observed:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+// A run goes on with the version it started with; new runs start with the
+// current one; a process without a run's version leaves it (ADR 0060).
+func testVersionsArePinned(t *testing.T, open Opener) {
+	runs := &counts{m: map[string]int{}}
+	start := func(versions ...string) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Lease: 100 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, v := range versions {
+			opts := []kairo.WorkflowOption{kairo.WorkflowVersion(v)}
+			if i < len(versions)-1 {
+				opts = append(opts, kairo.Draining())
+			}
+			kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+				runs.add(v)
+				p, err := kairo.WaitFor[string](ctx, "go")
+				return v + ":" + p, err
+			}, opts...)
+		}
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k1 := start("1")
+	if _, err := k1.Submit(context.Background(), "w", nil, kairo.WithID("ver-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return runs.get("1") == 1 })
+	k1.Close() // its drive lease is left expired
+
+	// Only version 2 here: it does not drive ver-1.
+	k2 := start("2")
+	time.Sleep(300 * time.Millisecond) // sweeps of k2 see ver-1's lease
+	if runs.get("2") != 0 {
+		t.Fatalf("version 2 drove a version 1 run")
+	}
+	k2.Close()
+
+	k3 := start("1", "2")
+	defer k3.Close()
+	if err := k3.Signal(context.Background(), "ver-1", "go", "x"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := kairo.Await[string](ctx, k3, "ver-1"); err != nil || out != "1:x" {
+		t.Fatalf("%q %v", out, err)
+	}
+	if _, err := k3.Submit(context.Background(), "w", nil, kairo.WithID("ver-2")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return k3.Signal(context.Background(), "ver-2", "go", "y") == nil })
+	if out, err := kairo.Await[string](ctx, k3, "ver-2"); err != nil || out != "2:y" {
+		t.Fatalf("%q %v", out, err)
+	}
+	for id, v := range map[string]string{"ver-1": "1", "ver-2": "2"} {
+		if r, err := k3.Get(context.Background(), id); err != nil || r.Version != v {
+			t.Fatalf("%s: %+v %v", id, r, err)
+		}
+	}
+	bad, _ := kairo.Open(context.Background(), kairo.Options{Store: open()})
+	kairo.Workflow(bad, "w", func(*kairo.Context, any) (any, error) { return nil, nil }, kairo.WorkflowVersion("1"))
+	kairo.Workflow(bad, "w", func(*kairo.Context, any) (any, error) { return nil, nil }, kairo.WorkflowVersion("2"))
+	if err := bad.Start(context.Background()); err == nil {
+		t.Fatal("two current versions")
+	}
+	bad.Close()
+}
+
+// An action's settings change while a call of it waits to retry: the call
+// goes on under the new ones (it used to stop for good).
+func testSettingsChangeUnderACall(t *testing.T, open Opener) {
+	start := func(opts ...kairo.ActionOption) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Mode: kairo.Suspend})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) { return kairo.Call[string](ctx, "a", nil) })
+		kairo.Action(k, "a", kairo.Unprotected, func(tc *kairo.TaskContext, _ any) (string, error) {
+			if tc.Attempt == 1 {
+				return "", kairo.Retryable(errors.New("busy"))
+			}
+			return "ok", nil
+		}, append([]kairo.ActionOption{kairo.Backoff(50 * time.Millisecond)}, opts...)...)
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k := start()
+	if _, err := kairo.Run[string](context.Background(), k, "w", nil, kairo.WithID("set-1")); !errors.Is(err, kairo.ErrSuspended) {
+		t.Fatalf("%v", err)
+	}
+	k.Close()
+	k = start(kairo.Timeout(time.Minute)) // a deploy changed its settings
+	defer k.Close()
+	waitUntil(t, func() bool {
+		if _, _, err := k.Tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		r, err := k.Get(context.Background(), "set-1")
+		return err == nil && r.Finished()
+	})
+	if out, err := kairo.Run[string](context.Background(), k, "w", nil, kairo.WithID("set-1")); err != nil || out != "ok" {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
+// A real attempt is out when its action is changed to unprotected: the
+// call does not go on under the new settings (it would be retried on its
+// unknown outcome); Tick goes on with the others; ResolveFailed settles it.
+func testEffectIsNotWeakened(t *testing.T, open Opener) {
+	var mu sync.Mutex
+	var stuck []string
+	start := func(mode kairo.Mode, effect kairo.Effect) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Mode: mode, Lease: 100 * time.Millisecond,
+			Observe: func(o kairo.Observation) {
+				if o.Kind == kairo.ObsRunStuck {
+					mu.Lock()
+					stuck = append(stuck, o.Error)
+					mu.Unlock()
+				}
+			}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "pay", effect, func(tc *kairo.TaskContext, _ any) (string, error) {
+			<-tc.Done() // the process stops while it runs
+			return "", tc.Err()
+		})
+		kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+			if _, err := kairo.Call[string](ctx, "pay", nil); err != nil {
+				var ce *kairo.CallError
+				if errors.As(err, &ce) {
+					return "resolved: " + ce.Message, nil
+				}
+				return "", err
+			}
+			return "paid", nil
+		})
+		kairo.Workflow(k, "nap", func(ctx *kairo.Context, _ any) (string, error) {
+			return "rested", ctx.Sleep(200 * time.Millisecond)
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	// A resident process: pay's real attempt is out (its intent recorded)
+	// when it stops; nap's timer is in the store.
+	k := start(kairo.Wait, kairo.Real)
+	for _, w := range []string{"w", "nap"} {
+		if _, err := k.Submit(context.Background(), w, nil, kairo.WithID(w+"-1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var call string
+	waitUntil(t, func() bool {
+		pay, _ := k.Children(context.Background(), "w-1")
+		nap, _ := k.Children(context.Background(), "nap-1")
+		if len(pay) == 1 {
+			call = pay[0].RunID
+		}
+		return call != "" && len(nap) == 1
+	})
+	k.Close()
+
+	k = start(kairo.Suspend, kairo.Unprotected) // a deploy made pay unprotected
+	defer k.Close()
+	weakened := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, e := range stuck {
+			if strings.Contains(e, kairo.ErrEffectWeakened.Error()) {
+				return true
+			}
+		}
+		return false
+	}
+	// Ticks, as a scheduler's, until pay's expired lease has been seen to
+	// be stuck and nap's timer has fired and nap has finished.
+	waitUntil(t, func() bool {
+		if _, _, err := k.Tick(context.Background()); err != nil {
+			t.Fatalf("tick: %v", err)
+		}
+		r, err := k.Get(context.Background(), "nap-1")
+		return err == nil && r.Finished() && weakened()
+	})
+	if out, err := kairo.Run[string](context.Background(), k, "nap", nil, kairo.WithID("nap-1")); err != nil || out != "rested" {
+		t.Fatalf("the other run did not go on: %q %v", out, err)
+	}
+	if r, _ := k.Get(context.Background(), call); r.Finished() {
+		t.Fatalf("the call went on: %+v", r)
+	}
+	if err := k.ResolveFailed(context.Background(), call, "not paid"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := kairo.Run[string](context.Background(), k, "w", nil, kairo.WithID("w-1")); err != nil || !strings.Contains(out, "not paid") {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
+// A child workflow goes on with the version it started with: a process
+// that has its parent's version but not the child's leaves both, without
+// failing the parent; one with both finishes them (ADR 0060).
+func testChildVersionNotHere(t *testing.T, open Opener) {
+	runs := &counts{m: map[string]int{}}
+	start := func(childVersions ...string) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Lease: 100 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Workflow(k, "parent", func(ctx *kairo.Context, _ any) (string, error) {
+			runs.add("parent")
+			return kairo.Child[string](ctx, "child", nil)
+		})
+		for i, v := range childVersions {
+			opts := []kairo.WorkflowOption{kairo.WorkflowVersion(v)}
+			if i < len(childVersions)-1 {
+				opts = append(opts, kairo.Draining())
+			}
+			kairo.Workflow(k, "child", func(ctx *kairo.Context, _ any) (string, error) {
+				runs.add("child " + v)
+				p, err := kairo.WaitFor[string](ctx, "go")
+				return v + ":" + p, err
+			}, opts...)
+		}
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k := start("1")
+	if _, err := k.Submit(context.Background(), "parent", nil, kairo.WithID("fam-1")); err != nil {
+		t.Fatal(err)
+	}
+	var child string
+	waitUntil(t, func() bool {
+		kids, _ := k.Children(context.Background(), "fam-1")
+		if len(kids) == 1 {
+			child = kids[0].RunID
+		}
+		return child != "" && runs.get("child 1") == 1
+	})
+	k.Close()
+
+	// The parent's version, not the child's: it takes the parent up.
+	k = start("2")
+	waitUntil(t, func() bool { return runs.get("parent") >= 2 })
+	if r, err := k.Get(context.Background(), "fam-1"); err != nil || r.Finished() {
+		t.Fatalf("the parent ended without its child's version: %+v %v", r, err)
+	}
+	if runs.get("child 2") != 0 {
+		t.Fatal("version 2 drove a version 1 child")
+	}
+	k.Close()
+
+	k = start("1", "2")
+	defer k.Close()
+	waitUntil(t, func() bool { return k.Signal(context.Background(), child, "go", "x") == nil })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := kairo.Await[string](ctx, k, "fam-1"); err != nil || out != "1:x" {
+		t.Fatalf("%q %v", out, err)
 	}
 }

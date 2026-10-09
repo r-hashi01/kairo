@@ -16,6 +16,7 @@
 //	kairo_apply(plan, run, runLen, state, stateLen, event, eventLen, traced) -> n
 //	    (result: u32 little-endian length of the new state, the state, then
 //	    wasmcore.Result as JSON)
+//	kairo_inspect(state, stateLen) -> n             (result: wasmcore.Inspection as JSON, ADR 0060)
 //	kairo_result() -> ptr
 package main
 
