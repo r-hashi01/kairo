@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -75,4 +76,43 @@ func TestPostgres(t *testing.T) {
 			return s
 		}
 	})
+}
+
+// A transaction whose context ends while it runs (the process closes)
+// still ends: it does not leave SQLite's write lock held from the other
+// processes on the file. The context ends at moments spread over the
+// transaction, beginning and commit included.
+func TestSQLiteTransactionEndsWithItsContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kairo.db")
+	a, b := openSQLite(t, path), openSQLite(t, path)
+	for _, s := range []kairo.Store{a, b} {
+		if err := s.Init(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	timers := func(run string) func(*kairo.RunRow) (*kairo.Changes, error) {
+		return func(*kairo.RunRow) (*kairo.Changes, error) {
+			ts := make([]kairo.TimerRow, 20)
+			for i := range ts {
+				ts[i] = kairo.TimerRow{Run: run, Timer: uint32(i + 1), Act: 1, At: 1}
+			}
+			return &kairo.Changes{SetTimers: ts}, nil
+		}
+	}
+	for i := range 200 {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Duration(i%40)*25*time.Microsecond, cancel)
+		_ = a.WithRun(ctx, "r", timers("r"))
+		cancel()
+		done := make(chan error, 1)
+		go func() { done <- b.WithRun(context.Background(), "s", timers("s")) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("after %d: another process could not write: %v", i, err)
+			}
+		case <-time.After(4 * time.Second): // under the store's busy timeout (5s)
+			t.Fatalf("after %d: another process waits for a lock left held", i)
+		}
+	}
 }

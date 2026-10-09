@@ -224,15 +224,23 @@ func (s *SQLStore) tx(ctx context.Context, fn func(ex execer) error) error {
 			return err
 		}
 		defer conn.Close()
+		// The transaction ends however ctx does: a connection back in the
+		// pool with a transaction open would hold SQLite's write lock from
+		// every other process (database is locked).
+		end := context.Background()
 		if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+			_, _ = conn.ExecContext(end, `ROLLBACK`) // if it began after all
 			return err
 		}
 		if err := fn(conn); err != nil {
-			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+			_, _ = conn.ExecContext(end, `ROLLBACK`)
 			return err
 		}
-		_, err = conn.ExecContext(ctx, `COMMIT`)
-		return err
+		if _, err := conn.ExecContext(end, `COMMIT`); err != nil {
+			_, _ = conn.ExecContext(end, `ROLLBACK`)
+			return err
+		}
+		return nil
 	}
 	t, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
