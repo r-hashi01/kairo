@@ -1,6 +1,6 @@
 [project]
 name = "kairo-sdk"
-version = "0.1.1"
+version = "0.2.0"
 description = "Durable workflows that run inside your Python process: a WASM core and your database (SQLite or PostgreSQL). No workflow server."
 requires-python = ">=3.12"
 license = "MIT"
