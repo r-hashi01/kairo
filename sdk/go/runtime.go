@@ -51,6 +51,8 @@ type RunInfo struct {
 	Meta     json.RawMessage `json:"meta,omitempty"`
 	Created  time.Time       `json:"created_at"`
 	Updated  time.Time       `json:"updated_at"`
+	// trimmed: finished, its result no longer kept (kairod, ADR 0027).
+	trimmed bool
 }
 
 // Finished reports whether the run is over (completed, failed or

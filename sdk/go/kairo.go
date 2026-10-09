@@ -159,6 +159,9 @@ type Options struct {
 	HTTP HTTPOptions
 	// Now is the clock (tests).
 	Now func() time.Time
+	// WorkerToken is kairod's worker token, if it has one (Connect only,
+	// ADR 0037).
+	WorkerToken string
 	// ManualTimers: timers are kept in the store but not armed in this
 	// process: only Tick fires them. For tests on a clock they move
 	// (kairotest.New), and for schedulers that own time.
@@ -168,6 +171,8 @@ type Options struct {
 // Kairo declares actions and workflows and drives them.
 type Kairo struct {
 	rt      *runtime
+	runs    runs    // where the runs live: rt, or remote
+	remote  *remote // Connect: kairod (ADR 0058)
 	mode    Mode
 	wake    func(time.Time) error
 	nowFn   func() time.Time
@@ -328,6 +333,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}}
+	k.runs = rt
 	k.bgCtx, k.bgCancel = context.WithCancel(context.Background())
 	k.redriveCond = sync.NewCond(&k.redriveMu)
 	k.client = k.httpClient()
@@ -562,6 +568,13 @@ func (k *Kairo) Start(ctx context.Context) error {
 	if err := k.rt.registerActions(js, k.serve); err != nil {
 		return err
 	}
+	if k.remote != nil {
+		// kairod runs the steps: of this process's actions, through its
+		// worker connection (ADR 0058).
+		if err := k.remote.start(ctx, k, specs); err != nil {
+			return err
+		}
+	}
 	for _, s := range specs {
 		a := s["action"].(string)
 		root := map[string]any{"kind": "step", "id": "call", "action": a, "input": map[string]any{"in": "$input.in"}}
@@ -576,6 +589,9 @@ func (k *Kairo) Start(ctx context.Context) error {
 	k.rt.lostDrive, k.rt.missingPlan = k.lostDrive, k.missingPlan
 	k.rt.leaseParents = k.mode == Suspend
 	k.rt.mu.Unlock()
+	if k.remote != nil {
+		return nil // kairod takes up what stopped processes left
+	}
 	if k.mode == Suspend {
 		// A call that settles drives its workflow on (its id is the
 		// workflow's id, "/", the call's key).
@@ -648,6 +664,11 @@ func (k *Kairo) plan(name string, root, vars map[string]any) error {
 	}
 	if _, err := k.rt.registerPlan(js); err != nil {
 		return err
+	}
+	if k.remote != nil {
+		if err := k.remote.registerPlan(context.Background(), js); err != nil {
+			return err
+		}
 	}
 	k.mu.Lock()
 	k.planned[name] = true
@@ -798,7 +819,7 @@ func Await[O any](ctx context.Context, k *Kairo, id string) (O, error) {
 
 func (k *Kairo) await(ctx context.Context, id string) (json.RawMessage, error) {
 	if k.mode == Suspend {
-		ri, err := k.rt.get(ctx, id)
+		ri, err := k.runs.get(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -811,7 +832,7 @@ func (k *Kairo) await(ctx context.Context, id string) (json.RawMessage, error) {
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer context.AfterFunc(k.bgCtx, cancel)()
-	ri, err := k.rt.waitDone(wctx, id)
+	ri, err := k.runs.waitDone(wctx, id)
 	if err != nil {
 		if wctx.Err() != nil {
 			return nil, fmt.Errorf("workflow %s: %w", id, ErrStopped)
@@ -848,7 +869,7 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 		return "", 0, nil, err
 	}
 	token = newToken()
-	existing, err := k.rt.run(ctx, planWorkflow, workflowInput(name, version, raw), o.id, runSpec{
+	existing, err := k.runs.run(ctx, planWorkflow, workflowInput(name, version, raw), o.id, runSpec{
 		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, workflow: name, meta: meta, drive: token})
 	if err != nil {
 		return "", 0, nil, err
@@ -865,8 +886,12 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 // lease when it waits (suspend mode: what it waits for drives it on), an
 // expired lease when it stopped otherwise (a tick takes it up).
 func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, parent string, token int32) (json.RawMessage, error) {
+	if k.remote != nil {
+		// kairod: no drive leases; driven where it is run.
+		return k.runAs(ctx, name, in, id, parent, nil)
+	}
 	if token == 0 {
-		ri, err := k.rt.get(ctx, id)
+		ri, err := k.runs.get(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -926,7 +951,7 @@ func (k *Kairo) driveBackground(id, name string, in json.RawMessage, parent stri
 // lostDrive takes up workflow l.Run, whose driver stopped (its drive lease
 // expired, ADR 0059).
 func (k *Kairo) lostDrive(ctx context.Context, l LeaseRow) error {
-	ri, err := k.rt.get(ctx, l.Run)
+	ri, err := k.runs.get(ctx, l.Run)
 	if errors.Is(err, ErrUnknownRun) || (err == nil && (ri.Plan != planWorkflow || ri.Finished())) {
 		// Nothing left to drive.
 		return k.rt.store.EndDrive(ctx, l.Run, l.Owner, l.Attempt, k.rt.now(), false)
@@ -961,17 +986,20 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	}
 	// A new run starts with the current version; one that exists goes on
 	// with the version it started with (ADR 0060).
-	if _, err := k.rt.run(ctx, planWorkflow, workflowInput(name, current, in), id, runSpec{vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, workflow: name}); err != nil {
+	if _, err := k.runs.run(ctx, planWorkflow, workflowInput(name, current, in), id, runSpec{vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, workflow: name}); err != nil {
 		return nil, err
 	}
-	ri, err := k.rt.get(ctx, id)
+	ri, err := k.runs.getInput(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if ri.Finished() {
 		return done(id, ri)
 	}
-	_, version, _, _ := workflowOf(ri.Input)
+	_, version, _, ok := workflowOf(ri.Input)
+	if !ok && k.remote != nil {
+		version = current // a kairod that does not report the input
+	}
 	fn := k.fnFor(name, version)
 	if fn == nil {
 		return nil, notHere(name, version)
@@ -996,7 +1024,7 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	if k.mode == Wait {
 		// The workflow's own run ends when it is cancelled: stop the calls.
 		go func() {
-			if r, err := k.rt.wait(cctx, id); err == nil && r.Status == "cancelled" {
+			if r, err := k.runs.wait(cctx, id); err == nil && r.Status == "cancelled" {
 				self.Store(true)
 				cancel()
 			}
@@ -1015,21 +1043,21 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 		case cancelled():
 			if !self.Load() {
 				// Cancelled with the workflow above it: so is its run.
-				_ = k.rt.cancel(context.Background(), id)
+				_ = k.runs.cancel(context.Background(), id)
 			}
 			return nil, fmt.Errorf("workflow %s: %w", id, ErrCancelled)
 		case cctx.Err() != nil:
 			// Not driven here any more; the workflow stays, to go on later.
 			return nil, fmt.Errorf("workflow %s: %w", id, ErrStopped)
 		}
-		_ = k.rt.signal(context.Background(), id, "done", map[string]any{"ok": false, "error": err.Error()})
+		_ = k.runs.signal(context.Background(), id, "done", map[string]any{"ok": false, "error": err.Error()})
 		return nil, &WorkflowError{ID: id, Message: err.Error(), Err: err}
 	}
 	js, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	if err := k.rt.signal(context.Background(), id, "done", map[string]any{"ok": true, "value": json.RawMessage(js)}); err != nil {
+	if err := k.runs.signal(context.Background(), id, "done", map[string]any{"ok": true, "value": json.RawMessage(js)}); err != nil {
 		return nil, err
 	}
 	return js, nil
@@ -1047,6 +1075,9 @@ func callWorkflow(fn workflowFn, c *Context, in json.RawMessage) (v any, err err
 
 // done is the result of a finished workflow run.
 func done(id string, ri RunInfo) (json.RawMessage, error) {
+	if ri.trimmed {
+		return nil, fmt.Errorf("workflow %s: %w", id, ErrResultLost)
+	}
 	if ri.Status == "cancelled" {
 		return nil, fmt.Errorf("workflow %s: %w", id, ErrCancelled)
 	}
@@ -1077,7 +1108,7 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 		}
 	}
 	// Kept and removed with the workflow that makes it (ADR 0054).
-	if _, err := k.rt.run(c, plan, map[string]any{"in": in}, runID, runSpec{parent: c.id}); err != nil {
+	if _, err := k.runs.run(c, plan, map[string]any{"in": in}, runID, runSpec{parent: c.id}); err != nil {
 		return nil, err
 	}
 	var r RunInfo
@@ -1086,24 +1117,27 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 		// Whatever this process can do for the call is done once it is
 		// idle; a call still going then waits for a timer or a signal.
 		k.rt.idle()
-		if r, err = k.rt.get(c, runID); err != nil {
+		if r, err = k.runs.get(c, runID); err != nil {
 			return nil, err
 		}
 		if !r.Finished() {
 			// Waiting, or stopped for review until it is resolved.
 			return nil, ErrSuspended
 		}
-	} else if r, err = k.rt.waitDone(c, runID); err != nil {
+	} else if r, err = k.runs.waitDone(c, runID); err != nil {
 		if c.Err() != nil {
 			// The workflow was cancelled in kairo: so is the call. If not,
 			// the workflow is only no longer driven here: the call goes on.
 			if c.cancelled() {
-				_ = k.rt.cancel(context.Background(), runID)
+				_ = k.runs.cancel(context.Background(), runID)
 				return nil, &CallError{RunID: runID, Action: calledAction(plan), Status: "cancelled"}
 			}
 			return nil, fmt.Errorf("call %s: %w", runID, ErrStopped)
 		}
 		return nil, err
+	}
+	if r.trimmed {
+		return nil, fmt.Errorf("call %s: %w", runID, ErrResultLost)
 	}
 	if r.Status != "completed" {
 		return nil, &CallError{RunID: runID, Action: calledAction(plan), Status: r.Status, Message: r.Error}
@@ -1129,8 +1163,11 @@ func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error 
 	}
 	for n := 0; ; n++ {
 		runID := callID(id, planWait+name, "null", n)
-		r, err := k.rt.get(ctx, runID)
+		r, err := k.runs.get(ctx, runID)
 		if errors.Is(err, ErrUnknownRun) {
+			if k.remote != nil {
+				return fmt.Errorf("kairo: workflow %s does not wait for %s (signals sent ahead: %w)", id, name, ErrNeedsEmbedded)
+			}
 			made, err := k.signalAhead(ctx, id, name, runID, payload)
 			if err != nil {
 				return err
@@ -1147,7 +1184,7 @@ func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error 
 		if r.Finished() {
 			continue
 		}
-		if err := k.rt.signal(ctx, runID, name, payload); err != nil {
+		if err := k.runs.signal(ctx, runID, name, payload); err != nil {
 			return err
 		}
 		break
@@ -1162,7 +1199,7 @@ func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error 
 // signalAhead makes wait runID of workflow id, as the workflow will when
 // it reaches it, with the signal applied in the same transaction.
 func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload any) (bool, error) {
-	wf, err := k.rt.get(ctx, id)
+	wf, err := k.runs.get(ctx, id)
 	if errors.Is(err, ErrUnknownRun) || (err == nil && wf.Plan != planWorkflow) {
 		return false, fmt.Errorf("kairo: no workflow %s", id)
 	}
@@ -1176,7 +1213,7 @@ func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload
 	if err != nil {
 		return false, err
 	}
-	existing, err := k.rt.run(ctx, planWait+name, map[string]any{"in": nil}, runID, runSpec{parent: id,
+	existing, err := k.runs.run(ctx, planWait+name, map[string]any{"in": nil}, runID, runSpec{parent: id,
 		then: []wasmcore.Event{{Kind: "signal", At: k.rt.now(), Name: name, Data: data}}})
 	return !existing, err
 }
@@ -1202,6 +1239,9 @@ type Filter struct {
 // List returns workflows started here or elsewhere (root runs: not child
 // workflows, not calls), in the order they were created (ADR 0059).
 func (k *Kairo) List(ctx context.Context, f Filter) ([]RunInfo, error) {
+	if k.remote != nil {
+		return nil, ErrNeedsEmbedded
+	}
 	lf := ListFilter{Workflow: f.Workflow, Status: f.Status, After: f.After, Limit: f.Limit}
 	if !f.Since.IsZero() {
 		lf.Since = f.Since.UnixMilli()
@@ -1221,14 +1261,17 @@ func (k *Kairo) List(ctx context.Context, f Filter) ([]RunInfo, error) {
 }
 
 // Cancel cancels workflow id: the calls it waits for are cancelled with it.
-func (k *Kairo) Cancel(ctx context.Context, id string) error { return k.rt.cancel(ctx, id) }
+func (k *Kairo) Cancel(ctx context.Context, id string) error { return k.runs.cancel(ctx, id) }
 
 // Get describes run id (a workflow or a call).
-func (k *Kairo) Get(ctx context.Context, id string) (RunInfo, error) { return k.rt.get(ctx, id) }
+func (k *Kairo) Get(ctx context.Context, id string) (RunInfo, error) { return k.runs.get(ctx, id) }
 
 // Children are the runs made by run id: a workflow's calls and child
 // workflows (ADR 0058).
 func (k *Kairo) Children(ctx context.Context, id string) ([]RunInfo, error) {
+	if k.remote != nil {
+		return nil, ErrNeedsEmbedded
+	}
 	rows, err := k.rt.store.Children(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1243,12 +1286,18 @@ func (k *Kairo) Children(ctx context.Context, id string) ([]RunInfo, error) {
 // Resolve settles a call stopped for review (blocked: a real step whose
 // outcome was unknown) with the output it had: it did take effect.
 func (k *Kairo) Resolve(ctx context.Context, callID string, output any) error {
+	if k.remote != nil {
+		return ErrNeedsEmbedded
+	}
 	return k.rt.resolve(ctx, callID, output, "")
 }
 
 // ResolveFailed settles a call stopped for review as not done: it failed
 // with msg.
 func (k *Kairo) ResolveFailed(ctx context.Context, callID string, msg string) error {
+	if k.remote != nil {
+		return ErrNeedsEmbedded
+	}
 	if msg == "" {
 		msg = "resolved as failed"
 	}
@@ -1266,6 +1315,9 @@ func (k *Kairo) Subscribe(id string) (chunks <-chan Chunk, stop func()) {
 // stopped, drives on the workflows whose calls settle, and returns once
 // that is done, with when something is next to do (ok false: nothing).
 func (k *Kairo) Tick(ctx context.Context) (next time.Time, ok bool, err error) {
+	if k.remote != nil {
+		return time.Time{}, false, ErrNeedsEmbedded
+	}
 	if err := k.rt.tick(ctx); err != nil {
 		return time.Time{}, false, err
 	}
@@ -1339,7 +1391,7 @@ func (k *Kairo) redrive(id string) {
 			k.mu.Lock()
 			delete(k.again, id)
 			k.mu.Unlock()
-			ri, err := k.rt.get(context.Background(), id)
+			ri, err := k.runs.get(context.Background(), id)
 			if err != nil || ri.Plan != planWorkflow || ri.Finished() {
 				return
 			}

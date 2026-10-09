@@ -228,7 +228,13 @@ The serving side is the same `k.Handler()`, with the action's real handler. A ha
 
 ## With kairod
 
-[kairod](https://github.com/r-hashi01/kairo#kairod-when-you-can-keep-a-process-running) is kairo's optional resident runtime: microsecond hand-offs, RPM/TPM limits across processes, and workers in any language. The Go SDK does not drive workflows through kairod yet; from Go, use the engine (`github.com/r-hashi01/kairo/engine`) or kairod's worker protocol (`github.com/r-hashi01/kairo/protocol`) directly.
+If you can run a resident process, [kairod](https://github.com/r-hashi01/kairo#kairod-when-you-can-keep-a-process-running) gives the same model microsecond hand-offs, RPM/TPM limits across processes, and workers in any language:
+
+```go
+k, err := kairo.Connect(ctx, "http://127.0.0.1:8420", "/var/lib/kairo/worker.sock", kairo.Options{})
+```
+
+The workflow code is the same: the runs live in kairod (over its HTTP API), and this process runs its actions' steps (over kairod's worker socket) and drives its workflows. There are no drive leases: a workflow is driven where it is run. Suspend mode, `List`, `Children`, `Resolve`, `Tick` and signals sent before their wait need the embedded runtime (`kairo.ErrNeedsEmbedded`).
 
 ## License
 
