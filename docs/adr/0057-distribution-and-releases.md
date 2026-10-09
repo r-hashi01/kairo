@@ -135,5 +135,5 @@ v0.1.0 と v0.1.1 では、決定の「1 つの版」が守れていなかった
   - `set X.Y.Z` は、すべてを書き換える。
   - `tags` は、リリースで打つタグを並べる。`vX.Y.Z` と、別モジュールの `<dir>/vX.Y.Z` を出す。対象の別モジュールは `store/*`、`executor/jev`、`sdk/go/pgnotify`。`compat/*`（評価用）と `sdk/go/storetest`（テスト用）にはタグを打たない。
 - **リリースのタグは `VERSION` と同じでなければならない。** `release.yml` が、タグで動いたときに `scripts/version.sh check <タグの版>` で確かめる。
-- **リリースの手順。** `scripts/version.sh set X.Y.Z` でコミットし、`scripts/version.sh tags` のタグをすべて同じコミットに打って push する。別モジュールのタグは `v*` に当たらないので、`release.yml` を二重に動かさない。
+- **リリースの手順。** `scripts/version.sh set X.Y.Z` でコミットし、`scripts/version.sh tags` のタグをすべて同じコミットに打つ。push は、別モジュールのタグを先にし、`vX.Y.Z` は最後に単独で行う。GitHub は、4 つ以上のタグを一度に push すると push のイベントを作らないので、まとめて push すると `release.yml` が動かない（v0.2.0 で起きた）。別モジュールのタグは `v*` に当たらないので、`release.yml` を二重に動かさない。
 - **言語ごとに版がずれる場合は、そのとき別の ADR で決める。** 言語のメジャーアップデートなどで、いずれずれることは見込んでいる。

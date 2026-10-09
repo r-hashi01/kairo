@@ -6,6 +6,10 @@
 #   scripts/version.sh check [X.Y.Z]   everything carries VERSION (and it is X.Y.Z)
 #   scripts/version.sh set X.Y.Z       write X.Y.Z everywhere
 #   scripts/version.sh tags            the tags a release pushes, at HEAD
+#
+# Push the nested modules' tags first, then vX.Y.Z alone: GitHub makes no
+# push event when more than three tags are pushed at once, and release.yml
+# runs on vX.Y.Z's.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
