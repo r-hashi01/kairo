@@ -22,10 +22,12 @@ from __future__ import annotations
 import asyncio
 import collections
 import datetime
+import decimal
 import hashlib
 import hmac
 import inspect
 import json
+import math
 import random
 import re
 import time
@@ -92,8 +94,96 @@ class _Action:
 
 
 def _canonical(v: Any) -> str:
-    """JSON with object keys sorted: equal values, equal text."""
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """JSON with object keys sorted: equal values, equal text, byte for byte
+    what the TypeScript SDK's canonical (JSON.stringify of each leaf, keys in
+    JavaScript's sort order) and the Go SDK's make of the same value, so that
+    call ids agree across SDKs (ADR 0049, 0058)."""
+    out: list[str] = []
+    _write_canonical(out, v)
+    return "".join(out)
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _write_canonical(out: list[str], v: Any) -> None:
+    if v is None:
+        out.append("null")
+    elif v is True:
+        out.append("true")
+    elif v is False:
+        out.append("false")
+    elif isinstance(v, int):
+        # A JavaScript number: exact up to 2**53, rounded beyond.
+        if abs(v) <= 2**53:
+            out.append(str(v))
+        else:
+            try:
+                out.append(_js_number(float(v)))
+            except OverflowError:
+                out.append("null")
+    elif isinstance(v, float):
+        out.append(_js_number(v))
+    elif isinstance(v, str):
+        out.append(_js_string(v))
+    elif isinstance(v, (list, tuple)):
+        out.append("[")
+        for i, e in enumerate(v):
+            if i:
+                out.append(",")
+            _write_canonical(out, e)
+        out.append("]")
+    elif isinstance(v, dict):
+        keys = {_js_key(k): x for k, x in v.items()}
+        out.append("{")
+        # JavaScript's default sort: by UTF-16 code units.
+        for i, k in enumerate(sorted(keys, key=lambda k: k.encode("utf-16-be", "surrogatepass"))):
+            if i:
+                out.append(",")
+            out.append(_js_string(k))
+            out.append(":")
+            _write_canonical(out, keys[k])
+        out.append("}")
+    else:
+        raise TypeError(f"canonical: {type(v).__name__} is not JSON")
+
+
+def _js_key(k: Any) -> str:
+    """A dict key as json.dumps makes it a string."""
+    if isinstance(k, str):
+        return k
+    if k is None or isinstance(k, (bool, int, float)):
+        return _canonical(k)
+    raise TypeError(f"canonical: a key of {type(k).__name__}")
+
+
+def _js_string(s: str) -> str:
+    """s as JSON.stringify writes it: ", \\ and control characters escaped
+    (as json.dumps does), and lone surrogates as \\uXXXX."""
+    return _SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", json.dumps(s, ensure_ascii=False))
+
+
+def _js_number(x: float) -> str:
+    """x as JavaScript writes a number (Number::toString): the shortest
+    digits that round-trip (Python's repr has the same), placed as
+    JavaScript places them; NaN and the infinities are null, -0 is 0."""
+    if math.isnan(x) or math.isinf(x):
+        return "null"
+    if x == 0:
+        return "0"
+    sign = "-" if x < 0 else ""
+    t = decimal.Decimal(repr(abs(x))).normalize().as_tuple()
+    s = "".join(map(str, t.digits))
+    k = len(s)
+    n = int(t.exponent) + k  # x = 0.s * 10**n
+    if k <= n <= 21:
+        return sign + s + "0" * (n - k)
+    if 0 < n <= 21:
+        return sign + s[:n] + "." + s[n:]
+    if -6 < n <= 0:
+        return sign + "0." + "0" * -n + s
+    e = n - 1
+    return sign + (s if k == 1 else s[0] + "." + s[1:]) + "e" + ("+" if e >= 0 else "-") + str(abs(e))
 
 
 def _call_id(workflow: str, kind: str, input: Any, n: int) -> str:

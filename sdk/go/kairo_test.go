@@ -8,11 +8,12 @@ import (
 	"time"
 )
 
-// Call ids are the TypeScript SDK's: testdata/callids.jsonl was made by its
+// Call ids are the TypeScript SDK's: sdk/testdata/callids.jsonl (shared
+// with the Python SDK's tests) was made by its
 // canonical and callId (sdk/ts/src/workflow.ts), on inputs at the edges
 // (key order with astral characters, <>&, U+2028, -0, 1e21, nesting).
 func TestCallIDsMatchTypeScript(t *testing.T) {
-	f, err := os.Open("testdata/callids.jsonl")
+	f, err := os.Open("../testdata/callids.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}

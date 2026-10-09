@@ -16,8 +16,9 @@ import (
 )
 
 // A workflow begun by one SDK is finished by another, on one SQLite file
-// (ADR 0058): the call ids, the plans and the tables are the same, so the
-// calls that finished are not run again, and the real one runs once.
+// (ADR 0058), Go with TypeScript and with Python: the call ids, the plans
+// and the tables are the same, so the calls that finished are not run
+// again, and the real one runs once.
 
 type editOut struct {
 	Answers []string `json:"answers"`
@@ -30,6 +31,13 @@ type editRuns struct {
 	llm, writes int
 }
 
+// ask is llm's input: a number with no fraction (Python writes 1.0 as
+// such), keys whose order differs by code point and by UTF-16 unit. Every
+// SDK must give it the same canonical text, so the same call ids.
+func ask(q string) map[string]any {
+	return map[string]any{"q": q, "temperature": 1.0, "😀": 1, "｡": 2}
+}
+
 // openEdit opens the Go side of testdata/edit.ts's workflow.
 func openEdit(t *testing.T, db string, hang bool, runs *editRuns) *kairo.Kairo {
 	t.Helper()
@@ -37,11 +45,11 @@ func openEdit(t *testing.T, db string, hang bool, runs *editRuns) *kairo.Kairo {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kairo.Action(k, "llm", kairo.Unprotected, func(_ *kairo.TaskContext, q string) (string, error) {
+	kairo.Action(k, "llm", kairo.Unprotected, func(_ *kairo.TaskContext, p struct{ Q string }) (string, error) {
 		runs.mu.Lock()
 		runs.llm++
 		runs.mu.Unlock()
-		return strings.ToUpper(q), nil
+		return strings.ToUpper(p.Q), nil
 	})
 	kairo.Action(k, "write", kairo.Real, func(_ *kairo.TaskContext, p string) (string, error) {
 		runs.mu.Lock()
@@ -50,11 +58,11 @@ func openEdit(t *testing.T, db string, hang bool, runs *editRuns) *kairo.Kairo {
 		return "wrote " + p, nil
 	})
 	kairo.Workflow(k, "edit", func(ctx *kairo.Context, files []string) (editOut, error) {
-		a, err := kairo.Call[string](ctx, "llm", files[0])
+		a, err := kairo.Call[string](ctx, "llm", ask(files[0]))
 		if err != nil {
 			return editOut{}, err
 		}
-		b, err := kairo.Call[string](ctx, "llm", files[1])
+		b, err := kairo.Call[string](ctx, "llm", ask(files[1]))
 		if err != nil {
 			return editOut{}, err
 		}
@@ -66,7 +74,7 @@ func openEdit(t *testing.T, db string, hang bool, runs *editRuns) *kairo.Kairo {
 			<-ctx.Done() // as a process that stops here
 			return editOut{}, ctx.Err()
 		}
-		again, err := kairo.Call[string](ctx, "llm", "done")
+		again, err := kairo.Call[string](ctx, "llm", ask("done"))
 		return editOut{Answers: []string{a, b}, Wrote: wrote, Again: again}, err
 	})
 	if err := k.Start(context.Background()); err != nil {
@@ -84,15 +92,7 @@ func node(t *testing.T, args ...string) []byte {
 	}
 	_, file, _, _ := runtime.Caller(0)
 	repo := filepath.Join(filepath.Dir(file), "..", "..", "..")
-	wasm := os.Getenv("KAIRO_WASM")
-	if wasm == "" {
-		wasm = filepath.Join(t.TempDir(), "kairo.wasm")
-		b := exec.Command("go", "build", "-buildmode=c-shared", "-o", wasm, "./cmd/kairo-wasm")
-		b.Dir, b.Env = repo, append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
-		if out, err := b.CombinedOutput(); err != nil {
-			t.Fatalf("building kairo.wasm: %v\n%s", err, out)
-		}
-	}
+	wasm := wasmFile(t, repo)
 	cmd := exec.Command(nodeBin, append([]string{"--no-warnings", filepath.Join(filepath.Dir(file), "testdata", "edit.ts"),
 		filepath.Join(repo, "sdk", "ts", "src"), wasm}, args...)...)
 	out, err := cmd.Output()
@@ -106,7 +106,61 @@ func node(t *testing.T, args ...string) []byte {
 	return out
 }
 
-func TestGoBeginsTypeScriptFinishes(t *testing.T) {
+// wasmFile is kairo.wasm: KAIRO_WASM, or built from this repository.
+func wasmFile(t *testing.T, repo string) string {
+	t.Helper()
+	if w := os.Getenv("KAIRO_WASM"); w != "" {
+		return w
+	}
+	w := filepath.Join(t.TempDir(), "kairo.wasm")
+	b := exec.Command("go", "build", "-buildmode=c-shared", "-o", w, "./cmd/kairo-wasm")
+	b.Dir, b.Env = repo, append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
+	if out, err := b.CombinedOutput(); err != nil {
+		t.Fatalf("building kairo.wasm: %v\n%s", err, out)
+	}
+	return w
+}
+
+// python runs testdata/edit.py with KAIRO_PYTHON (default python3); skips
+// the test without it or without wasmtime.
+func python(t *testing.T, args ...string) []byte {
+	t.Helper()
+	bin := os.Getenv("KAIRO_PYTHON")
+	if bin == "" {
+		bin = "python3"
+	}
+	if exec.Command(bin, "-c", "import wasmtime").Run() != nil {
+		t.Skip(bin + " with wasmtime not found (KAIRO_PYTHON)")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	repo := filepath.Join(filepath.Dir(file), "..", "..", "..")
+	cmd := exec.Command(bin, append([]string{filepath.Join(filepath.Dir(file), "testdata", "edit.py"),
+		filepath.Join(repo, "sdk", "python"), wasmFile(t, repo)}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		var stderr []byte
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = ee.Stderr
+		}
+		t.Fatalf("python: %v\n%s", err, stderr)
+	}
+	return out
+}
+
+// other runs the workflow's other side: TypeScript or Python.
+func other(t *testing.T, lang string, args ...string) []byte {
+	if lang == "python" {
+		return python(t, args...)
+	}
+	return node(t, args...)
+}
+
+func TestGoBeginsTypeScriptFinishes(t *testing.T) { goBegins(t, "typescript") }
+func TestTypeScriptBeginsGoFinishes(t *testing.T) { goFinishes(t, "typescript") }
+func TestGoBeginsPythonFinishes(t *testing.T)     { goBegins(t, "python") }
+func TestPythonBeginsGoFinishes(t *testing.T)     { goFinishes(t, "python") }
+
+func goBegins(t *testing.T, lang string) {
 	db := filepath.Join(t.TempDir(), "x.db")
 	runs := &editRuns{}
 	k := openEdit(t, db, true, runs)
@@ -130,28 +184,28 @@ func TestGoBeginsTypeScriptFinishes(t *testing.T) {
 		Runs struct{ LLM, Write int } `json:"runs"`
 		Out  editOut                  `json:"out"`
 	}
-	if err := json.Unmarshal(node(t, db, "finish", "x-1"), &res); err != nil {
+	if err := json.Unmarshal(other(t, lang, db, "finish", "x-1"), &res); err != nil {
 		t.Fatal(err)
 	}
 	want := editOut{Answers: []string{"A", "B"}, Wrote: "wrote a", Again: "DONE"}
 	if !sameJSON(res.Out, want) {
-		t.Fatalf("TypeScript finished with %+v", res.Out)
+		t.Fatalf("%s finished with %+v", lang, res.Out)
 	}
 	if res.Runs.Write != 0 || res.Runs.LLM != 1 {
-		t.Fatalf("TypeScript ran calls again: %+v", res.Runs)
+		t.Fatalf("%s ran calls again: %+v", lang, res.Runs)
 	}
 }
 
-func TestTypeScriptBeginsGoFinishes(t *testing.T) {
+func goFinishes(t *testing.T, lang string) {
 	db := filepath.Join(t.TempDir(), "x.db")
 	var started struct {
 		Runs struct{ LLM, Write int } `json:"runs"`
 	}
-	if err := json.Unmarshal(node(t, db, "start", "x-2"), &started); err != nil {
+	if err := json.Unmarshal(other(t, lang, db, "start", "x-2"), &started); err != nil {
 		t.Fatal(err)
 	}
 	if started.Runs.Write != 1 || started.Runs.LLM != 2 {
-		t.Fatalf("the TypeScript side ran %+v", started.Runs)
+		t.Fatalf("the %s side ran %+v", lang, started.Runs)
 	}
 	runs := &editRuns{}
 	k := openEdit(t, db, false, runs)

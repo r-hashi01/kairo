@@ -7,14 +7,17 @@ const { EmbeddedBackend, Kairo, SQLiteStore } = await import(sdk + '/index.ts');
 
 const runs = { llm: 0, write: 0 };
 const k = new Kairo({ backend: await EmbeddedBackend.open({ store: new SQLiteStore(db), wasm }) });
-k.defineAction('llm', { effect: 'unprotected', handler: async (q: string) => (runs.llm++, q.toUpperCase()) });
+k.defineAction('llm', { effect: 'unprotected', handler: async (p: { q: string }) => (runs.llm++, p.q.toUpperCase()) });
+// The input of llm: a number with no fraction, keys whose order differs by
+// code point and by UTF-16 unit; written alike in every SDK, the same ids.
+const ask = (q: string) => ({ q, temperature: 1.0, '😀': 1, '｡': 2 });
 k.defineAction('write', { effect: 'real', handler: async (p: string) => (runs.write++, `wrote ${p}`) });
 k.workflow('edit', async (ctx: any, files: string[]) => {
-	const a = await ctx.call('llm', files[0]);
-	const b = await ctx.call('llm', files[1]);
+	const a = await ctx.call('llm', ask(files[0]!));
+	const b = await ctx.call('llm', ask(files[1]!));
 	const wrote = await ctx.call('write', files[0]);
 	if (mode === 'start') await new Promise(() => {}); // as a process that stops here
-	const again = await ctx.call('llm', 'done');
+	const again = await ctx.call('llm', ask('done'));
 	return { answers: [a, b], wrote, again };
 });
 await k.start();
