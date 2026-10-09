@@ -3,8 +3,8 @@ module github.com/r-hashi01/kairo/compat/n8n
 go 1.27.2
 
 require (
-	github.com/r-hashi01/kairo v0.2.0
-	github.com/r-hashi01/kairo/store/postgres v0.2.0
+	github.com/r-hashi01/kairo v0.3.0
+	github.com/r-hashi01/kairo/store/postgres v0.3.0
 )
 
 require (
@@ -14,7 +14,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	github.com/r-hashi01/kairo/store/sqlstore v0.2.0 // indirect
+	github.com/r-hashi01/kairo/store/sqlstore v0.3.0 // indirect
 )
 
 replace (
