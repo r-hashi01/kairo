@@ -122,6 +122,25 @@ const k = new Kairo({ backend, observe: (o) => metrics.record(o) });
 
 With kairod (`HttpBackend`), only `step.started` and `step.finished` of the steps this process's worker runs are observed: runs are kairod's.
 
+### Testing
+
+`createTestEnv()` gives your tests a kairo in memory (SQLite `:memory:`), in suspend mode, on a clock the test moves (from 2026-01-01T00:00:00Z, or `at`). Nothing waits in real time: a workflow that sleeps or waits throws `Suspended`, and `advance(ms)` fires what comes due, in order, each at its own time.
+
+```ts
+const env = await createTestEnv();
+env.k.defineAction('charge', { handler: async (o) => `charged ${o.id}` });
+env.k.workflow('refund', refund);          // sleeps a day, then waits an hour for "approve"
+await env.start();
+await assert.rejects(env.k.run('refund', order, { id: 'r-1' }), Suspended);
+await env.advance(24 * 3600_000);
+await env.signal('r-1', 'approve', 'alice');
+assert.equal(await env.k.result('r-1'), 'charged o-1 by alice');
+(await env.calls('r-1')).map((c) => `${c.kind} ${c.name}`); // call kairo.sleep, wait approve, call charge
+await env.close();
+```
+
+`env.calls(id)` lists the calls a workflow made, in the order it made them: `kind` (`call`, `wait`, `workflow`), `name`, `input`, `output` (an action's output, a wait's payload, a child workflow's result), `status` and `error`. Other `Kairo` options go in `kairo`.
+
 ## Storage
 
 ```ts

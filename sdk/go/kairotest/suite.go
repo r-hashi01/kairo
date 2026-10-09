@@ -1,6 +1,7 @@
-// Package kairotest is the behaviour of kairo's Go SDK, as a suite any
-// store runs (ADR 0058): sdk/go runs it in memory, sdk/go/storetest on
-// SQLite and PostgreSQL.
+// Package kairotest helps test with kairo's Go SDK. New gives an
+// application's tests a kairo in memory, on a clock they move (Env). Run is
+// the SDK's behaviour, as a suite any store runs (ADR 0058): sdk/go runs it
+// in memory, sdk/go/storetest on SQLite and PostgreSQL.
 package kairotest
 
 import (

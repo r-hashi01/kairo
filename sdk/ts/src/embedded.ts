@@ -54,6 +54,12 @@ export interface EmbeddedOptions {
 	 * works: it must not block.
 	 */
 	observe?: Observer;
+	/**
+	 * Timers are kept in the store but not armed in this process: only
+	 * tick fires them. For tests on a clock they move (createTestEnv), and
+	 * for schedulers that own time.
+	 */
+	manualTimers?: boolean;
 }
 
 /** Finished trees removed per tick at most (ADR 0054); the rest next time. */
@@ -94,7 +100,9 @@ const PLAN_WORKFLOW = 'kairo.workflow';
 export class Embedded {
 	private readonly core: Core;
 	private readonly store: Store;
-	private readonly now: () => number;
+	/** The runtime's clock (unix ms): EmbeddedOptions.now, or Date.now. */
+	readonly now: () => number;
+	private readonly manualTimers: boolean;
 	private readonly plans = new Map<string, Compiled>();
 	private handler?: ActionHandler;
 	private readonly waiters = new Map<string, Set<(r: RunInfo) => void>>();
@@ -130,6 +138,7 @@ export class Embedded {
 		this.core = core;
 		this.store = opts.store;
 		this.now = opts.now ?? Date.now;
+		this.manualTimers = !!opts.manualTimers;
 		this.owner = opts.owner ?? randomUUID();
 		this.leaseMs = opts.leaseMs ?? 30_000;
 		this.keepMs = keepFinished(opts.keepFinished);
@@ -542,6 +551,7 @@ export class Embedded {
 				this.background(this.dispatch(runId, c), "kairo: applying a step's outcome", { run: runId });
 				return;
 			case 'timer': {
+				if (this.manualTimers) return; // fired by tick only
 				const tk = `${runId}\0t${c.timer}`;
 				clearTimeout(this.timers.get(tk));
 				const t: TimerRow = { run: runId, timer: c.timer!, act: c.act ?? 0, at: c.at! };

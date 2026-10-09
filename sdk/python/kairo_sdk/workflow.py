@@ -422,6 +422,8 @@ class Kairo:
             if observe is not None:
                 self._rt.observer = observe
         self._logger = logger or (self._rt.logger if self._rt is not None else LOGGER)
+        # The clock (unix ms): the embedded runtime's (its now), or the system's.
+        self._now: Callable[[], int] = self._rt.now if self._rt is not None else _now_ms
         # With kairod, the steps its worker runs here are observed here (the
         # embedded runtime observes its own).
         self._observer = observe if self._rt is None else None
@@ -741,22 +743,22 @@ class Kairo:
     def _serve_observed(self, task: Task, ctx: TaskContext) -> Result:
         """_serve, observed (kairod's worker; on its thread)."""
         step = {"run_id": task.run_id, "action": task.action, "step_id": task.step_id, "attempt": task.attempt}
-        observe(self._observer, self._logger, _now_ms, Observation(STEP_STARTED, **step))
+        observe(self._observer, self._logger, self._now, Observation(STEP_STARTED, **step))
         began = time.monotonic()
         res = self._serve(task, ctx)
         duration = time.monotonic() - began
-        observe(self._observer, self._logger, _now_ms, Observation(STEP_FINISHED, **step, status=step_status(res), error=res.error, duration=duration))
+        observe(self._observer, self._logger, self._now, Observation(STEP_FINISHED, **step, status=step_status(res), error=res.error, duration=duration))
         return res
 
     def _serve(self, task: Task, ctx: TaskContext) -> Result:
         input = (task.input or {}).get("in") if isinstance(task.input, dict) else None
         if task.action == NOW:
-            return Result(output=int(time.time() * 1000))
+            return Result(output=self._now())
         if task.action == RANDOM:
             return Result(output=random.random())
         if task.action == SLEEP:
             # Waits in kairo, not here (ADR 0045).
-            return Result(wait={"until": int(time.time() * 1000 + float(input["ms"])), "output": None})
+            return Result(wait={"until": int(self._now() + float(input["ms"])), "output": None})
         a = self._actions.get(task.action)
         if a is None:
             return Result(error=f"no action {task.action} here")
@@ -1022,7 +1024,7 @@ class Kairo:
             PLAN_WORKFLOW,
             _workflow_input(name, version, input),
             run_id=id,
-            vars={"started_at": int(time.time() * 1000)},
+            vars={"started_at": self._now()},
             workflow=name,
             meta=meta,
             drive=token,
@@ -1191,7 +1193,7 @@ class Kairo:
             PLAN_WORKFLOW,
             _workflow_input(name, current, input),
             run_id=id,
-            vars={"started_at": int(time.time() * 1000)},
+            vars={"started_at": self._now()},
             parent=parent,
             workflow=name,
         )
@@ -1208,7 +1210,7 @@ class Kairo:
         # (The embedded runtime keeps the calls while the workflow runs, ADR 0054.)
         if started.get("existing") and not getattr(self.backend, "keeps_calls", False):
             at = int((info.get("vars") or {}).get("started_at") or 0)
-            if at and time.time() * 1000 - at > self._ttl * 1000:
+            if at and self._now() - at > self._ttl * 1000:
                 raise ResultLostError(f"workflow {id} started more than {self._ttl}s ago: its calls' records may be gone")
         # Set when the workflow stops being driven here: cancelled in kairo
         # (its run, or a workflow above it), or the process closes. Only when
@@ -1281,6 +1283,19 @@ class Kairo:
                 # to another process, not failed (ADR 0060).
                 raise
             except (Exception, asyncio.CancelledError) as e:
+                if stop.done():
+                    # Stopped (the process closes, the caller stopped waiting)
+                    # or cancelled, at the same time as the function ended:
+                    # with that, not with the error it ended with (a child
+                    # stopped by the same close raises StoppedError into it).
+                    if cancelled():
+                        if not me["cancelled"]:
+                            try:
+                                await self.backend.cancel(id)
+                            except Exception:
+                                pass
+                        raise Cancelled(f"workflow {id} cancelled") from e
+                    raise StoppedError(f"workflow {id}: not driven here any more") from e
                 # (A CancelledError here is not this driver's: the function's own.)
                 error = str(e) or type(e).__name__
                 try:

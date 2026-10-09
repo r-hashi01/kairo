@@ -350,6 +350,8 @@ export class Kairo {
 	private slots?: Slots;
 	private readonly limits = new Map<string, Limiter>();
 	private readonly logger: Logger;
+	/** The clock (unix ms): the embedded runtime's (EmbeddedOptions.now), or Date.now. */
+	private readonly clock: () => number;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
@@ -363,6 +365,8 @@ export class Kairo {
 			if (opts.observe) rt.observer = opts.observe;
 		}
 		this.logger = opts.logger ?? this.rt?.logger ?? consoleLogger;
+		const rtNow = this.rt?.now;
+		this.clock = rtNow ? () => rtNow() : Date.now;
 	}
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
@@ -553,10 +557,10 @@ export class Kairo {
 	/** serve, observed (kairod's worker). */
 	private async serveObserved(observer: Observer, task: Task, ctx: TaskContext): Promise<Result> {
 		const step = { runId: task.run_id, action: task.action, stepId: task.step_id, attempt: task.attempt };
-		observe(observer, this.logger, Date.now, { kind: 'step.started', ...step });
+		observe(observer, this.logger, this.clock, { kind: 'step.started', ...step });
 		const began = performance.now();
 		const res = await this.serve(task, ctx);
-		observe(observer, this.logger, Date.now, {
+		observe(observer, this.logger, this.clock, {
 			kind: 'step.finished',
 			...step,
 			status: stepStatus(res),
@@ -570,12 +574,12 @@ export class Kairo {
 		const input = (task.input as { in?: unknown } | null)?.in;
 		switch (task.action) {
 			case BUILTIN.now:
-				return { output: Date.now() };
+				return { output: this.clock() };
 			case BUILTIN.random:
 				return { output: Math.random() };
 			case BUILTIN.sleep:
 				// Waits in kairo, not here (ADR 0045).
-				return { wait: { until: Date.now() + Number((input as { ms: number }).ms), output: null } };
+				return { wait: { until: this.clock() + Number((input as { ms: number }).ms), output: null } };
 		}
 		const def = this.actions.get(task.action);
 		if (!def) return { error: `no action ${task.action} here` };
@@ -829,7 +833,7 @@ export class Kairo {
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
 			workflowInput(name, version, input),
-			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(meta ? { meta } : {}), ...(token ? { drive: token } : {}) },
+			{ runId: id, vars: { started_at: this.clock() }, workflow: name, ...(meta ? { meta } : {}), ...(token ? { drive: token } : {}) },
 		);
 		return started.existing ? 0 : token;
 	}
@@ -1001,7 +1005,7 @@ export class Kairo {
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
 			workflowInput(name, current, input),
-			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
+			{ runId: id, vars: { started_at: this.clock() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
 		);
 		const info = await this.backend.get(id, { input: true });
 		if (finished(info)) return done(id, info);
@@ -1014,7 +1018,7 @@ export class Kairo {
 			// (The embedded runtime keeps them while the workflow runs, ADR 0054.)
 			const at = Number((info.vars as { started_at?: number } | undefined)?.started_at ?? 0);
 			const ttl = this.opts.idempotencyTTL ?? 24 * 3600 * 1000;
-			if (at > 0 && Date.now() - at > ttl) {
+			if (at > 0 && this.clock() - at > ttl) {
 				throw new ResultLostError(`workflow ${id} started more than ${ttl}ms ago: its calls' records may be gone`);
 			}
 		}

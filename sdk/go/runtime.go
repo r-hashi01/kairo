@@ -144,6 +144,7 @@ type runtime struct {
 	leaseParents bool
 	logger       *slog.Logger
 	observer     func(Observation)
+	manualTimers bool
 	lostDrive    func(ctx context.Context, l LeaseRow) error
 	missingPlan  func(name string) bool
 }
@@ -859,6 +860,9 @@ func (r *runtime) carryOut(runID string, c wasmcore.Command) {
 	case "dispatch":
 		r.track(func() { r.dispatch(runID, c) })
 	case "timer":
+		if r.manualTimers {
+			return // fired by Tick only
+		}
 		key := fmt.Sprintf("%s\x00t%d", runID, c.Timer)
 		t := TimerRow{Run: runID, Timer: c.Timer, Act: c.Act, At: c.At}
 		r.mu.Lock()

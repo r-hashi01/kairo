@@ -147,6 +147,7 @@ class Embedded:
         keep_finished: float | None | str = "env",
         logger: logging.Logger | None = None,
         observe: Observer | None = None,
+        manual_timers: bool = False,
     ) -> None:
         """keep_finished: how long a finished tree of runs is kept before tick
         removes it (ms; ADR 0054); None keeps it. Default: KAIRO_KEEP_FINISHED
@@ -155,12 +156,17 @@ class Embedded:
         logger takes what goes wrong in the runtime's background work (lease
         renewals, sweeps, timers, steps' outcomes; default
         logging.getLogger("kairo_sdk")). observe, if given, is given each
-        Observation as it happens, on the event loop: it must not block."""
+        Observation as it happens, on the event loop: it must not block.
+
+        manual_timers: timers are kept in the store but not armed in this
+        process: only tick fires them. For tests on a clock they move
+        (kairo_sdk.testing.TestEnv), and for schedulers that own time."""
         self.logger = logger or LOGGER
         self.observer = observe
         self.core = Core(wasm)
         self.store = store
         self.now = now
+        self._manual_timers = manual_timers
         self.lease_ms = lease_ms
         self.keep_ms = keep_finished_ms(keep_finished)
         self.owner = owner or str(uuid.uuid4())
@@ -669,6 +675,8 @@ class Embedded:
         if kind == "dispatch":
             self._background(self._dispatch(run_id, c), "kairo: run %s: applying a step's outcome", run_id)
         elif kind == "timer":
+            if self._manual_timers:
+                return  # fired by tick only
             key = f"{run_id}\0t{c['timer']}"
             old = self._timers.pop(key, None)
             if old is not None:

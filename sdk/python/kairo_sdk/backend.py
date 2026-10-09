@@ -131,7 +131,7 @@ class EmbeddedBackend:
 
     @classmethod
     async def open(cls, store: Store, **kw: Any) -> EmbeddedBackend:
-        """Opens the runtime on store (kw: wasm, lease_ms, owner, now)."""
+        """Opens the runtime on store (kw: wasm, lease_ms, owner, now, manual_timers, ...)."""
         return cls(await Embedded(store, **kw).open())
 
     async def start(self, specs: list[dict[str, Any]], serve: ActionHandler) -> None:

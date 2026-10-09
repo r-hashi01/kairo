@@ -125,6 +125,27 @@ k = Kairo(backend=backend, observe=lambda o: metrics.record(o))
 
 With kairod (`HttpBackend`), only `STEP_STARTED` and `STEP_FINISHED` of the steps this process's worker runs are observed (on the worker's threads): runs are kairod's.
 
+### Testing
+
+`kairo_sdk.testing.TestEnv` gives your tests a kairo in memory (SQLite `:memory:`), in suspend mode, on a clock the test moves (from 2026-01-01T00:00:00Z, or `at`). Nothing waits in real time: a workflow that sleeps or waits raises `Suspended`, and `await env.advance(seconds)` fires what comes due, in order, each at its own time.
+
+```python
+from kairo_sdk.testing import TestEnv
+
+async with await TestEnv.open() as env:
+    env.k.action("charge")(lambda o, ctx: f"charged {o['id']}")
+    env.k.workflow("refund")(refund)        # sleeps a day, then waits an hour for "approve"
+    await env.start()
+    with self.assertRaises(Suspended):
+        await env.k.run("refund", order, id="r-1")
+    await env.advance(24 * 3600)
+    await env.signal("r-1", "approve", "alice")
+    assert await env.k.result("r-1") == "charged o-1 by alice"
+    [f"{c.kind} {c.name}" for c in await env.calls("r-1")]  # call kairo.sleep, wait approve, call charge
+```
+
+`await env.calls(id)` lists the calls a workflow made, in the order it made them: `kind` (`call`, `wait`, `workflow`), `name`, `input`, `output` (an action's output, a wait's payload, a child workflow's result), `status` and `error`. `env.now()` is the clock (a datetime); other `Kairo` arguments go to `TestEnv.open`.
+
 ## Storage
 
 ```python

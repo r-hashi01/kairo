@@ -159,6 +159,10 @@ type Options struct {
 	HTTP HTTPOptions
 	// Now is the clock (tests).
 	Now func() time.Time
+	// ManualTimers: timers are kept in the store but not armed in this
+	// process: only Tick fires them. For tests on a clock they move
+	// (kairotest.New), and for schedulers that own time.
+	ManualTimers bool
 }
 
 // Kairo declares actions and workflows and drives them.
@@ -316,6 +320,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	if opts.Logger != nil {
 		rt.logger = opts.Logger
 	}
+	rt.manualTimers = opts.ManualTimers
 	rt.observer = opts.Observe
 	if err := rt.open(ctx, opts.Owner != ""); err != nil {
 		return nil, err
