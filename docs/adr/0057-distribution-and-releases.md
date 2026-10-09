@@ -124,3 +124,16 @@ SDK は、純粋なコアを WASM（`kairo.wasm`、4.4MB、gzip で 1.2MB）と�
   - CI の認証（OIDC）が悪用されても、承認なしには公開されない。
   - `npm stage publish` は npm 11.15.0 以上が要るので、CI で npm を上げる。tarball のパスを受け付けるかが文書にないため、展開したディレクトリの中で実行する。
   - PyPI には仮置きの仕組みがないので、GitHub の `release` 環境の承認者で、公開の前に人の確認を挟む。
+
+### 版を 1 か所で持つ（2026-10-09 追記）
+
+v0.1.0 と v0.1.1 では、決定の「1 つの版」が守れていなかった。npm と PyPI はタグの版で出ていたが、リポジトリの `package.json` と `pyproject.toml` は 0.1.0 のままだった。Go の別モジュールにはタグがなく、互いの `require` も `v0.0.0` だったので、`go get` で同じ版を取れなかった。そこで次のようにした。
+
+- **版はリポジトリ直下の `VERSION` に 1 つだけ持つ。** npm（`package.json` と `src/version.ts` の `version`）、PyPI（`pyproject.toml` と `kairo_sdk.__version__`）、Go の SDK（`kairo.Version`）、Go のモジュールどうしの `require` が、この版を持つ。
+- **`scripts/version.sh` で扱う。**
+  - `check` は、これらがそろっていることを確かめる。`check.sh` から呼ぶ。
+  - `set X.Y.Z` は、すべてを書き換える。
+  - `tags` は、リリースで打つタグを並べる。`vX.Y.Z` と、別モジュールの `<dir>/vX.Y.Z` を出す。対象の別モジュールは `store/*`、`executor/jev`、`sdk/go/pgnotify`。`compat/*`（評価用）と `sdk/go/storetest`（テスト用）にはタグを打たない。
+- **リリースのタグは `VERSION` と同じでなければならない。** `release.yml` が、タグで動いたときに `scripts/version.sh check <タグの版>` で確かめる。
+- **リリースの手順。** `scripts/version.sh set X.Y.Z` でコミットし、`scripts/version.sh tags` のタグをすべて同じコミットに打って push する。別モジュールのタグは `v*` に当たらないので、`release.yml` を二重に動かさない。
+- **言語ごとに版がずれる場合は、そのとき別の ADR で決める。** 言語のメジャーアップデートなどで、いずれずれることは見込んでいる。

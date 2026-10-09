@@ -1,6 +1,6 @@
 {
   "name": "kairo-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable workflows that run inside your Node process: a WASM core and your database (SQLite or PostgreSQL). No workflow server.",
   "type": "module",
   "main": "dist/index.js",

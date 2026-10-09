@@ -38,6 +38,8 @@ jobs:
         name: version
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then v=${GITHUB_REF_NAME#v}; else v=${{ inputs.version }}; fi
+          # A tag is the repository's version: VERSION, carried everywhere.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then scripts/version.sh check "$v"; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: check (the SDKs' embedded runtime included)
         run: |

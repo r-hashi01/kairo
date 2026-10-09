@@ -27,6 +27,9 @@ fi
 step "adr-lint"
 scripts/adr-lint.sh
 
+step "version"
+scripts/version.sh check
+
 step "go vet"
 go vet ./...
 

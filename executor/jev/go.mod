@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/mattn/go-jev v0.0.3
-	github.com/r-hashi01/kairo v0.0.0
+	github.com/r-hashi01/kairo v0.1.1
 )
 
 replace github.com/r-hashi01/kairo => ../..

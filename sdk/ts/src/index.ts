@@ -7,3 +7,4 @@ export * from './core.ts';
 export * from './embedded.ts';
 export * from './store.ts';
 export * from './http.ts';
+export * from './version.ts';

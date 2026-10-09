@@ -13,9 +13,11 @@ from .http import SignatureError
 from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import Task, TaskContext, Worker
 from .store import PostgresStore, SQLiteStore
-from .workflow import Cancelled, Context, Kairo, ResultLostError, Suspended, tick_handler
+from ._version import __version__
+from .workflow import Cancelled, Context, Kairo, ResultLostError, StoppedError, Suspended, TimedOutError, tick_handler
 
 __all__ = [
+    "__version__",
     "Backend",
     "EmbeddedBackend",
     "HttpBackend",
@@ -29,6 +31,8 @@ __all__ = [
     "Kairo",
     "KairoError",
     "ResultLostError",
+    "StoppedError",
+    "TimedOutError",
     "Chunk",
     "Credit",
     "Hello",

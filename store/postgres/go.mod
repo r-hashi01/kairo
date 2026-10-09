@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/r-hashi01/kairo/store/sqlstore v0.0.0
+	github.com/r-hashi01/kairo/store/sqlstore v0.1.1
 )
 
 require (
@@ -13,7 +13,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	github.com/r-hashi01/kairo v0.0.0 // indirect
+	github.com/r-hashi01/kairo v0.1.1 // indirect
 )
 
 replace (
