@@ -59,6 +59,45 @@ var ErrStopped = errors.New("kairo: stopped waiting for the workflow")
 // ErrTimedOut: a wait's timeout came before its signal (WaitTimeout).
 var ErrTimedOut = errors.New("kairo: the wait timed out")
 
+// CallError is a call that did not complete: it failed (its action's
+// failure, after its retries) or was cancelled (errors.Is ErrCancelled).
+type CallError struct {
+	RunID   string // the call's run
+	Action  string // the action called ("" for a wait)
+	Status  string // "failed" or "cancelled"
+	Message string
+}
+
+func (e *CallError) Error() string {
+	what := e.RunID
+	if e.Action != "" {
+		what += " (" + e.Action + ")"
+	}
+	if e.Message == "" {
+		return "call " + what + " " + e.Status
+	}
+	return "call " + what + " " + e.Status + ": " + e.Message
+}
+
+func (e *CallError) Unwrap() error {
+	if e.Status == "cancelled" {
+		return ErrCancelled
+	}
+	return nil
+}
+
+// WorkflowError is a workflow that failed: its function returned an error
+// (Err, when it failed in this process: errors.As finds a CallError in it)
+// or panicked. Message is what is recorded.
+type WorkflowError struct {
+	ID      string
+	Message string
+	Err     error
+}
+
+func (e *WorkflowError) Error() string { return "workflow " + e.ID + " failed: " + e.Message }
+func (e *WorkflowError) Unwrap() error { return e.Err }
+
 // errDrivenElsewhere: another process holds the workflow's drive lease.
 var errDrivenElsewhere = errors.New("kairo: the workflow is driven by another process")
 
@@ -253,6 +292,20 @@ func Timeout(d time.Duration) ActionOption {
 // Destination: the rate-limit key (default: the action).
 func Destination(name string) ActionOption {
 	return func(s map[string]any) { s["destination"] = name }
+}
+
+// MaxAttempts: a step of the action is tried at most n times when it
+// fails retryably (Retryable; default 3, or 1 for a Real action without
+// IdempotentRetry: such a step is retried only when it did not take
+// effect).
+func MaxAttempts(n int) ActionOption {
+	return func(s map[string]any) { s["max_attempts"] = n }
+}
+
+// Backoff: the wait before a step's second attempt, doubled for each one
+// after (default 200ms).
+func Backoff(d time.Duration) ActionOption {
+	return func(s map[string]any) { s["backoff"] = d.String() }
 }
 
 // Limit: at most n steps of the action (of its Destination, if it has
@@ -856,7 +909,7 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 			return nil, fmt.Errorf("workflow %s: %w", id, ErrStopped)
 		}
 		_ = k.rt.signal(context.Background(), id, "done", map[string]any{"ok": false, "error": err.Error()})
-		return nil, err
+		return nil, &WorkflowError{ID: id, Message: err.Error(), Err: err}
 	}
 	js, err := json.Marshal(value)
 	if err != nil {
@@ -894,10 +947,10 @@ func done(id string, ri RunInfo) (json.RawMessage, error) {
 		_ = json.Unmarshal(ri.Output, &out)
 	}
 	if out.Payload == nil {
-		return nil, fmt.Errorf("workflow %s %s: %s", id, ri.Status, ri.Error)
+		return nil, &WorkflowError{ID: id, Message: ri.Status + ": " + ri.Error}
 	}
 	if !out.Payload.OK {
-		return nil, errors.New(out.Payload.Error)
+		return nil, &WorkflowError{ID: id, Message: out.Payload.Error}
 	}
 	return out.Payload.Value, nil
 }
@@ -932,16 +985,25 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 			// the workflow is only no longer driven here: the call goes on.
 			if c.cancelled() {
 				_ = k.rt.cancel(context.Background(), runID)
-				return nil, fmt.Errorf("call %s: %w", runID, ErrCancelled)
+				return nil, &CallError{RunID: runID, Action: calledAction(plan), Status: "cancelled"}
 			}
 			return nil, fmt.Errorf("call %s: %w", runID, ErrStopped)
 		}
 		return nil, err
 	}
 	if r.Status != "completed" {
-		return nil, fmt.Errorf("call %s %s: %s", runID, r.Status, r.Error)
+		return nil, &CallError{RunID: runID, Action: calledAction(plan), Status: r.Status, Message: r.Error}
 	}
 	return r.Output, nil
+}
+
+// calledAction is the action a call's plan calls ("" for a wait).
+func calledAction(plan string) string {
+	a, _ := strings.CutPrefix(plan, planCall)
+	if a == plan {
+		return ""
+	}
+	return a
 }
 
 // Signal sends a signal to the first wait for it in workflow id that has

@@ -18,7 +18,7 @@ from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.store import SQLiteStore
-from kairo_sdk.workflow import Cancelled, Kairo, StoppedError, TimedOutError
+from kairo_sdk.workflow import CallError, Cancelled, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError
 
 try:
     from .test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -385,6 +385,50 @@ class DrivingTest(unittest.TestCase):
             since = datetime.datetime.fromtimestamp(all[0]["created_at"] / 1000)
             self.assertEqual(len(await k.list(status="completed", since=since)), 5)
             self.assertEqual(len(await k.list(until=all[0]["created_at"])), 0)
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_retries_and_typed_errors(self) -> None:
+        """An action's retryable failures are retried up to its max_attempts,
+        its backoff apart; a call that fails is a CallError, a workflow that
+        fails a WorkflowError."""
+
+        async def main() -> None:
+            k = await self.open(self.path("retry.db"))
+            runs = {"flaky": 0, "broken": 0}
+
+            @k.action("flaky", effect="unprotected", max_attempts=5, backoff="1ms")
+            def flaky(_, ctx):
+                runs["flaky"] += 1
+                if runs["flaky"] < 5:
+                    raise RetryableError("busy")
+                return runs["flaky"]
+
+            @k.action("broken", effect="unprotected", max_attempts=5)
+            def broken(_, ctx):
+                runs["broken"] += 1
+                raise OSError("no such file")
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                n = await ctx.call("flaky")
+                try:
+                    await ctx.call("broken")
+                    raise AssertionError("broken did not fail")
+                except CallError as e:
+                    if e.action != "broken" or e.status != "failed" or "no such file" not in e.message:
+                        raise AssertionError(f"not the CallError: {e!r}") from e
+                await ctx.call("broken", 1)
+                return n
+
+            await k.start()
+            with self.assertRaises(WorkflowError) as cm:
+                await k.run("w", None, id="retry-1")
+            self.assertEqual(cm.exception.id, "retry-1")
+            self.assertIn("no such file", cm.exception.message)
+            self.assertEqual(runs["flaky"], 5)
+            self.assertEqual(runs["broken"], 2, "a failure not retryable: once each")
             await k.close()
 
         asyncio.run(main())

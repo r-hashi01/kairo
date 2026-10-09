@@ -15,7 +15,7 @@ import { after, before, describe, test } from 'node:test';
 import { EmbeddedBackend } from './backend.ts';
 import { checkURL, nodeHandler, post, sign } from './http.ts';
 import { SQLiteStore } from './store.ts';
-import { Kairo, Suspended } from './workflow.ts';
+import { Kairo, RetryableError, Suspended, UnknownOutcomeError } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-http-'));
@@ -189,6 +189,22 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 		assert.equal(out.a, 'attempt 2');
 		assert.match(out.real, /blocked/);
 		assert.deepEqual(calls, { idem: 2, real: 1 }, 'the real action is not called again');
+	});
+
+	test("the serving side sends a handler's RetryableError as retryable, its UnknownOutcomeError as 502", async () => {
+		const remote = new Kairo({ secret });
+		remote.defineAction('busy', { effect: 'unprotected', handler: async () => { throw new RetryableError('busy'); } });
+		remote.defineAction('lost', { effect: 'real', handler: async () => { throw new UnknownOutcomeError('connection reset'); } });
+		remote.defineAction('bad', { effect: 'real', handler: async () => { throw new Error('no such file'); } });
+		const serve = remote.fetchHandler();
+		const call = async (action: string) => {
+			const body = JSON.stringify({ run_id: 'r', step_id: 'call', act: 1, attempt: 1, action, input: null, idempotency_key: 'k' });
+			const res = await serve(new Request('http://127.0.0.1/kairo/action', { method: 'POST', body, headers: { 'kairo-signature': sign(secret, body) } }));
+			return [res.status, await res.json()];
+		};
+		assert.deepEqual(await call('busy'), [200, { error: 'busy', retryable: true, error_type: 'RetryableError' }]);
+		assert.deepEqual(await call('lost'), [502, { error: 'connection reset', error_type: 'UnknownOutcomeError' }]);
+		assert.deepEqual(await call('bad'), [200, { error: 'no such file', error_type: 'Error' }]);
 	});
 
 	test('4xx fails the step; 5xx is unknown: unprotected retries, real stops for review', async () => {

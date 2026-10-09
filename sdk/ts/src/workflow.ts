@@ -23,6 +23,14 @@ export interface ActionDef<I = any, O = any> {
 	timeout?: string;
 	/** The rate-limit key (default: the action). Actions of one destination share limit and rate: the strictest. */
 	destination?: string;
+	/**
+	 * A step of the action is tried at most this many times when it fails
+	 * retryably (RetryableError; default 3, or 1 for a real action: such a
+	 * step is retried only when it did not take effect).
+	 */
+	maxAttempts?: number;
+	/** The wait before a step's second attempt, doubled for each one after (e.g. "10ms"; default "200ms"). */
+	backoff?: string;
 	/** At most this many steps of the action (of its destination) run in this process at once (ADR 0059). */
 	limit?: number;
 	/** At most this many steps of the action (of its destination) start in this process a minute, spaced evenly (ADR 0059). */
@@ -112,6 +120,81 @@ export class StoppedError extends Error {}
 export class TimedOutError extends Error {}
 /** Another process holds the workflow's drive lease (ADR 0059). */
 class DrivenElsewhere extends Error {}
+
+/** Thrown by an action's handler: a failure that may be retried (it did not take effect). */
+export class RetryableError extends Error {
+	override name = 'RetryableError';
+}
+
+/**
+ * Thrown by an action's handler: its outcome is unknown (it may have taken
+ * effect). Never taken for success (invariant 5): a real step stops for
+ * review, an unprotected one is retried.
+ */
+export class UnknownOutcomeError extends Error {
+	override name = 'UnknownOutcomeError';
+}
+
+/**
+ * A call that did not complete: it failed (its action's failure, after its
+ * retries) or was cancelled (then its cause is a CancelledError).
+ */
+export class CallError extends Error {
+	override name = 'CallError';
+	/** The call's run. */
+	readonly runId: string;
+	/** The action called ("" for a wait). */
+	readonly action: string;
+	/** "failed" or "cancelled". */
+	readonly status: string;
+	/** The failure as recorded ("" when cancelled). */
+	readonly error: string;
+
+	constructor(runId: string, action: string, status: string, error = '') {
+		const what = action ? `${runId} (${action})` : runId;
+		super(`call ${what} ${status}${error ? `: ${error}` : ''}`, status === 'cancelled' ? { cause: new CancelledError(`call ${runId} cancelled`) } : undefined);
+		this.runId = runId;
+		this.action = action;
+		this.status = status;
+		this.error = error;
+	}
+}
+
+/**
+ * A workflow that failed: its function threw (cause: what it threw, when
+ * it failed in this process). error is what is recorded.
+ */
+export class WorkflowError extends Error {
+	override name = 'WorkflowError';
+	readonly id: string;
+	readonly error: string;
+
+	constructor(id: string, error: string, opts?: { cause?: unknown }) {
+		super(`workflow ${id} failed: ${error}`, opts);
+		this.id = id;
+		this.error = error;
+	}
+}
+
+/** The result of a handler that threw. */
+function failure(e: unknown): Result {
+	const error = String((e as Error)?.message ?? e);
+	const errorType = (e as Error)?.name;
+	if (e instanceof UnknownOutcomeError) return { error, unknown: true, retryable: true, errorType };
+	return { error, ...(e instanceof RetryableError ? { retryable: true } : {}), ...(errorType ? { errorType } : {}) };
+}
+
+/** A result as an action over HTTP(S) answers it (ADR 0052): an unknown outcome has no 200 body. */
+function toWire(r: Result): { wire: Wire; unknown: boolean } {
+	if (r.unknown) return { wire: { error: r.error ?? '', ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: true };
+	if (r.error !== undefined) return { wire: { error: r.error, ...(r.retryable ? { retryable: true } : {}), ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: false };
+	return { wire: { output: r.output ?? null }, unknown: false };
+}
+
+/** The action a call's plan calls ("" for a wait). */
+function calledAction(plan: string): string {
+	return plan.startsWith(PLAN_CALL) ? plan.slice(PLAN_CALL.length) : '';
+}
 
 /** What list selects (ADR 0059): workflows of workflow, in status, created in [since, until), after the run after, at most limit. */
 export interface ListOptions {
@@ -239,6 +322,8 @@ export class Kairo {
 			effect: def.effect ?? 'real',
 			...(def.timeout ? { timeout: def.timeout } : {}),
 			...(def.destination ? { destination: def.destination } : {}),
+			...(def.maxAttempts ? { max_attempts: def.maxAttempts } : {}),
+			...(def.backoff ? { backoff: def.backoff } : {}),
 		}));
 		for (const action of Object.values(BUILTIN)) specs.push({ action, effect: 'unprotected' });
 		if ([...this.actions.values()].some((d) => d.url)) {
@@ -402,6 +487,8 @@ export class Kairo {
 		try {
 			if (def.url) return await this.callRemote(task, def, input);
 			return { output: (await def.handler(input, ctx)) ?? null };
+		} catch (e) {
+			return failure(e);
 		} finally {
 			release();
 		}
@@ -516,17 +603,22 @@ export class Kairo {
 			if (!path.endsWith('/action')) return json(404, { error: 'no such path' });
 			const def = this.actions.get(m.action);
 			if (!def) return json(404, { error: `no action ${m.action} here` });
-			const run = async (): Promise<Wire> => {
+			const run = async (): Promise<{ wire: Wire; unknown: boolean }> => {
 				try {
-					return { output: (await def.handler(m.input, { signal: new AbortController().signal, emit: () => {} })) ?? null };
+					return toWire({ output: (await def.handler(m.input, { signal: new AbortController().signal, emit: () => {} })) ?? null });
 				} catch (e) {
-					return { error: String((e as Error)?.message ?? e), error_type: (e as Error)?.name };
+					return toWire(failure(e));
 				}
 			};
-			if (!def.async) return json(200, await run());
+			if (!def.async) {
+				// An unknown outcome: 502, which the caller takes as unknown.
+				const { wire, unknown } = await run();
+				return json(unknown ? 502 : 200, wire);
+			}
 			// Answer now; run after, and send the outcome to the callback.
 			const work = (async () => {
-				const result = await run();
+				const { wire: result, unknown } = await run();
+				if (unknown) return; // no callback: the lease expires and the step is taken up
 				const cb = JSON.stringify({ run_id: m.run_id, act: m.act, attempt: m.attempt, result });
 				checkURL(m.callback, this.opts.allowInsecure);
 				await post(m.callback, cb, { ca: this.opts.ca, headers: { 'kairo-signature': sign(this.opts.secret!, cb) } });
@@ -826,8 +918,9 @@ export class Kairo {
 				}
 				throw new StoppedError(`workflow ${id}: not driven here any more`);
 			}
-			await this.backend.signal(id, 'done', { ok: false, error: String((e as Error)?.message ?? e) }).catch(() => {});
-			throw e;
+			const error = String((e as Error)?.message ?? e);
+			await this.backend.signal(id, 'done', { ok: false, error }).catch(() => {});
+			throw new WorkflowError(id, error, { cause: e });
 		} finally {
 			parent?.signal?.removeEventListener('abort', stop);
 			this.driving.delete(abort);
@@ -858,7 +951,7 @@ export class Kairo {
 					// in kairo, and the workflow resumes it later.
 					if (ctx.cancelled()) {
 						await this.backend.cancel(runId).catch(() => {});
-						throw new CancelledError(`call ${runId} cancelled`);
+						throw new CallError(runId, calledAction(plan), 'cancelled');
 					}
 					throw new StoppedError(`call ${runId}: stopped waiting for it`);
 				}
@@ -866,7 +959,7 @@ export class Kairo {
 			}
 		}
 		if (r.trimmed) throw new ResultLostError(`call ${runId} finished, but kairo no longer keeps its result`);
-		if (r.status !== 'completed') throw new Error(`call ${runId} ${r.status}: ${r.error ?? ''}`);
+		if (r.status !== 'completed') throw new CallError(runId, calledAction(plan), r.status, r.error ?? '');
 		return r.output;
 	}
 
@@ -973,8 +1066,8 @@ function done(id: string, info: RunInfo): unknown {
 	if (info.trimmed) throw new ResultLostError(`workflow ${id} finished, but kairo no longer keeps its result`);
 	if (info.status === 'cancelled') throw new CancelledError(`workflow ${id} cancelled`);
 	const out = (info.output as { payload?: { ok: boolean; value?: unknown; error?: string } } | undefined)?.payload;
-	if (!out) throw new Error(`workflow ${id} ${info.status}: ${info.error ?? ''}`);
-	if (!out.ok) throw new Error(out.error);
+	if (!out) throw new WorkflowError(id, `${info.status}: ${info.error ?? ''}`);
+	if (!out.ok) throw new WorkflowError(id, out.error ?? '');
 	return out.value;
 }
 

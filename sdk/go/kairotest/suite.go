@@ -41,6 +41,7 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"WaitTimesOut":                     testWaitTimesOut,
 		"Limits":                           testLimits,
 		"SubmitAwaitAndList":               testSubmitAwaitAndList,
+		"RetriesAndTypedErrors":            testRetriesAndTypedErrors,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
 	}
@@ -846,5 +847,53 @@ func testSubmitAwaitAndList(t *testing.T, open Opener) {
 	}
 	if roots, err := k.List(context.Background(), kairo.Filter{}); err != nil || len(roots) != 5 {
 		t.Fatalf("%d %v", len(roots), err)
+	}
+}
+
+// An action's retryable failures are retried up to its MaxAttempts, its
+// Backoff apart; a call that fails is a CallError, a workflow that fails a
+// WorkflowError with the CallError in it.
+func testRetriesAndTypedErrors(t *testing.T, open Opener) {
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: open()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	runs := &counts{m: map[string]int{}}
+	kairo.Action(k, "flaky", kairo.Unprotected, func(tc *kairo.TaskContext, _ any) (int32, error) {
+		runs.add("flaky")
+		if tc.Attempt < 5 {
+			return 0, kairo.Retryable(errors.New("busy"))
+		}
+		return tc.Attempt, nil
+	}, kairo.MaxAttempts(5), kairo.Backoff(time.Millisecond))
+	kairo.Action(k, "broken", kairo.Unprotected, func(*kairo.TaskContext, any) (any, error) {
+		runs.add("broken")
+		return nil, errors.New("no such file")
+	}, kairo.MaxAttempts(5))
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (int32, error) {
+		n, err := kairo.Call[int32](ctx, "flaky", nil)
+		if err != nil {
+			return 0, err
+		}
+		var ce *kairo.CallError
+		if _, err := kairo.Call[any](ctx, "broken", nil); !errors.As(err, &ce) || ce.Action != "broken" || ce.Status != "failed" ||
+			!strings.Contains(ce.Message, "no such file") {
+			return 0, fmt.Errorf("not the CallError: %v", err)
+		}
+		_, err = kairo.Call[any](ctx, "broken", 1)
+		return n, err
+	})
+	k.Start(context.Background())
+	_, err = kairo.Run[int32](context.Background(), k, "w", nil, kairo.WithID("retry-1"))
+	var we *kairo.WorkflowError
+	if !errors.As(err, &we) || we.ID != "retry-1" || !strings.Contains(we.Message, "no such file") {
+		t.Fatalf("%v", err)
+	}
+	if runs.get("flaky") != 5 {
+		t.Fatalf("flaky ran %d times", runs.get("flaky"))
+	}
+	if runs.get("broken") != 2 { // a failure not retryable: once each
+		t.Fatalf("broken ran %d times", runs.get("broken"))
 	}
 }

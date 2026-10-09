@@ -13,7 +13,7 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
 import { PostgresStore, SQLiteStore, type Store } from './store.ts';
-import { CancelledError, Kairo, StoppedError, TimedOutError, type KairoOptions } from './workflow.ts';
+import { CallError, CancelledError, Kairo, RetryableError, StoppedError, TimedOutError, WorkflowError, type KairoOptions } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-driving-'));
@@ -303,6 +303,48 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		assert.equal((await k.list()).length, 5);
 		assert.equal((await k.list({ status: 'completed', since: new Date(all[0]!.createdAt!) })).length, 5);
 		assert.equal((await k.list({ until: all[0]!.createdAt! })).length, 0);
+		await k.close();
+	});
+
+	// An action's retryable failures are retried up to its maxAttempts, its
+	// backoff apart; a call that fails is a CallError, a workflow that fails
+	// a WorkflowError.
+	test('retries and typed errors', async () => {
+		const k = await open(join(dir, 'retry.db'));
+		const runs = { flaky: 0, broken: 0 };
+		k.defineAction('flaky', {
+			effect: 'unprotected',
+			maxAttempts: 5,
+			backoff: '1ms',
+			handler: async () => {
+				if (++runs.flaky < 5) throw new RetryableError('busy');
+				return runs.flaky;
+			},
+		});
+		k.defineAction('broken', {
+			effect: 'unprotected',
+			maxAttempts: 5,
+			handler: async () => {
+				runs.broken++;
+				throw new Error('no such file');
+			},
+		});
+		k.workflow('w', async (ctx) => {
+			const n = await ctx.call<number>('flaky');
+			const e = await ctx.call('broken').then(() => undefined, (e: unknown) => e);
+			if (!(e instanceof CallError) || e.action !== 'broken' || e.status !== 'failed' || !e.message.includes('no such file')) {
+				throw new Error(`not the CallError: ${e}`);
+			}
+			await ctx.call('broken', 1);
+			return n;
+		});
+		await k.start();
+		const e = await k.run('w', null, { id: 'retry-1' }).then(() => undefined, (e: unknown) => e);
+		assert.ok(e instanceof WorkflowError, `${e}`);
+		assert.equal(e.id, 'retry-1');
+		assert.match(e.message, /no such file/);
+		assert.equal(runs.flaky, 5);
+		assert.equal(runs.broken, 2, 'a failure not retryable: once each');
 		await k.close();
 	});
 });

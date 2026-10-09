@@ -49,7 +49,14 @@ An action is a function your workflows call. You declare what it does to the wor
 | `'unprotected'` | Safe to repeat: an LLM call, a read, a computation | It runs again |
 | `'real'` (the default) | Acts on the world: a payment, an email, a write | It stops for review (`blocked`). It is never re-run blindly |
 
-A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`'30s'`, `'5m'`), `destination` (a rate-limit key), and `url` for [actions over HTTP(S)](#actions-over-https).
+A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`'30s'`, `'5m'`), `destination` (a rate-limit key), `maxAttempts` and `backoff` (below), and `url` for [actions over HTTP(S)](#actions-over-https).
+
+A handler that throws fails its step for good. To say otherwise, throw one of these:
+
+| Thrown | Means | The step |
+|---|---|---|
+| `RetryableError` | It did not take effect: try again | Is retried up to `maxAttempts` (default 3; 1 for a real action), `backoff` apart (default `'200ms'`, doubled each time) |
+| `UnknownOutcomeError` | It may have taken effect | Is never taken for success: a real step stops for review, an unprotected one is retried |
 
 ### Workflows
 
@@ -67,6 +74,8 @@ k.workflow('name', async (ctx, input) => { ... });
 | `ctx.workflow(name, input)` | Runs a child workflow |
 
 A workflow must be deterministic between its calls: read the clock and randomness through `ctx.now()` and `ctx.random()`, and do I/O in actions.
+
+A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status`: `'failed'` or `'cancelled'`, `error`: the failure as recorded); a cancelled one has a `CancelledError` as its `cause`. A workflow whose function throws fails: `run` and `result` throw `WorkflowError` (`id`, `error`; `cause` is what the function threw, when it failed in this process).
 
 ### Running
 
@@ -129,7 +138,7 @@ k.defineAction('render', { effect: 'unprotected', url: 'https://gpu.example.com/
 - `4xx` fails the step. `5xx`, a timeout or a broken connection make the outcome unknown.
 - HTTPS is required, except to `localhost` or with `allowInsecure`. Trust your own CA with `ca`.
 
-The serving side is the same `k.fetchHandler()`, with the action's real `handler`. For `node:http`, wrap it with `nodeHandler()`.
+The serving side is the same `k.fetchHandler()`, with the action's real `handler`. For `node:http`, wrap it with `nodeHandler()`. A handler's `RetryableError` is sent as a retryable failure; its `UnknownOutcomeError` is answered with `502` (and an async action sends no callback), which the caller takes as unknown.
 
 ## With kairod
 

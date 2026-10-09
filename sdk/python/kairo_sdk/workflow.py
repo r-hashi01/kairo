@@ -73,6 +73,78 @@ class TimedOutError(Exception):
     """A wait's timeout came before its signal (wait_for's timeout, ADR 0059)."""
 
 
+class RetryableError(Exception):
+    """Raised by an action's handler: a failure that may be retried (it did
+    not take effect)."""
+
+
+class UnknownOutcomeError(Exception):
+    """Raised by an action's handler: its outcome is unknown (it may have
+    taken effect). Never taken for success (invariant 5): a real step stops
+    for review, an unprotected one is retried."""
+
+
+class CallError(RuntimeError):
+    """A call that did not complete: it failed (its action's failure, after
+    its retries) or was cancelled (then it is a Cancelled too).
+
+    run_id: the call's run. action: the action called ("" for a wait).
+    status: "failed" or "cancelled". message: the failure as recorded."""
+
+    def __init__(self, run_id: str, action: str, status: str, message: str = "") -> None:
+        what = f"{run_id} ({action})" if action else run_id
+        super().__init__(f"call {what} {status}: {message}" if message else f"call {what} {status}")
+        self.run_id = run_id
+        self.action = action
+        self.status = status
+        self.message = message
+
+
+class _CancelledCall(CallError, Cancelled):
+    """A call that was cancelled: caught as CallError or as Cancelled."""
+
+
+def _call_error(run_id: str, plan: str, status: str, message: str = "") -> CallError:
+    # The action a call's plan calls ("" for a wait).
+    action = plan[len(PLAN_CALL) :] if plan.startswith(PLAN_CALL) else ""
+    if status == "cancelled":
+        return _CancelledCall(run_id, action, status, message)
+    return CallError(run_id, action, status, message)
+
+
+class WorkflowError(RuntimeError):
+    """A workflow that failed: its function raised (__cause__: what it
+    raised, when it failed in this process). message: what is recorded."""
+
+    def __init__(self, id: str, message: str) -> None:
+        super().__init__(f"workflow {id} failed: {message}")
+        self.id = id
+        self.message = message
+
+
+def _failure(e: BaseException) -> Result:
+    """The result of a handler that raised."""
+    error = f"{type(e).__name__}: {e}"
+    if isinstance(e, UnknownOutcomeError):
+        return Result(error=error, unknown=True, retryable=True, error_type=type(e).__name__)
+    return Result(error=error, retryable=isinstance(e, RetryableError), error_type=type(e).__name__)
+
+
+def _to_wire(r: Result) -> tuple[dict[str, Any], bool]:
+    """A result as an action over HTTP(S) answers it (ADR 0052), and whether
+    it is unknown: an unknown outcome has no 200 body."""
+    if r.unknown:
+        return {"error": r.error, **({"error_type": r.error_type} if r.error_type else {})}, True
+    if r.error:
+        w: dict[str, Any] = {"error": r.error}
+        if r.retryable:
+            w["retryable"] = True
+        if r.error_type:
+            w["error_type"] = r.error_type
+        return w, False
+    return {"output": r.output}, False
+
+
 class _DrivenElsewhere(Exception):
     """Another process holds the workflow's drive lease (ADR 0059)."""
 
@@ -91,6 +163,8 @@ class _Action:
     async_: bool = False
     limit: int | None = None
     rate: float | None = None
+    max_attempts: int | None = None
+    backoff: str | None = None
 
 
 def _canonical(v: Any) -> str:
@@ -314,6 +388,8 @@ class Kairo:
         allow_insecure: bool | None = None,
         limit: int | None = None,
         rate: float | None = None,
+        max_attempts: int | None = None,
+        backoff: str | None = None,
     ):
         """Declares an action: "real" (the default) acts outside and never runs
         twice; "unprotected" may run again. The handler takes the input and a
@@ -324,6 +400,12 @@ class Kairo:
         this many start in this process a minute, spaced evenly (ADR 0059).
         Actions of one destination share limit and rate: the strictest.
 
+        max_attempts: a step of the action is tried at most this many times
+        when it fails retryably (RetryableError; default 3, or 1 for a real
+        action: such a step is retried only when it did not take effect).
+        backoff: the wait before a step's second attempt, doubled for each
+        one after (e.g. "10ms"; default "200ms").
+
         url (ADR 0052): the action's steps are called over HTTP(S) there, and
         the handler runs there (asgi_app). async_: where the URL serves it,
         it answers at once (202) and sends the outcome to the callback."""
@@ -333,7 +415,7 @@ class Kairo:
             check_url(url, self._allow_insecure if allow_insecure is None else allow_insecure)
 
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate)
+            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate, max_attempts, backoff)
             return fn
 
         return register
@@ -358,6 +440,10 @@ class Kairo:
                 s["timeout"] = a.timeout
             if a.destination:
                 s["destination"] = a.destination
+            if a.max_attempts:
+                s["max_attempts"] = a.max_attempts
+            if a.backoff:
+                s["backoff"] = a.backoff
             specs.append(s)
         for name in BUILTIN:
             specs.append({"action": name, "effect": "unprotected"})
@@ -594,6 +680,8 @@ class Kairo:
             if inspect.isawaitable(out):
                 out = asyncio.run(_await(out))
             return Result(output=out)
+        except Exception as e:  # the handler's failure, of the kind it says
+            return _failure(e)
         finally:
             if release is not None:
                 self._loop.call_soon_threadsafe(release)  # type: ignore[union-attr]
@@ -699,21 +787,25 @@ class Kairo:
         if a is None:
             return 404, {"error": f"no action {m.get('action')} here"}
 
-        async def run() -> dict[str, Any]:
+        async def run() -> tuple[dict[str, Any], bool]:
             try:
                 out = await asyncio.to_thread(a.handler, m.get("input"), TaskContext(lambda _d: None))
                 if inspect.isawaitable(out):
                     out = await out
-                return {"output": out}
+                return _to_wire(Result(output=out))
             except Exception as e:
-                return {"error": f"{type(e).__name__}: {e}", "error_type": type(e).__name__}
+                return _to_wire(_failure(e))
 
         if not a.async_:
-            return 200, await run()
+            # An unknown outcome: 502, which the caller takes as unknown.
+            result, unknown = await run()
+            return (502 if unknown else 200), result
 
         # Answer now; run after, and send the outcome to the callback.
         async def work() -> None:
-            result = await run()
+            result, unknown = await run()
+            if unknown:
+                return  # no callback: the lease expires and the step is taken up
             cb = json.dumps({"run_id": m["run_id"], "act": m["act"], "attempt": m["attempt"], "result": result}).encode()
             try:
                 check_url(m["callback"], self._allow_insecure)
@@ -1055,14 +1147,13 @@ class Kairo:
             except Suspended:
                 raise  # goes on later
             except (Exception, asyncio.CancelledError) as e:
+                # (A CancelledError here is not this driver's: the function's own.)
+                error = str(e) or type(e).__name__
                 try:
-                    await self.backend.signal(id, "done", {"ok": False, "error": str(e) or type(e).__name__})
+                    await self.backend.signal(id, "done", {"ok": False, "error": error})
                 except Exception:
                     pass
-                if isinstance(e, asyncio.CancelledError):
-                    # Not this driver's: the function's own.
-                    raise RuntimeError(f"workflow {id}: its function was cancelled") from e
-                raise
+                raise WorkflowError(id, error) from e
             await self.backend.signal(id, "done", {"ok": True, "value": value})
             return value
         finally:
@@ -1091,7 +1182,7 @@ class Kairo:
         if r.get("trimmed"):
             raise ResultLostError(f"call {run_id} finished, but kairo no longer keeps its result")
         if r.get("status") != "completed":
-            raise RuntimeError(f"call {run_id} {r.get('status')}: {r.get('error', '')}")
+            raise _call_error(run_id, plan, str(r.get("status")), r.get("error") or "")
         return r.get("output")
 
 
@@ -1141,9 +1232,9 @@ def _done(id: str, info: dict[str, Any]) -> Any:
         raise Cancelled(f"workflow {id} cancelled")
     out = (info.get("output") or {}).get("payload")
     if not out:
-        raise RuntimeError(f"workflow {id} {info.get('status')}: {info.get('error', '')}")
+        raise WorkflowError(id, f"{info.get('status')}: {info.get('error', '')}")
     if not out.get("ok"):
-        raise RuntimeError(out.get("error"))
+        raise WorkflowError(id, str(out.get("error")))
     return out.get("value")
 
 

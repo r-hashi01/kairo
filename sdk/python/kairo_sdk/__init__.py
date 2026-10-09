@@ -14,7 +14,20 @@ from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Resu
 from .worker import Task, TaskContext, Worker
 from .store import PostgresStore, SQLiteStore
 from ._version import __version__
-from .workflow import Cancelled, Context, Kairo, ResultLostError, StoppedError, Suspended, TimedOutError, tick_handler
+from .workflow import (
+    CallError,
+    Cancelled,
+    Context,
+    Kairo,
+    ResultLostError,
+    RetryableError,
+    StoppedError,
+    Suspended,
+    TimedOutError,
+    UnknownOutcomeError,
+    WorkflowError,
+    tick_handler,
+)
 
 __all__ = [
     "__version__",
@@ -25,14 +38,18 @@ __all__ = [
     "SQLiteStore",
     "Suspended",
     "Cancel",
+    "CallError",
     "Cancelled",
     "Client",
     "Context",
     "Kairo",
     "KairoError",
     "ResultLostError",
+    "RetryableError",
     "StoppedError",
     "TimedOutError",
+    "UnknownOutcomeError",
+    "WorkflowError",
     "Chunk",
     "Credit",
     "Hello",

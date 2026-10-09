@@ -53,7 +53,14 @@ Action handlers may be plain functions (they run on a thread) or `async` functio
 | `"unprotected"` | Safe to repeat: an LLM call, a read, a computation | It runs again |
 | `"real"` (the default) | Acts on the world: a payment, an email, a write | It stops for review (`blocked`). It is never re-run blindly |
 
-A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`"30s"`, `"5m"`), `destination` (a rate-limit key), and `url` for [actions over HTTP(S)](#actions-over-https).
+A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`"30s"`, `"5m"`), `destination` (a rate-limit key), `max_attempts` and `backoff` (below), and `url` for [actions over HTTP(S)](#actions-over-https).
+
+A handler that raises fails its step for good. To say otherwise, raise one of these:
+
+| Raised | Means | The step |
+|---|---|---|
+| `RetryableError` | It did not take effect: try again | Is retried up to `max_attempts` (default 3; 1 for a real action), `backoff` apart (default `"200ms"`, doubled each time) |
+| `UnknownOutcomeError` | It may have taken effect | Is never taken for success: a real step stops for review, an unprotected one is retried |
 
 ### Workflows
 
@@ -67,6 +74,8 @@ A real step is dispatched only after its intent is committed to the database. Op
 | `await ctx.workflow(name, input)` | Runs a child workflow |
 
 A workflow must be deterministic between its calls: read the clock and randomness through `ctx.now()` and `ctx.random()`, and do I/O in actions.
+
+A call that fails or is cancelled raises `CallError` (`run_id`, `action`, `status`: `"failed"` or `"cancelled"`, `message`); a cancelled one is a `Cancelled` too. A workflow whose function raises fails: `run` and `result` raise `WorkflowError` (`id`, `message`; its `__cause__` is what the function raised, when it failed in this process). Both are `RuntimeError`s.
 
 ### Running
 
@@ -126,7 +135,7 @@ k.action("render", effect="unprotected", url="https://gpu.example.com/kairo/acti
 - `4xx` fails the step. `5xx`, a timeout or a broken connection make the outcome unknown.
 - HTTPS is required, except to `localhost` or with `allow_insecure=True`. Trust your own CA with `ca`.
 
-The serving side is the same `k.asgi_app()`, with the action's real handler.
+The serving side is the same `k.asgi_app()`, with the action's real handler. A handler's `RetryableError` is sent as a retryable failure; its `UnknownOutcomeError` is answered with `502` (and an async action sends no callback), which the caller takes as unknown.
 
 ## With kairod
 

@@ -20,7 +20,7 @@ from typing import Any
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.http import check_url, post, sign
 from kairo_sdk.store import SQLiteStore
-from kairo_sdk.workflow import Kairo, Suspended
+from kairo_sdk.workflow import Kairo, RetryableError, Suspended, UnknownOutcomeError
 
 from test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
 
@@ -319,6 +319,35 @@ class HttpActionTest(unittest.TestCase):
             self.assertEqual(runs, [])
             r = await asyncio.to_thread(post, base + "/kairo/action", body, headers={"Kairo-Signature": sign(SECRET, body)})
             self.assertEqual((r.status, json.loads(r.body)), (200, {"output": 1}))
+
+        run(main)
+
+    def test_serving_side_sends_retryable_and_unknown(self) -> None:
+        """A handler's RetryableError is sent as retryable; its
+        UnknownOutcomeError is answered with 502, which the caller takes as
+        unknown."""
+
+        def raises(e: Exception):
+            def handler(_, ctx):
+                raise e
+
+            return handler
+
+        async def main() -> None:
+            k = Kairo(secret=SECRET)
+            k.action("busy", effect="unprotected")(raises(RetryableError("busy")))
+            k.action("lost")(raises(UnknownOutcomeError("connection reset")))
+            k.action("bad")(raises(OSError("no such file")))
+            base, _ = await serve(k.asgi_app())
+
+            async def call(action: str) -> tuple[int, Any]:
+                body = json.dumps({"run_id": "r", "act": 1, "attempt": 1, "action": action, "input": None}).encode()
+                r = await asyncio.to_thread(post, base + "/kairo/action", body, headers={"Kairo-Signature": sign(SECRET, body)})
+                return r.status, json.loads(r.body)
+
+            self.assertEqual(await call("busy"), (200, {"error": "RetryableError: busy", "retryable": True, "error_type": "RetryableError"}))
+            self.assertEqual(await call("lost"), (502, {"error": "UnknownOutcomeError: connection reset", "error_type": "UnknownOutcomeError"}))
+            self.assertEqual(await call("bad"), (200, {"error": "OSError: no such file", "error_type": "OSError"}))
 
         run(main)
 
