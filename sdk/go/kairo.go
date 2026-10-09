@@ -917,7 +917,7 @@ func (k *Kairo) driveBackground(id, name string, in json.RawMessage, parent stri
 			k.mu.Unlock()
 		}()
 		if _, err := k.drive(k.bgCtx, id, name, in, parent, token); err != nil && !errors.Is(err, errDrivenElsewhere) && !errors.Is(err, errUnknownPlan) &&
-			!errors.Is(err, ErrStopped) && !errors.Is(err, ErrCancelled) {
+			!errors.Is(err, ErrStopped) && !errors.Is(err, ErrCancelled) && k.bgCtx.Err() == nil { // not the process closing
 			k.rt.logger.Warn("kairo: driving a workflow", "workflow", id, "err", err)
 		}
 	}()

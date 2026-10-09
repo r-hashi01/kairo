@@ -30,7 +30,7 @@ k.workflow('refund', async (ctx, req: { order: string; amount: number }) => {
 
 ## Why kairo
 
-- **No server to run.** The engine is a pure Go core compiled to WebAssembly (1.2 MB gzipped). It runs inside your Node or Python process, and SQLite or PostgreSQL is the only infrastructure. There is no daemon, no broker and no worker fleet to operate.
+- **No server to run.** The engine is a pure Go core compiled to WebAssembly (1.2 MB gzipped). It runs inside your Node or Python process (in a Go one, natively), and SQLite or PostgreSQL is the only infrastructure. There is no daemon, no broker and no worker fleet to operate.
 - **Serverless first.** In suspend mode, a function invocation advances a workflow as far as it can and returns. A scheduler's `/tick` or a one-off `wake(at)` brings it back exactly when the next timer is due. Nothing polls.
 - **Effects have types.** You declare each action as `real` (it acts on the world) or `unprotected` (safe to repeat). A real step is dispatched only after its intent is committed. If its outcome is unknown, it is never retried blindly; it stops for review.
 - **Branch on types, not on text.** Conditions test only typed fields (bool, int, number, enum). Pair this with typed LLM decisions ([kairo-jev](docs/jev.md)) and an agent's choice drives the graph without parsing prose.
@@ -40,8 +40,11 @@ k.workflow('refund', async (ctx, req: { order: string; amount: number }) => {
 
 ## Quick start
 
-> [!NOTE]
-> kairo has not been released yet. The SDKs will be published as **`kairo-sdk`** on npm and PyPI. Until then, [build them from source](#from-source).
+```sh
+npm install kairo-sdk                        # TypeScript (Node 22+)
+pip install 'kairo-sdk[embedded]'            # Python (3.12+)
+go get github.com/r-hashi01/kairo@latest     # Go (1.27+): kairo "github.com/r-hashi01/kairo/sdk/go"
+```
 
 ### TypeScript (Node 22+)
 
@@ -103,7 +106,29 @@ async def main():
 asyncio.run(main())
 ```
 
-Run either one, kill it at any point, and run it again: the workflow resumes, and `refund-payment` runs exactly once.
+### Go (1.27+)
+
+The same, with the core running natively in your process. See the [Go SDK's README](sdk/go/README.md) for the whole of it.
+
+```go
+kairo.Action(k, "classify", kairo.Unprotected, func(_ *kairo.TaskContext, r Req) (bool, error) { return r.Amount > 100, nil })
+kairo.Action(k, "refund-payment", kairo.Real, func(_ *kairo.TaskContext, r Req) (string, error) { return "refunded " + r.Order, nil })
+
+kairo.Workflow(k, "refund", func(ctx *kairo.Context, r Req) (string, error) {
+	risky, err := kairo.Call[bool](ctx, "classify", r)
+	if err != nil {
+		return "", err
+	}
+	if risky {
+		if _, err := kairo.WaitFor[string](ctx, "approve"); err != nil {
+			return "", err
+		}
+	}
+	return kairo.Call[string](ctx, "refund-payment", r)
+})
+```
+
+Run any of them, kill it at any point, and run it again: the workflow resumes, and `refund-payment` runs exactly once. The three SDKs share their tables and call ids: a workflow begun in one language can be finished in another.
 
 ## How it works
 
@@ -209,7 +234,7 @@ The full list, with the tests behind each, is in [AGENTS.md](AGENTS.md). Every d
 |---|---|
 | `core/` `ir/` | the pure state machine, the plan compiler and its graph IR |
 | `wasmcore/` `cmd/kairo-wasm/` | the core as a WASM module for the SDKs |
-| `sdk/ts/` `sdk/python/` | the SDKs: the embedded runtime, workflows as code, HTTP actions, scheduler entry points |
+| `sdk/ts/` `sdk/python/` `sdk/go/` | the SDKs: the embedded runtime, workflows as code, HTTP actions, scheduler entry points, test environments (Go runs the core natively) |
 | `engine/` `sched/` `wal/` `timerwheel/` | kairod's engine: shards, admission and quotas, write-ahead log, timers |
 | `cmd/kairod/` `api/` `protocol/` | the daemon, its HTTP API and the worker protocol |
 | `store/` | SQL backends for kairod (each a module of its own) |
