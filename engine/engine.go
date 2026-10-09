@@ -212,6 +212,9 @@ type RunInfo struct {
 	// the host persists them (ADR 0033).
 	Vars       json.RawMessage `json:"vars,omitempty"`
 	FinishedAt time.Time       `json:"finished_at,omitzero"`
+	// Input is the run's input, as it was submitted: given by GetInput
+	// only (for a run not finished), not by Get.
+	Input json.RawMessage `json:"input,omitempty"`
 }
 
 type Review struct {
@@ -735,6 +738,30 @@ func (e *Engine) Get(ctx context.Context, runID string) (RunInfo, error) {
 				return ri, nil
 			}
 			return RunInfo{}, ErrUnknownRun
+		}
+		return r.info, nil
+	case <-ctx.Done():
+		return RunInfo{}, ctx.Err()
+	}
+}
+
+// GetInput is Get with the run's input, for a run not finished: what the
+// host submitted, given back as it was (an SDK reads its own data in it,
+// such as a workflow's version, ADR 0060). An evicted run is loaded for
+// it: the cost is paid by who asks, not by every run.
+func (e *Engine) GetInput(ctx context.Context, runID string) (RunInfo, error) {
+	e.waitMu.Lock()
+	if ri, ok := e.finished[runID]; ok {
+		e.waitMu.Unlock()
+		return ri, nil
+	}
+	e.waitMu.Unlock()
+	reply := make(chan queryReply, 1)
+	e.shardFor(runID).inbox.Push(msg{kind: mQueryInput, runID: runID, reply: reply})
+	select {
+	case r := <-reply:
+		if !r.found {
+			return e.Get(ctx, runID)
 		}
 		return r.info, nil
 	case <-ctx.Done():

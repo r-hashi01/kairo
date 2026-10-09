@@ -44,8 +44,9 @@ class Backend(Protocol):
         embedded runtime only (ADR 0059); kairod ignores them."""
         ...
 
-    async def get(self, run_id: str) -> dict[str, Any]:
-        """Raises KairoError 404 for a run that does not exist."""
+    async def get(self, run_id: str, *, input: bool = False) -> dict[str, Any]:
+        """Raises KairoError 404 for a run that does not exist. With input:
+        the run's input too (ADR 0060)."""
         ...
 
     async def wait(self, run_id: str) -> dict[str, Any]: ...
@@ -101,8 +102,8 @@ class HttpBackend:
             lambda: self.client.run(plan, input, run_id=run_id, tenant=self._tenant, tier="file", vars=vars, keep_output=True)
         )
 
-    async def get(self, run_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self.client.get, run_id)
+    async def get(self, run_id: str, *, input: bool = False) -> dict[str, Any]:
+        return await asyncio.to_thread(self.client.get, run_id, input=input)
 
     async def wait(self, run_id: str) -> dict[str, Any]:
         while True:
@@ -145,7 +146,7 @@ class EmbeddedBackend:
     async def run(self, plan: str, input: Any, *, run_id: str, **kw: Any) -> dict[str, Any]:
         return await self.runtime.run(plan, input, run_id=run_id, **kw)
 
-    async def get(self, run_id: str) -> dict[str, Any]:
+    async def get(self, run_id: str, *, input: bool = False) -> dict[str, Any]:
         return await self.runtime.get(run_id)
 
     async def wait(self, run_id: str) -> dict[str, Any]:

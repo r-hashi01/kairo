@@ -113,3 +113,19 @@
 - **TypeScript と Python には、アクションに `IdempotentRetry` を宣言する手段がまだない。** 判定で `idempotent` を読む処理は入れたので、宣言の手段を足せば、そのまま効く。
 - **テスト**：Go と同じ 4 つ（VersionsArePinned、SettingsChangeUnderACall、EffectIsNotWeakened、ChildVersionNotHere）を、両方に足した。
   - EffectIsNotWeakened では、止まったことの観測も待つ条件に入れた。Go のテストも同じ形に直した。
+
+### kairod が実行の入力を返す（2026-10-09 追記）
+
+上の「kairod では版による固定が効かない」は、次の変更で解消した。
+
+- **ランタイムは版を知らないままにした（利用者の方針）。** 版を読んで、どの関数で動かすかを決めるのは、実行させる側（SDK）である。kairod は、SDK が書いた入力を、中身を見ずに返すだけにした。
+- **`engine.Engine.GetInput` を足した。**
+  - 終わっていない実行について、投入されたときの入力を `RunInfo.Input` に入れて返す。
+  - 退避されている実行は、そのために読み込む。読み込みは、尋ねた人の分だけ払う（ADR 0041）。
+  - 尋ねられたときだけ使う対応表をシャードに置き、実行ごとの構造体やメッセージには項目を足していない。そのため、待機中の実行のメモリは増えない。
+  - `Get` は、これまでどおり入力を返さない。
+- **HTTP API は `GET /v1/runs/{id}?input=true` で入力を返す。** ブロブに置かれた大きな入力も、中身に戻して返す。
+- **TypeScript・Python の kairod 経由（`HttpBackend`）は、ワークフローを再開するときに入力を尋ねて、版を読む。** 入力を返さない古い kairod では、今の版で動かす。
+- **テスト**
+  - エンジン：`TestGetInput`。退避された実行の入力を返すこと、`Get` は返さないことを確かめる。
+  - TypeScript・Python：kairod と埋め込みの両方で「始めたときの版で続く」テストを足した。入力を尋ねないようにすると、kairod の側が落ちることも確かめた。

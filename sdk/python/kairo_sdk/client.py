@@ -87,8 +87,10 @@ class Client:
             raise KairoError(504, f"run {out.get('run_id')}: start not confirmed")
         return out
 
-    def get(self, run_id: str) -> dict[str, Any]:
-        return self._call("GET", f"/v1/runs/{self._id(run_id)}")[1]
+    def get(self, run_id: str, *, input: bool = False) -> dict[str, Any]:
+        """With input: the run's input too, as it was submitted (a run not
+        finished, ADR 0060)."""
+        return self._call("GET", f"/v1/runs/{self._id(run_id)}" + ("?input=true" if input else ""))[1]
 
     def wait(self, run_id: str, poll: str = "10s") -> dict[str, Any]:
         """Waits until the run has finished."""

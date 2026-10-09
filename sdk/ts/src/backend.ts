@@ -17,8 +17,8 @@ export interface Backend {
 	run(plan: string, input: unknown, opts: RunStart): Promise<{ run_id: string; existing: boolean }>;
 	/** Keeps a workflow's calls while it runs, however long (the embedded runtime, ADR 0054). */
 	readonly keepsCalls?: boolean;
-	/** Throws KairoError 404 for a run that does not exist. */
-	get(runId: string): Promise<RunInfo>;
+	/** Throws KairoError 404 for a run that does not exist. With input: the run's input too (ADR 0060). */
+	get(runId: string, opts?: { input?: boolean }): Promise<RunInfo>;
 	wait(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	signal(runId: string, name: string, payload: unknown): Promise<void>;
 	cancel(runId: string): Promise<void>;
@@ -90,8 +90,8 @@ export class HttpBackend implements Backend {
 		return this.client.run(plan, input, { runId: opts.runId, tier: 'file', vars: opts.vars, keepOutput: true });
 	}
 
-	get(runId: string) {
-		return this.client.get(runId);
+	get(runId: string, opts?: { input?: boolean }) {
+		return this.client.get(runId, opts);
 	}
 
 	wait(runId: string, signal?: AbortSignal) {

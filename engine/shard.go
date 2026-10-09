@@ -47,6 +47,9 @@ type shard struct {
 	feedWait  []*run
 	fired     []timerRef
 	now       int64
+	// inputWaits: GetInput's replies for evicted runs being loaded for
+	// them (made on first use: no cost to runs nobody asks about).
+	inputWaits map[*run][]chan queryReply
 
 	inMemory   atomic.Int64
 	evicted    atomic.Int64
@@ -166,6 +169,7 @@ const (
 	mKept
 	mKeptDeleted
 	mStop
+	mQueryInput // GetInput (ADR 0060)
 )
 
 type msg struct {
@@ -378,6 +382,41 @@ func (s *shard) handle(m *msg) {
 			return
 		}
 		m.reply <- queryReply{info: s.info(r), found: true}
+	case mQueryInput:
+		r := s.runs[m.runID]
+		if r == nil {
+			m.reply <- queryReply{}
+			return
+		}
+		if r.st != nil {
+			ri := s.info(r)
+			ri.Input = r.st.Input
+			m.reply <- queryReply{info: ri, found: true}
+			return
+		}
+		// Evicted: answered once it is loaded.
+		if s.inputWaits == nil {
+			s.inputWaits = map[*run][]chan queryReply{}
+		}
+		s.inputWaits[r] = append(s.inputWaits[r], m.reply)
+		s.load(r)
+	}
+}
+
+// answerInputs answers GetInput's replies waiting for r to be loaded (with
+// no input if it could not be).
+func (s *shard) answerInputs(r *run) {
+	replies := s.inputWaits[r]
+	if len(replies) == 0 {
+		return
+	}
+	delete(s.inputWaits, r)
+	ri := s.info(r)
+	if r.st != nil {
+		ri.Input = r.st.Input
+	}
+	for _, reply := range replies {
+		reply <- queryReply{info: ri, found: true}
 	}
 }
 
@@ -954,8 +993,10 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 	}
 	if err != nil {
 		log.Printf("kairo: shard %d: loading snapshot of %s: %v", s.id, r.id, err)
+		s.answerInputs(r)
 		return
 	}
+	defer s.answerInputs(r)
 	r.snap = nil
 	r.onDisk = false
 	s.inMemory.Add(1)

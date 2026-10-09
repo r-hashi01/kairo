@@ -870,3 +870,36 @@ func TestSubmitNotAcceptedWhileQueued(t *testing.T) {
 		t.Fatalf("admission leaked: active %d queued %d", active, queued)
 	}
 }
+
+// GetInput gives a run's input back as it was submitted, loading an
+// evicted run for it; Get does not carry it (ADR 0060).
+func TestGetInput(t *testing.T) {
+	dir := t.TempDir()
+	e := newEngine(t, Config{Shards: 2, DataDir: dir, EvictAfter: time.Millisecond})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"approve","signal":"ok"}}`)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ft := TierFile
+	in := json.RawMessage(`{"workflow":"refund","input":{"order":42},"version":"2"}`)
+	id, err := submit(e, SubmitRequest{Plan: "w", Input: in, Tenant: "t", Tier: &ft})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { ri, _ := e.Get(context.Background(), id); return ri.Evicted })
+	if ri, _ := e.Get(context.Background(), id); ri.Input != nil {
+		t.Fatalf("Get carries the input: %s", ri.Input)
+	}
+	ri, err := e.GetInput(context.Background(), id)
+	if err != nil || string(ri.Input) != string(in) {
+		t.Fatalf("GetInput of an evicted run: %s %v", ri.Input, err)
+	}
+	ri, err = e.GetInput(context.Background(), id) // loaded now, or evicted again
+	if err != nil || string(ri.Input) != string(in) {
+		t.Fatalf("GetInput again: %s %v", ri.Input, err)
+	}
+	if _, err := e.GetInput(context.Background(), "no-such-run"); err != ErrUnknownRun {
+		t.Fatalf("an unknown run: %v", err)
+	}
+}

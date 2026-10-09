@@ -171,13 +171,23 @@ func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
-	ri, err := a.E.Get(r.Context(), r.PathValue("id"))
+	get := a.E.Get
+	if r.URL.Query().Get("input") == "true" {
+		// With the run's input, as it was submitted (ADR 0060).
+		get = a.E.GetInput
+	}
+	ri, err := get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		fail(w, 404, err)
 		return
 	}
 	if out, err := a.E.ResolveInput(ri.Output); err == nil {
 		ri.Output = out // large outputs live in the blob store
+	}
+	if len(ri.Input) > 0 {
+		if in, err := a.E.ResolveInput(ri.Input); err == nil {
+			ri.Input = in
+		}
 	}
 	reply(w, 200, ri)
 }

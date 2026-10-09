@@ -1003,9 +1003,9 @@ export class Kairo {
 			workflowInput(name, current, input),
 			{ runId: id, vars: { started_at: Date.now() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
 		);
-		const info = await this.backend.get(id);
+		const info = await this.backend.get(id, { input: true });
 		if (finished(info)) return done(id, info);
-		// kairod does not report a run's input: there, the current version.
+		// A kairod before ADR 0060's GetInput reports no input: there, the current version.
 		const version = 'input' in info ? (workflowOf(info.input)?.version ?? '') : current;
 		const fn = this.fnFor(name, version);
 		if (!fn) throw notHere(name, version);

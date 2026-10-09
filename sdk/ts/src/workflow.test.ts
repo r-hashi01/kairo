@@ -161,6 +161,42 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			await waitUntil(() => slowAborted);
 			await k.close();
 		});
+
+		// A run goes on with the version it started with (ADR 0060); through
+		// kairod too, which gives a run's input back when asked (GetInput).
+		test('a run goes on with the version it started with', async () => {
+			const seen: string[] = [];
+			const versioned = async (...versions: string[]) => {
+				const k = new Kairo({ backend: await backend(), concurrency: 8 });
+				k.defineAction('mark', { effect: 'unprotected', handler: async (v: string) => (seen.push(v), v) });
+				versions.forEach((v, i) =>
+					k.workflow(
+						'ver',
+						async (ctx) => {
+							await ctx.call('mark', v);
+							return `${v}:${await ctx.waitFor<string>('go')}`;
+						},
+						{ version: v, draining: i < versions.length - 1 },
+					),
+				);
+				await k.start();
+				return k;
+			};
+			const id = `wf-ver-${name.replace(/\W/g, '')}`;
+			const k1 = await versioned('1');
+			k1.run('ver', null, { id }).catch(() => {});
+			await waitUntil(() => seen.includes('1'));
+			await k1.close();
+			const k2 = await versioned('1', '2');
+			try {
+				const out = k2.run('ver', null, { id });
+				await waitUntil(() => k2.signal(id, 'go', 'x').then(() => true, () => false));
+				assert.equal(await out, '1:x');
+				assert.deepEqual(seen, ['1'], 'version 2 did not run it, and its call ran once');
+			} finally {
+				await k2.close();
+			}
+		});
 	});
 }
 

@@ -1195,10 +1195,11 @@ class Kairo:
             parent=parent,
             workflow=name,
         )
-        info = await self.backend.get(id)
+        info = await self.backend.get(id, input=True)
         if finished(info):
             return _done(id, info)
-        # kairod does not report a run's input: there, the current version.
+        # A kairod before ADR 0060's GetInput reports no input: there, the
+        # current version.
         w = _workflow_of(info.get("input")) if "input" in info else None
         version = w[1] if w is not None else ("" if "input" in info else current)
         fn = self._fn_for(name, version)

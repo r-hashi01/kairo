@@ -113,8 +113,9 @@ export class Client {
 		return data;
 	}
 
-	async get(runId: string): Promise<RunInfo> {
-		return (await this.call('GET', `/v1/runs/${encodeURIComponent(runId)}`))[1];
+	/** With input: the run's input too, as it was submitted (a run not finished, ADR 0060). */
+	async get(runId: string, opts: { input?: boolean } = {}): Promise<RunInfo> {
+		return (await this.call('GET', `/v1/runs/${encodeURIComponent(runId)}${opts.input ? '?input=true' : ''}`))[1];
 	}
 
 	/** Waits until the run has finished (as long as signal allows). */

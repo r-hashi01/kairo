@@ -193,6 +193,54 @@ class WorkflowTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_a_run_goes_on_with_the_version_it_started_with(self) -> None:
+        """ADR 0060; through kairod too, which gives a run's input back when
+        asked (GetInput)."""
+        seen: list[str] = []
+
+        async def versioned(*versions: str) -> Kairo:
+            b = await self.backend()
+            k = Kairo(self.url, worker=self.sock, concurrency=8) if b is None else Kairo(backend=b)
+
+            @k.action("mark", effect="unprotected")
+            def mark(v, ctx):
+                seen.append(v)
+                return v
+
+            for i, v in enumerate(versions):
+
+                async def ver(ctx, _, v=v):
+                    await ctx.call("mark", v)
+                    return f"{v}:{await ctx.wait_for('go')}"
+
+                k.workflow("ver", version=v, draining=i < len(versions) - 1)(ver)
+            await k.start()
+            return k
+
+        async def main() -> None:
+            id = f"wf-ver-{type(self).__name__}"
+            k1 = await versioned("1")
+            first = asyncio.ensure_future(k1.run("ver", None, id=id))
+            for _ in range(400):
+                if "1" in seen:
+                    break
+                await asyncio.sleep(0.025)
+            await k1.close()
+            first.cancel()
+            k2 = await versioned("1", "2")
+            out = asyncio.ensure_future(k2.run("ver", None, id=id))
+            for _ in range(400):
+                try:
+                    await k2.signal(id, "go", "x")
+                    break
+                except LookupError:
+                    await asyncio.sleep(0.025)
+            self.assertEqual(await asyncio.wait_for(out, 30), "1:x")
+            self.assertEqual(seen, ["1"], "version 2 did not run it, and its call ran once")
+            await k2.close()
+
+        asyncio.run(main())
+
 
 @unittest.skipUnless(HAS_GO and HAS_WASMTIME, "go or wasmtime not found")
 class EmbeddedWorkflowTest(WorkflowTest):
