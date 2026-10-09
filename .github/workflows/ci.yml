@@ -73,6 +73,6 @@ jobs:
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          for m in . $(find store executor -name go.mod -exec dirname {} \;); do
+          for m in . $(find store executor sdk -name go.mod -not -path '*/node_modules/*' -exec dirname {} \;); do
             echo "== $m"; (cd "$m" && "$(go env GOPATH)/bin/govulncheck" ./...)
           done

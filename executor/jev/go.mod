@@ -1,6 +1,6 @@
 module github.com/r-hashi01/kairo/executor/jev
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/mattn/go-jev v0.0.3
