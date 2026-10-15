@@ -336,6 +336,8 @@ export class Kairo {
 	private stopHook?: () => void;
 	/** Closing: calls interrupted now go on in kairo, to be resumed (not cancelled). */
 	private closing = false;
+	/** Draining (drain): no new call starts here. */
+	private draining = false;
 	/** The embedded runtime, when that is the backend (drive leases, ADR 0059). */
 	private readonly rt?: Embedded;
 	/** Wait mode: workflows driven in the background here (by id), and their drives. */
@@ -455,7 +457,7 @@ export class Kairo {
 				if (this.sweeping || this.closing) return;
 				this.sweeping = (async () => {
 					try {
-						await rt.tick();
+						if (!this.draining) await rt.tick(); // draining: left to other processes
 						await rt.recheck();
 					} catch (e) {
 						// Again next time.
@@ -485,6 +487,38 @@ export class Kairo {
 		// process to take up (ADR 0059).
 		await Promise.allSettled([...this.background, ...this.redrives, this.sweeping]);
 		await this.backend.close();
+	}
+
+	/**
+	 * Stops this process at the edges of its steps, before close: no new
+	 * step starts here (a workflow driven here stops at its next call, to
+	 * go on where it is driven next; timers and sweeps are left to a tick
+	 * here or elsewhere), and the steps already running run to their end
+	 * and have their outcomes recorded. Returns once they have; a signal
+	 * that aborts first throws StoppedError, and close then stops what
+	 * still runs, as a process that stops (a real step then waits for
+	 * review in the next process). After drain, close. The embedded
+	 * runtime only.
+	 */
+	async drain(opts: { signal?: AbortSignal } = {}): Promise<void> {
+		const rt = this.rt;
+		if (!rt) throw new Error('drain needs the embedded backend');
+		this.draining = true;
+		rt.drain();
+		for (const a of this.driving) a.abort(); // stops at its next call; its drive lease is handed over
+		const signal = opts.signal;
+		if (!signal) return rt.idle();
+		if (signal.aborted) throw new StoppedError('drain: stopped waiting for the steps running here');
+		let stop!: () => void;
+		const stopped = new Promise<never>((_, rej) => {
+			stop = () => rej(new StoppedError('drain: stopped waiting for the steps running here'));
+			signal.addEventListener('abort', stop, { once: true });
+		});
+		try {
+			await Promise.race([rt.idle(), stopped]);
+		} finally {
+			signal.removeEventListener('abort', stop);
+		}
 	}
 
 	/**
@@ -1079,6 +1113,16 @@ export class Kairo {
 
 	/** One call of workflow ctx: a run of its own, found again by its id. */
 	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
+		if (this.draining) {
+			// Draining: no new call starts here (its step would be
+			// dispatched); one already made is waited for as before.
+			try {
+				await this.backend.get(runId);
+			} catch (e) {
+				if (e instanceof KairoError && e.status === 404) throw new StoppedError(`call ${runId}: stopped (draining)`);
+				throw e;
+			}
+		}
 		if (root) await this.plan(plan, root);
 		// Kept and removed with the workflow that makes it (ADR 0054).
 		await this.backend.run(plan, { in: input }, { runId, parent: ctx.id });

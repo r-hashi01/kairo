@@ -226,7 +226,9 @@ class WorkflowTest(unittest.TestCase):
                     break
                 await asyncio.sleep(0.025)
             await k1.close()
-            first.cancel()
+            # It stopped with the process: the workflow goes on in k2.
+            with self.assertRaises((StoppedError, asyncio.CancelledError)):
+                await first
             k2 = await versioned("1", "2")
             out = asyncio.ensure_future(k2.run("ver", None, id=id))
             for _ in range(400):

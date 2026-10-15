@@ -147,8 +147,11 @@ type runtime struct {
 	logger       *slog.Logger
 	observer     func(Observation)
 	manualTimers bool
-	lostDrive    func(ctx context.Context, l LeaseRow) error
-	missingPlan  func(name string) bool
+	// draining (Kairo.Drain): no timer is armed here and no sweep runs; the
+	// steps already dispatched run to their end.
+	draining    atomic.Bool
+	lostDrive   func(ctx context.Context, l LeaseRow) error
+	missingPlan func(name string) bool
 }
 
 type subscription struct {
@@ -212,6 +215,32 @@ func (r *runtime) idle() {
 		r.busyCond.Wait()
 	}
 	r.busyMu.Unlock()
+}
+
+// waitIdle is idle, as long as ctx allows.
+func (r *runtime) waitIdle(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		r.idle()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stopTimers drops the timers armed in this process: they stay in the
+// store, for a tick (here or elsewhere) to fire.
+func (r *runtime) stopTimers() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, t := range r.timers {
+		t.Stop()
+		delete(r.timers, key)
+	}
 }
 
 func (r *runtime) registerActions(specs []byte, h handlerFunc) error {
@@ -846,7 +875,7 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 		r.wake(info(newRow))
 	}
 	// Along the way: what no process is doing (at most once a lease period).
-	if r.now()-r.lastSweep.Load() >= r.leaseMs {
+	if r.now()-r.lastSweep.Load() >= r.leaseMs && !r.draining.Load() {
 		r.lastSweep.Store(r.now())
 		r.track(func() {
 			if err := r.tick(context.Background()); err != nil {
@@ -862,8 +891,8 @@ func (r *runtime) carryOut(runID string, c wasmcore.Command) {
 	case "dispatch":
 		r.track(func() { r.dispatch(runID, c) })
 	case "timer":
-		if r.manualTimers {
-			return // fired by Tick only
+		if r.manualTimers || r.draining.Load() {
+			return // fired by Tick only, or by another process
 		}
 		key := fmt.Sprintf("%s\x00t%d", runID, c.Timer)
 		t := TimerRow{Run: runID, Timer: c.Timer, Act: c.Act, At: c.At}

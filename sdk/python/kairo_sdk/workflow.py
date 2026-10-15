@@ -395,6 +395,8 @@ class Kairo:
         self._stops: set[asyncio.Future[None]] = set()
         # Closing: calls interrupted now go on in kairo, to be resumed (not cancelled).
         self._closing = False
+        # Draining (drain): no new call starts here.
+        self._draining = False
         if mode not in ("wait", "suspend"):
             raise ValueError(f"mode {mode}: wait or suspend")
         self.suspend = mode == "suspend"
@@ -579,7 +581,8 @@ class Kairo:
         life = self._life_future()
         while not self._closing:
             try:
-                await rt.tick()
+                if not self._draining:  # draining: left to other processes
+                    await rt.tick()
                 await rt.recheck()
             except Exception as e:
                 # Again next time.
@@ -595,6 +598,25 @@ class Kairo:
             if self._closing:
                 _set(self._life)
         return self._life
+
+    async def drain(self) -> None:
+        """Stops this process at the edges of its steps, before close: no new
+        step starts here (a workflow driven here stops at its next call, to go
+        on where it is driven next; timers and sweeps are left to a tick here
+        or elsewhere), and the steps already running run to their end and
+        have their outcomes recorded. Returns once they have; a caller that
+        stops waiting first (its task cancelled, or timed out: asyncio.timeout)
+        leaves them running, and close then stops what still runs, as a
+        process that stops (a real step then waits for review in the next
+        process). After drain, close. The embedded runtime only."""
+        rt = self._rt
+        if rt is None:
+            raise RuntimeError("drain needs the embedded backend")
+        self._draining = True
+        rt.drain()
+        for stop in list(self._stops):
+            _set(stop)  # stops at its next call; its drive lease is handed over
+        await rt.wait_idle()
 
     async def close(self) -> None:
         """Stops serving actions and driving workflows, as a process that stops
@@ -842,10 +864,16 @@ class Kairo:
                 if not m.get("more_body"):
                     break
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-            if scope["path"].endswith("/tick"):
-                status, out = await self._handle_tick(scope["method"], headers.get("authorization"))
-            else:
-                status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
+            try:
+                if scope["path"].endswith("/tick"):
+                    status, out = await self._handle_tick(scope["method"], headers.get("authorization"))
+                else:
+                    status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
+            except Exception:
+                if not self._closing:
+                    raise
+                # Closed while it was answered (its store too): as before it.
+                status, out = 503, {"error": "closing"}
             data = json.dumps(out).encode()
             await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": data})
@@ -853,6 +881,8 @@ class Kairo:
         return app
 
     async def _handle_tick(self, method: str, authorization: str | None) -> tuple[int, Any]:
+        if self._closing:
+            return 503, {"error": "closing"}
         if not self._tick_secret or not self.suspend:
             return 404, {"error": "no such path"}
         if method not in ("GET", "POST"):
@@ -862,6 +892,10 @@ class Kairo:
         return 200, {"next": await self.tick()}
 
     async def _handle(self, method: str, path: str, signature: str | None, body: bytes) -> tuple[int, Any]:
+        if self._closing:
+            # Closed (its store too): the caller tries again, or another
+            # process takes the step up when its lease expires.
+            return 503, {"error": "closing"}
         if method != "POST":
             return 405, {"error": "POST only"}
         if not self._secret:
@@ -1315,6 +1349,15 @@ class Kairo:
             _set(stop)
 
     async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
+        if self._draining:
+            # Draining: no new call starts here (its step would be
+            # dispatched); one already made is waited for as before.
+            try:
+                await self.backend.get(run_id)
+            except KairoError as e:
+                if e.status != 404:
+                    raise
+                raise StoppedError(f"call {run_id}: stopped (draining)") from None
         if root is not None:
             await self._plan(plan, root)
         # Kept and removed with the workflow that makes it (ADR 0054).

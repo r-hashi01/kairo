@@ -266,6 +266,57 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_drain_keeps_the_outcome(self) -> None:
+        """drain lets a real step that runs finish and records its outcome, and
+        starts no new step: the next process goes on from there, with nothing
+        to review and nothing run twice (issue #1)."""
+        path = self.path("drain.db")
+        runs = {"pay": 0, "mail": 0}
+
+        gate = threading.Event()  # the actions run on threads of their own
+
+        async def main() -> None:
+            async def start() -> Kairo:
+                k = await self.open(path, lease_ms=200)
+
+                @k.action("pay", effect="real")
+                def pay(_, ctx):
+                    runs["pay"] += 1
+                    gate.wait()
+                    return "paid"
+
+                @k.action("mail", effect="real")
+                def mail(_, ctx):
+                    runs["mail"] += 1
+                    return "mailed"
+
+                @k.workflow("w")
+                async def w(ctx, _):
+                    p = await ctx.call("pay")
+                    m = await ctx.call("mail")
+                    return f"{p}, {m}"
+
+                await k.start()
+                return k
+
+            k = await start()
+            await k.submit("w", None, id="drain-1")
+            await wait_until(lambda: runs["pay"] == 1)
+            drained = asyncio.ensure_future(asyncio.wait_for(k.drain(), 10))
+            await asyncio.sleep(0.05)  # pay is held at its gate: drain cannot return before it opens
+            self.assertFalse(drained.done(), "drained while pay runs")
+            gate.set()
+            await drained
+            self.assertEqual(runs["mail"], 0, "a step started while draining")
+            await k.close()
+
+            k = await start()
+            self.assertEqual(await asyncio.wait_for(k.run("w", None, id="drain-1"), 10), "paid, mailed")
+            self.assertEqual(runs, {"pay": 1, "mail": 1})
+            await k.close()
+
+        asyncio.run(main())
+
     def test_signals_sent_before_their_waits_are_received_there_in_order(self) -> None:
         async def main() -> None:
             k = await self.open(self.path("ahead.db"))

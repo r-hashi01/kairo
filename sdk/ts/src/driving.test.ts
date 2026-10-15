@@ -212,6 +212,46 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k2.close();
 	});
 
+	// drain lets a real step that runs finish and records its outcome, and
+	// starts no new step: the next process goes on from there, with
+	// nothing to review and nothing run twice (issue #1).
+	test('drain keeps the outcome', async () => {
+		const path = join(dir, 'drain.db');
+		const runs = { pay: 0, mail: 0 };
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		const start = async () => {
+			const k = await open(path, { leaseMs: 200 });
+			k.defineAction('pay', { effect: 'real', handler: async () => (runs.pay++, await gate, 'paid') });
+			k.defineAction('mail', { effect: 'real', handler: async () => (runs.mail++, 'mailed') });
+			k.workflow('w', async (ctx) => {
+				const p = await ctx.call<string>('pay', null);
+				const m = await ctx.call<string>('mail', null);
+				return `${p}, ${m}`;
+			});
+			await k.start();
+			return k;
+		};
+		let k = await start();
+		await k.submit('w', null, { id: 'drain-1' });
+		await waitUntil(() => runs.pay === 1);
+		let drained = false;
+		const draining = k.drain({ signal: AbortSignal.timeout(10_000) }).then(() => {
+			drained = true;
+		});
+		await sleep(50); // pay is held at its gate: drain cannot return before it opens
+		assert.equal(drained, false, 'drained while pay runs');
+		release();
+		await draining;
+		assert.equal(runs.mail, 0, 'a step started while draining');
+		await k.close();
+
+		k = await start();
+		assert.equal(await k.run('w', null, { id: 'drain-1', signal: AbortSignal.timeout(10_000) }), 'paid, mailed');
+		assert.deepEqual(runs, { pay: 1, mail: 1 });
+		await k.close();
+	});
+
 	test('signals sent before their waits are received there, in order', async () => {
 		const k = await open(join(dir, 'ahead.db'));
 		let open_!: () => void;

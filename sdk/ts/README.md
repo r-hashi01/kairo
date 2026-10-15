@@ -98,6 +98,8 @@ A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status
 | `k.resolve(callId, output)`, `k.resolveFailed(callId, message)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above: it took effect with `output`, or it failed. The embedded runtime only |
 | `k.list({ workflow?, status?, since?, until?, after?, limit? })` | Workflows (not child workflows or calls), oldest first, with `meta`, `createdAt` and `updatedAt` |
 
+To stop a resident process without leaving a real step to review, `await k.drain({ signal? })` before `k.close()`: no new step starts here (workflows stop at their next call, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. An aborted `signal` throws `StoppedError`. `close` alone is a process that stops. The embedded runtime only.
+
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
 
 Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.

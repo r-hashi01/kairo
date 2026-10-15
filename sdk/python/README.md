@@ -101,6 +101,8 @@ A call that fails or is cancelled raises `CallError` (`run_id`, `action`, `statu
 | `await k.resolve(call_id, output)`, `await k.resolve_failed(call_id, message)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above: it took effect with `output`, or it failed. The embedded runtime only |
 | `await k.list(workflow=, status=, since=, until=, after=, limit=)` | Workflows (not child workflows or calls), oldest first, with `meta`, `created_at` and `updated_at` |
 
+To stop a resident process without leaving a real step to review, `await k.drain()` before `await k.close()`: no new step starts here (workflows stop at their next call, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. To bound the wait, `async with asyncio.timeout(...)`: the steps go on, and `close` then stops them. `close` alone is a process that stops. The embedded runtime only.
+
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
 
 Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.

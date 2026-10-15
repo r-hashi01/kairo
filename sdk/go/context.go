@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,6 +27,13 @@ type Context struct {
 	lane string
 	mu   sync.Mutex
 	seen map[string]int
+	// parallels counts the Parallel calls made with this context: each
+	// call's branches have lanes of their own.
+	parallels int
+	// root is the workflow's own Context (nil: this one): waits are
+	// numbered across the workflow, not by lane, so that Signal finds
+	// them.
+	root *Context
 	// cancelled reports whether the workflow (or one above it) was
 	// cancelled in kairo.
 	cancelled func() bool
@@ -38,6 +46,11 @@ func (c *Context) ID() string { return c.id }
 // TypeScript and Python SDKs' rule (ADR 0049), with the lane inside
 // Parallel.
 func (c *Context) next(kind, canon string) string {
+	if c.root != nil && strings.HasPrefix(kind, planWait) {
+		// A wait, in a branch: numbered with the workflow's other waits,
+		// in the order the workflow reaches them, as Signal numbers them.
+		return c.root.next(kind, canon)
+	}
 	key := kind + "\x00" + canon
 	c.mu.Lock()
 	n := c.seen[key]
@@ -155,12 +168,25 @@ func Child[O any](ctx *Context, name string, in any) (O, error) {
 func Parallel(ctx *Context, fns ...func(ctx *Context) error) error {
 	errs := make([]error, len(fns))
 	var wg sync.WaitGroup
+	// The branches of each Parallel call have lanes of their own: p<i> for
+	// the first (as before), p<i>@<k> for the k-th after it.
+	ctx.mu.Lock()
+	k := ctx.parallels
+	ctx.parallels++
+	ctx.mu.Unlock()
+	root := ctx.root
+	if root == nil {
+		root = ctx
+	}
 	for i, fn := range fns {
 		lane := "p" + strconv.Itoa(i)
+		if k > 0 {
+			lane += "@" + strconv.Itoa(k)
+		}
 		if ctx.lane != "" {
 			lane = ctx.lane + "." + lane
 		}
-		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled}
+		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled, root: root}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

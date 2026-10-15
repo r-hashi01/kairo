@@ -182,6 +182,9 @@ class Embedded:
         self._last_sweep = 0
         self._unlisten: Callable[[], Awaitable[None]] | None = None
         self._closed = False
+        # Draining (Kairo.drain): no timer is armed here and no sweep runs;
+        # the steps already dispatched run to their end.
+        self._draining = False
         # Workflows driven by this process now: their drive leases are
         # renewed with its steps' (ADR 0059).
         self._drives = 0
@@ -227,6 +230,24 @@ class Embedded:
             if not pending:
                 return
             await asyncio.gather(*pending, return_exceptions=True)
+
+    def drain(self) -> None:
+        """Drains (Kairo.drain): arms no timer here and runs no sweep from now
+        on, and drops the timers armed here: they stay in the database, for a
+        tick (here or elsewhere) to fire."""
+        self._draining = True
+        for h in self._timers.values():
+            h.cancel()
+        self._timers.clear()
+
+    async def wait_idle(self) -> None:
+        """idle, for a caller that may stop waiting: the work is not cancelled
+        with it (asyncio.wait, not gather)."""
+        while True:
+            pending = {f for f in self._busy if not f.done()}
+            if not pending:
+                return
+            await asyncio.wait(pending)
 
     def _plan(self, name: str) -> dict[str, Any] | None:
         """Plan name, registered here, or made now from plan_for."""
@@ -666,7 +687,7 @@ class Embedded:
             for h in list(self._hooks):
                 h(r)
         # Along the way: what no process is doing (at most once a lease period).
-        if self.now() - self._last_sweep >= self.lease_ms:
+        if self.now() - self._last_sweep >= self.lease_ms and not self._draining:
             self._background(self.tick(), "kairo: sweeping")
         return out["existing"]
 
@@ -675,8 +696,8 @@ class Embedded:
         if kind == "dispatch":
             self._background(self._dispatch(run_id, c), "kairo: run %s: applying a step's outcome", run_id)
         elif kind == "timer":
-            if self._manual_timers:
-                return  # fired by tick only
+            if self._manual_timers or self._draining:
+                return  # fired by tick only, or by another process
             key = f"{run_id}\0t{c['timer']}"
             old = self._timers.pop(key, None)
             if old is not None:

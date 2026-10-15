@@ -189,6 +189,8 @@ type Kairo struct {
 	again      map[string]bool
 	stopHook   func()
 
+	draining atomic.Bool // Drain
+
 	redriveMu   sync.Mutex
 	redriveCond *sync.Cond
 	redrivesN   int
@@ -612,8 +614,10 @@ func (k *Kairo) Start(ctx context.Context) error {
 		t := time.NewTicker(time.Duration(k.rt.leaseMs) * time.Millisecond)
 		defer t.Stop()
 		for {
-			if err := k.rt.tick(k.bgCtx); err != nil && k.bgCtx.Err() == nil {
-				k.rt.logger.Warn("kairo: sweeping", "err", err)
+			if !k.draining.Load() { // draining: left to other processes
+				if err := k.rt.tick(k.bgCtx); err != nil && k.bgCtx.Err() == nil {
+					k.rt.logger.Warn("kairo: sweeping", "err", err)
+				}
 			}
 			k.rt.recheck(k.bgCtx)
 			select {
@@ -1102,6 +1106,13 @@ func done(id string, ri RunInfo) (json.RawMessage, error) {
 
 // callRun runs one call: a run of its own, found again by its id.
 func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, runID string) (json.RawMessage, error) {
+	if k.draining.Load() {
+		// Draining: no new call starts here (its step would be
+		// dispatched); one already made is waited for as before.
+		if _, err := k.runs.get(c, runID); errors.Is(err, ErrUnknownRun) {
+			return nil, fmt.Errorf("call %s: %w", runID, ErrStopped)
+		}
+	}
 	if root != nil {
 		if err := k.plan(plan, root, nil); err != nil {
 			return nil, err
@@ -1410,6 +1421,28 @@ func (k *Kairo) redrive(id string) {
 			}
 		}
 	}()
+}
+
+// Drain stops this process at the edges of its steps, before Close: no
+// new step starts here (a workflow driven here stops at its next call, to
+// go on where it is driven next; timers and sweeps are left to a tick
+// here or elsewhere), and the steps already running run to their end and
+// have their outcomes recorded. It returns once they have, or when ctx
+// ends: Close then stops what still runs, as a process that stops (a real
+// step then waits for review in the next process). After Drain, Close.
+func (k *Kairo) Drain(ctx context.Context) error {
+	if k.remote != nil {
+		return ErrNeedsEmbedded
+	}
+	k.draining.Store(true)
+	k.rt.draining.Store(true)
+	k.rt.stopTimers()
+	k.mu.Lock()
+	for d := range k.driving {
+		d.cancel() // stops at its next call; its drive lease is handed over
+	}
+	k.mu.Unlock()
+	return k.rt.waitIdle(ctx)
 }
 
 // Close stops serving actions and driving workflows, as a process that

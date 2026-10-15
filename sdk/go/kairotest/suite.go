@@ -48,6 +48,9 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"SettingsChangeUnderACall":         testSettingsChangeUnderACall,
 		"EffectIsNotWeakened":              testEffectIsNotWeakened,
 		"ChildVersionNotHere":              testChildVersionNotHere,
+		"ParallelTwice":                    testParallelTwice,
+		"WaitInAParallelBranch":            testWaitInAParallelBranch,
+		"DrainKeepsTheOutcome":             testDrainKeepsTheOutcome,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
 	}
@@ -1242,5 +1245,178 @@ func testChildVersionNotHere(t *testing.T, open Opener) {
 	defer cancel()
 	if out, err := kairo.Await[string](ctx, k, "fam-1"); err != nil || out != "1:x" {
 		t.Fatalf("%q %v", out, err)
+	}
+}
+
+// Two Parallel calls whose branches make the same call: each runs it,
+// and a process that resumes the workflow gets each its own result.
+func testParallelTwice(t *testing.T, open Opener) {
+	var n atomic.Int32
+	var hang atomic.Bool
+	hang.Store(true)
+	start := func() *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "next", kairo.Unprotected, func(*kairo.TaskContext, string) (int32, error) { return n.Add(1), nil })
+		kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) ([]int32, error) {
+			got := make([]int32, 4)
+			for round := range 2 {
+				err := kairo.Parallel(ctx,
+					func(b *kairo.Context) (err error) { got[2*round], err = kairo.Call[int32](b, "next", "x"); return },
+					func(b *kairo.Context) (err error) { got[2*round+1], err = kairo.Call[int32](b, "next", "y"); return },
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if hang.Load() {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return got, nil
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k := start()
+	if _, err := k.Submit(context.Background(), "w", nil, kairo.WithID("par-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return n.Load() == 4 })
+	k.Close()
+	hang.Store(false)
+	k = start()
+	defer k.Close()
+	out, err := kairo.Run[[]int32](context.Background(), k, "w", nil, kairo.WithID("par-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int32]bool{}
+	for _, v := range out {
+		seen[v] = true
+	}
+	if len(seen) != 4 || n.Load() != 4 {
+		t.Fatalf("results %v (each call its own, none run again: next ran %d times)", out, n.Load())
+	}
+}
+
+// A wait in a Parallel branch receives its signal, sent before or after
+// the branch reaches it.
+func testWaitInAParallelBranch(t *testing.T, open Opener) {
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: open()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	kairo.Action(k, "echo", kairo.Unprotected, func(_ *kairo.TaskContext, s string) (string, error) { return s, nil })
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+		var a, b, c string
+		err := kairo.Parallel(ctx,
+			func(br *kairo.Context) (err error) { a, err = kairo.WaitFor[string](br, "go"); return },
+			func(br *kairo.Context) (err error) { b, err = kairo.Call[string](br, "echo", "b"); return },
+		)
+		if err != nil {
+			return "", err
+		}
+		err = kairo.Parallel(ctx, func(br *kairo.Context) (err error) { c, err = kairo.WaitFor[string](br, "go"); return })
+		return a + b + c, err
+	})
+	k.Start(context.Background())
+	if _, err := k.Submit(context.Background(), "w", nil, kairo.WithID("pw-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return k.Signal(context.Background(), "pw-1", "go", "a") == nil })
+	if err := k.Signal(context.Background(), "pw-1", "go", "c"); err != nil { // before the second branch waits, maybe
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := kairo.Await[string](ctx, k, "pw-1"); err != nil || out != "abc" {
+		t.Fatalf("%q %v", out, err)
+	}
+}
+
+// Drain lets a real step that runs finish and records its outcome, and
+// starts no new step: the next process goes on from there, with nothing
+// to review and nothing run twice (issue #1).
+func testDrainKeepsTheOutcome(t *testing.T, open Opener) {
+	runs := &counts{m: map[string]int{}}
+	release := make(chan struct{})
+	start := func() *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Lease: 200 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "pay", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
+			runs.add("pay")
+			<-release
+			return "paid", nil
+		})
+		kairo.Action(k, "mail", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
+			runs.add("mail")
+			return "mailed", nil
+		})
+		kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+			p, err := kairo.Call[string](ctx, "pay", nil)
+			if err != nil {
+				return "", err
+			}
+			m, err := kairo.Call[string](ctx, "mail", nil)
+			return p + ", " + m, err
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k := start()
+	if _, err := k.Submit(context.Background(), "w", nil, kairo.WithID("drain-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return runs.get("pay") == 1 })
+	drained := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		drained <- k.Drain(ctx)
+	}()
+	select {
+	case err := <-drained:
+		t.Fatalf("drained while pay runs: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	if runs.get("mail") != 0 {
+		t.Fatal("a step started while draining")
+	}
+	// A workflow run after Drain starts no step here either: it waits for
+	// the next process.
+	if _, err := k.Submit(context.Background(), "w", nil, kairo.WithID("drain-2")); err != nil {
+		t.Fatal(err)
+	}
+	k.Close() // after its background driving has ended
+	if runs.get("pay") != 1 {
+		t.Fatalf("pay ran %d times: a call started after Drain", runs.get("pay"))
+	}
+
+	k = start()
+	defer k.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, id := range []string{"drain-1", "drain-2"} {
+		if out, err := kairo.Run[string](ctx, k, "w", nil, kairo.WithID(id)); err != nil || out != "paid, mailed" {
+			t.Fatalf("%s: %q %v", id, out, err)
+		}
+	}
+	// Each step once for each workflow: none run again, none to review.
+	if runs.get("pay") != 2 || runs.get("mail") != 2 {
+		t.Fatalf("pay %d, mail %d", runs.get("pay"), runs.get("mail"))
 	}
 }

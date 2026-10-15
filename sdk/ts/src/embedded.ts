@@ -113,6 +113,8 @@ export class Embedded {
 	/** Work started by this runtime (steps, timers): close waits for it. */
 	private readonly busy = new Set<Promise<unknown>>();
 	private closed = false;
+	/** Draining (Kairo.drain): no timer is armed here and no sweep runs; the steps already dispatched run to their end. */
+	private draining = false;
 	readonly owner: string;
 	private readonly leaseMs: number;
 	private readonly keepMs: number;
@@ -189,6 +191,17 @@ export class Embedded {
 	/** Returns once the work started here (steps, timers that fired) is done. */
 	async idle(): Promise<void> {
 		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
+	}
+
+	/**
+	 * Drains (Kairo.drain): arms no timer here and runs no sweep from now
+	 * on, and drops the timers armed here: they stay in the database, for a
+	 * tick (here or elsewhere) to fire.
+	 */
+	drain(): void {
+		this.draining = true;
+		for (const t of this.timers.values()) clearTimeout(t);
+		this.timers.clear();
 	}
 
 	/** Registers node specs and the handler that runs their steps here. */
@@ -521,7 +534,7 @@ export class Embedded {
 			for (const h of this.settledHooks) h(r);
 		}
 		// Along the way: what no process is doing (at most once a lease period).
-		if (this.now() - this.lastSweep >= this.leaseMs) this.background(this.tick(), 'kairo: sweeping');
+		if (this.now() - this.lastSweep >= this.leaseMs && !this.draining) this.background(this.tick(), 'kairo: sweeping');
 		return out.existing;
 	}
 
@@ -551,7 +564,7 @@ export class Embedded {
 				this.background(this.dispatch(runId, c), "kairo: applying a step's outcome", { run: runId });
 				return;
 			case 'timer': {
-				if (this.manualTimers) return; // fired by tick only
+				if (this.manualTimers || this.draining) return; // fired by tick only, or by another process
 				const tk = `${runId}\0t${c.timer}`;
 				clearTimeout(this.timers.get(tk));
 				const t: TimerRow = { run: runId, timer: c.timer!, act: c.act ?? 0, at: c.at! };

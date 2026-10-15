@@ -115,7 +115,7 @@ kairo.Workflow(k, "name", func(ctx *kairo.Context, in In) (Out, error) { ... })
 | `ctx.Now()`, `ctx.Random()` | The time and a random number, the same each time the workflow runs again |
 | `kairo.Child[O](ctx, name, in)` | Runs a child workflow |
 
-A workflow must be deterministic between its calls: read the clock and randomness through `ctx.Now()` and `ctx.Random()`, do I/O in actions, and run calls at once only through `Parallel`. A panic fails the workflow; it does not crash the process.
+A workflow must be deterministic between its calls: read the clock and randomness through `ctx.Now()` and `ctx.Random()`, do I/O in actions, and run calls at once only through `Parallel`. Each branch of each `Parallel` numbers its calls apart from the others'; waits are numbered across the workflow, in the order it reaches them, so that a signal finds a wait in a branch (two branches that wait for the same signal at once receive them in the order they reach their waits). A panic fails the workflow; it does not crash the process.
 
 To change a workflow's function while runs of it are under way, give it a version. A run keeps the version it started with to its end, and a process drives only the runs whose version it has. New runs start with the current version; keep the old one, `Draining`, until no run of it is left (`RunInfo.Version`, `k.List`).
 
@@ -140,6 +140,8 @@ A call that fails or is cancelled returns a `*kairo.CallError` (`RunID`, `Action
 | `k.Resolve(ctx, callID, output)`, `k.ResolveFailed(ctx, callID, msg)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above |
 | `k.List(ctx, kairo.Filter{Workflow, Status, Since, Until, After, Limit})` | Workflows (not child workflows or calls), oldest first, with `Meta`, `Created`, `Updated` |
 | `k.Get(ctx, id)`, `k.Children(ctx, id)` | A run, and the runs it made |
+
+To stop a resident process without leaving a real step to review, `k.Drain(ctx)` before `k.Close()`: no new step starts here (workflows stop at their next call, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. `Close` alone is a process that stops.
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires (`Options.Lease`, 30s by default); while the lease lives, a `Run` elsewhere waits instead of running the workflow twice. `Close` hands its leases over at once.
 
