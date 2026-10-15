@@ -156,8 +156,10 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			const k = await kairo();
 			const done = k.run('long', null, { id: 'wf-long-1' });
 			await waitUntil(() => runs.slow === 1);
+			// Checked from now: it may reject before cancel answers.
+			const rejected = assert.rejects(done, CancelledError);
 			await k.cancel('wf-long-1');
-			await assert.rejects(done, CancelledError);
+			await rejected;
 			await waitUntil(() => slowAborted);
 			await k.close();
 		});

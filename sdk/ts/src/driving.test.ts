@@ -131,8 +131,9 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k.start();
 		const res = k.run('outer', null, { id: 'tree-1' });
 		await waitUntil(() => started);
+		const rejected = assert.rejects(res, CancelledError); // it may reject before cancel answers
 		await k.cancel('tree-1');
-		await assert.rejects(res, CancelledError);
+		await rejected;
 		await waitUntil(() => stopped);
 		const kids = await children(path, 'tree-1');
 		assert.equal(kids.length, 1);
