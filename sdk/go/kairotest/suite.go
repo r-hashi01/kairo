@@ -1378,6 +1378,14 @@ func testDrainKeepsTheOutcome(t *testing.T, open Opener) {
 		t.Fatal(err)
 	}
 	waitUntil(t, func() bool { return runs.get("pay") == 1 })
+	// Draining from here: a Drain with its context ended has stopped the
+	// new steps and the drivers (all before it returns), and waits for
+	// nothing; the Drain below waits for pay.
+	ended, cancelEnded := context.WithCancel(context.Background())
+	cancelEnded()
+	if err := k.Drain(ended); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a drain with its context ended: %v", err)
+	}
 	drained := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

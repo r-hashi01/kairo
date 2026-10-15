@@ -1429,7 +1429,9 @@ func (k *Kairo) redrive(id string) {
 // here or elsewhere), and the steps already running run to their end and
 // have their outcomes recorded. It returns once they have, or when ctx
 // ends: Close then stops what still runs, as a process that stops (a real
-// step then waits for review in the next process). After Drain, Close.
+// step then waits for review in the next process). Draining has begun when
+// Drain returns, whatever ctx did; it may be called again to wait. After
+// Drain, Close.
 func (k *Kairo) Drain(ctx context.Context) error {
 	if k.remote != nil {
 		return ErrNeedsEmbedded
