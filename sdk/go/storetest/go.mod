@@ -4,8 +4,8 @@ go 1.27.2
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/r-hashi01/kairo v0.4.0
-	github.com/r-hashi01/kairo/sdk/go/pgnotify v0.4.0
+	github.com/r-hashi01/kairo v0.4.1
+	github.com/r-hashi01/kairo/sdk/go/pgnotify v0.4.1
 	modernc.org/sqlite v1.60.1
 )
 
