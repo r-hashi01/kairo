@@ -426,6 +426,7 @@ class Kairo:
         self._stops: set[asyncio.Future[None]] = set()
         self._stops_by_id: dict[str, asyncio.Future[None]] = {}
         self._cancel_requests: dict[str, asyncio.Future[bool]] = {}
+        self._tree_cancellations: dict[str, int] = {}
         # Closing: calls interrupted now go on in kairo, to be resumed (not cancelled).
         self._closing = False
         # Draining (drain): no new call starts here.
@@ -1548,7 +1549,12 @@ class Kairo:
         me = {"cancelled": False}
 
         def cancelled() -> bool:
-            return me["cancelled"] or id in self._cancel_requests or (up is not None and up.cancelled())
+            return (
+                me["cancelled"]
+                or id in self._cancel_requests
+                or self._tree_cancellations.get(id, 0) > 0
+                or (up is not None and up.cancelled())
+            )
 
         watcher: asyncio.Future[None] | None = None
         if not self.suspend:
@@ -1686,16 +1692,30 @@ class Kairo:
                     rows.append(child)
 
             await walk(id)
+            marked = [row["run_id"] for row in rows if not finished(row)]
+            for child in marked:
+                self._tree_cancellations[child] = self._tree_cancellations.get(child, 0) + 1
+                stop = self._stops_by_id.get(child)
+                if stop is not None:
+                    _set(stop)
             unfinished = 0
-            for row in rows:
-                if finished(row):
-                    continue
-                unfinished += 1
-                try:
-                    await self.backend.cancel(row["run_id"])
-                except ChildrenUnsettledError:
-                    continue
-                await self.backend.wait(row["run_id"])
+            try:
+                for row in rows:
+                    if finished(row):
+                        continue
+                    unfinished += 1
+                    try:
+                        await self.backend.cancel(row["run_id"])
+                    except ChildrenUnsettledError:
+                        continue
+                    await self.backend.wait(row["run_id"])
+            finally:
+                for child in marked:
+                    n = self._tree_cancellations.get(child, 1) - 1
+                    if n == 0:
+                        self._tree_cancellations.pop(child, None)
+                    else:
+                        self._tree_cancellations[child] = n
             if not unfinished:
                 return
 

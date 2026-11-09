@@ -344,6 +344,7 @@ export class Kairo {
 	private readonly driveIdleWaiters = new Set<() => void>();
 	private readonly drivingById = new Map<string, AbortController>();
 	private readonly cancelRequests = new Map<string, { done: Promise<boolean>; finish: (settled: boolean) => void }>();
+	private readonly treeCancellations = new Map<string, number>();
 	readonly suspend: boolean;
 	/** Suspend mode: workflows being driven on here, and those to drive again after. */
 	private readonly drivingIds = new Set<string>();
@@ -1344,7 +1345,7 @@ export class Kairo {
 		// are its calls cancelled. Otherwise an abort only stops the driving
 		// here (the process closes), and the workflow goes on later.
 		let self = false;
-		const cancelled = () => self || this.cancelRequests.has(id) || (parent?.cancelled?.() ?? false);
+		const cancelled = () => self || this.cancelRequests.has(id) || (this.treeCancellations.get(id) ?? 0) > 0 || (parent?.cancelled?.() ?? false);
 		if (!this.suspend) {
 			// The workflow's own run ends when it is cancelled: stop the calls.
 			// (Suspended, a cancelled workflow stops when it is driven next.)
@@ -1439,17 +1440,30 @@ export class Kairo {
 				}
 			};
 			await walk(id);
+			const marked = rows.filter((row) => !finished(row)).map((row) => row.run_id);
+			for (const child of marked) {
+				this.treeCancellations.set(child, (this.treeCancellations.get(child) ?? 0) + 1);
+				this.drivingById.get(child)?.abort();
+			}
 			let unfinished = 0;
-			for (const row of rows) {
-				if (finished(row)) continue;
-				unfinished++;
-				try {
-					await this.backend.cancel(row.run_id);
-				} catch (e) {
-					if (e instanceof ChildrenUnsettledError) continue;
-					throw e;
+			try {
+				for (const row of rows) {
+					if (finished(row)) continue;
+					unfinished++;
+					try {
+						await this.backend.cancel(row.run_id);
+					} catch (e) {
+						if (e instanceof ChildrenUnsettledError) continue;
+						throw e;
+					}
+					await this.backend.wait(row.run_id);
 				}
-				await this.backend.wait(row.run_id);
+			} finally {
+				for (const child of marked) {
+					const n = (this.treeCancellations.get(child) ?? 1) - 1;
+					if (n === 0) this.treeCancellations.delete(child);
+					else this.treeCancellations.set(child, n);
+				}
 			}
 			if (unfinished === 0) return;
 		}

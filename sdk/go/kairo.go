@@ -219,6 +219,7 @@ type Kairo struct {
 	planned      map[string]bool
 	driving      map[*drive]struct{}
 	drivingIDs   map[string]bool
+	treeCancels  map[string]int
 	redriving    map[string]bool
 	again        map[string]bool
 	stopHook     func()
@@ -386,7 +387,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 		return nil, err
 	}
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
-		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, redriving: map[string]bool{}, again: map[string]bool{},
+		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
 	k.tickSlot <- struct{}{}
 	k.runs = rt
@@ -1226,7 +1227,7 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	var self atomic.Bool
 	cancelled := func() bool {
 		k.mu.Lock()
-		requested := d.cancelReq != nil
+		requested := d.cancelReq != nil || k.treeCancels[id] > 0
 		k.mu.Unlock()
 		return self.Load() || requested || (parentCancelled != nil && parentCancelled())
 	}
@@ -1335,6 +1336,34 @@ func (k *Kairo) settleDescendants(ctx context.Context, id string) error {
 		if err := walk(id); err != nil {
 			return err
 		}
+		var marked []string
+		k.mu.Lock()
+		if k.treeCancels == nil {
+			k.treeCancels = map[string]int{}
+		}
+		for i := range rows {
+			if rows[i].Finished() {
+				continue
+			}
+			marked = append(marked, rows[i].RunID)
+			k.treeCancels[rows[i].RunID]++
+			for d := range k.driving {
+				if d.id == rows[i].RunID {
+					d.cancel()
+				}
+			}
+		}
+		k.mu.Unlock()
+		defer func(ids []string) {
+			k.mu.Lock()
+			defer k.mu.Unlock()
+			for _, child := range ids {
+				k.treeCancels[child]--
+				if k.treeCancels[child] == 0 {
+					delete(k.treeCancels, child)
+				}
+			}
+		}(marked)
 		unfinished := 0
 		for i := range rows {
 			if rows[i].Finished() {
