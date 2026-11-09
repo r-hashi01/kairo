@@ -1,6 +1,6 @@
 # ADR（Architecture Decision Records）
 
-設計判断を1判断1ファイルで記録します。運用のルールは [0000](0000-record-decisions.md) にあり、書式は [template.md](template.md) です。判断を変えるときは既存のファイルを書き換えず、新しい ADR で置き換えます。
+設計判断を1判断1ファイルで記録します。運用のルールは [0000](0000-record-decisions.md)、今後の執筆・レビュー規約は [authoring-guideline.md](authoring-guideline.md)、書式は [template.md](template.md) にあります。判断を変えるときは既存のファイルを書き換えず、新しい ADR で置き換えます。
 
 | # | 決定 | 状態 |
 |---|---|---|
@@ -65,5 +65,20 @@
 | [0058](0058-go-sdk.md) | Go の SDK を用意する: コアを WASM なしで埋め込み、TypeScript・Python と同じ表と同じ取り決めで動かす | 承認 |
 | [0059](0059-embedded-runtime-gaps.md) | 埋め込みのランタイムの不足を埋める: 動かす側の借用で再開し、先に来たシグナルを受け、上限・待ちの期限・一覧・投げっぱなしの開始を足す | 承認 |
 | [0060](0060-code-changes-under-running-workflows.md) | 実行中のワークフローの下でコードと設定が変わるとき: ワークフローは版で固定し、呼び出しは今の設定で続ける（作用は弱めない） | 承認 |
+| [0061](0061-first-recorded-workflow-settlement-wins.md) | コードで書くワークフローの完了と取り消しは、先に記録された結果だけを返す | 承認 |
+| [0062](0062-children-run-only-when-replay-reaches-them.md) | 子の実行は親のリプレイが到達したときだけ再開し、親が終わる前に未完了の子孫を取り消す | 承認 |
+| [0063](0063-retry-workflow-after-transient-store-errors.md) | 一時的な保存先エラーではワークフローを失敗にせず、駆動を譲ってリプレイする | 承認 |
+| [0064](0064-atomic-signal-receipts-and-only-if-waiting.md) | Signal の適用を原子的に確認し、待ちの番号と先取りかどうかを返す | 承認 |
+| [0065](0065-attach-external-workflow-to-parent.md) | 外から始めるワークフローを、未完了の親の木へ原子的に加える | 承認 |
+| [0066](0066-resolve-code-calls-over-kairod.md) | コードワークフローの Resolve を、既存の kairod API へ接続する | 承認 |
+| [0067](0067-parent-trees-over-kairod.md) | kairod の親子を耐久化し、親 shard で子の開始と親の終端を直列化する | 承認 |
+| [0068](0068-list-code-workflows-over-kairod.md) | kairod のコードワークフローを shard 横断で一覧する | 承認 |
+| [0069](0069-suspend-code-workflows-over-kairod.md) | kairod のコードワークフローを、期限付きの駆動権と起床通知で suspend できるようにする | 承認 |
+| [0070](0070-kairod-owns-async-action-callbacks.md) | kairod が非同期 HTTP アクションのコールバックと期限切れを所有する | 提案 |
+| [0071](0071-atomic-early-signals-over-kairod.md) | kairod の Signal を耐久化まで同期し、先取りの wait と receipt を原子的に作る | 提案 |
+| [0072](0072-retry-unconfirmed-kairod-starts-by-run-id.md) | kairod で開始を確認できない実行は、同じ RunID で確認し直し、ワークフローの失敗にしない | 承認 |
+| [0073](0073-drain-kairod-workers-before-planned-shutdown.md) | 計画停止では、kairod のworkerが新しい仕事を止め、実行中の結果を記録してから閉じる | 承認 |
+| [0074](0074-adapt-durable-start-admission-to-storage.md) | 耐久開始の受け付けを保存先の処理能力に合わせ、開始前に過負荷を返す | 承認 |
+| [0075](0075-negotiate-graceful-worker-drain-capability.md) | worker と kairod は graceful Drain の能力を接続ごとに合意してから使う | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

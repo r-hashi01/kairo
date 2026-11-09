@@ -22,9 +22,14 @@ var errBadRecord = errors.New("engine: bad log record")
 
 type startMeta struct {
 	RunID    string
+	Parent   string
 	Plan     string
 	PlanHash string
 	Tenant   string
+	Workflow string
+	Meta     []byte
+	Created  int64
+	Updated  int64
 	Tier     Tier
 	// Keep: the run's output is kept after it finishes, for IdempotencyTTL
 	// (SubmitRequest.KeepOutput, ADR 0050). Stored in the tier byte's high
@@ -32,13 +37,37 @@ type startMeta struct {
 	Keep bool
 }
 
-// keepBit marks startMeta.Keep in the tier byte (tiers are small numbers).
-const keepBit = 0x80
+// keepBit, parentBit and infoBit extend the tier byte (tiers are small
+// numbers). infoBit carries the code-workflow listing metadata (ADR 0068).
+const (
+	keepBit   = 0x80
+	parentBit = 0x40
+	infoBit   = 0x20
+)
 
 func tierByte(m *startMeta) byte {
 	b := byte(m.Tier)
 	if m.Keep {
 		b |= keepBit
+	}
+	if m.Parent != "" {
+		b |= parentBit
+	}
+	if m.Workflow != "" {
+		b |= infoBit
+	}
+	return b
+}
+
+func appendMeta(b []byte, m *startMeta) []byte {
+	if m.Parent != "" {
+		b = appendStr(b, m.Parent)
+	}
+	if m.Workflow != "" {
+		b = appendStr(b, m.Workflow)
+		b = appendStr(b, string(m.Meta))
+		b = binary.AppendVarint(b, m.Created)
+		b = binary.AppendVarint(b, m.Updated)
 	}
 	return b
 }
@@ -54,7 +83,8 @@ func encodeStart(b []byte, m *startMeta) []byte {
 	b = appendStr(b, m.Plan)
 	b = appendStr(b, m.PlanHash)
 	b = appendStr(b, m.Tenant)
-	return append(b, tierByte(m))
+	b = append(b, tierByte(m))
+	return appendMeta(b, m)
 }
 
 // encodeCheckpoint records that the snapshot of m.RunID covering the log up
@@ -68,6 +98,7 @@ func encodeCheckpoint(b []byte, m *startMeta, snapLSN uint64) []byte {
 	b = appendStr(b, m.PlanHash)
 	b = appendStr(b, m.Tenant)
 	b = append(b, tierByte(m))
+	b = appendMeta(b, m)
 	return binary.AppendUvarint(b, snapLSN)
 }
 
@@ -189,7 +220,16 @@ func decodeMeta(r *rdr) *startMeta {
 	m.PlanHash = r.str()
 	m.Tenant = r.str()
 	t := r.byte1()
-	m.Tier, m.Keep = Tier(t&^keepBit), t&keepBit != 0
+	m.Tier, m.Keep = Tier(t&^(keepBit|parentBit|infoBit)), t&keepBit != 0
+	if t&parentBit != 0 {
+		m.Parent = r.str()
+	}
+	if t&infoBit != 0 {
+		m.Workflow = r.str()
+		m.Meta = r.bytes()
+		m.Created = r.i()
+		m.Updated = r.i()
+	}
 	return m
 }
 

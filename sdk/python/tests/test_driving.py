@@ -20,8 +20,8 @@ from typing import Any
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.embedded import EFFECT_WEAKENED
 from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation
-from kairo_sdk.store import SQLiteStore
-from kairo_sdk.workflow import CallError, Cancelled, Kairo, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError
+from kairo_sdk.store import SQLiteStore, WorkflowRetryError
+from kairo_sdk.workflow import CallError, Cancelled, Kairo, NotWaitingError, RetryableError, SignalReceipt, StoppedError, Suspended, TimedOutError, WorkflowError
 
 try:
     from .test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -73,6 +73,25 @@ class Dying:
             return await v(*args, **kw)
 
         return cut
+
+
+class FailingOnce:
+    def __init__(self, store: SQLiteStore) -> None:
+        self._store = store
+        self.fail = False
+
+    def __getattr__(self, name: str) -> Any:
+        v = getattr(self._store, name)
+        if name != "with_run":
+            return v
+
+        async def once(*args: Any, **kw: Any) -> Any:
+            if self.fail:
+                self.fail = False
+                raise sqlite3.OperationalError("store busy")
+            return await v(*args, **kw)
+
+        return once
 
 
 @unittest.skipUnless(HAS_GO and HAS_WASMTIME, "go or wasmtime not found")
@@ -163,13 +182,73 @@ class DrivingTest(unittest.TestCase):
             res = asyncio.ensure_future(k.run("outer", None, id="tree-1"))
             await wait_until(started.is_set)
             await k.cancel("tree-1")
+            kids = children(path, "tree-1")
+            self.assertEqual(len(kids), 1)
+            grandkids = children(path, kids[0])
+            self.assertEqual(len(grandkids), 1)
+            for id in (kids[0], grandkids[0]):
+                self.assertEqual((await k.backend.get(id))["status"], "cancelled", id)
             with self.assertRaises(Cancelled):
                 await res
             await wait_until(stopped.is_set)
-            kids = children(path, "tree-1")
-            self.assertEqual(len(kids), 1)
-            await wait_until(lambda: self.status(path, kids[0]) == "cancelled")
             await k.close()
+
+        asyncio.run(main())
+
+    def test_unreached_child_is_cancelled_before_parent_settles(self) -> None:
+        """A replay that takes another path cancels the child left by the
+        stopped process without recovering its action first (ADR 0062)."""
+
+        async def case(outcome: str) -> None:
+            path = self.path(f"unreached-{outcome}.db")
+            attempts = 0
+            skip = False
+
+            async def start() -> Kairo:
+                k = await self.open(path, mode="suspend")
+
+                @k.action("old", effect="unprotected")
+                def old(_, ctx):
+                    nonlocal attempts
+                    attempts += 1
+                    ctx.cancelled.wait(30)
+                    raise RuntimeError("stopped")
+
+                @k.workflow("parent")
+                async def parent(ctx, _):
+                    if skip:
+                        if outcome == "failure":
+                            raise RuntimeError("guard failed")
+                        return "new path"
+                    return await ctx.call("old")
+
+                await k.start()
+                return k
+
+            id = f"unreached-{outcome}"
+            k = await start()
+            first = asyncio.ensure_future(k.run("parent", None, id=id))
+            await wait_until(lambda: attempts == 1)
+            await k.close()
+            with self.assertRaises(StoppedError):
+                await first
+
+            skip = True
+            k = await start()
+            if outcome == "failure":
+                with self.assertRaises(WorkflowError):
+                    await k.run("parent", None, id=id)
+            else:
+                self.assertEqual(await k.run("parent", None, id=id), "new path")
+            self.assertEqual(attempts, 1)
+            child = children(path, id)[0]
+            self.assertEqual((await k.backend.get(child))["status"], "cancelled")
+            self.assertIn((await k.backend.get(id))["status"], DONE)
+            await k.close()
+
+        async def main() -> None:
+            await case("success")
+            await case("failure")
 
         asyncio.run(main())
 
@@ -346,6 +425,129 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_signal_receipts_and_only_if_waiting_are_atomic_across_processes(self) -> None:
+        async def main() -> None:
+            path = self.path("signal-receipts.db")
+            gates = {"only": threading.Event(), "early": threading.Event()}
+            gate_started = {"only": threading.Event(), "early": threading.Event()}
+
+            def register(k: Kairo) -> None:
+                @k.action("signal-gate", effect="unprotected")
+                def signal_gate(key, ctx):
+                    gate_started[key].set()
+                    gates[key].wait()
+
+                @k.workflow("signals")
+                async def signals(ctx, key):
+                    first = await ctx.wait_for("message")
+                    await ctx.call("signal-gate", key)
+                    return [first, await ctx.wait_for("message")]
+
+                @k.workflow("signal-race")
+                async def signal_race(ctx, _):
+                    await ctx.call("signal-gate", "create")
+                    first = await ctx.wait_for("message")
+                    await ctx.call("signal-gate", "create-after")
+                    return [first, await ctx.wait_for("message")]
+
+            a = await self.open(path, lease_ms=50)
+            b = await self.open(path, lease_ms=50)
+            register(a)
+            register(b)
+            await a.start()
+            await b.start()
+
+            def waits(id: str) -> list[tuple]:
+                return query(
+                    path,
+                    "SELECT id, status FROM kairo_run WHERE parent = ? AND plan = 'kairo.wait/message' ORDER BY created_at, id",
+                    id,
+                )
+
+            async def waiting(id: str, n: int) -> None:
+                await wait_until(lambda: len(waits(id)) == n and waits(id)[n - 1][1] not in DONE)
+
+            await a.submit("signals", "only", id="signal-only-1")
+            await waiting("signal-only-1", 1)
+            only = await asyncio.gather(
+                a.send_signal("signal-only-1", "message", "answer-a", only_if_waiting=True),
+                b.send_signal("signal-only-1", "message", "answer-b", only_if_waiting=True),
+                return_exceptions=True,
+            )
+            receipts = [x for x in only if isinstance(x, SignalReceipt)]
+            failures = [x for x in only if isinstance(x, BaseException)]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual((receipts[0].index, receipts[0].early), (0, False))
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(failures[0], NotWaitingError)
+            await wait_until(gate_started["only"].is_set)
+            self.assertEqual(len(waits("signal-only-1")), 1, "no answer was left for the next wait")
+            gates["only"].set()
+            await waiting("signal-only-1", 2)
+            second = await a.send_signal("signal-only-1", "message", "second", only_if_waiting=True)
+            self.assertEqual((second.index, second.early), (1, False))
+            first_payload = "answer-a" if isinstance(only[0], SignalReceipt) else "answer-b"
+            self.assertEqual(await a.result("signal-only-1"), [first_payload, "second"])
+            with self.assertRaises(NotWaitingError):
+                await a.send_signal("signal-only-1", "message", "late", only_if_waiting=True)
+            with self.assertRaises(LookupError):
+                await a.send_signal("no-such-workflow", "message", "x", only_if_waiting=True)
+
+            await a.submit("signals", "early", id="signal-early-1")
+            await waiting("signal-early-1", 1)
+            sent = await asyncio.gather(
+                a.send_signal("signal-early-1", "message", "early-a"),
+                b.send_signal("signal-early-1", "message", "early-b"),
+            )
+            ordered = sorted(zip(sent, ("early-a", "early-b")), key=lambda x: x[0].index)
+            self.assertEqual([(x.index, x.early) for x, _ in ordered], [(0, False), (1, True)])
+            self.assertNotEqual(ordered[0][0].run_id, ordered[1][0].run_id)
+            await wait_until(gate_started["early"].is_set)
+            gates["early"].set()
+            self.assertEqual(await a.result("signal-early-1"), [payload for _, payload in ordered])
+
+            gates["create"] = threading.Event()
+            gates["create-after"] = threading.Event()
+            gate_started["create"] = threading.Event()
+            gate_started["create-after"] = threading.Event()
+            await a.submit("signal-race", None, id="signal-create-1")
+            await wait_until(gate_started["create"].is_set)
+            racing = asyncio.create_task(
+                b.send_signal("signal-create-1", "message", "raced", only_if_waiting=True)
+            )
+            gates["create"].set()
+            first = "raced"
+            try:
+                receipt = await racing
+                self.assertEqual((receipt.index, receipt.early), (0, False))
+            except NotWaitingError:
+                await waiting("signal-create-1", 1)
+                await a.send_signal("signal-create-1", "message", "manual", only_if_waiting=True)
+                first = "manual"
+            await wait_until(gate_started["create-after"].is_set)
+            self.assertEqual(len(waits("signal-create-1")), 1, "the creation race did not leave an early signal")
+            gates["create-after"].set()
+            await waiting("signal-create-1", 2)
+            await a.send_signal("signal-create-1", "message", "second", only_if_waiting=True)
+            self.assertEqual(await a.result("signal-create-1"), [first, "second"])
+
+            gates["legacy"] = threading.Event()
+            gate_started["legacy"] = threading.Event()
+            await a.submit("signals", "legacy", id="signal-legacy-1")
+            await waiting("signal-legacy-1", 1)
+            await asyncio.gather(
+                a.signal("signal-legacy-1", "message", "legacy-a"),
+                b.signal("signal-legacy-1", "message", "legacy-b"),
+            )
+            await wait_until(gate_started["legacy"].is_set)
+            self.assertEqual(len(waits("signal-legacy-1")), 2)
+            gates["legacy"].set()
+            self.assertEqual(sorted(await a.result("signal-legacy-1")), ["legacy-a", "legacy-b"])
+            await a.close()
+            await b.close()
+
+        asyncio.run(main())
+
     def test_a_wait_times_out(self) -> None:
         async def main() -> None:
             k = await self.open(self.path("late.db"))
@@ -443,6 +645,52 @@ class DrivingTest(unittest.TestCase):
             since = datetime.datetime.fromtimestamp(all[0]["created_at"] / 1000)
             self.assertEqual(len(await k.list(status="completed", since=since)), 5)
             self.assertEqual(len(await k.list(until=all[0]["created_at"])), 0)
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_a_transient_store_error_retries_the_workflow_without_recording_failure(self) -> None:
+        async def main() -> None:
+            path = self.path("store-retry.db")
+            store = FailingOnce(SQLiteStore(path))
+            k = await self.open(path, store=store, lease_ms=50)
+            runs = {"first": 0, "second": 0, "workflow": 0, "explicit": 0}
+            armed = False
+
+            @k.action("first")
+            def first(_, ctx):
+                runs["first"] += 1
+                return "one"
+
+            @k.action("second", effect="unprotected")
+            def second(_, ctx):
+                runs["second"] += 1
+                return "two"
+
+            @k.workflow("store-retry")
+            async def store_retry(ctx, _):
+                nonlocal armed
+                runs["workflow"] += 1
+                a = await ctx.call("first")
+                if not armed:
+                    armed = True
+                    store.fail = True
+                return a + await ctx.call("second")
+
+            @k.workflow("explicit-retry")
+            async def explicit_retry(ctx, _):
+                runs["explicit"] += 1
+                if runs["explicit"] == 1:
+                    raise WorkflowRetryError("try later")
+                return "ok"
+
+            await k.start()
+            self.assertEqual(await k.run("store-retry", None, id="store-retry-1"), "onetwo")
+            self.assertEqual((runs["first"], runs["second"]), (1, 1))
+            self.assertGreaterEqual(runs["workflow"], 2)
+            self.assertEqual((await k.backend.get("store-retry-1"))["status"], "completed")
+            self.assertEqual(await k.run("explicit-retry", None, id="explicit-retry-1"), "ok")
+            self.assertEqual(runs["explicit"], 2)
             await k.close()
 
         asyncio.run(main())

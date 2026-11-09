@@ -18,14 +18,19 @@ import (
 // and its records released for retirement, only once the marker is
 // durable.
 
-// markerVersion 2 adds the kept flag (ADR 0050); version 1 markers are
-// read as not kept.
-const markerVersion = 2
+// Marker version 2 adds kept (ADR 0050), version 3 adds parent (ADR 0067),
+// and version 4 adds code-workflow listing metadata (ADR 0068).
+const markerVersion = 4
 
 type marker struct {
-	runID  string
-	at     int64 // unix ms
-	status string
+	runID    string
+	at       int64 // unix ms
+	status   string
+	parent   string
+	workflow string
+	meta     []byte
+	created  int64
+	updated  int64
 	// kept: the run's output is in the blob store under keptKey(runID,
 	// gen), written before this marker (ADR 0050).
 	kept bool
@@ -42,22 +47,35 @@ func keptKey(runID string, gen uint64) string { return fmt.Sprintf("kept/%s/%d",
 var errBadMarker = errors.New("engine: malformed done-log record")
 
 func encodeMarker(b []byte, m marker) []byte {
-	b = append(b, markerVersion)
+	version := byte(3)
+	if m.workflow != "" {
+		version = markerVersion
+	}
+	b = append(b, version)
 	b = binary.AppendVarint(b, m.at)
 	b = binary.AppendUvarint(b, uint64(len(m.runID)))
 	b = append(b, m.runID...)
 	b = binary.AppendUvarint(b, uint64(len(m.status)))
 	b = append(b, m.status...)
 	if !m.kept {
-		return append(b, 0)
+		b = append(b, 0)
+	} else {
+		b = append(b, 1)
+		b = binary.AppendUvarint(b, m.gen)
 	}
-	b = append(b, 1)
-	return binary.AppendUvarint(b, m.gen)
+	b = appendStr(b, m.parent)
+	if version >= 4 {
+		b = appendStr(b, m.workflow)
+		b = appendStr(b, string(m.meta))
+		b = binary.AppendVarint(b, m.created)
+		b = binary.AppendVarint(b, m.updated)
+	}
+	return b
 }
 
 func decodeMarker(rec []byte) (marker, error) {
 	var m marker
-	if len(rec) == 0 || (rec[0] != 1 && rec[0] != markerVersion) {
+	if len(rec) == 0 || rec[0] < 1 || rec[0] > markerVersion {
 		return m, errBadMarker
 	}
 	version := rec[0]
@@ -92,6 +110,27 @@ func decodeMarker(rec []byte) (marker, error) {
 			m.gen, rec = gen, rec[k:]
 		}
 	}
+	if version >= 3 && ok1 && ok2 {
+		m.parent, ok1 = str()
+	}
+	if version >= 4 && ok1 && ok2 {
+		m.workflow, ok1 = str()
+		var meta string
+		meta, ok2 = str()
+		m.meta = []byte(meta)
+		if ok1 && ok2 {
+			created, n := binary.Varint(rec)
+			if n <= 0 {
+				return m, errBadMarker
+			}
+			m.created, rec = created, rec[n:]
+			updated, n := binary.Varint(rec)
+			if n <= 0 {
+				return m, errBadMarker
+			}
+			m.updated, rec = updated, rec[n:]
+		}
+	}
 	if !ok1 || !ok2 || len(rec) != 0 {
 		return m, errBadMarker
 	}
@@ -99,11 +138,16 @@ func decodeMarker(rec []byte) (marker, error) {
 }
 
 type doneEntry struct {
-	at     int64
-	lsn    uint64
-	status string
-	kept   bool   // the output is kept (ADR 0050)
-	gen    uint64 // its keptKey generation
+	at       int64
+	lsn      uint64
+	status   string
+	parent   string
+	workflow string
+	meta     []byte
+	created  int64
+	updated  int64
+	kept     bool   // the output is kept (ADR 0050)
+	gen      uint64 // its keptKey generation
 }
 
 // doneIndex is written by the shard loop and read by Submit, Get and Wait.
@@ -192,16 +236,23 @@ func (e *Engine) marker(id string) (doneEntry, bool) {
 	return s.doneLog.idx.get(id, e.cfg.Now().UnixMilli()-e.cfg.IdempotencyTTL.Milliseconds())
 }
 
+func doneFromMarker(m marker, lsn uint64) doneEntry {
+	return doneEntry{at: m.at, lsn: lsn, status: m.status, parent: m.parent, workflow: m.workflow, meta: m.meta,
+		created: m.created, updated: m.updated, kept: m.kept, gen: m.gen}
+}
+
 // addMarker logs a marker for a finished run; after runs once it is
 // durable. kept: its output was durably put under keptKey(id, gen) first.
-func (s *shard) addMarker(id, status string, kept bool, gen uint64, after func()) {
+func (s *shard) addMarker(r *run, status string, kept bool, gen uint64, after func()) {
 	d := s.doneLog
-	d.buf = wal.Frame(d.buf, encodeMarker(nil, marker{runID: id, at: s.now, status: status, kept: kept, gen: gen}))
+	m := marker{runID: r.id, parent: r.parent, workflow: r.workflow, meta: r.meta, created: r.created, updated: r.updated,
+		at: s.now, status: status, kept: kept, gen: gen}
+	d.buf = wal.Frame(d.buf, encodeMarker(nil, m))
 	d.lsn++
 	d.idx.mu.Lock()
-	d.idx.m[id] = doneEntry{at: s.now, lsn: d.lsn, status: status, kept: kept, gen: gen}
+	d.idx.m[r.id] = doneFromMarker(m, d.lsn)
 	d.idx.mu.Unlock()
-	d.order = append(d.order, doneRef{id: id, at: s.now, lsn: d.lsn})
+	d.order = append(d.order, doneRef{id: r.id, at: s.now, lsn: d.lsn})
 	if after != nil {
 		d.waiting = append(d.waiting, doneWait{lsn: d.lsn, after: after})
 	}
@@ -224,6 +275,10 @@ func (s *shard) forgetMarker(id string) {
 		// run's will have another key.
 		s.deleteKept([]keptRef{{id: id, gen: en.gen, lsn: en.lsn}})
 	}
+	if ok && en.parent != "" {
+		s.e.detach(en.parent, id)
+	}
+	s.forgetTree(id)
 }
 
 // deleteKept deletes kept outputs off the loop. Their markers are kept in
@@ -296,6 +351,10 @@ func (s *shard) expireMarkers() {
 			}
 			if en, ok := d.idx.m[ref.id]; ok && en.lsn == ref.lsn {
 				delete(d.idx.m, ref.id)
+				s.forgetTree(ref.id)
+				if en.parent != "" {
+					s.e.detach(en.parent, ref.id)
+				}
 				if en.kept {
 					kept = append(kept, keptRef{id: ref.id, gen: en.gen, lsn: ref.lsn})
 				}
@@ -359,7 +418,10 @@ func (s *shard) recoverMarkers() error {
 			// A later run with this id: the earlier output is not needed.
 			d.expiredKept = append(d.expiredKept, keptRef{id: m.runID, gen: old.gen, lsn: old.lsn})
 		}
-		d.idx.m[m.runID] = doneEntry{at: m.at, lsn: lsn, status: m.status, kept: m.kept, gen: m.gen}
+		d.idx.m[m.runID] = doneFromMarker(m, lsn)
+		if m.parent != "" {
+			s.e.addRecoveredChild(m.parent, m.runID, true)
+		}
 		d.order = append(d.order, doneRef{id: m.runID, at: m.at, lsn: lsn})
 		return nil
 	})
@@ -398,7 +460,7 @@ func (s *shard) writeMarkers(ms []marker) error {
 			// An earlier run's output, replaced (before the loop starts).
 			d.deleting[old.lsn] = struct{}{}
 		}
-		d.idx.m[m.runID] = doneEntry{at: m.at, lsn: d.lsn, status: m.status, kept: m.kept, gen: m.gen}
+		d.idx.m[m.runID] = doneFromMarker(m, d.lsn)
 		d.order = append(d.order, doneRef{id: m.runID, at: m.at, lsn: d.lsn})
 	}
 	d.durable = d.lsn

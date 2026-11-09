@@ -69,7 +69,7 @@ func (s *shard) recover() error {
 			case recCheckpoint:
 				x := get(Tier(t), r.meta)
 				if r.snapLSN >= x.cpLSN {
-					x.cpLSN, x.cpRec = r.snapLSN, lsn
+					x.meta, x.cpLSN, x.cpRec = r.meta, r.snapLSN, lsn
 				}
 			case recEvent:
 				if x := runs[r.runID]; x != nil {
@@ -137,8 +137,8 @@ func (s *shard) recover() error {
 			continue
 		}
 		last := from
-		var feedLast uint64       // last event that produced traces again
-		var startAt, lastAt int64 // times of this run's start and last event
+		var feedLast uint64 // last event that produced traces again
+		startAt, lastAt := x.meta.Created, x.meta.Updated
 		for _, le := range x.events {
 			if le.ev.Kind == core.EvStart && startAt == 0 {
 				startAt = le.ev.At
@@ -159,6 +159,9 @@ func (s *shard) recover() error {
 			core.Apply(p, st, le.ev, nil)
 		}
 		if st.Status.Done() {
+			if x.meta.Parent != "" {
+				s.e.addRecoveredChild(x.meta.Parent, id, true)
+			}
 			if x.tier < TierFile {
 				s.e.deleteBlobs(id)
 				continue
@@ -175,7 +178,8 @@ func (s *shard) recover() error {
 					// TTL runs from when the run finished. An expired one
 					// is not written at all.
 					if at >= s.markerCut() {
-						m := marker{runID: id, at: at, status: st.Status.String()}
+						m := marker{runID: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta,
+							created: startAt, updated: lastAt, at: at, status: st.Status.String()}
 						if x.meta.Keep {
 							// Its output before its marker, as when it
 							// finished (ADR 0050). Its blobs are still here.
@@ -217,8 +221,13 @@ func (s *shard) recover() error {
 			finished = append(finished, id)
 			continue
 		}
-		r := &run{id: id, plan: p, tenant: x.meta.Tenant, tier: x.tier, keep: x.meta.Keep, st: st, timers: map[uint32]timerwheel.Handle{},
+		r := &run{id: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta, created: startAt, updated: lastAt,
+			plan: p, tenant: x.meta.Tenant, tier: x.tier, keep: x.meta.Keep, st: st, timers: map[uint32]timerwheel.Handle{},
 			lastLSN: last, startLSN: x.startLSN, status: st.Status, started: true, feedLSN: feedLast}
+		if r.parent != "" {
+			s.e.addRecoveredChild(r.parent, r.id, false)
+			r.unreached = true
+		}
 		if x.cpRec > 0 {
 			r.cpLSN, r.cpRec = x.cpLSN, x.cpRec
 			for _, le := range x.events {
@@ -230,6 +239,13 @@ func (s *shard) recover() error {
 		}
 		s.forgetMarker(id) // reused after an earlier run's marker
 		s.runs[id] = r
+		if r.plan.Name == "kairo.workflow" {
+			d := &driveState{}
+			if r.parent == "" {
+				d.ready = 1
+			}
+			s.drives[id] = d
+		}
 		s.inMemory.Add(1)
 		if st.Status == core.StatusBlocked {
 			r.reviews = reviews(r)
@@ -238,7 +254,9 @@ func (s *shard) recover() error {
 			r.waits = core.Waits(p, st)
 		}
 		s.e.adm.Readmit(r.tenant)
-		s.event(r, core.Event{Kind: core.EvRecover})
+		if !r.unreached {
+			s.event(r, core.Event{Kind: core.EvRecover})
+		}
 	}
 	if len(unmarked) > 0 {
 		if err := s.writeMarkers(unmarked); err != nil {

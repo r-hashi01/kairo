@@ -15,6 +15,7 @@ import (
 	"github.com/r-hashi01/kairo/live"
 	"github.com/r-hashi01/kairo/mpsc"
 	"github.com/r-hashi01/kairo/obs"
+	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/task"
 	"github.com/r-hashi01/kairo/timerwheel"
 	"github.com/r-hashi01/kairo/wal"
@@ -50,6 +51,14 @@ type shard struct {
 	// inputWaits: GetInput's replies for evicted runs being loaded for
 	// them (made on first use: no cost to runs nobody asks about).
 	inputWaits map[*run][]chan queryReply
+	// children is owned by the parent shard. The bool says the child is
+	// finished; closed rejects new children once terminal settlement starts.
+	children map[string]map[string]bool
+	closed   map[string]bool
+	// drives exists only for code workflows (ADR 0069).
+	drives map[string]*driveState
+	// quietWaits is allocated only while callers wait for quiescence.
+	quietWaits map[string]map[uint64]chan queryReply
 
 	inMemory   atomic.Int64
 	evicted    atomic.Int64
@@ -92,41 +101,56 @@ type held struct {
 }
 
 type run struct {
-	id      string
-	plan    *ir.Plan
-	tenant  string
-	tier    Tier
-	keep    bool // keep the output after it finishes (ADR 0050)
-	st      *core.State
-	snap    []byte // encoded state while evicted (in memory, or pending write)
-	onDisk  bool   // evicted and the snapshot is in the snapshot store
-	loading bool
-	writing bool         // a snapshot write is in progress
-	pending []core.Event // events that arrived while loading
-	timers  map[uint32]timerwheel.Handle
-	lastLSN uint64
+	id       string
+	parent   string
+	workflow string
+	meta     json.RawMessage
+	created  int64
+	updated  int64
+	plan     *ir.Plan
+	tenant   string
+	tier     Tier
+	keep     bool // keep the output after it finishes (ADR 0050)
+	st       *core.State
+	snap     []byte // encoded state while evicted (in memory, or pending write)
+	onDisk   bool   // evicted and the snapshot is in the snapshot store
+	loading  bool
+	writing  bool         // a snapshot write is in progress
+	pending  []core.Event // events that arrived while loading
+	timers   map[uint32]timerwheel.Handle
+	lastLSN  uint64
 	// Log retention (ADR 0016). Before its first durable checkpoint a run
 	// needs everything from its start record. After it, only its latest
 	// checkpoint record (cpRec, so recovery can find it) and its own
 	// records after the snapshot (the first of which is postSnap).
-	startLSN  uint64
-	cpLSN     uint64 // snapshot LSN of the latest durable checkpoint
-	cpRec     uint64 // LSN of that checkpoint record
-	postSnap  uint64 // first own record after cpLSN, 0 if none yet
-	pendSnap  uint64 // LSN of a snapshot being written, not yet checkpointed
-	pendFirst uint64 // first own record after pendSnap
-	finishJob func() // finished while a snapshot write was in flight: run after it
-	afterFeed func() // waits for the feed's acknowledgements (ADR 0034)
-	feedLSN   uint64 // LSN of the run's last event that produced traces
-	started   bool   // the start is durable (Submit answered)
-	startWait []chan startReply
-	compactCP bool        // the snapshot in flight was requested by compaction
-	starts    []*startReq // runs reusing this id, started once the snapshot is deleted
-	holds     int
-	done      bool
-	status    core.RunStatus
-	reviews   []Review    // steps needing review (kept outside the state so an evicted run can report them)
-	waits     []core.Wait // steps waiting for a signal, while quiescent
+	startLSN    uint64
+	startTicket *sched.StartTicket
+	cpLSN       uint64 // snapshot LSN of the latest durable checkpoint
+	cpRec       uint64 // LSN of that checkpoint record
+	postSnap    uint64 // first own record after cpLSN, 0 if none yet
+	pendSnap    uint64 // LSN of a snapshot being written, not yet checkpointed
+	pendFirst   uint64 // first own record after pendSnap
+	finishJob   func() // finished while a snapshot write was in flight: run after it
+	afterFeed   func() // waits for the feed's acknowledgements (ADR 0034)
+	feedLSN     uint64 // LSN of the run's last event that produced traces
+	started     bool   // the start is durable (Submit answered)
+	startWait   []chan startReply
+	compactCP   bool        // the snapshot in flight was requested by compaction
+	starts      []*startReq // runs reusing this id, started once the snapshot is deleted
+	holds       int
+	done        bool
+	status      core.RunStatus
+	reviews     []Review    // steps needing review (kept outside the state so an evicted run can report them)
+	waits       []core.Wait // steps waiting for a signal, while quiescent
+	unreached   bool        // recovered child: wait for its parent's replay (ADR 0067)
+}
+
+type driveState struct {
+	ready uint64
+	seen  uint64
+	token string
+	owner string
+	until int64
 }
 
 type timerRef struct {
@@ -136,21 +160,33 @@ type timerRef struct {
 }
 
 type startReq struct {
-	runID  string
-	tenant string
-	plan   *ir.Plan
-	tier   Tier
-	input  json.RawMessage
-	entry  string
-	limits RunLimits
-	depth  int
-	vars   json.RawMessage
-	keep   bool            // SubmitRequest.KeepOutput (ADR 0050)
-	reply  chan startReply // answered once the start is durable
+	runID         string
+	parent        string
+	workflow      string
+	meta          json.RawMessage
+	tenant        string
+	plan          *ir.Plan
+	tier          Tier
+	input         json.RawMessage
+	entry         string
+	limits        RunLimits
+	depth         int
+	vars          json.RawMessage
+	keep          bool            // SubmitRequest.KeepOutput (ADR 0050)
+	drive         bool            // explicit code-workflow reach (ADR 0069)
+	reply         chan startReply // answered once the start is durable
+	startTicket   *sched.StartTicket
+	inboxObserved bool
 }
 
 type startReply struct {
 	existing bool
+	err      error
+}
+
+type attachReply struct {
+	added bool
+	err   error
 }
 
 type msgKind uint8
@@ -170,19 +206,51 @@ const (
 	mKeptDeleted
 	mStop
 	mQueryInput // GetInput (ADR 0060)
+	mAttach
+	mDetach
+	mChildDone
+	mQueryChildren
+	mGuardedEvent
+	mList
+	mQueryQuiescent
+	mCancelQuiescent
+	mDriveReady
+	mDriveSnapshot
+	mDriveClaim
+	mDriveRenew
+	mDriveRelease
 )
 
+type listItem struct {
+	info   RunInfo
+	runID  string
+	marker bool
+}
+
 type msg struct {
-	kind  msgKind
-	runID string
-	ev    core.Event
-	start *startReq
-	tier  Tier
-	lsn   uint64
-	err   error
-	data  []byte
-	run   *run
-	reply chan queryReply
+	kind          msgKind
+	runID         string
+	ev            core.Event
+	start         *startReq
+	tier          Tier
+	lsn           uint64
+	err           error
+	data          []byte
+	run           *run
+	reply         chan queryReply
+	child         string
+	attachReply   chan attachReply
+	childrenReply chan []string
+	errReply      chan error
+	listFilter    ListFilter
+	listReply     chan []listItem
+	quietID       uint64
+	driveToken    string
+	driveOwner    string
+	driveUntil    int64
+	driveRetry    bool
+	driveReply    chan driveReply
+	driveList     chan []DriveCandidate
 	// mFeedStart
 	feedReply chan [tierCount]uint64
 	// mKept: the marker to add once the output is kept (ADR 0050)
@@ -196,13 +264,16 @@ type queryReply struct {
 
 func newShard(e *Engine, id int, sinks [tierCount]wal.Sink, done wal.Sink) *shard {
 	s := &shard{
-		e:     e,
-		id:    id,
-		inbox: mpsc.New[msg](),
-		runs:  map[string]*run{},
-		pins:  map[string]*run{},
-		wheel: timerwheel.New[timerRef](e.cfg.Now().UnixMilli()),
-		timer: time.NewTimer(time.Hour),
+		e:        e,
+		id:       id,
+		inbox:    mpsc.New[msg](),
+		runs:     map[string]*run{},
+		pins:     map[string]*run{},
+		children: map[string]map[string]bool{},
+		closed:   map[string]bool{},
+		drives:   map[string]*driveState{},
+		wheel:    timerwheel.New[timerRef](e.cfg.Now().UnixMilli()),
+		timer:    time.NewTimer(time.Hour),
 	}
 	s.timer.Stop()
 	for t := TierMemory; t < tierCount; t++ {
@@ -304,6 +375,157 @@ func (s *shard) handle(m *msg) {
 	switch m.kind {
 	case mStart:
 		s.startRun(m.start)
+	case mAttach:
+		r := s.runs[m.runID]
+		if r == nil || r.done || s.closed[m.runID] || r.plan.Name != "kairo.workflow" || m.child == m.runID {
+			m.attachReply <- attachReply{err: ErrParentUnavailable}
+			return
+		}
+		cs := s.children[m.runID]
+		if cs == nil {
+			cs = map[string]bool{}
+			s.children[m.runID] = cs
+		}
+		_, existed := cs[m.child]
+		if !existed {
+			cs[m.child] = false
+		}
+		m.attachReply <- attachReply{added: !existed}
+	case mDetach:
+		if cs := s.children[m.runID]; cs != nil {
+			delete(cs, m.child)
+			if len(cs) == 0 {
+				delete(s.children, m.runID)
+			}
+		}
+	case mChildDone:
+		if cs := s.children[m.runID]; cs != nil {
+			if _, ok := cs[m.child]; ok {
+				cs[m.child] = true
+			}
+		}
+		s.driveReady(m.runID)
+	case mQueryChildren:
+		var ids []string
+		for id := range s.children[m.runID] {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		m.childrenReply <- ids
+	case mGuardedEvent:
+		r := s.runs[m.runID]
+		if r == nil || r.done {
+			m.errReply <- ErrUnknownRun
+			return
+		}
+		for _, done := range s.children[m.runID] {
+			if !done {
+				m.errReply <- ErrChildrenUnsettled
+				return
+			}
+		}
+		s.closed[m.runID] = true
+		s.event(r, m.ev)
+		m.errReply <- nil
+	case mList:
+		items := make([]listItem, 0)
+		for _, r := range s.runs {
+			ri := s.info(r)
+			if listMatches(ri, m.listFilter) {
+				items = append(items, listItem{info: ri})
+			}
+		}
+		if d := s.doneLog; d != nil {
+			d.idx.mu.RLock()
+			cut := s.markerCut()
+			for id, en := range d.idx.m {
+				if en.at >= cut && en.parent == "" && en.workflow != "" && listEntryMatches(en, m.listFilter) {
+					items = append(items, listItem{runID: id, marker: true})
+				}
+			}
+			d.idx.mu.RUnlock()
+		}
+		m.listReply <- items
+	case mQueryQuiescent:
+		r := s.runs[m.runID]
+		if r == nil {
+			m.reply <- queryReply{}
+			return
+		}
+		if r.st == nil {
+			if s.quietWaits == nil {
+				s.quietWaits = map[string]map[uint64]chan queryReply{}
+			}
+			s.addQuietWait(m.runID, m.quietID, m.reply)
+			s.load(r)
+			return
+		}
+		if r.st.Quiescent() {
+			ri := s.info(r)
+			ri.NextAt = nextRunTimer(r.st)
+			m.reply <- queryReply{info: ri, found: true}
+			return
+		}
+		s.addQuietWait(m.runID, m.quietID, m.reply)
+	case mCancelQuiescent:
+		if ws := s.quietWaits[m.runID]; ws != nil {
+			delete(ws, m.quietID)
+			if len(ws) == 0 {
+				delete(s.quietWaits, m.runID)
+			}
+		}
+	case mDriveReady:
+		s.driveReady(m.runID)
+	case mDriveSnapshot:
+		out := make([]DriveCandidate, 0, len(s.drives))
+		for id, d := range s.drives {
+			r := s.runs[id]
+			if r == nil || r.done || r.unreached {
+				continue
+			}
+			if d.token != "" && d.until <= s.now {
+				d.token, d.owner, d.until = "", "", 0
+				d.ready++
+			}
+			active := d.token != "" && d.until > s.now
+			out = append(out, DriveCandidate{Run: s.info(r), Ready: !active && d.ready > d.seen, Until: d.until})
+		}
+		m.driveList <- out
+	case mDriveClaim:
+		r, d := s.runs[m.runID], s.drives[m.runID]
+		if d != nil && d.token != "" && d.until <= s.now {
+			d.token, d.owner, d.until = "", "", 0
+			d.ready++
+		}
+		if r == nil || r.done || r.unreached || d == nil || d.token != "" || d.ready <= d.seen {
+			m.driveReply <- driveReply{}
+			return
+		}
+		d.seen, d.token, d.owner, d.until = d.ready, m.driveToken, m.driveOwner, m.driveUntil
+		m.driveReply <- driveReply{ok: true, until: d.until}
+	case mDriveRenew:
+		d := s.drives[m.runID]
+		if d == nil || d.token != m.driveToken || d.owner != m.driveOwner || d.until <= s.now {
+			m.driveReply <- driveReply{}
+			return
+		}
+		d.until = m.driveUntil
+		m.driveReply <- driveReply{ok: true, until: d.until}
+	case mDriveRelease:
+		d := s.drives[m.runID]
+		if d == nil || d.token != m.driveToken || d.owner != m.driveOwner {
+			m.driveReply <- driveReply{}
+			return
+		}
+		d.token, d.owner, d.until = "", "", 0
+		if m.driveRetry {
+			d.ready++
+		}
+		ready := d.ready > d.seen
+		m.driveReply <- driveReply{ok: true}
+		if ready {
+			s.e.notifyDrive()
+		}
 	case mEvent:
 		r := s.runs[m.runID]
 		if r == nil || r.done {
@@ -317,7 +539,7 @@ func (s *shard) handle(m *msg) {
 	case mKept:
 		// The output is durably kept (or could not be: then it is not, and
 		// the run reads as trimmed once forgotten): now the marker.
-		s.addMarker(m.runID, string(m.data), m.err == nil, m.lsn, m.after)
+		s.addMarker(m.run, string(m.data), m.err == nil, m.lsn, m.after)
 	case mKeptDeleted:
 		delete(s.doneLog.deleting, m.lsn)
 	case mFeedBound:
@@ -421,12 +643,61 @@ func (s *shard) answerInputs(r *run) {
 }
 
 func (s *shard) info(r *run) RunInfo {
-	ri := RunInfo{RunID: r.id, Plan: r.plan.Name, Tenant: r.tenant, Tier: r.tier, Status: r.status.String(), Evicted: r.st == nil, Reviews: r.reviews, Waits: r.waits}
+	ri := RunInfo{RunID: r.id, Parent: r.parent, Workflow: r.workflow, Meta: r.meta, Plan: r.plan.Name, Tenant: r.tenant, Tier: r.tier,
+		Status: r.status.String(), Evicted: r.st == nil, Reviews: r.reviews, Waits: r.waits}
+	ri.CreatedAt, ri.UpdatedAt = r.created, r.updated
 	if st := r.st; st != nil {
 		ri.Output, ri.Error, ri.Exceptions = st.Output, st.Error, int(st.Exceptions)
 		ri.Vars = core.RunVars(st)
 	}
 	return ri
+}
+
+func nextRunTimer(st *core.State) int64 {
+	next := int64(0)
+	if st.DeadlineTimer != 0 {
+		next = st.Deadline
+	}
+	for _, a := range st.Acts {
+		if a.Timer != 0 && (next == 0 || a.TimerAt < next) {
+			next = a.TimerAt
+		}
+	}
+	return next
+}
+
+func (s *shard) addQuietWait(runID string, id uint64, reply chan queryReply) {
+	if s.quietWaits == nil {
+		s.quietWaits = map[string]map[uint64]chan queryReply{}
+	}
+	ws := s.quietWaits[runID]
+	if ws == nil {
+		ws = map[uint64]chan queryReply{}
+		s.quietWaits[runID] = ws
+	}
+	ws[id] = reply
+}
+
+func (s *shard) answerQuiet(r *run) {
+	ws := s.quietWaits[r.id]
+	if len(ws) == 0 || r.st == nil || !r.st.Quiescent() {
+		return
+	}
+	delete(s.quietWaits, r.id)
+	ri := s.info(r)
+	ri.NextAt = nextRunTimer(r.st)
+	for _, reply := range ws {
+		reply <- queryReply{info: ri, found: true}
+	}
+}
+
+func (s *shard) driveReady(runID string) {
+	d := s.drives[runID]
+	if d == nil {
+		return
+	}
+	d.ready++
+	s.e.notifyDrive()
 }
 
 // updateWaits refreshes the list of waiting steps once the run has nothing
@@ -463,9 +734,27 @@ func reviews(r *run) []Review {
 }
 
 func (s *shard) startRun(sr *startReq) {
+	if !sr.inboxObserved {
+		sr.inboxObserved = true
+		s.e.starts.ObserveInbox(sr.startTicket, s.e.cfg.Now())
+	}
 	if r, dup := s.runs[sr.runID]; dup {
+		s.e.starts.Drop(sr.startTicket)
+		if sr.parent != "" && sr.parent != r.parent {
+			s.e.adm.Release(sr.tenant)
+			s.e.detach(sr.parent, sr.runID)
+			sr.reply <- startReply{err: ErrParentUnavailable}
+			return
+		}
 		// The id is an idempotency key: answer for the existing run.
 		s.e.adm.Release(sr.tenant)
+		if r.unreached {
+			r.unreached = false
+			s.event(r, core.Event{Kind: core.EvRecover})
+		}
+		if sr.drive {
+			s.driveReady(r.id)
+		}
 		if r.started {
 			sr.reply <- startReply{existing: true}
 		} else {
@@ -475,6 +764,7 @@ func (s *shard) startRun(sr *startReq) {
 	}
 	if d := s.doneLog; d != nil {
 		if _, ok := d.idx.get(sr.runID, s.markerCut()); ok {
+			s.e.starts.Drop(sr.startTicket)
 			// Finished within IdempotencyTTL (ADR 0027).
 			s.e.adm.Release(sr.tenant)
 			sr.reply <- startReply{existing: true}
@@ -485,9 +775,15 @@ func (s *shard) startRun(sr *startReq) {
 		old.starts = append(old.starts, sr)
 		return
 	}
-	r := &run{id: sr.runID, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, keep: sr.keep, st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
+	r := &run{id: sr.runID, parent: sr.parent, workflow: sr.workflow, meta: sr.meta, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, keep: sr.keep, startTicket: sr.startTicket,
+		st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
 	s.forgetMarker(r.id) // an expired marker of an earlier run with this id
+	s.forgetTree(r.id)
 	s.runs[r.id] = r
+	if r.plan.Name == "kairo.workflow" {
+		s.drives[r.id] = &driveState{ready: 1}
+		s.e.notifyDrive()
+	}
 	s.inMemory.Add(1)
 	if l := s.logFor(r); l != nil {
 		l.buf = wal.Frame(l.buf, encodeStart(nil, s.meta(r)))
@@ -512,7 +808,8 @@ func (s *shard) startRun(sr *startReq) {
 }
 
 func (s *shard) meta(r *run) *startMeta {
-	return &startMeta{RunID: r.id, Plan: r.plan.Name, PlanHash: r.plan.Hash, Tenant: r.tenant, Tier: r.tier, Keep: r.keep}
+	return &startMeta{RunID: r.id, Parent: r.parent, Plan: r.plan.Name, PlanHash: r.plan.Hash, Tenant: r.tenant, Workflow: r.workflow,
+		Meta: r.meta, Created: r.created, Updated: r.updated, Tier: r.tier, Keep: r.keep}
 }
 
 func (s *shard) logFor(r *run) *shardLog {
@@ -544,6 +841,10 @@ func (s *shard) event(r *run, ev core.Event) {
 	if err != nil {
 		return // ignored (stale) events are not logged
 	}
+	if ev.Kind == core.EvStart && r.created == 0 {
+		r.created = ev.At
+	}
+	r.updated = ev.At
 	s.record(r, &ev)
 	if s.e.feed != nil && len(s.traces) > 0 {
 		// Before the commands: a task's chunks must not overtake the trace
@@ -559,6 +860,9 @@ func (s *shard) event(r *run, ev core.Event) {
 	s.commands(r, out)
 	if !r.done {
 		s.updateWaits(r)
+		if s.quietWaits != nil {
+			s.answerQuiet(r)
+		}
 	}
 	if !r.done {
 		s.maybeEvict(r)
@@ -660,6 +964,7 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 			s.failedLogs.Add(1)
 		}
 		l.failed = err
+		s.e.starts.FailRound(sched.StartKey{Shard: s.id, Tier: int(t)}, lsn)
 		log.Printf("kairo: shard %d: %s log write failed: %v", s.id, t, err)
 		return
 	}
@@ -667,12 +972,17 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 		l.durable = lsn
 	}
 	i := 0
+	var starts []*sched.StartTicket
 	for ; i < len(l.held); i++ {
 		h := l.held[i]
 		if h.lsn > l.durable {
 			break
 		}
 		h.run.holds--
+		if h.kind == hStarted && h.run.startTicket != nil {
+			starts = append(starts, h.run.startTicket)
+			h.run.startTicket = nil
+		}
 		s.release(h)
 		if h.run.holds == 0 && h.kind != hEvict {
 			// An eviction may have been skipped while this was held.
@@ -684,6 +994,7 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 		clear(l.held[n:])
 		l.held = l.held[:n]
 	}
+	s.e.starts.ConfirmRound(sched.StartKey{Shard: s.id, Tier: int(t)}, lsn, starts, s.e.cfg.Now())
 	s.maybeCompact(l)
 }
 
@@ -845,7 +1156,24 @@ func (s *shard) done(r *run) {
 
 func (s *shard) finish(r *run) {
 	ri := s.info(r)
+	ri.FinishedAt = time.UnixMilli(r.updated)
+	s.e.childDone(r.parent, r.id)
+	if r.tier < TierFile || s.doneLog == nil {
+		s.forgetTree(r.id)
+	}
 	delete(s.runs, r.id)
+	if _, ok := s.drives[r.id]; ok {
+		delete(s.drives, r.id)
+		s.e.notifyDrive()
+	}
+	if s.quietWaits != nil {
+		if ws := s.quietWaits[r.id]; len(ws) > 0 {
+			delete(s.quietWaits, r.id)
+			for _, reply := range ws {
+				reply <- queryReply{info: ri, found: true}
+			}
+		}
+	}
 	s.inMemory.Add(-1)
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "run.done", RunID: r.id, Tenant: r.tenant, Data: r.st.Output, Err: r.st.Error})
 	s.e.adm.Release(r.tenant)
@@ -902,7 +1230,7 @@ func (s *shard) finish(r *run) {
 	// Clean up only once the marker is durable: until then the records
 	// are what tells a restart that the run finished (ADR 0027).
 	if !r.keep {
-		s.addMarker(id, ri.Status, false, 0, start)
+		s.addMarker(r, ri.Status, false, 0, start)
 		return
 	}
 	// Its output first, then the marker that says it is there: a marker
@@ -916,8 +1244,13 @@ func (s *shard) finish(r *run) {
 		if err != nil {
 			log.Printf("kairo: run %s: keeping its output: %v", id, err)
 		}
-		s.inbox.Push(msg{kind: mKept, runID: id, data: []byte(status), lsn: gen, err: err, after: start})
+		s.inbox.Push(msg{kind: mKept, runID: id, run: r, data: []byte(status), lsn: gen, err: err, after: start})
 	})
+}
+
+func (s *shard) forgetTree(id string) {
+	delete(s.children, id)
+	delete(s.closed, id)
 }
 
 // maybeEvict snapshots a run that is only waiting (timers far away,
@@ -994,6 +1327,12 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 	if err != nil {
 		log.Printf("kairo: shard %d: loading snapshot of %s: %v", s.id, r.id, err)
 		s.answerInputs(r)
+		if ws := s.quietWaits[r.id]; len(ws) > 0 {
+			delete(s.quietWaits, r.id)
+			for _, reply := range ws {
+				reply <- queryReply{info: s.info(r), found: true}
+			}
+		}
 		return
 	}
 	defer s.answerInputs(r)
@@ -1011,6 +1350,9 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 			continue
 		}
 		s.event(r, ev)
+	}
+	if s.quietWaits != nil {
+		s.answerQuiet(r)
 	}
 }
 

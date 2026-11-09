@@ -276,6 +276,46 @@ func (s *SQLStore) WithRun(ctx context.Context, id string, fn func(*RunRow) (*Ch
 		if err != nil || ch == nil {
 			return err
 		}
+		if ch.GuardParent != "" {
+			// SQLite has no SELECT FOR UPDATE. A no-op write takes its write
+			// lock before the check; PostgreSQL locks only the parent row.
+			lock := ""
+			if s.dialect == Postgres {
+				lock = " FOR UPDATE"
+			} else if _, err := ex.ExecContext(ctx, s.q(`UPDATE `+p+`run SET id = id WHERE id = ?`), ch.GuardParent); err != nil {
+				return err
+			}
+			parent, err := scanRun(ex.QueryRowContext(ctx, s.q(`SELECT `+runCols+` FROM `+p+`run WHERE id = ?`+lock), ch.GuardParent))
+			if err == sql.ErrNoRows {
+				parent, err = nil, nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := checkParent(parent, ch.GuardParent, id); err != nil {
+				return err
+			}
+		}
+		if ch.GuardTreeSettled {
+			if s.dialect != Postgres {
+				// Pair with a child's GuardParent no-op write.
+				if _, err := ex.ExecContext(ctx, s.q(`UPDATE `+p+`run SET id = id WHERE id = ?`), id); err != nil {
+					return err
+				}
+			}
+			q := `WITH RECURSIVE tree(id) AS (
+				SELECT id FROM ` + p + `run WHERE parent = ?
+				UNION SELECT r.id FROM ` + p + `run r JOIN tree t ON r.parent = t.id
+			) SELECT 1 FROM ` + p + `run WHERE id IN (SELECT id FROM tree) AND status NOT IN ('completed','failed','cancelled') LIMIT 1`
+			var one int
+			err := ex.QueryRowContext(ctx, s.q(q), id).Scan(&one)
+			if err == nil {
+				return errChildrenUnsettled
+			}
+			if err != sql.ErrNoRows {
+				return err
+			}
+		}
 		var seq int64
 		if before != nil {
 			seq = before.Seq
@@ -393,6 +433,39 @@ func (s *SQLStore) ExpiredLeases(ctx context.Context, now int64, limit int) ([]L
 		out = append(out, l)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLStore) Recoverable(ctx context.Context, run string, now int64) ([]LeaseRow, []TimerRow, error) {
+	leaseRows, err := s.db.QueryContext(ctx, s.q(`SELECT run, act, attempt, owner, until FROM `+s.p+`lease WHERE run = ? AND act <> 0 AND until < ? ORDER BY until`), run, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	var leases []LeaseRow
+	for leaseRows.Next() {
+		var l LeaseRow
+		if err := leaseRows.Scan(&l.Run, &l.Act, &l.Attempt, &l.Owner, &l.Until); err != nil {
+			leaseRows.Close()
+			return nil, nil, err
+		}
+		leases = append(leases, l)
+	}
+	if err := leaseRows.Close(); err != nil {
+		return nil, nil, err
+	}
+	timerRows, err := s.db.QueryContext(ctx, s.q(`SELECT run, timer, act, at FROM `+s.p+`timer WHERE run = ? AND at <= ? ORDER BY at`), run, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer timerRows.Close()
+	var timers []TimerRow
+	for timerRows.Next() {
+		var t TimerRow
+		if err := timerRows.Scan(&t.Run, &t.Timer, &t.Act, &t.At); err != nil {
+			return nil, nil, err
+		}
+		timers = append(timers, t)
+	}
+	return leases, timers, timerRows.Err()
 }
 
 func (s *SQLStore) RenewLeases(ctx context.Context, owner string, until int64) error {

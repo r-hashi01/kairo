@@ -135,6 +135,15 @@ func (s *Server) handle(c net.Conn) {
 		return
 	}
 	c.SetReadDeadline(time.Time{})
+	if len(h.Capabilities) > 0 {
+		selected := make([]string, 0, 1)
+		if hasCapability(h.Capabilities, CapabilityGracefulDrain) {
+			selected = append(selected, CapabilityGracefulDrain)
+		}
+		if WriteFrame(w, MsgHello, Welcome{Capabilities: selected}) != nil || w.Flush() != nil {
+			return
+		}
+	}
 	if h.Credit <= 0 {
 		h.Credit = 1
 	}
@@ -168,6 +177,7 @@ func (s *Server) handle(c net.Conn) {
 	}
 	var wmu sync.Mutex // the writer goroutine and Cancel senders share w
 	done := make(chan struct{})
+	drain := make(chan struct{})
 	writerDone := make(chan struct{})
 	var ec *endConn
 	var wake chan struct{} // nil (never ready) without RunEnd
@@ -184,6 +194,11 @@ func (s *Server) handle(c net.Conn) {
 	go func() {
 		defer close(writerDone)
 		for {
+			select {
+			case <-drain:
+				return
+			default:
+			}
 			var dl sched.Delivery
 			select {
 			case dl = <-p.C:
@@ -209,6 +224,8 @@ func (s *Server) handle(c net.Conn) {
 				}
 				continue
 			case <-done:
+				return
+			case <-drain:
 				return
 			}
 			t := dl.Task
@@ -261,6 +278,8 @@ func (s *Server) handle(c net.Conn) {
 		}
 	}()
 
+	drained := false
+	unpolled := false
 	for {
 		typ, body, err := ReadFrame(r)
 		if err != nil {
@@ -277,11 +296,41 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait})
-			d.Poll(p, 1)
+			if drained {
+				wmu.Lock()
+				err = WriteFrame(w, MsgCredit, Credit{N: 1})
+				if err == nil {
+					err = w.Flush()
+				}
+				wmu.Unlock()
+				if err != nil {
+					c.Close()
+				}
+			} else {
+				d.Poll(p, 1)
+			}
 		case MsgCredit:
 			var cr Credit
-			if json.Unmarshal(body, &cr) == nil && cr.N > 0 {
+			if json.Unmarshal(body, &cr) != nil {
+				continue
+			}
+			if cr.N > 0 && !drained {
 				d.Poll(p, cr.N)
+			} else if cr.N < 0 && !drained {
+				close(drain)
+				<-writerDone
+				d.Unpoll(p)
+				unpolled = true
+				drained = true
+				wmu.Lock()
+				err = WriteFrame(w, MsgCredit, Credit{N: 0})
+				if err == nil {
+					err = w.Flush()
+				}
+				wmu.Unlock()
+				if err != nil {
+					c.Close()
+				}
 			}
 		case MsgChunk:
 			var ch Chunk
@@ -299,7 +348,9 @@ func (s *Server) handle(c net.Conn) {
 	close(done)
 	c.Close() // unblocks a writer stuck on a dead connection
 	<-writerDone
-	d.Unpoll(p) // requeues tasks that were never sent
+	if !unpolled {
+		d.Unpoll(p) // requeues tasks that were never sent
+	}
 	mu.Lock()
 	lost := outstanding
 	outstanding = nil

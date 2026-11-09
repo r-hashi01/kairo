@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -261,28 +262,51 @@ func TestKeptOutputWrittenOnRecovery(t *testing.T) {
 	}
 }
 
-// Markers of version 1 (before ADR 0050) read as not kept.
+// Markers before ADR 0067 read without a parent.
 func TestMarkerVersion1(t *testing.T) {
 	m := marker{runID: "r", at: 42, status: "completed"}
-	v2 := encodeMarker(nil, m)
-	v1 := append([]byte{1}, v2[1:len(v2)-1]...) // no kept byte
+	v3 := encodeMarker(nil, m)
+	v1 := append([]byte{1}, v3[1:len(v3)-2]...) // no kept byte or parent
 	got, err := decodeMarker(v1)
-	if err != nil || got != m {
+	if err != nil || !reflect.DeepEqual(got, m) {
 		t.Fatalf("v1: %+v %v", got, err)
 	}
-	m.kept = true
-	if got, err := decodeMarker(encodeMarker(nil, m)); err != nil || got != m {
+	v2 := append([]byte{2}, v3[1:len(v3)-1]...) // kept byte, no parent
+	if got, err := decodeMarker(v2); err != nil || !reflect.DeepEqual(got, m) {
 		t.Fatalf("v2: %+v %v", got, err)
+	}
+	m.kept, m.parent = true, "parent"
+	if got, err := decodeMarker(encodeMarker(nil, m)); err != nil || !reflect.DeepEqual(got, m) {
+		t.Fatalf("v3: %+v %v", got, err)
+	}
+	m.workflow, m.meta, m.created, m.updated = "orders", []byte(`{"user":"a"}`), 40, 42
+	if got, err := decodeMarker(encodeMarker(nil, m)); err != nil || !reflect.DeepEqual(got, m) {
+		t.Fatalf("v4: %+v %v", got, err)
 	}
 }
 
-// The keep flag rides in the tier byte; old records read as not kept.
+// Optional metadata rides after flags in the tier byte; workflowless records
+// remain byte-for-byte compatible with records written before ADR 0067/0068.
 func TestStartMetaKeep(t *testing.T) {
+	old := &startMeta{RunID: "r", Plan: "p", PlanHash: "h", Tenant: "t", Tier: TierFile}
+	wantStart := []byte{recStart, 1, 'r', 1, 'p', 1, 'h', 1, 't', byte(TierFile)}
+	wantCheckpoint := append(append([]byte(nil), []byte{recCheckpoint, 1, 'r', 1, 'p', 1, 'h', 1, 't', byte(TierFile)}...), 42)
+	if got := encodeStart(nil, old); !reflect.DeepEqual(got, wantStart) {
+		t.Fatalf("old start changed: %v", got)
+	}
+	if got := encodeCheckpoint(nil, old, 42); !reflect.DeepEqual(got, wantCheckpoint) {
+		t.Fatalf("old checkpoint changed: %v", got)
+	}
 	for _, keep := range []bool{false, true} {
-		m := &startMeta{RunID: "r", Plan: "p", PlanHash: "h", Tenant: "t", Tier: TierFile, Keep: keep}
+		m := &startMeta{RunID: "r", Parent: "parent", Plan: "p", PlanHash: "h", Tenant: "t", Workflow: "orders",
+			Meta: []byte(`{"user":"a"}`), Created: 40, Updated: 42, Tier: TierFile, Keep: keep}
 		rec, err := decodeRecord(encodeStart(nil, m))
-		if err != nil || *rec.meta != *m {
+		if err != nil || !reflect.DeepEqual(*rec.meta, *m) {
 			t.Fatalf("keep=%v: %+v %v", keep, rec.meta, err)
+		}
+		rec, err = decodeRecord(encodeCheckpoint(nil, m, 42))
+		if err != nil || !reflect.DeepEqual(*rec.meta, *m) || rec.snapLSN != 42 {
+			t.Fatalf("checkpoint keep=%v: %+v %v", keep, rec, err)
 		}
 	}
 }

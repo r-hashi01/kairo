@@ -9,10 +9,10 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { HttpBackend, type Backend } from './backend.ts';
 import { SignatureError, checkURL, post, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
-import { Embedded, newToken } from './embedded.ts';
+import { EffectWeakenedError, Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
 import { consoleLogger, observe, stepStatus, type Logger, type Observer } from './observe.ts';
-import type { LeaseRow } from './store.ts';
+import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, type LeaseRow } from './store.ts';
 import type { Address, TaskContext } from './worker.ts';
 
 /** An action: what a step of a workflow runs, on this process's worker. */
@@ -72,15 +72,15 @@ interface WorkflowDef {
 }
 
 /** A workflow run's input: the workflow, its version (when it has one) and the input it was given. */
-function workflowInput(name: string, version: string, input: unknown): Record<string, unknown> {
-	return { workflow: name, input: input ?? null, ...(version ? { version } : {}) };
+function workflowInput(name: string, version: string, input: unknown, externalParent = false): Record<string, unknown> {
+	return { workflow: name, input: input ?? null, ...(version ? { version } : {}), ...(externalParent ? { external_parent: true } : {}) };
 }
 
 /** Reads a workflow run's input. */
-function workflowOf(input: unknown): { name: string; version: string; input: unknown } | undefined {
-	const w = input as { workflow?: unknown; version?: unknown; input?: unknown } | null | undefined;
+function workflowOf(input: unknown): { name: string; version: string; input: unknown; externalParent: boolean } | undefined {
+	const w = input as { workflow?: unknown; version?: unknown; input?: unknown; external_parent?: unknown } | null | undefined;
 	if (!w || typeof w.workflow !== 'string' || !w.workflow) return undefined;
-	return { name: w.workflow, version: typeof w.version === 'string' ? w.version : '', input: w.input };
+	return { name: w.workflow, version: typeof w.version === 'string' ? w.version : '', input: w.input, externalParent: w.external_parent === true };
 }
 
 /** A workflow run whose version this process does not have (another process's to drive). */
@@ -115,7 +115,7 @@ export interface KairoOptions {
 	/**
 	 * "wait" (the default): run() drives a workflow to its end, waiting in
 	 * this process for timers and signals. "suspend" (serverless, embedded
-	 * only): run() goes as far as it can now and throws Suspended at a call
+	 * or kairod): run() goes as far as it can now and throws Suspended at a call
 	 * that waits for a timer or a signal; tick() and signal() drive the
 	 * workflows on when their calls settle (ADR 0051).
 	 */
@@ -163,6 +163,8 @@ export interface KairoOptions {
 export class ResultLostError extends Error {}
 /** The workflow was cancelled. */
 export class CancelledError extends Error {}
+/** Cancel did not change the workflow because it had completed or failed. */
+export class RunSettledError extends Error {}
 /** The workflow waits (a timer, a signal): tick() or signal() drives it on. */
 export class Suspended extends Error {}
 /**
@@ -170,8 +172,19 @@ export class Suspended extends Error {}
  * closing. The workflow is not cancelled: it goes on (ADR 0059).
  */
 export class StoppedError extends Error {}
+/** sendSignal(onlyIfWaiting) found no current wait (ADR 0064). */
+export class NotWaitingError extends Error {}
 /** A wait's timeout came before its signal (waitFor's timeout, ADR 0059). */
 export class TimedOutError extends Error {}
+
+/** The wait that atomically accepted a signal (ADR 0064). */
+export interface SignalReceipt {
+	runId: string;
+	/** Zero-based occurrence of waitFor with this signal name. */
+	index: number;
+	/** This send made the wait before the workflow reached it. */
+	early: boolean;
+}
 /** Another process holds the workflow's drive lease (ADR 0059). */
 class DrivenElsewhere extends Error {}
 
@@ -328,9 +341,14 @@ export class Kairo {
 	private readonly workflows = new Map<string, WorkflowDef>();
 	private readonly planned = new Set<string>();
 	private readonly driving = new Set<AbortController>();
+	private readonly driveIdleWaiters = new Set<() => void>();
+	private readonly drivingById = new Map<string, AbortController>();
+	private readonly cancelRequests = new Map<string, { done: Promise<boolean>; finish: (settled: boolean) => void }>();
+	private readonly treeCancellations = new Map<string, number>();
 	readonly suspend: boolean;
 	/** Suspend mode: workflows being driven on here, and those to drive again after. */
 	private readonly drivingIds = new Set<string>();
+	private readonly redriving = new Set<string>();
 	private readonly again = new Set<string>();
 	private readonly redrives = new Set<Promise<void>>();
 	private stopHook?: () => void;
@@ -354,12 +372,15 @@ export class Kairo {
 	private readonly logger: Logger;
 	/** The clock (unix ms): the embedded runtime's (EmbeddedOptions.now), or Date.now. */
 	private readonly clock: () => number;
+	/** Tick drains process-wide work; concurrent callers take turns. */
+	private tickTail = Promise.resolve();
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
 		this.backend = opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
 		this.suspend = opts.mode === 'suspend';
-		if (this.suspend && !this.backend.idle) throw new Error('suspend mode needs the embedded backend');
+		if (this.suspend && !this.backend.idle && !(this.backend instanceof HttpBackend))
+			throw new Error('suspend mode needs the embedded backend or kairod');
 		const rt = (this.backend as { runtime?: unknown }).runtime;
 		if (rt instanceof Embedded) {
 			this.rt = rt;
@@ -438,10 +459,11 @@ export class Kairo {
 		const rt = this.rt;
 		if (rt) {
 			rt.lostDrive = (l) => this.lostDrive(l);
+			rt.wakeParent = (id) => this.redrive(id);
 			rt.planFor = waitPlan;
 			rt.leaseParents = this.suspend;
 		}
-		if (this.suspend) {
+		if (this.suspend && rt) {
 			// A call that settles drives its workflow on (its id is the
 			// workflow's id, "/", the call's key).
 			this.stopHook = this.backend.onSettled!((r) => {
@@ -497,17 +519,28 @@ export class Kairo {
 	 * and have their outcomes recorded. Returns once they have; a signal
 	 * that aborts first throws StoppedError, and close then stops what
 	 * still runs, as a process that stops (a real step then waits for
-	 * review in the next process). After drain, close. The embedded
-	 * runtime only.
+	 * review in the next process). After drain, close.
 	 */
 	async drain(opts: { signal?: AbortSignal } = {}): Promise<void> {
 		const rt = this.rt;
-		if (!rt) throw new Error('drain needs the embedded backend');
 		this.draining = true;
-		rt.drain();
+		rt?.drain();
 		for (const a of this.driving) a.abort(); // stops at its next call; its drive lease is handed over
 		const signal = opts.signal;
-		if (!signal) return rt.idle();
+		const idle = rt ? rt.idle() : (async () => {
+			this.logger.info?.('kairo: draining kairod worker', {
+				worker_tasks: this.backend instanceof HttpBackend ? this.backend.inflight : 0,
+				workflow_drives: this.driving.size,
+			});
+			try {
+				await Promise.all([this.backend.drain?.(signal), this.waitForDrives()]);
+			} catch (e) {
+				this.logger.warn('kairo: kairod worker drain stopped', { err: e });
+				throw e;
+			}
+			this.logger.info?.('kairo: kairod worker drained');
+		})();
+		if (!signal) return idle;
 		if (signal.aborted) throw new StoppedError('drain: stopped waiting for the steps running here');
 		let stop!: () => void;
 		const stopped = new Promise<never>((_, rej) => {
@@ -515,10 +548,15 @@ export class Kairo {
 			signal.addEventListener('abort', stop, { once: true });
 		});
 		try {
-			await Promise.race([rt.idle(), stopped]);
+			await Promise.race([idle, stopped]);
 		} finally {
 			signal.removeEventListener('abort', stop);
 		}
+	}
+
+	private waitForDrives(): Promise<void> {
+		if (this.driving.size === 0) return Promise.resolve();
+		return new Promise((resolve) => this.driveIdleWaiters.add(resolve));
 	}
 
 	/**
@@ -528,9 +566,47 @@ export class Kairo {
 	 * do (unix ms), or null.
 	 */
 	async tick(): Promise<number | null> {
-		await this.backend.tick?.();
+		const previous = this.tickTail;
+		let release!: () => void;
+		this.tickTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await this.tickOnce();
+		} finally {
+			release();
+		}
+	}
+
+	private async tickOnce(): Promise<number | null> {
+		if (this.backend instanceof HttpBackend) {
+			this.backend.clearDue(this.clock());
+			for (;;) {
+				const claim = await this.backend.claimWorkflow(this.supportedWorkflows());
+				if (!claim) break;
+				const w = workflowOf(claim.run.input);
+				if (!w) {
+					await this.backend.releaseWorkflow(claim);
+					continue;
+				}
+				try {
+					await this.runAs(w.name, w.input, claim.run.run_id, claim.run.parent ? { id: claim.run.parent } : undefined);
+					await this.backend.releaseWorkflow(claim);
+				} catch (e) {
+					await this.backend.releaseWorkflow(claim, isWorkflowRetry(e));
+					if (!(e instanceof Suspended) && !(e instanceof KairoError && e.status === 404) && !isWorkflowRetry(e)) throw e;
+				}
+			}
+		} else {
+			await this.backend.tick?.();
+		}
 		await this.settle();
 		return this.wakeUp();
+	}
+
+	private supportedWorkflows(): Record<string, string[]> {
+		return Object.fromEntries([...this.workflows].map(([name, d]) => [name, [...d.versions.keys()].sort()]));
 	}
 
 	/** Suspend mode: tells wake when something is next to do (ADR 0053); returns it. */
@@ -555,28 +631,34 @@ export class Kairo {
 
 	/** Suspend mode: drives workflow id on (again, if it is being driven now). */
 	private redrive(id: string): void {
-		if (this.drivingIds.has(id)) {
+		if (this.redriving.has(id)) {
 			this.again.add(id);
 			return;
 		}
+		if (this.drivingIds.has(id)) return;
+		this.redriving.add(id);
 		const p = (async () => {
-			do {
-				this.again.delete(id);
-				let info: RunInfo;
-				try {
-					info = await this.backend.get(id);
-				} catch {
-					return;
-				}
-				const w = workflowOf(info.input);
-				if (info.plan !== PLAN_WORKFLOW || finished(info) || !w) return;
-				try {
-					await this.drive(id, w.name, w.input, info.parent, 0);
-				} catch {
-					// Suspended again, failed (recorded), cancelled, driven
-					// elsewhere, or of a version not here.
-				}
-			} while (this.again.has(id));
+			try {
+				do {
+					this.again.delete(id);
+					let info: RunInfo;
+					try {
+						info = await this.backend.get(id);
+					} catch {
+						return;
+					}
+					const w = workflowOf(info.input);
+					if (info.plan !== PLAN_WORKFLOW || finished(info) || !w) return;
+					try {
+						await this.drive(id, w.name, w.input, info.parent, 0);
+					} catch {
+						// Suspended again, failed (recorded), cancelled, driven
+						// elsewhere, or of a version not here.
+					}
+				} while (this.again.has(id));
+			} finally {
+				this.redriving.delete(id);
+			}
 		})();
 		this.redrives.add(p);
 		void p.finally(() => this.redrives.delete(p));
@@ -780,22 +862,25 @@ export class Kairo {
 	 * workflow goes on. In suspend mode it is driven here until it waits:
 	 * Suspended. meta is kept with a new workflow (RunInfo.meta, list).
 	 */
-	async run<O = any>(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown>; signal?: AbortSignal } = {}): Promise<O> {
+	async run<O = any>(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown>; signal?: AbortSignal; parent?: string } = {}): Promise<O> {
 		const id = opts.id ?? randomUUID();
 		try {
-			const token = await this.begin(name, input, id, opts.meta);
+			const { token, parent } = await this.begin(name, input, id, opts.meta, opts.parent, opts.signal);
 			if (this.suspend) {
 				try {
-					return (await this.drive(id, name, input, undefined, token)) as O;
+					return (await this.drive(id, name, input, parent, token)) as O;
 				} catch (e) {
 					if (e instanceof DrivenElsewhere) throw new Suspended(e.message);
 					throw e;
 				}
 			}
 			// kairod: driven here, as the caller waits.
-			if (!this.rt) return (await this.drive(id, name, input, undefined, 0)) as O;
-			this.driveBackground(id, name, input, undefined, token);
+			if (!this.rt) return (await this.drive(id, name, input, parent, 0)) as O;
+			this.driveBackground(id, name, input, parent, token);
 			return await this.result<O>(id, { signal: opts.signal });
+		} catch (e) {
+			if (opts.signal?.aborted || this.draining || this.closing) throw new StoppedError(`workflow ${id}: stopped waiting for it`);
+			throw e;
 		} finally {
 			await this.wakeUp();
 		}
@@ -808,14 +893,14 @@ export class Kairo {
 	 * mode it is driven here until it waits (what it comes to is recorded:
 	 * nothing is thrown). The id is an idempotency key, as in run.
 	 */
-	async submit(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown> } = {}): Promise<string> {
+	async submit(name: string, input: unknown, opts: { id?: string; meta?: Record<string, unknown>; parent?: string } = {}): Promise<string> {
 		const id = opts.id ?? randomUUID();
-		const token = await this.begin(name, input, id, opts.meta);
+		const { token, parent } = await this.begin(name, input, id, opts.meta, opts.parent);
 		if (!this.suspend) {
-			this.driveBackground(id, name, input, undefined, token);
+			this.driveBackground(id, name, input, parent, token);
 			return id;
 		}
-		await this.drive(id, name, input, undefined, token).catch(() => {});
+		await this.drive(id, name, input, parent, token).catch(() => {});
 		await this.wakeUp();
 		return id;
 	}
@@ -845,13 +930,16 @@ export class Kairo {
 
 	/**
 	 * Workflows started here or elsewhere (root runs: not child workflows,
-	 * not calls), in the order they were created (ADR 0059). The embedded
-	 * runtime only.
+	 * not calls), in the order they were created (ADR 0059, 0068).
 	 */
 	async list(opts: ListOptions = {}): Promise<RunInfo[]> {
-		if (!this.rt) throw new Error('list needs the embedded backend');
 		const ms = (t: number | Date | undefined) => (t instanceof Date ? t.getTime() : t);
-		return this.rt.list({ ...opts, since: ms(opts.since), until: ms(opts.until) });
+		return this.backend.list({ ...opts, since: ms(opts.since), until: ms(opts.until) });
+	}
+
+	/** Runs made directly by id: calls, waits and child workflows. */
+	async children(id: string): Promise<RunInfo[]> {
+		return this.backend.children(id);
 	}
 
 	/**
@@ -859,17 +947,48 @@ export class Kairo {
 	 * this process to drive, in the same transaction: its token (0: it
 	 * existed, or no leases here).
 	 */
-	private async begin(name: string, input: unknown, id: string, meta?: Record<string, unknown>): Promise<number> {
+	private async begin(
+		name: string,
+		input: unknown,
+		id: string,
+		meta?: Record<string, unknown>,
+		requestedParent?: string,
+		signal?: AbortSignal,
+	): Promise<{ token: number; parent?: string }> {
 		const version = this.currentVersion(name);
 		if (version === undefined) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
-		const token = this.rt ? newToken() : 0;
+		const token = this.rt || this.backend instanceof HttpBackend ? newToken() : 0;
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
-			workflowInput(name, version, input),
-			{ runId: id, vars: { started_at: this.clock() }, workflow: name, ...(meta ? { meta } : {}), ...(token ? { drive: token } : {}) },
+			workflowInput(name, version, input, !!requestedParent),
+			{
+				runId: id,
+				vars: { started_at: this.clock() },
+				workflow: name,
+				...(requestedParent ? { parent: requestedParent, guardParent: true } : {}),
+				...(meta ? { meta } : {}),
+				...(token ? { drive: token } : {}),
+				...(signal ? { signal } : {}),
+			},
 		);
-		return started.existing ? 0 : token;
+		if (!started.existing) return { token, parent: requestedParent };
+		const info = await this.backend.get(id);
+		const parent = info.parent;
+		if (requestedParent && requestedParent !== parent)
+			throw new ParentUnavailableError(`parent ${requestedParent}: run ${id} already belongs to parent ${JSON.stringify(parent ?? '')}`);
+		if (parent && !finished(info)) {
+			let p: RunInfo;
+			try {
+				p = await this.backend.get(parent);
+			} catch (e) {
+				if (e instanceof KairoError && e.status === 404) throw new ParentUnavailableError(`parent ${parent}: it does not exist`);
+				throw e;
+			}
+			if (p.plan !== PLAN_WORKFLOW || !p.workflow) throw new ParentUnavailableError(`parent ${parent}: it is not a workflow`);
+			if (finished(p)) throw new ParentUnavailableError(`parent ${parent}: it has finished`);
+		}
+		return { token: 0, parent };
 	}
 
 	/**
@@ -881,6 +1000,13 @@ export class Kairo {
 	 */
 	private async drive(id: string, name: string, input: unknown, parent: string | undefined, token: number): Promise<unknown> {
 		const rt = this.rt;
+		const remote = this.backend instanceof HttpBackend ? this.backend : undefined;
+		if (remote) {
+			const info = await this.backend.get(id, { input: true });
+			if (finished(info)) return done(id, info);
+		}
+		let claim = remote ? await remote.claimWorkflow(this.supportedWorkflows(), id, this.suspend ? 0 : 60_000) : undefined;
+		if (remote && !claim) throw new DrivenElsewhere(`workflow ${id} is driven by another process`);
 		if (rt && token === 0) {
 			const info = await this.backend.get(id);
 			if (finished(info)) return done(id, info);
@@ -893,10 +1019,38 @@ export class Kairo {
 		try {
 			return await this.runAs(name, input, id, parent ? { id: parent } : undefined);
 		} catch (e) {
+			if ((this.draining || this.closing) && remote && claim) {
+				await remote.releaseWorkflow(claim, true);
+				claim = undefined;
+				throw new StoppedError(`workflow ${id}: not driven here any more`, { cause: e });
+			}
+			if (isWorkflowRetry(e)) {
+				if (remote && claim) {
+					await remote.releaseWorkflow(claim, true);
+					claim = undefined;
+					this.logger.warn('kairo: retrying a workflow after a transient error', { workflow: id, err: e });
+					if (this.suspend) throw new Suspended(`workflow ${id}: suspended after a transient error`, { cause: e });
+					throw new StoppedError(`workflow ${id}: stopped for a transient error`, { cause: e });
+				}
+				if (!rt) {
+					this.logger.warn('kairo: retrying a workflow after a transient error', { workflow: id, err: e });
+					throw new StoppedError(`workflow ${id}: stopped for a transient error`, { cause: e });
+				}
+				const retry = rt.retryDrive(id, token);
+				await retry.done.catch((err) => this.logger.warn('kairo: handing over a workflow for retry', { workflow: id, err }));
+				this.logger.warn('kairo: retrying a workflow after a transient error', { workflow: id, err: e, retryAt: retry.at });
+				if (this.suspend) throw new Suspended(`workflow ${id}: suspended after a transient error`, { cause: e });
+				throw e;
+			}
 			if (rt) await rt.endDrive(id, token, !(e instanceof Suspended)).catch((err) => this.logger.warn('kairo: ending a drive lease', { workflow: id, err }));
+			if (remote && claim) {
+				await remote.releaseWorkflow(claim, e instanceof StoppedError);
+				claim = undefined;
+			}
 			throw e;
 		} finally {
 			rt?.driving(false);
+			if (remote && claim) await remote.releaseWorkflow(claim);
 		}
 	}
 
@@ -911,6 +1065,7 @@ export class Kairo {
 					// Stopped, cancelled, driven elsewhere, or of a version not
 					// here: nothing to do here.
 					if (e instanceof DrivenElsewhere || e instanceof StoppedError || e instanceof CancelledError) return;
+					if (isWorkflowRetry(e)) return;
 					if (e instanceof KairoError && e.status === 404) return;
 					this.logger.warn('kairo: driving a workflow', { workflow: id, err: e });
 				},
@@ -938,6 +1093,11 @@ export class Kairo {
 		}
 		const w = workflowOf(info.input);
 		if (!w) return;
+		if (w.externalParent) {
+			// An external re-submission is this workflow's replay reach.
+			await rt.endDrive(l.run, l.attempt, false, l.owner);
+			return;
+		}
 		if (!this.fnFor(w.name, w.version)) throw notHere(w.name, w.version); // another process's
 		if (this.suspend) {
 			this.redrive(l.run);
@@ -953,8 +1113,13 @@ export class Kairo {
 	 * go to its waits in order.
 	 */
 	async signal(id: string, name: string, payload: unknown = null): Promise<void> {
+		if (this.rt) {
+			await this.sendSignal(id, name, payload);
+			return;
+		}
 		// The waits' plan, which this process may not have needed yet.
 		await this.plan(PLAN_WAIT + name, waitRoot(name));
+		let signaled = '';
 		for (let n = 0; ; n++) {
 			const runId = callId(id, PLAN_WAIT + name, null, n);
 			let r: RunInfo;
@@ -962,19 +1127,78 @@ export class Kairo {
 				r = await this.backend.get(runId);
 			} catch (e) {
 				if (!(e instanceof KairoError && e.status === 404)) throw e;
-				if (!this.rt) throw new Error(`workflow ${id} does not wait for ${name}`);
-				if (await this.signalAhead(id, name, runId, payload)) break;
-				n--; // the workflow made the wait meanwhile: signal it
-				continue;
+				throw new Error(`workflow ${id} does not wait for ${name}`);
 			}
 			if (finished(r)) continue;
 			await this.backend.signal(runId, name, payload);
+			signaled = runId;
 			break;
+		}
+		if (this.suspend) {
+			await this.backend.wait(signaled);
+			await this.tick();
+		}
+	}
+
+	/**
+	 * Atomically sends a signal and reports which wait accepted it. Embedded
+	 * runtime only; onlyIfWaiting refuses to keep an early signal (ADR 0064).
+	 */
+	async sendSignal(
+		id: string,
+		name: string,
+		payload: unknown = null,
+		opts: { onlyIfWaiting?: boolean } = {},
+	): Promise<SignalReceipt> {
+		const rt = this.rt;
+		if (!rt) throw new Error('sendSignal needs the embedded runtime');
+		await this.plan(PLAN_WAIT + name, waitRoot(name));
+		let receipt: SignalReceipt | undefined;
+		for (let n = 0; ; n++) {
+			const runId = callId(id, PLAN_WAIT + name, null, n);
+			let r: RunInfo | undefined;
+			try {
+				r = await this.backend.get(runId);
+			} catch (e) {
+				if (!(e instanceof KairoError && e.status === 404)) throw e;
+			}
+			if (!r) {
+				// The no-op transaction is the linearization point for "not
+				// present now". A wait created first accepts the signal here.
+				if (await rt.signalApplied(runId, name, payload)) {
+					receipt = { runId, index: n, early: false };
+					break;
+				}
+				if (opts.onlyIfWaiting) {
+					let wf: RunInfo;
+					try {
+						wf = await this.backend.get(id);
+					} catch (e) {
+						if (e instanceof KairoError && e.status === 404) throw new Error(`no workflow ${id}`);
+						throw e;
+					}
+					if (wf.plan !== PLAN_WORKFLOW) throw new Error(`no workflow ${id}`);
+					throw new NotWaitingError(`workflow ${id} is not waiting for ${name}`);
+				}
+				if (!(await this.signalAhead(id, name, runId, payload))) {
+					n--; // a concurrent wait or signal made this number; inspect it
+					continue;
+				}
+				receipt = { runId, index: n, early: true };
+				break;
+			}
+			if (finished(r)) continue;
+			if (await rt.signalApplied(runId, name, payload)) {
+				receipt = { runId, index: n, early: false };
+				break;
+			}
+			// A concurrent signal, timeout or cancellation won; try the next.
 		}
 		if (this.suspend) {
 			await this.settle();
 			await this.wakeUp();
 		}
+		return receipt!;
 	}
 
 	/** Makes wait runId of workflow id, as the workflow will when it reaches it, with the signal applied in the same transaction. */
@@ -992,16 +1216,48 @@ export class Kairo {
 		return !r.existing;
 	}
 
-	/** Cancels workflow id: the calls it is waiting for are cancelled with it. */
+	/**
+	 * Cancels workflow id and waits for its durable outcome. An already
+	 * cancelled workflow is an idempotent success; one already completed or
+	 * failed throws RunSettledError (ADR 0061).
+	 */
 	async cancel(id: string): Promise<void> {
-		await this.backend.cancel(id);
+		// Stop this process's replay first, so a child cancellation cannot make
+		// the function record a failure before the durable parent cancellation.
+		let request = this.cancelRequests.get(id);
+		if (!request && this.drivingById.has(id)) {
+			let finish!: (settled: boolean) => void;
+			const done = new Promise<boolean>((resolve) => (finish = resolve));
+			request = { done, finish };
+			this.cancelRequests.set(id, request);
+		}
+		this.drivingById.get(id)?.abort();
+		let settled = false;
+		try {
+			for (;;) {
+				await this.settleDescendants(id);
+				try {
+					await this.backend.cancel(id);
+					break;
+				} catch (e) {
+					if (!(e instanceof ChildrenUnsettledError)) throw e;
+				}
+			}
+			await this.settleDescendants(id);
+			const info = await this.backend.wait(id);
+			settled = true;
+			if (info.status !== 'cancelled') throw new RunSettledError(`workflow ${id} is ${info.status}`);
+		} finally {
+			request?.finish(settled);
+		}
 	}
 
 	/**
 	 * Settles call callId, stopped for review (blocked: a real step whose
 	 * outcome was unknown) or with a real attempt out that cannot go on (its
 	 * action is no longer real, ADR 0060), with the output it had: it did
-	 * take effect. The embedded runtime only.
+	 * take effect. A weakened action's attempt can be settled only by the
+	 * embedded runtime; a normal review can also be settled over kairod.
 	 */
 	async resolve(callId: string, output: unknown = null): Promise<void> {
 		await this.settleCall(callId, output, undefined);
@@ -1013,11 +1269,14 @@ export class Kairo {
 	}
 
 	private async settleCall(callId: string, output: unknown, error: string | undefined): Promise<void> {
-		if (!this.backend.resolve) throw new Error('resolve needs the embedded backend');
+		if (!this.backend.resolve) throw new Error('resolve is not supported by this backend');
 		await this.backend.resolve(callId, output, error);
 		if (this.suspend) {
-			await this.settle();
-			await this.wakeUp();
+			if (this.backend instanceof HttpBackend) await this.tick();
+			else {
+				await this.settle();
+				await this.wakeUp();
+			}
 		}
 	}
 
@@ -1031,6 +1290,20 @@ export class Kairo {
 		id: string,
 		parent?: { id: string; signal?: AbortSignal; cancelled?: () => boolean },
 	): Promise<unknown> {
+		if (this.rt && parent) this.rt.reach(id, true);
+		try {
+			return await this.runAsReached(name, input, id, parent);
+		} finally {
+			if (this.rt && parent) this.rt.reach(id, false);
+		}
+	}
+
+	private async runAsReached(
+		name: string,
+		input: unknown,
+		id: string,
+		parent?: { id: string; signal?: AbortSignal; cancelled?: () => boolean },
+	): Promise<unknown> {
 		const current = this.currentVersion(name);
 		if (current === undefined) throw new Error(`no workflow ${name}`);
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
@@ -1039,7 +1312,13 @@ export class Kairo {
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
 			workflowInput(name, current, input),
-			{ runId: id, vars: { started_at: this.clock() }, workflow: name, ...(parent ? { parent: parent.id } : {}) },
+			{
+				runId: id,
+				vars: { started_at: this.clock() },
+				workflow: name,
+				...(parent ? { parent: parent.id } : {}),
+				...(parent?.signal ? { signal: parent.signal } : {}),
+			},
 		);
 		const info = await this.backend.get(id, { input: true });
 		if (finished(info)) return done(id, info);
@@ -1058,6 +1337,7 @@ export class Kairo {
 		}
 		const abort = new AbortController();
 		this.driving.add(abort);
+		this.drivingById.set(id, abort);
 		const stop = () => abort.abort();
 		parent?.signal?.addEventListener('abort', stop);
 		if (parent?.signal?.aborted) abort.abort();
@@ -1065,7 +1345,7 @@ export class Kairo {
 		// are its calls cancelled. Otherwise an abort only stops the driving
 		// here (the process closes), and the workflow goes on later.
 		let self = false;
-		const cancelled = () => self || (parent?.cancelled?.() ?? false);
+		const cancelled = () => self || this.cancelRequests.has(id) || (this.treeCancellations.get(id) ?? 0) > 0 || (parent?.cancelled?.() ?? false);
 		if (!this.suspend) {
 			// The workflow's own run ends when it is cancelled: stop the calls.
 			// (Suspended, a cancelled workflow stops when it is driven next.)
@@ -1079,40 +1359,133 @@ export class Kairo {
 		this.drivingIds.add(id);
 		const ctx = new Context(this, id, abort.signal, cancelled);
 		try {
-			// A function that throws, at once or later, fails the workflow; one
-			// that does not stop when the workflow is cancelled or the process
-			// closes is left behind.
-			const running = Promise.resolve().then(() => fn(ctx, input));
-			running.catch(() => {});
-			const value = await Promise.race([running, aborted(abort.signal)]);
-			await this.backend.signal(id, 'done', { ok: true, value: value ?? null });
-			return value;
-		} catch (e) {
-			if (e instanceof Suspended) throw e; // goes on later
-			// A child workflow whose version is not here: this one is left
-			// to another process, not failed (ADR 0060).
-			if (e instanceof NotHereError) throw e;
-			if (abort.signal.aborted) {
-				if (cancelled()) {
-					// Cancelled with the workflow above it: so is its run.
-					if (!self) await this.backend.cancel(id).catch(() => {});
-					throw new CancelledError(`workflow ${id} cancelled`);
+			let value: unknown;
+			let failed = false;
+			let cause: unknown;
+			try {
+				// A function that throws, at once or later, fails the workflow; one
+				// that does not stop when the workflow is cancelled or the process
+				// closes is left behind.
+				const running = Promise.resolve().then(() => fn(ctx, input));
+				running.catch(() => {});
+				value = await Promise.race([running, aborted(abort.signal)]);
+			} catch (e) {
+				if (e instanceof Suspended) throw e; // goes on later
+				// A child workflow whose version is not here: this one is left
+				// to another process, not failed (ADR 0060).
+				if (e instanceof NotHereError) throw e;
+				if (e instanceof EffectWeakenedError) throw e;
+				if (isWorkflowRetry(e)) throw e;
+				if (abort.signal.aborted) {
+					const request = this.cancelRequests.get(id);
+					if (request) {
+						if (await request.done) return this.workflowOutcome(id, e);
+						throw new StoppedError(`workflow ${id}: not driven here any more`);
+					}
+					if (cancelled()) {
+						// Cancelled with the workflow above it: so is its run.
+						if (!self) await this.backend.cancel(id).catch(() => {});
+						throw new CancelledError(`workflow ${id} cancelled`);
+					}
+					throw new StoppedError(`workflow ${id}: not driven here any more`);
 				}
-				throw new StoppedError(`workflow ${id}: not driven here any more`);
+				failed = true;
+				cause = e;
 			}
-			const error = String((e as Error)?.message ?? e);
-			await this.backend.signal(id, 'done', { ok: false, error }).catch(() => {});
-			throw new WorkflowError(id, error, { cause: e });
+			if (failed) {
+				const error = String((cause as Error)?.message ?? cause);
+				abort.abort();
+				await this.finishWorkflow(id, { ok: false, error });
+				return await this.workflowOutcome(id, cause);
+			}
+			abort.abort();
+			await this.finishWorkflow(id, { ok: true, value: value ?? null });
+			return await this.workflowOutcome(id);
 		} finally {
 			parent?.signal?.removeEventListener('abort', stop);
 			this.driving.delete(abort);
+			if (this.driving.size === 0) {
+				for (const resolve of this.driveIdleWaiters) resolve();
+				this.driveIdleWaiters.clear();
+			}
+			if (this.drivingById.get(id) === abort) this.drivingById.delete(id);
+			this.cancelRequests.delete(id);
 			this.drivingIds.delete(id);
 			abort.abort();
 		}
 	}
 
+	/** Atomically finishes after the last descendant scan (ADR 0065). */
+	private async finishWorkflow(id: string, payload: unknown): Promise<void> {
+		for (;;) {
+			await this.settleDescendants(id);
+			try {
+				if (this.backend.finish) await this.backend.finish(id, payload);
+				else await this.backend.signal(id, 'done', payload);
+				return;
+			} catch (e) {
+				if (!(e instanceof ChildrenUnsettledError)) throw e;
+			}
+		}
+	}
+
+	/** Cancels unfinished descendants deepest first before their parent settles. */
+	private async settleDescendants(id: string): Promise<void> {
+		for (;;) {
+			const rows: RunInfo[] = [];
+			const walk = async (parent: string): Promise<void> => {
+				for (const child of await this.backend.children(parent)) {
+					await walk(child.run_id);
+					rows.push(child);
+				}
+			};
+			await walk(id);
+			const marked = rows.filter((row) => !finished(row)).map((row) => row.run_id);
+			for (const child of marked) {
+				this.treeCancellations.set(child, (this.treeCancellations.get(child) ?? 0) + 1);
+				this.drivingById.get(child)?.abort();
+			}
+			let unfinished = 0;
+			try {
+				for (const row of rows) {
+					if (finished(row)) continue;
+					unfinished++;
+					try {
+						await this.backend.cancel(row.run_id);
+					} catch (e) {
+						if (e instanceof ChildrenUnsettledError) continue;
+						throw e;
+					}
+					await this.backend.wait(row.run_id);
+				}
+			} finally {
+				for (const child of marked) {
+					const n = (this.treeCancellations.get(child) ?? 1) - 1;
+					if (n === 0) this.treeCancellations.delete(child);
+					else this.treeCancellations.set(child, n);
+				}
+			}
+			if (unfinished === 0) return;
+		}
+	}
+
+	/** The durable outcome, even when cancellation beat the local function (ADR 0061). */
+	private async workflowOutcome(id: string, cause?: unknown): Promise<unknown> {
+		return done(id, await this.backend.wait(id), cause);
+	}
+
 	/** One call of workflow ctx: a run of its own, found again by its id. */
 	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
+		this.rt?.reach(runId, true);
+		try {
+			return await this.callRunReached(plan, root, input, runId, ctx);
+		} finally {
+			this.rt?.reach(runId, false);
+		}
+	}
+
+	private async callRunReached(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
+		if (ctx.signal.aborted) throw new StoppedError(`call ${runId}: stopped before it started`);
 		if (this.draining) {
 			// Draining: no new call starts here (its step would be
 			// dispatched); one already made is waited for as before.
@@ -1125,13 +1498,17 @@ export class Kairo {
 		}
 		if (root) await this.plan(plan, root);
 		// Kept and removed with the workflow that makes it (ADR 0054).
-		await this.backend.run(plan, { in: input }, { runId, parent: ctx.id });
+		await this.backend.run(plan, { in: input }, { runId, parent: ctx.id, signal: ctx.signal });
+		await this.rt?.resumeReached(runId);
 		let r: RunInfo;
 		if (this.suspend) {
 			// Whatever this process can do for the call is done once it is
 			// idle; a call still going then waits for a timer or a signal.
-			await this.backend.idle!();
-			r = await this.backend.get(runId);
+			if (this.backend instanceof HttpBackend) r = await this.backend.waitQuiescent(runId, ctx.signal);
+			else {
+				await this.backend.idle!();
+				r = await this.backend.get(runId);
+			}
 			if (!finished(r) && r.status !== 'blocked') throw new Suspended(`call ${runId} waits`);
 		} else {
 			try {
@@ -1156,6 +1533,19 @@ export class Kairo {
 	}
 
 	async childWorkflow(name: string, input: unknown, id: string, ctx: Context): Promise<unknown> {
+		if (this.backend instanceof HttpBackend) {
+			const version = this.currentVersion(name);
+			if (version === undefined) throw new Error(`no workflow ${name}`);
+			await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+			await this.backend.run(PLAN_WORKFLOW, workflowInput(name, version, input), {
+				runId: id,
+				parent: ctx.id,
+				signal: ctx.signal,
+				vars: { started_at: this.clock() },
+				drive: newToken(),
+			});
+			return this.drive(id, name, input, ctx.id, 0);
+		}
 		return this.runAs(name, input, id, { id: ctx.id, signal: ctx.signal, cancelled: ctx.cancelled });
 	}
 }
@@ -1254,12 +1644,16 @@ class Limiter {
 }
 
 /** The result of a finished workflow run. */
-function done(id: string, info: RunInfo): unknown {
+function done(id: string, info: RunInfo, cause?: unknown): unknown {
 	if (info.trimmed) throw new ResultLostError(`workflow ${id} finished, but kairo no longer keeps its result`);
 	if (info.status === 'cancelled') throw new CancelledError(`workflow ${id} cancelled`);
 	const out = (info.output as { payload?: { ok: boolean; value?: unknown; error?: string } } | undefined)?.payload;
 	if (!out) throw new WorkflowError(id, `${info.status}: ${info.error ?? ''}`);
-	if (!out.ok) throw new WorkflowError(id, out.error ?? '');
+	if (!out.ok) {
+		const error = out.error ?? '';
+		const same = cause !== undefined && String((cause as Error)?.message ?? cause) === error;
+		throw new WorkflowError(id, error, same ? { cause } : undefined);
+	}
 	return out.value;
 }
 

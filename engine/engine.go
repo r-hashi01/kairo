@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -160,6 +161,14 @@ type SubmitRequest struct {
 	Tenant string          `json:"tenant"`
 	Tier   *Tier           `json:"tier,omitempty"`
 	RunID  string          `json:"run_id,omitempty"`
+	// Parent is the unfinished code workflow that owns this run (ADR 0067).
+	Parent string `json:"parent,omitempty"`
+	// Workflow and Meta identify a code-workflow root for List (ADR 0068).
+	Workflow string          `json:"workflow,omitempty"`
+	Meta     json.RawMessage `json:"meta,omitempty"`
+	// Drive says this submission is an explicit reach of a code workflow.
+	// It makes an existing workflow eligible for a driver (ADR 0069).
+	Drive bool `json:"drive,omitempty"`
 	// Entry starts the run at one entry node of its root graph (e.g. the
 	// trigger that fired); the other entries' paths are skipped. Empty
 	// starts at all of them (ADR 0029).
@@ -190,15 +199,18 @@ type RunLimits struct {
 
 // RunInfo describes a run.
 type RunInfo struct {
-	RunID   string          `json:"run_id"`
-	Plan    string          `json:"plan"`
-	Tenant  string          `json:"tenant"`
-	Tier    Tier            `json:"tier"`
-	Status  string          `json:"status"`
-	Output  json.RawMessage `json:"output,omitempty"`
-	Error   string          `json:"error,omitempty"`
-	Evicted bool            `json:"evicted,omitempty"`
-	Reviews []Review        `json:"reviews,omitempty"`
+	RunID    string          `json:"run_id"`
+	Plan     string          `json:"plan"`
+	Tenant   string          `json:"tenant"`
+	Tier     Tier            `json:"tier"`
+	Status   string          `json:"status"`
+	Parent   string          `json:"parent,omitempty"`
+	Workflow string          `json:"workflow,omitempty"`
+	Meta     json.RawMessage `json:"meta,omitempty"`
+	Output   json.RawMessage `json:"output,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Evicted  bool            `json:"evicted,omitempty"`
+	Reviews  []Review        `json:"reviews,omitempty"`
 	// Waits lists steps waiting for a signal (approvals, webhooks, user
 	// messages) while the run has nothing in flight.
 	Waits []core.Wait `json:"waits,omitempty"`
@@ -212,6 +224,11 @@ type RunInfo struct {
 	// the host persists them (ADR 0033).
 	Vars       json.RawMessage `json:"vars,omitempty"`
 	FinishedAt time.Time       `json:"finished_at,omitzero"`
+	CreatedAt  int64           `json:"created_at,omitempty"`
+	UpdatedAt  int64           `json:"updated_at,omitempty"`
+	// NextAt is the earliest timer deadline while the run is quiescent.
+	// It is populated by WaitQuiescent (ADR 0069).
+	NextAt int64 `json:"next_at,omitempty"`
 	// Input is the run's input, as it was submitted: given by GetInput
 	// only (for a run not finished), not by Get.
 	Input json.RawMessage `json:"input,omitempty"`
@@ -223,10 +240,12 @@ type Review struct {
 }
 
 var (
-	ErrUnknownPlan = errors.New("engine: unknown plan")
-	ErrUnknownRun  = errors.New("engine: unknown run")
-	ErrTier        = errors.New("engine: durability tier not available")
-	ErrClosed      = errors.New("engine: closed")
+	ErrUnknownPlan       = errors.New("engine: unknown plan")
+	ErrUnknownRun        = errors.New("engine: unknown run")
+	ErrTier              = errors.New("engine: durability tier not available")
+	ErrClosed            = errors.New("engine: closed")
+	ErrParentUnavailable = errors.New("engine: parent unavailable")
+	ErrChildrenUnsettled = errors.New("engine: children unsettled")
 )
 
 type Engine struct {
@@ -234,6 +253,7 @@ type Engine struct {
 	shards []*shard
 	disp   *sched.Dispatcher
 	adm    *sched.Admission
+	starts *sched.StartAdmission
 	live   *live.Hub
 	obs    *obs.Stream
 	blobs  blob.Store
@@ -261,6 +281,10 @@ type Engine struct {
 	stopped chan struct{}
 	wg      sync.WaitGroup // shard loops
 	ioWG    sync.WaitGroup
+
+	driveMu      sync.Mutex
+	driveChanged chan struct{}
+	quietID      atomic.Uint64
 }
 
 // Open creates an engine and recovers the runs found in its logs. Plans
@@ -304,18 +328,20 @@ func New(cfg Config) (*Engine, error) {
 		cfg.Observe = obs.Discard
 	}
 	e := &Engine{
-		cfg:      cfg,
-		disp:     sched.NewDispatcher(cfg.Limits),
-		adm:      sched.NewAdmission(cfg.Admission),
-		live:     live.NewHub(),
-		obs:      obs.NewStream(cfg.Observe, 1<<16, 512),
-		plans:    map[string]*ir.Plan{},
-		waiters:  map[string][]chan RunInfo{},
-		finished: map[string]RunInfo{},
-		io:       make(chan func()),
-		ioq:      mpsc.New[func()](),
-		ioStop:   make(chan struct{}),
-		stopped:  make(chan struct{}),
+		cfg:          cfg,
+		disp:         sched.NewDispatcher(cfg.Limits),
+		adm:          sched.NewAdmission(cfg.Admission),
+		starts:       sched.NewStartAdmission(cfg.Admission.MaxStarting, cfg.Now),
+		live:         live.NewHub(),
+		obs:          obs.NewStream(cfg.Observe, 1<<16, 512),
+		plans:        map[string]*ir.Plan{},
+		waiters:      map[string][]chan RunInfo{},
+		finished:     map[string]RunInfo{},
+		io:           make(chan func()),
+		ioq:          mpsc.New[func()](),
+		ioStop:       make(chan struct{}),
+		stopped:      make(chan struct{}),
+		driveChanged: make(chan struct{}),
 	}
 	var err error
 	if e.blobs = cfg.Blobs; e.blobs == nil {
@@ -615,6 +641,15 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 	if p == nil {
 		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
 	}
+	if req.Workflow != "" && p.Name != "kairo.workflow" {
+		return SubmitResult{}, errors.New("engine: workflow metadata requires the kairo.workflow plan")
+	}
+	if len(req.Meta) > 0 {
+		meta := bytes.TrimSpace(req.Meta)
+		if req.Workflow == "" || len(meta) == 0 || meta[0] != '{' || !json.Valid(meta) {
+			return SubmitResult{}, errors.New("engine: meta must be a JSON object on a workflow run")
+		}
+	}
 	if e.cfg.MaxDepth > 0 && req.Depth > e.cfg.MaxDepth {
 		return SubmitResult{}, fmt.Errorf("%w: depth %d > %d", ErrTooDeep, req.Depth, e.cfg.MaxDepth)
 	}
@@ -642,7 +677,29 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 			_, done = e.marker(id)
 		}
 		if done {
+			var parent string
+			e.waitMu.Lock()
+			if ri, ok := e.finished[id]; ok {
+				parent = ri.Parent
+			}
+			e.waitMu.Unlock()
+			if parent == "" {
+				if en, ok := e.marker(id); ok {
+					parent = en.parent
+				}
+			}
+			if req.Parent != "" && req.Parent != parent {
+				return SubmitResult{}, ErrParentUnavailable
+			}
 			return SubmitResult{RunID: id, Existing: true}, nil
+		}
+	}
+	attached := false
+	if req.Parent != "" {
+		var err error
+		attached, err = e.attach(req.Parent, id)
+		if err != nil {
+			return SubmitResult{}, err
 		}
 	}
 	reply := make(chan startReply, 1)
@@ -656,21 +713,269 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 			lim.MaxDuration = l.MaxDuration
 		}
 	}
-	sr := &startReq{runID: id, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars,
+	sr := &startReq{runID: id, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive,
 		keep: req.KeepOutput && tier >= TierFile, reply: reply}
 	sh := e.shardFor(id)
-	ticket, err := e.adm.Admit(req.Tenant, func() { sh.inbox.Push(msg{kind: mStart, start: sr}) })
+	active := make(chan struct{}, 1)
+	ticket, err := e.adm.Admit(req.Tenant, func() { active <- struct{}{} })
 	if err != nil {
+		if attached {
+			e.detach(req.Parent, id)
+		}
 		return SubmitResult{}, err
 	}
 	select {
+	case <-active:
+	case <-ctx.Done():
+		if !ticket.Cancel() {
+			<-active
+			e.adm.Release(req.Tenant)
+		}
+		if attached {
+			e.detach(req.Parent, id)
+		}
+		return SubmitResult{}, ErrNotAccepted
+	}
+	var startTicket *sched.StartTicket
+	if tier == TierNone {
+		sh.inbox.Push(msg{kind: mStart, start: sr})
+	} else {
+		var startErr error
+		startTicket, startErr = e.starts.Admit(sched.StartKey{Shard: sh.id, Tier: int(tier)}, req.Tenant,
+			func(ticket *sched.StartTicket) {
+				sr.startTicket = ticket
+				sh.inbox.Push(msg{kind: mStart, start: sr})
+			})
+		if startErr != nil {
+			e.adm.Release(req.Tenant)
+			if attached {
+				e.detach(req.Parent, id)
+			}
+			return SubmitResult{}, startErr
+		}
+	}
+	select {
 	case r := <-reply:
+		if r.err != nil {
+			if attached {
+				e.detach(req.Parent, id)
+			}
+			return SubmitResult{}, r.err
+		}
 		return SubmitResult{RunID: id, Existing: r.existing}, nil
 	case <-ctx.Done():
-		if ticket.Cancel() {
+		if startTicket != nil && startTicket.Cancel() {
+			e.adm.Release(req.Tenant)
+			if attached {
+				e.detach(req.Parent, id)
+			}
 			return SubmitResult{}, ErrNotAccepted
 		}
+		if tier == TierNone {
+			// The start was already handed to its shard.
+			return SubmitResult{RunID: id}, ErrUnconfirmed
+		}
 		return SubmitResult{RunID: id}, ErrUnconfirmed
+	}
+}
+
+func (e *Engine) attach(parent, child string) (bool, error) {
+	reply := make(chan attachReply, 1)
+	e.shardFor(parent).inbox.Push(msg{kind: mAttach, runID: parent, child: child, attachReply: reply})
+	// Once the request is in the inbox, wait for its result even if Submit's
+	// context is cancelled. Otherwise the shard could add a child after Submit
+	// returned, leaving a reservation that nobody can remove.
+	select {
+	case r := <-reply:
+		return r.added, r.err
+	case <-e.stopped:
+		return false, ErrClosed
+	}
+}
+
+func (e *Engine) detach(parent, child string) {
+	if parent != "" {
+		e.shardFor(parent).inbox.Push(msg{kind: mDetach, runID: parent, child: child})
+	}
+}
+
+func (e *Engine) childDone(parent, child string) {
+	if parent != "" {
+		e.shardFor(parent).inbox.Push(msg{kind: mChildDone, runID: parent, child: child})
+	}
+}
+
+// addRecoveredChild runs before shard loops start.
+func (e *Engine) addRecoveredChild(parent, child string, done bool) {
+	s := e.shardFor(parent)
+	cs := s.children[parent]
+	if cs == nil {
+		cs = map[string]bool{}
+		s.children[parent] = cs
+	}
+	cs[child] = done
+}
+
+// Children returns the direct children of parent, in RunID byte order.
+func (e *Engine) Children(ctx context.Context, parent string) ([]RunInfo, error) {
+	reply := make(chan []string, 1)
+	e.shardFor(parent).inbox.Push(msg{kind: mQueryChildren, runID: parent, childrenReply: reply})
+	var ids []string
+	select {
+	case ids = <-reply:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	out := make([]RunInfo, 0, len(ids))
+	for _, id := range ids {
+		ri, err := e.Get(ctx, id)
+		if errors.Is(err, ErrUnknownRun) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ri)
+	}
+	return out, nil
+}
+
+// ListFilter selects root code workflows in creation order (ADR 0068).
+type ListFilter struct {
+	Workflow string
+	Status   string
+	Since    time.Time
+	Until    time.Time
+	After    string
+	Limit    int
+}
+
+func listMatches(ri RunInfo, f ListFilter) bool {
+	if ri.Parent != "" || ri.Workflow == "" || (f.Workflow != "" && ri.Workflow != f.Workflow) || (f.Status != "" && ri.Status != f.Status) {
+		return false
+	}
+	created := ri.CreatedAt
+	return (f.Since.IsZero() || created >= f.Since.UnixMilli()) && (f.Until.IsZero() || created < f.Until.UnixMilli())
+}
+
+func listEntryMatches(en doneEntry, f ListFilter) bool {
+	return (f.Workflow == "" || en.workflow == f.Workflow) && (f.Status == "" || en.status == f.Status) &&
+		(f.Since.IsZero() || en.created >= f.Since.UnixMilli()) && (f.Until.IsZero() || en.created < f.Until.UnixMilli())
+}
+
+func (e *Engine) retainedListCursor(ri RunInfo) bool {
+	if ri.Parent != "" || ri.Workflow == "" {
+		return false
+	}
+	done := ri.Status == "completed" || ri.Status == "failed" || ri.Status == "cancelled"
+	if !done || e.cfg.IdempotencyTTL < 0 || ri.FinishedAt.IsZero() {
+		return true
+	}
+	return !ri.FinishedAt.Before(e.cfg.Now().Add(-e.cfg.IdempotencyTTL))
+}
+
+// List returns retained root code workflows ordered by (created_at, RunID).
+// Each shard contributes an independently consistent snapshot; listing does
+// not stop unrelated shard loops.
+func (e *Engine) List(ctx context.Context, f ListFilter) ([]RunInfo, error) {
+	var afterAt int64
+	if f.After != "" {
+		cursor, err := e.Get(ctx, f.After)
+		if errors.Is(err, ErrUnknownRun) {
+			return []RunInfo{}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !e.retainedListCursor(cursor) {
+			return []RunInfo{}, nil
+		}
+		afterAt = cursor.CreatedAt
+	}
+
+	replies := make([]chan []listItem, len(e.shards))
+	for i, s := range e.shards {
+		replies[i] = make(chan []listItem, 1)
+		s.inbox.Push(msg{kind: mList, listFilter: f, listReply: replies[i]})
+	}
+	items := make([]listItem, 0)
+	for _, reply := range replies {
+		select {
+		case rows := <-reply:
+			items = append(items, rows...)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	byID := make(map[string]RunInfo, len(items))
+	for _, item := range items {
+		if item.marker {
+			if ri, ok := e.trimmed(item.runID); ok {
+				byID[ri.RunID] = ri
+			}
+			continue
+		}
+		byID[item.info.RunID] = item.info
+	}
+	// TierNone/Memory runs have no done marker; the recent finished cache is
+	// also the full-information version of a file-tier marker.
+	e.waitMu.Lock()
+	cut := e.cfg.Now().Add(-e.cfg.IdempotencyTTL)
+	for id, ri := range e.finished {
+		done := ri.Status == "completed" || ri.Status == "failed" || ri.Status == "cancelled"
+		expired := e.cfg.IdempotencyTTL >= 0 && done && !ri.FinishedAt.IsZero() && ri.FinishedAt.Before(cut)
+		if !expired && listMatches(ri, f) {
+			byID[id] = ri
+		}
+	}
+	e.waitMu.Unlock()
+
+	out := make([]RunInfo, 0, len(byID))
+	for _, ri := range byID {
+		if !listMatches(ri, f) {
+			continue
+		}
+		if f.After != "" {
+			created := ri.CreatedAt
+			if created < afterAt || (created == afterAt && ri.RunID <= f.After) {
+				continue
+			}
+		}
+		out = append(out, ri)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].CreatedAt, out[j].CreatedAt
+		if a != b {
+			return a < b
+		}
+		return out[i].RunID < out[j].RunID
+	})
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+// FinishWorkflow applies the terminal done signal only if every direct child
+// is finished, ordered with child attachment by the parent shard (ADR 0067).
+func (e *Engine) FinishWorkflow(ctx context.Context, runID string, payload json.RawMessage) error {
+	return e.guardedEvent(ctx, runID, core.Event{Kind: core.EvSignal, Name: "done", Data: payload})
+}
+
+// CancelTree starts cancellation only if every direct child is finished.
+func (e *Engine) CancelTree(ctx context.Context, runID, reason string) error {
+	return e.guardedEvent(ctx, runID, core.Event{Kind: core.EvCancel, Err: reason})
+}
+
+func (e *Engine) guardedEvent(ctx context.Context, runID string, ev core.Event) error {
+	reply := make(chan error, 1)
+	e.shardFor(runID).inbox.Push(msg{kind: mGuardedEvent, runID: runID, ev: ev, errReply: reply})
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -799,7 +1104,12 @@ func (e *Engine) trimmed(runID string) (RunInfo, bool) {
 	if !ok {
 		return RunInfo{}, false
 	}
-	ri := RunInfo{RunID: runID, Status: en.status, Trimmed: true, FinishedAt: time.UnixMilli(en.at)}
+	ri := RunInfo{RunID: runID, Parent: en.parent, Workflow: en.workflow, Meta: en.meta, Status: en.status, Trimmed: true,
+		FinishedAt: time.UnixMilli(en.at)}
+	if en.workflow != "" {
+		ri.Plan = "kairo.workflow"
+	}
+	ri.CreatedAt, ri.UpdatedAt = en.created, en.updated
 	if en.kept {
 		if out, err := e.blobs.Get(keptKey(runID, en.gen)); err == nil {
 			ri.Output, ri.Trimmed = out, false
@@ -945,6 +1255,8 @@ type Stats struct {
 	FailedLogs int
 	// Dests is each destination's concurrency (ADR 0039).
 	Dests []sched.DestStat `json:",omitempty"`
+	// Starts is durable-start admission by shard and tier (ADR 0074).
+	Starts []sched.StartStat `json:",omitempty"`
 }
 
 func (e *Engine) Stats() Stats {
@@ -952,6 +1264,7 @@ func (e *Engine) Stats() Stats {
 	st.Active, st.AdmissionQueued = e.adm.Stats()
 	st.DispatchQueued = e.disp.Queued()
 	st.Dests = e.disp.Dests()
+	st.Starts = e.starts.Stats()
 	for _, s := range e.shards {
 		st.InMemory += int(s.inMemory.Load())
 		st.Evicted += int(s.evicted.Load())

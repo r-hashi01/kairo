@@ -11,8 +11,11 @@ import { join, resolve } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend, HttpBackend, type Backend } from './backend.ts';
+import { KairoError } from './client.ts';
+import { ObservationKind, StepStatus } from './observe.ts';
 import { PostgresStore, SQLiteStore } from './store.ts';
-import { CancelledError, Kairo, Suspended } from './workflow.ts';
+import { ParentUnavailableError } from './store.ts';
+import { CallError, CancelledError, Kairo, RunSettledError, Suspended, UnknownOutcomeError } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-'));
@@ -59,15 +62,138 @@ async function waitUntil(cond: () => boolean | Promise<boolean>): Promise<void> 
 	throw new Error('timed out');
 }
 
+test('remote drain uses the backend', async () => {
+	let drained = false;
+	const backend = { async drain() { drained = true; } } as unknown as Backend;
+	await new Kairo({ backend }).drain();
+	assert.equal(drained, true);
+});
+
+test('concurrent ticks take turns', async () => {
+	let active = 0;
+	let maximum = 0;
+	let entered!: () => void;
+	let release!: () => void;
+	const enteredPromise = new Promise<void>((resolve) => (entered = resolve));
+	const releasePromise = new Promise<void>((resolve) => (release = resolve));
+	const backend = {
+		async tick() {
+			active++;
+			maximum = Math.max(maximum, active);
+			entered();
+			await releasePromise;
+			active--;
+		},
+		async idle() {},
+		async nextWake() { return null; },
+	} as unknown as Backend;
+	const k = new Kairo({ backend, mode: 'suspend' });
+	const first = k.tick();
+	await enteredPromise;
+	const second = k.tick();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(maximum, 1);
+	release();
+	await Promise.all([first, second]);
+	assert.equal(maximum, 1);
+});
+
+test('an unconfirmed start is retried with the same id', async () => {
+	const backend = new HttpBackend();
+	const calls: string[] = [];
+	(backend.client as unknown as { run: (plan: string, input: unknown, opts: { runId?: string }) => Promise<unknown> }).run = async (_plan, _input, opts) => {
+		calls.push(opts.runId ?? '');
+		if (calls.length === 1) throw new KairoError(504, 'start not confirmed');
+		return { run_id: opts.runId, existing: true };
+	};
+	const out = await backend.run('plan', null, { runId: 'same' });
+	assert.equal(out.existing, true);
+	assert.deepEqual(calls, ['same', 'same']);
+});
+
+test('an overloaded start honors retry metadata and retries with the same id', async () => {
+	const backend = new HttpBackend();
+	const calls: string[] = [];
+	(backend.client as unknown as { run: (plan: string, input: unknown, opts: { runId?: string }) => Promise<any> }).run = async (_plan, _input, opts) => {
+		calls.push(opts.runId ?? '');
+		if (calls.length === 1) throw new KairoError(429, 'busy', 0);
+		return { run_id: opts.runId, existing: false };
+	};
+	const out = await backend.run('plan', null, { runId: 'same' });
+	assert.equal(out.existing, false);
+	assert.deepEqual(calls, ['same', 'same']);
+});
+
+test('cancelling an unconfirmed start stops retries', async () => {
+	const backend = new HttpBackend();
+	const stop = new AbortController();
+	let calls = 0;
+	(backend.client as unknown as { run: () => Promise<unknown> }).run = async () => {
+		calls++;
+		if (calls === 2) stop.abort(new Error('deadline'));
+		if (calls > 2) return { run_id: 'cancelled', existing: true };
+		throw new KairoError(504, 'start not confirmed');
+	};
+	await assert.rejects(backend.run('plan', null, { runId: 'cancelled', signal: stop.signal }), /deadline/);
+	assert.equal(calls, 2);
+	await new Promise((resolve) => setTimeout(resolve, 80));
+	assert.equal(calls, 2);
+	assert.equal((await backend.run('plan', null, { runId: 'cancelled' })).existing, true);
+	assert.equal(calls, 3);
+});
+
+test('drain stops and waits for an unconfirmed start', async () => {
+	const backend = new HttpBackend();
+	let entered!: () => void;
+	const started = new Promise<void>((resolve) => (entered = resolve));
+	(backend.client as unknown as { run: (_plan: string, _input: unknown, opts: { signal?: AbortSignal }) => Promise<unknown> }).run =
+		async (_plan, _input, opts) => {
+			entered();
+			await new Promise<never>((_, reject) => opts.signal?.addEventListener('abort', () => reject(opts.signal?.reason), { once: true }));
+		};
+	const running = backend.run('plan', null, { runId: 'drained' });
+	await started;
+	await backend.drain();
+	await assert.rejects(running, /draining/);
+});
+
+/** Cancels the workflow durably immediately before its driver sends done. */
+function cancelBeforeDone(inner: Backend): Backend {
+	let once = false;
+	return new Proxy(inner, {
+		get(target, prop) {
+			if (prop === 'finish') {
+				return async (runId: string, payload: unknown) => {
+					if (!once) {
+						once = true;
+						await target.cancel(runId);
+						await target.wait(runId);
+					}
+					return target.finish ? target.finish(runId, payload) : target.signal(runId, 'done', payload);
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === 'function' ? value.bind(target) : value;
+		},
+	});
+}
+
 /** The suite, against backends made by backend() (a new one = a new process). */
 function suite(name: string, backend: () => Promise<Backend>) {
 	describe(name, { skip: !hasGo }, () => {
 		const runs = { write: 0, llm: 0, slow: 0 };
+		const unknownCalls: string[] = [];
 		let hang = true;
 		let slowAborted = false;
 
 		async function kairo(): Promise<Kairo> {
-			const k = new Kairo({ backend: await backend(), concurrency: 8 });
+			const k = new Kairo({
+				backend: await backend(),
+				concurrency: 8,
+				observe: (o) => {
+					if (o.kind === ObservationKind.stepFinished && o.status === StepStatus.unknown) unknownCalls.push(o.runId);
+				},
+			});
 			k.defineAction('write', {
 				effect: 'real',
 				handler: async (input: { path: string }) => {
@@ -90,6 +216,11 @@ function suite(name: string, backend: () => Promise<Backend>) {
 					return null;
 				},
 			});
+			k.defineAction('lost', {
+				handler: async () => {
+					throw new UnknownOutcomeError('connection lost');
+				},
+			});
 			k.workflow('edit', async (ctx, input: { files: string[] }) => {
 				const answers = await Promise.all(input.files.map((f) => ctx.call('llm', { q: f })));
 				const w = await ctx.call('write', { path: input.files[0] });
@@ -107,6 +238,16 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			k.workflow('long', async (ctx) => ctx.call('slow', null));
 			k.workflow('parent', async (ctx, n: number) => ctx.workflow('child', n));
 			k.workflow('child', async (ctx, n: number) => (await ctx.call('llm', { q: `c${n}` })).answer);
+			k.workflow('uncertain', async (ctx) => {
+				try {
+					return await ctx.call<string>('lost', null);
+				} catch (e) {
+					if (e instanceof CallError) return `failed: ${e.error}`;
+					throw e;
+				}
+			});
+			k.workflow('tree-hold', async (_ctx) => new Promise(() => {}));
+			k.workflow('listed', async (_ctx, input) => input);
 			await k.start();
 			return k;
 		}
@@ -152,6 +293,23 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			await k.close();
 		});
 
+		test('resolves an unknown call', { skip: name !== 'kairod' }, async () => {
+			const k = await kairo();
+			const key = name.replace(/\W/g, '');
+			const succeeded = k.run('uncertain', null, { id: `ts-resolve-ok-${key}` });
+			await waitUntil(async () => unknownCalls.length > 0 && (await k.backend.get(unknownCalls[0]!)).status === 'blocked');
+			const call = unknownCalls.shift()!;
+			await k.resolve(call, 'confirmed');
+			assert.equal(await succeeded, 'confirmed');
+			await k.resolve(call, 'confirmed'); // an HTTP retry is idempotent
+
+			const failed = k.run('uncertain', null, { id: `ts-resolve-failed-${key}` });
+			await waitUntil(async () => unknownCalls.length > 0 && (await k.backend.get(unknownCalls[0]!)).status === 'blocked');
+			await k.resolveFailed(unknownCalls.shift()!, 'not paid');
+			assert.match(await failed, /not paid/);
+			await k.close();
+		});
+
 		test('a cancelled workflow stops its calls', async () => {
 			const k = await kairo();
 			const done = k.run('long', null, { id: 'wf-long-1' });
@@ -161,6 +319,63 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			await k.cancel('wf-long-1');
 			await rejected;
 			await waitUntil(() => slowAborted);
+			await k.close();
+		});
+
+		test('an externally attached workflow belongs to the remote parent tree', async () => {
+			const key = name.replace(/\W/g, '');
+			const parent = `ts-tree-parent-${key}`;
+			const child = `ts-tree-child-${key}`;
+			const k = await kairo();
+			await k.submit('tree-hold', null, { id: parent });
+			await k.submit('tree-hold', null, { id: child, parent });
+			assert.deepEqual(
+				(await k.children(parent)).map((r) => [r.run_id, r.parent]),
+				[[child, parent]],
+			);
+			await assert.rejects(k.submit('tree-hold', null, { id: `${child}-orphan`, parent: `${parent}-missing` }), ParentUnavailableError);
+			await k.cancel(parent);
+			assert.equal((await k.backend.get(child)).status, 'cancelled');
+			await k.close();
+		});
+
+		test('lists roots with metadata and pagination', async () => {
+			const key = name.replace(/\W/g, '');
+			const ids = [`ts-list-${key}-1`, `ts-list-${key}-2`];
+			const k = await kairo();
+			await k.run('listed', 1, { id: ids[0], meta: { owner: 'alice' } });
+			await k.run('listed', 2, { id: ids[1], meta: { owner: 'bob' } });
+			const rows = await k.list({ workflow: 'listed', status: 'completed' });
+			assert.deepEqual(rows.map((r) => r.run_id), ids);
+			assert.deepEqual(rows.map((r) => r.meta), [{ owner: 'alice' }, { owner: 'bob' }]);
+			assert.ok(rows.every((r) => r.createdAt !== undefined && r.updatedAt !== undefined));
+			assert.deepEqual((await k.list({ workflow: 'listed', after: ids[0], limit: 1 })).map((r) => r.run_id), [ids[1]]);
+			await k.close();
+		});
+
+		for (const [outcome, fn] of [
+			['success', async () => 'local value'],
+			['failure', async () => { throw new Error('local failure'); }],
+		] as const) {
+			test(`a recorded cancellation wins over local ${outcome}`, async () => {
+				const k = new Kairo({ backend: cancelBeforeDone(await backend()) });
+				k.workflow('race', fn);
+				await k.start();
+				const id = `ts-cancel-before-done-${name.replace(/\W/g, '')}-${outcome}`;
+				await assert.rejects(k.run('race', null, { id }), CancelledError);
+				await assert.rejects(k.run('race', null, { id }), CancelledError);
+				await k.cancel(id); // repeated cancellation is idempotent
+				await k.close();
+			});
+		}
+
+		test('cancel reports a workflow that already completed', async () => {
+			const k = new Kairo({ backend: await backend() });
+			k.workflow('quick', async () => 'done');
+			await k.start();
+			const id = `ts-already-complete-${name.replace(/\W/g, '')}`;
+			assert.equal(await k.run('quick', null, { id }), 'done');
+			await assert.rejects(k.cancel(id), RunSettledError);
 			await k.close();
 		});
 
@@ -203,6 +418,53 @@ function suite(name: string, backend: () => Promise<Backend>) {
 }
 
 suite('kairod', async () => new HttpBackend({ url, worker: sock, concurrency: 8 }));
+
+describe('kairod suspend', { skip: !hasGo }, () => {
+	test('waits for quiescence and resumes from tick', async () => {
+		const wakes: number[] = [];
+		let calls = 0;
+		const k = new Kairo({
+			backend: new HttpBackend({ url, worker: sock, concurrency: 8, leaseMs: 1000 }),
+			mode: 'suspend',
+			wake: async (at) => {
+				wakes.push(at);
+			},
+		});
+		k.defineAction('ts-suspend-upper', {
+			effect: 'unprotected',
+			handler: async (value: string) => {
+				await new Promise((r) => setTimeout(r, 40));
+				calls++;
+				return value.toUpperCase();
+			},
+		});
+		k.workflow('ts-suspend-job', async (ctx, value: string) => {
+			const out = await ctx.call<string, string>('ts-suspend-upper', value);
+			await ctx.sleep(120);
+			return out;
+		});
+		await k.start();
+		const began = performance.now();
+		await assert.rejects(k.run('ts-suspend-job', 'hi', { id: 'ts-kairod-suspend' }), Suspended);
+		assert.ok(performance.now() - began >= 35, 'returned before the in-flight action settled');
+		assert.equal(calls, 1);
+		assert.ok(wakes.at(-1)! > Date.now());
+		assert.equal(await k.tick(), wakes.at(-1));
+		await new Promise((r) => setTimeout(r, Math.max(0, wakes.at(-1)! - Date.now()) + 40));
+		for (let i = 0; i < 50; i++) {
+			await k.tick();
+			try {
+				assert.equal(await k.result('ts-kairod-suspend'), 'HI');
+				break;
+			} catch (e) {
+				if (!(e instanceof Suspended) || i === 49) throw e;
+				await new Promise((r) => setTimeout(r, 10));
+			}
+		}
+		assert.equal(calls, 1);
+		await k.close();
+	});
+});
 
 // One database file for the suite: a new backend on it is a new process.
 const db = join(dir, 'embedded.db');

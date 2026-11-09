@@ -6,12 +6,13 @@ import logging
 import os
 import socket
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import Cancel, Chunk, Hello, MsgType, Result, read_frame, write_frame
+from .protocol import CAPABILITY_GRACEFUL_DRAIN, Cancel, Chunk, Credit, Hello, MsgType, Result, read_frame, write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,13 @@ class TaskContext:
 Handler = Callable[[Task, TaskContext], Result]
 
 
+class DrainUnsupportedError(RuntimeError):
+    """The connected kairod did not negotiate graceful worker Drain."""
+
+
+CAPABILITY_NEGOTIATION_TIMEOUT = 1.0
+
+
 # What one IO task is assumed to hold in memory (a thread, its buffers).
 IO_TASK_BYTES = 2 << 20
 
@@ -166,8 +174,17 @@ class Worker:
         self.concurrency = max(concurrency, 1)
         self._wlock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._writer: Any | None = None
         self._cancels: dict[int, TaskContext] = {}
         self._clock = threading.Lock()
+        self._state = threading.Condition()
+        self._draining = False
+        self._drain_ack = False
+        self._negotiated = False
+        self._drain_cap = False
+        self._inflight = 0
+        self._pending_acks = 0
+        self._failed: Exception | None = None
 
     def _send(self, w: Any, t: MsgType, body: dict[str, Any]) -> None:
         with self._wlock:
@@ -187,7 +204,16 @@ class Worker:
             sock.close()
 
     def _run_on(self, r: Any, w: Any) -> None:
-        self._send(w, MsgType.HELLO, Hello(self.name, self.actions, self.concurrency, self.token).body())
+        with self._state:
+            self._writer = w
+            self._failed = None
+            self._negotiated = False
+            self._drain_cap = False
+        self._send(
+            w,
+            MsgType.HELLO,
+            Hello(self.name, self.actions, self.concurrency, self.token, [CAPABILITY_GRACEFUL_DRAIN]).body(),
+        )
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix=self.name) as pool:
             try:
                 while True:
@@ -195,11 +221,25 @@ class Worker:
                         typ, body = read_frame(r)
                     except (EOFError, OSError):
                         break
-                    if typ == MsgType.TASK:
+                    if typ != MsgType.HELLO:
+                        with self._state:
+                            if not self._negotiated:
+                                self._negotiated = True
+                                self._state.notify_all()
+                    if typ == MsgType.HELLO:
+                        capabilities = body.get("capabilities", []) if isinstance(body, dict) else []
+                        with self._state:
+                            self._negotiated = True
+                            self._drain_cap = CAPABILITY_GRACEFUL_DRAIN in capabilities
+                            self._state.notify_all()
+                    elif typ == MsgType.TASK:
                         task = Task.from_body(body)
                         ctx = TaskContext(lambda d, s=task.seq: self._send(w, MsgType.CHUNK, Chunk(s, d).body()))
                         with self._clock:
                             self._cancels[task.seq] = ctx
+                        with self._state:
+                            self._inflight += 1
+                            self._state.notify_all()
                         pool.submit(self._serve, w, task, ctx)
                     elif typ == MsgType.CANCEL:
                         c = Cancel(body.get("seq", 0))
@@ -207,11 +247,24 @@ class Worker:
                             ctx = self._cancels.get(c.seq)
                         if ctx is not None:
                             ctx.cancelled.set()
+                    elif typ == MsgType.CREDIT:
+                        with self._state:
+                            n = int(body.get("n", 0))
+                            if self._draining and n == 0:
+                                self._drain_ack = True
+                            elif self._draining and n > 0:
+                                self._pending_acks = max(self._pending_acks - n, 0)
+                            self._state.notify_all()
                     # Unknown types are skipped.
             finally:
                 with self._clock:
                     for ctx in self._cancels.values():
                         ctx.cancelled.set()
+                with self._state:
+                    if self._draining and not (self._drain_ack and self._inflight == 0 and self._pending_acks == 0):
+                        self._failed = ConnectionError("worker connection closed while draining")
+                    self._writer = None
+                    self._state.notify_all()
 
     def _serve(self, w: Any, task: Task, ctx: TaskContext) -> None:
         try:
@@ -222,10 +275,59 @@ class Worker:
         res.seq = task.seq
         with self._clock:
             self._cancels.pop(task.seq, None)
-        try:
-            self._send(w, MsgType.RESULT, res.body())
-        except OSError:
-            pass
+        with self._wlock:
+            with self._state:
+                needs_ack = self._draining
+                if needs_ack:
+                    self._pending_acks += 1
+            try:
+                write_frame(w, MsgType.RESULT, res.body())
+                w.flush()
+            except OSError as e:
+                with self._state:
+                    if needs_ack:
+                        self._pending_acks -= 1
+                    self._failed = e
+            finally:
+                with self._state:
+                    self._inflight -= 1
+                    self._state.notify_all()
+
+    def drain(self) -> None:
+        """Stops new delivery and waits for accepted results (ADR 0073).
+
+        Raises DrainUnsupportedError when kairod did not negotiate this
+        capability (ADR 0075).
+        """
+        deadline = time.monotonic() + CAPABILITY_NEGOTIATION_TIMEOUT
+        with self._state:
+            while self._writer is not None and not self._negotiated:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._state.wait(remaining)
+        with self._wlock:
+            with self._state:
+                w = self._writer
+                if w is None:
+                    raise ConnectionError("worker is not connected")
+                if not self._drain_cap:
+                    raise DrainUnsupportedError("kairod does not support graceful worker drain")
+                if not self._draining:
+                    self._draining = True
+                    write_frame(w, MsgType.CREDIT, Credit(-1).body())
+                    w.flush()
+                    self._state.notify_all()
+        with self._state:
+            while not (self._drain_ack and self._inflight == 0 and self._pending_acks == 0):
+                if self._failed is not None:
+                    raise self._failed
+                self._state.wait()
+
+    @property
+    def inflight(self) -> int:
+        with self._state:
+            return self._inflight
 
     def stop(self) -> None:
         if self._sock is not None:

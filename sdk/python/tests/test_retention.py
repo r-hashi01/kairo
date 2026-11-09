@@ -15,7 +15,7 @@ import unittest
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.embedded import Embedded, keep_finished_ms
 from kairo_sdk.protocol import Result
-from kairo_sdk.store import SQLiteStore
+from kairo_sdk.store import ParentUnavailableError, SQLiteStore
 from kairo_sdk.workflow import Kairo, Suspended
 
 from test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -51,6 +51,139 @@ class RetentionTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_external_workflow_joins_parent_tree(self) -> None:
+        """An externally started workflow joins an unfinished parent tree (ADR 0065)."""
+        path = os.path.join(self.dir, "external-parent.db")
+        clock = Clock()
+
+        async def main() -> None:
+            backend = await EmbeddedBackend.open(SQLiteStore(path), wasm=self.wasm, now=clock, keep_finished=HOUR)
+            k = Kairo(backend=backend, mode="suspend")
+
+            @k.workflow("hold")
+            async def hold(ctx, _):
+                return await ctx.wait_for("go")
+
+            @k.workflow("quick")
+            async def quick(ctx, value):
+                return value
+
+            @k.workflow("child-wait")
+            async def child_wait(ctx, _):
+                return await ctx.wait_for("child-go")
+
+            await k.start()
+            await k.submit("hold", None, id="external-parent")
+            await k.submit("quick", "kept", id="external-child", parent="external-parent")
+            self.assertEqual(await k.result("external-child"), "kept")
+            self.assertEqual((await backend.get("external-child")).get("parent"), "external-parent")
+            await k.submit("quick", "ignored", id="external-child")
+            self.assertNotIn("external-child", [r["run_id"] for r in await k.list()])
+
+            db = sqlite3.connect(path)
+            wait = db.execute(
+                "SELECT id FROM kairo_run WHERE parent = ? AND plan = 'kairo.wait/go'", ("external-parent",)
+            ).fetchone()[0]
+            db.close()
+            for id, parent in (("bad-missing", "no-parent"), ("bad-call", wait), ("bad-self", "bad-self")):
+                with self.assertRaises(ParentUnavailableError):
+                    await k.submit("quick", "x", id=id, parent=parent)
+                with self.assertRaises(Exception):
+                    await backend.get(id)
+            await k.submit("quick", "done", id="finished-parent")
+            with self.assertRaises(ParentUnavailableError):
+                await k.submit("quick", "x", id="bad-finished", parent="finished-parent")
+            await k.submit("hold", None, id="other-parent")
+            with self.assertRaises(ParentUnavailableError):
+                await k.submit("quick", "x", id="external-child", parent="other-parent")
+            for i in range(5):
+                parent = f"settlement-parent-{i}"
+                child = f"settlement-child-{i}"
+                await k.submit("hold", None, id=parent)
+                raced = await asyncio.gather(
+                    k.signal(parent, "go", "done"),
+                    k.submit("quick", "x", id=child, parent=parent),
+                    return_exceptions=True,
+                )
+                for result in raced:
+                    if isinstance(result, BaseException):
+                        self.assertIsInstance(result, ParentUnavailableError)
+                self.assertEqual(await k.run("hold", None, id=parent), "done")
+                try:
+                    row = await backend.get(child)
+                except Exception:
+                    row = None
+                self.assertTrue(row is None or row["status"] in ("completed", "failed", "cancelled"), row)
+
+            clock.skew = 2 * HOUR
+            await k.tick()
+            self.assertEqual(
+                (await backend.get("external-child")).get("parent"),
+                "external-parent",
+                "the finished child stays with its unfinished parent",
+            )
+            await k.signal("external-parent", "go", "done")
+            self.assertEqual(await k.run("hold", None, id="external-parent"), "done")
+            clock.skew = 4 * HOUR
+            await k.tick()
+            with self.assertRaises(Exception):
+                await backend.get("external-parent")
+            with self.assertRaises(Exception):
+                await backend.get("external-child")
+
+            await k.submit("hold", None, id="cancel-external-parent")
+            await k.submit("child-wait", None, id="cancel-external-child", parent="cancel-external-parent")
+            await k.cancel("cancel-external-parent")
+            self.assertEqual((await backend.get("cancel-external-child"))["status"], "cancelled")
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_external_workflow_replays_on_resubmit(self) -> None:
+        """An expired drive lease alone does not replay an external child (ADR 0065)."""
+        path = os.path.join(self.dir, "external-recovery.db")
+        replays = {"n": 0}
+
+        async def start(owner: str, mode: str) -> Kairo:
+            backend = await EmbeddedBackend.open(SQLiteStore(path), wasm=self.wasm, owner=owner, lease_ms=50)
+            k = Kairo(backend=backend, mode=mode)
+
+            @k.workflow("hold")
+            async def hold(ctx, _):
+                return await ctx.wait_for("parent-go")
+
+            @k.workflow("external-replay")
+            async def external_replay(ctx, _):
+                replays["n"] += 1
+                return await ctx.wait_for("child-go")
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            k = await start("external-recovery-1", "wait")
+            await k.submit("hold", None, id="recovery-parent")
+            await k.submit("external-replay", None, id="recovery-child", parent="recovery-parent")
+            for _ in range(100):
+                if replays["n"] == 1:
+                    break
+                await asyncio.sleep(0.005)
+            self.assertEqual(replays["n"], 1)
+            await k.close()
+
+            await asyncio.sleep(0.005)
+            k = await start("external-recovery-2", "suspend")
+            await k.tick()
+            await asyncio.sleep(0.02)
+            self.assertEqual(replays["n"], 1, "the expired drive lease did not replay the external child")
+            await k.submit("external-replay", None, id="recovery-child")
+            self.assertEqual(replays["n"], 2, "re-submission is the new reach")
+            self.assertEqual((await k.backend.get("recovery-child")).get("parent"), "recovery-parent")
+            await k.cancel("recovery-parent")
+            await k.close()
+
+        asyncio.run(main())
 
     def test_tree_removed_once_kept_long_enough(self) -> None:
         """A finished workflow goes with its calls; a removed id starts anew."""

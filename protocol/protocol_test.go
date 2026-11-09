@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -74,6 +75,155 @@ func TestRemoteWorker(t *testing.T) {
 	ri, err := e.Wait(wctx, id)
 	if err != nil || string(ri.Output) != "[1,4,9,16,25,36,49,64,81,100]" {
 		t.Fatalf("%v %+v", err, ri)
+	}
+}
+
+func TestWorkerDrainStopsDeliveryAndWaitsForAcceptedResult(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"par","nodes":[
+	  {"kind":"step","id":"a","action":"code.run"},{"kind":"step","id":"b","action":"code.run"}]}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var first atomic.Int32
+	wk := &Worker{Name: "draining", Actions: []string{"code.run"}, Concurrency: 1, Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+		first.Add(1)
+		close(started)
+		<-release
+		return task.Result{Output: json.RawMessage(`1`)}
+	}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first task did not start")
+	}
+	drained := make(chan error, 1)
+	go func() {
+		dctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		drained <- wk.Drain(dctx)
+	}()
+	select {
+	case err := <-drained:
+		t.Fatalf("drain returned before the result: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	var second atomic.Int32
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	other := &Worker{Name: "other", Actions: []string{"code.run"}, Concurrency: 1, Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+		second.Add(1)
+		return task.Result{Output: json.RawMessage(`2`)}
+	}}
+	go other.Run(ctx2, "unix", sock)
+	close(release)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	wctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if _, err := e.Wait(wctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if first.Load() != 1 || second.Load() != 1 {
+		t.Fatalf("tasks after drain: draining worker=%d other=%d", first.Load(), second.Load())
+	}
+}
+
+func TestWorkerDrainNeedsNegotiatedCapability(t *testing.T) {
+	var wire bytes.Buffer
+	s := newWorkerSession(bufio.NewWriter(&wire))
+	s.negotiated = true
+	wk := &Worker{session: s}
+	err := wk.Drain(context.Background())
+	if !errors.Is(err, ErrDrainUnsupported) {
+		t.Fatalf("Drain error = %v, want ErrDrainUnsupported", err)
+	}
+	if err := s.w.Flush(); err != nil || wire.Len() != 0 {
+		t.Fatalf("unsupported Drain wrote %d bytes: %v", wire.Len(), err)
+	}
+}
+
+func TestWorkerDrainWaitsForCapabilityNegotiation(t *testing.T) {
+	var wire bytes.Buffer
+	s := newWorkerSession(bufio.NewWriter(&wire))
+	go func() {
+		time.Sleep(time.Millisecond)
+		s.mu.Lock()
+		s.negotiated = true
+		s.drainCap = true
+		s.notifyLocked()
+		s.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.beginDrain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	typ, _, err := ReadFrame(bufio.NewReader(&wire))
+	if err != nil || typ != MsgCredit {
+		t.Fatalf("drain frame = %v, %v, want Credit", typ, err)
+	}
+}
+
+func TestServerNegotiatesDrainBeforeWork(t *testing.T) {
+	_, sock := setup(t)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "new", Actions: []string{"code.run"}, Credit: 1,
+		Capabilities: []string{CapabilityGracefulDrain, "unknown-v1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	typ, body, err := ReadFrame(r)
+	if err != nil || typ != MsgHello {
+		t.Fatalf("first frame = %v, %v, want Hello", typ, err)
+	}
+	var welcome Welcome
+	if err := json.Unmarshal(body, &welcome); err != nil {
+		t.Fatal(err)
+	}
+	if len(welcome.Capabilities) != 1 || welcome.Capabilities[0] != CapabilityGracefulDrain {
+		t.Fatalf("selected capabilities = %v", welcome.Capabilities)
+	}
+}
+
+func TestServerAcceptsLegacyDrainWithoutCapabilityHello(t *testing.T) {
+	_, sock := setup(t)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "legacy-drain", Actions: []string{"code.run"}, Credit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFrame(w, MsgCredit, Credit{N: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	typ, body, err := ReadFrame(r)
+	if err != nil || typ != MsgCredit {
+		t.Fatalf("drain ack = %v, %v, want Credit", typ, err)
+	}
+	var credit Credit
+	if err := json.Unmarshal(body, &credit); err != nil || credit.N != 0 {
+		t.Fatalf("drain ack = %+v, %v", credit, err)
 	}
 }
 

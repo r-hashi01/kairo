@@ -29,21 +29,22 @@ import (
 
 func main() {
 	var (
-		dataDir   = flag.String("data", "./kairo-data", "data directory (logs, snapshots, blobs, plans)")
-		shards    = flag.Int("shards", 0, "number of shards (default: GOMAXPROCS; fixed per data directory)")
-		httpAddr  = flag.String("http", "127.0.0.1:8420", "control API listen address")
-		sockPath  = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
-		tcpAddr   = flag.String("worker-tcp", "", "optional TCP address for workers")
-		nodesFile = flag.String("nodes", "", "JSON file with an array of node specs")
-		limitFile = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
-		obsFile   = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
-		tierName  = flag.String("tier", "none", "default durability tier: none|memory|file")
-		noSync    = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
-		maxActive = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
-		maxQueued = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
-		perTenant = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
-		httpConc  = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
-		idemTTL   = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
+		dataDir     = flag.String("data", "./kairo-data", "data directory (logs, snapshots, blobs, plans)")
+		shards      = flag.Int("shards", 0, "number of shards (default: GOMAXPROCS; fixed per data directory)")
+		httpAddr    = flag.String("http", "127.0.0.1:8420", "control API listen address")
+		sockPath    = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
+		tcpAddr     = flag.String("worker-tcp", "", "optional TCP address for workers")
+		nodesFile   = flag.String("nodes", "", "JSON file with an array of node specs")
+		limitFile   = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
+		obsFile     = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
+		tierName    = flag.String("tier", "none", "default durability tier: none|memory|file")
+		noSync      = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
+		maxActive   = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
+		maxQueued   = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
+		perTenant   = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
+		maxStarting = flag.Int("max-starting", 0, "admission: safety ceiling per shard/tier for starts awaiting durable acknowledgement (0 = adaptive)")
+		httpConc    = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
+		idemTTL     = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
 
@@ -97,7 +98,7 @@ func main() {
 		IdempotencyTTL: *idemTTL,
 		Admission: sched.AdmissionConfig{
 			MaxActive: *maxActive, MaxQueued: *maxQueued,
-			MaxActivePerTenant: func(string) int { return *perTenant },
+			MaxActivePerTenant: func(string) int { return *perTenant }, MaxStarting: *maxStarting,
 		},
 		Limits:  func(dest string) sched.DestLimits { return limits[dest] },
 		Observe: sink,

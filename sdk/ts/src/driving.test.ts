@@ -13,9 +13,9 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
 import { finished } from './client.ts';
-import { PostgresStore, SQLiteStore, type Store } from './store.ts';
+import { PostgresStore, SQLiteStore, WorkflowRetryError, type Store } from './store.ts';
 import { ObservationKind, type Observation } from './observe.ts';
-import { CallError, CancelledError, Kairo, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions } from './workflow.ts';
+import { CallError, CancelledError, Kairo, NotWaitingError, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions, type SignalReceipt } from './workflow.ts';
 import { EFFECT_WEAKENED } from './embedded.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
@@ -87,6 +87,24 @@ function dying(store: Store): [Store, { dead: boolean }] {
 	return [proxy, state];
 }
 
+function failingOnce(store: Store): [Store, { fail: boolean }] {
+	const state = { fail: false };
+	return [new Proxy(store, {
+		get(target, prop) {
+			const v = (target as any)[prop];
+			if (typeof v !== 'function') return v;
+			if (prop === 'withRun') return (...args: unknown[]) => {
+				if (state.fail) {
+					state.fail = false;
+					return Promise.reject(new Error('store busy'));
+				}
+				return v.apply(target, args);
+			};
+			return v.bind(target);
+		},
+	}), state];
+}
+
 describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 	// A caller that stops waiting does not cancel the workflow: its calls
 	// stay, and it goes on when it is run again.
@@ -133,13 +151,61 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await waitUntil(() => started);
 		const rejected = assert.rejects(res, CancelledError); // it may reject before cancel answers
 		await k.cancel('tree-1');
-		await rejected;
-		await waitUntil(() => stopped);
 		const kids = await children(path, 'tree-1');
 		assert.equal(kids.length, 1);
-		await waitUntil(async () => (await k.backend.get(kids[0]!)).status === 'cancelled');
+		const grandkids = await children(path, kids[0]!);
+		assert.equal(grandkids.length, 1);
+		for (const id of [kids[0]!, grandkids[0]!]) assert.equal((await k.backend.get(id)).status, 'cancelled', id);
+		await rejected;
+		await waitUntil(() => stopped);
 		await k.close();
 	});
+
+	// A replay that takes another path cancels the child left by the stopped
+	// process without recovering its action first (ADR 0062).
+	for (const outcome of ['success', 'failure'] as const) {
+		test(`an unreached child is cancelled before parent ${outcome}`, async () => {
+			const path = join(dir, `unreached-${outcome}.db`);
+			let attempts = 0;
+			let skip = false;
+			const start = async () => {
+				const k = await open(path, { mode: 'suspend' });
+				k.defineAction('old', {
+					effect: 'unprotected',
+					handler: async (_input, ctx) => {
+						attempts++;
+						await new Promise<void>((resolve) => ctx.signal.addEventListener('abort', () => resolve(), { once: true }));
+						throw new Error('stopped');
+					},
+				});
+				k.workflow('parent', async (ctx) => {
+					if (skip) {
+						if (outcome === 'failure') throw new Error('guard failed');
+						return 'new path';
+					}
+					return ctx.call<string>('old');
+				});
+				await k.start();
+				return k;
+			};
+
+			let k = await start();
+			const first = k.run('parent', null, { id: `unreached-${outcome}` });
+			await waitUntil(() => attempts === 1);
+			await k.close();
+			await assert.rejects(first, StoppedError);
+
+			skip = true;
+			k = await start();
+			if (outcome === 'failure') await assert.rejects(k.run('parent', null, { id: `unreached-${outcome}` }), WorkflowError);
+			else assert.equal(await k.run('parent', null, { id: `unreached-${outcome}` }), 'new path');
+			assert.equal(attempts, 1);
+			const [child] = await children(path, `unreached-${outcome}`);
+			assert.equal((await k.backend.get(child)).status, 'cancelled');
+			assert.ok(finished(await k.backend.get(`unreached-${outcome}`)));
+			await k.close();
+		});
+	}
 
 	test('a workflow that throws fails; the process goes on', async () => {
 		const k = await open(join(dir, 'bad.db'));
@@ -273,6 +339,117 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k.close();
 	});
 
+	test('signal receipts and only-if-waiting are atomic across processes', async () => {
+		const path = join(dir, 'signal-receipts.db');
+		const gates = new Map<string, () => void>();
+		const gateStarted = new Set<string>();
+		const register = (k: Kairo) => {
+			k.defineAction('signal-gate', {
+				effect: 'unprotected',
+				handler: async (key: string) => {
+					gateStarted.add(key);
+					await new Promise<void>((resolve) => gates.set(key, resolve));
+				},
+			});
+			k.workflow('signals', async (ctx, key: string) => {
+				const first = await ctx.waitFor<string>('message');
+				await ctx.call('signal-gate', key);
+				return [first, await ctx.waitFor<string>('message')];
+			});
+			k.workflow('signal-race', async (ctx) => {
+				await ctx.call('signal-gate', 'create');
+				const first = await ctx.waitFor<string>('message');
+				await ctx.call('signal-gate', 'create-after');
+				return [first, await ctx.waitFor<string>('message')];
+			});
+		};
+		const a = await open(path, { leaseMs: 50 });
+		const b = await open(path, { leaseMs: 50 });
+		register(a);
+		register(b);
+		await a.start();
+		await b.start();
+		const waits = async (id: string) => query(path, "SELECT id, status FROM kairo_run WHERE parent = ? AND plan = 'kairo.wait/message' ORDER BY created_at, id", id);
+		const waiting = (id: string, n: number) => waitUntil(async () => {
+			const rows = await waits(id);
+			return rows.length === n && !['completed', 'failed', 'cancelled'].includes(rows[n - 1]?.status);
+		});
+
+		await a.submit('signals', 'only', { id: 'signal-only-1' });
+		await waiting('signal-only-1', 1);
+		const only = await Promise.allSettled([
+			a.sendSignal('signal-only-1', 'message', 'answer-a', { onlyIfWaiting: true }),
+			b.sendSignal('signal-only-1', 'message', 'answer-b', { onlyIfWaiting: true }),
+		]);
+		const won = only.find((r): r is PromiseFulfilledResult<SignalReceipt> => r.status === 'fulfilled');
+		const lost = only.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+		assert.ok(won);
+		assert.ok(lost?.reason instanceof NotWaitingError, `${lost?.reason}`);
+		assert.deepEqual({ index: won.value.index, early: won.value.early }, { index: 0, early: false });
+		await waitUntil(() => gateStarted.has('only'));
+		assert.equal((await waits('signal-only-1')).length, 1, 'no answer was left for the next wait');
+		gates.get('only')!();
+		await waiting('signal-only-1', 2);
+		assert.deepEqual(
+			await a.sendSignal('signal-only-1', 'message', 'second', { onlyIfWaiting: true }).then((r) => ({ index: r.index, early: r.early })),
+			{ index: 1, early: false },
+		);
+		const firstPayload = only[0]!.status === 'fulfilled' ? 'answer-a' : 'answer-b';
+		assert.deepEqual(await a.result('signal-only-1'), [firstPayload, 'second']);
+		await assert.rejects(a.sendSignal('signal-only-1', 'message', 'late', { onlyIfWaiting: true }), NotWaitingError);
+		await assert.rejects(a.sendSignal('no-such-workflow', 'message', 'x', { onlyIfWaiting: true }), (e: Error) => !(e instanceof NotWaitingError) && /no workflow/.test(e.message));
+
+		await a.submit('signals', 'early', { id: 'signal-early-1' });
+		await waiting('signal-early-1', 1);
+		const sent = await Promise.all([
+			a.sendSignal('signal-early-1', 'message', 'early-a'),
+			b.sendSignal('signal-early-1', 'message', 'early-b'),
+		]);
+		const ordered = sent.map((receipt, i) => ({ receipt, payload: i === 0 ? 'early-a' : 'early-b' })).sort((x, y) => x.receipt.index - y.receipt.index);
+		assert.deepEqual(ordered.map((x) => ({ index: x.receipt.index, early: x.receipt.early })), [
+			{ index: 0, early: false },
+			{ index: 1, early: true },
+		]);
+		assert.notEqual(ordered[0]!.receipt.runId, ordered[1]!.receipt.runId);
+		await waitUntil(() => gateStarted.has('early'));
+		gates.get('early')!();
+		assert.deepEqual(await a.result('signal-early-1'), ordered.map((x) => x.payload));
+
+		await a.submit('signal-race', null, { id: 'signal-create-1' });
+		await waitUntil(() => gateStarted.has('create'));
+		const racing = b.sendSignal('signal-create-1', 'message', 'raced', { onlyIfWaiting: true });
+		gates.get('create')!();
+		let first = 'raced';
+		try {
+			const receipt = await racing;
+			assert.deepEqual({ index: receipt.index, early: receipt.early }, { index: 0, early: false });
+		} catch (e) {
+			assert.ok(e instanceof NotWaitingError, `${e}`);
+			await waiting('signal-create-1', 1);
+			await a.sendSignal('signal-create-1', 'message', 'manual', { onlyIfWaiting: true });
+			first = 'manual';
+		}
+		await waitUntil(() => gateStarted.has('create-after'));
+		assert.equal((await waits('signal-create-1')).length, 1, 'the creation race did not leave an early signal');
+		gates.get('create-after')!();
+		await waiting('signal-create-1', 2);
+		await a.sendSignal('signal-create-1', 'message', 'second', { onlyIfWaiting: true });
+		assert.deepEqual(await a.result('signal-create-1'), [first, 'second']);
+
+		await a.submit('signals', 'legacy', { id: 'signal-legacy-1' });
+		await waiting('signal-legacy-1', 1);
+		await Promise.all([
+			a.signal('signal-legacy-1', 'message', 'legacy-a'),
+			b.signal('signal-legacy-1', 'message', 'legacy-b'),
+		]);
+		await waitUntil(() => gateStarted.has('legacy'));
+		assert.equal((await waits('signal-legacy-1')).length, 2);
+		gates.get('legacy')!();
+		assert.deepEqual((await a.result('signal-legacy-1') as string[]).sort(), ['legacy-a', 'legacy-b']);
+		await a.close();
+		await b.close();
+	});
+
 	test('a wait times out', async () => {
 		const k = await open(join(dir, 'late.db'));
 		k.workflow('w', async (ctx) => {
@@ -393,6 +570,37 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		assert.match(e.message, /no such file/);
 		assert.equal(runs.flaky, 5);
 		assert.equal(runs.broken, 2, 'a failure not retryable: once each');
+		await k.close();
+	});
+
+	test('a transient store error retries the workflow without recording failure', async () => {
+		const path = join(dir, 'store-retry.db');
+		const [store, state] = failingOnce(new SQLiteStore(path));
+		const k = await open(path, { store, leaseMs: 50 });
+		const runs = { first: 0, second: 0, workflow: 0, explicit: 0 };
+		let armed = false;
+		k.defineAction('first', { effect: 'real', handler: async () => (runs.first++, 'one') });
+		k.defineAction('second', { effect: 'unprotected', handler: async () => (runs.second++, 'two') });
+		k.workflow('store-retry', async (ctx) => {
+			runs.workflow++;
+			const a = await ctx.call<string>('first');
+			if (!armed) {
+				armed = true;
+				state.fail = true;
+			}
+			return a + await ctx.call<string>('second');
+		});
+		k.workflow('explicit-retry', async () => {
+			if (++runs.explicit === 1) throw new WorkflowRetryError('try later');
+			return 'ok';
+		});
+		await k.start();
+		assert.equal(await k.run('store-retry', null, { id: 'store-retry-1' }), 'onetwo');
+		assert.deepEqual({ first: runs.first, second: runs.second }, { first: 1, second: 1 });
+		assert.ok(runs.workflow >= 2);
+		assert.equal((await k.backend.get('store-retry-1')).status, 'completed');
+		assert.equal(await k.run('explicit-retry', null, { id: 'explicit-retry-1' }), 'ok');
+		assert.equal(runs.explicit, 2);
 		await k.close();
 	});
 

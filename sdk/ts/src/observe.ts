@@ -7,12 +7,14 @@ import type { Result } from './protocol.ts';
 
 /** Takes what goes wrong in the runtime's background work (lease renewals, sweeps, callbacks). */
 export interface Logger {
+	info?(msg: string, attrs?: Record<string, unknown>): void;
 	warn(msg: string, attrs?: Record<string, unknown>): void;
 	error(msg: string, attrs?: Record<string, unknown>): void;
 }
 
 /** The default Logger: console.warn and console.error. */
 export const consoleLogger: Logger = {
+	info: (msg, attrs) => (attrs ? console.info(msg, attrs) : console.info(msg)),
 	warn: (msg, attrs) => (attrs ? console.warn(msg, attrs) : console.warn(msg)),
 	error: (msg, attrs) => (attrs ? console.error(msg, attrs) : console.error(msg)),
 };

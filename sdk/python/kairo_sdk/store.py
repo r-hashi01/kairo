@@ -18,6 +18,32 @@ from typing import Any, Generic, Protocol, TypeVar
 T = TypeVar("T")
 
 
+class WorkflowRetryError(Exception):
+    """Stops the current workflow drive without recording an outcome, so
+    the same run can be replayed later (ADR 0063). This is not an action's
+    RetryableError."""
+
+
+class ParentUnavailableError(Exception):
+    """A run cannot safely be added to the requested parent's tree (ADR 0065)."""
+
+
+class ChildrenUnsettledError(Exception):
+    """A child appeared or remained unfinished while its workflow was settling."""
+
+
+def is_workflow_retry(error: BaseException) -> bool:
+    """Whether error or one of its causes asks for workflow replay."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, WorkflowRetryError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass
 class RunRow:
     id: str
@@ -64,6 +90,8 @@ class Changes(Generic[T]):
     result: T
     events: list[dict[str, Any]] = field(default_factory=list)
     row: RunRow | None = None
+    guard_parent: str | None = None  # atomically require this unfinished workflow
+    guard_tree_settled: bool = False
     set_timers: list[TimerRow] = field(default_factory=list)
     delete_timers: list[int] = field(default_factory=list)
     clear: bool = False  # the run ended: drop its timers and leases
@@ -74,10 +102,16 @@ class Changes(Generic[T]):
 
 class Store(Protocol):
     async def init(self) -> None: ...
-    async def with_run(self, id: str, fn: Callable[[RunRow | None], Changes[T]]) -> T: ...
+    async def with_run(self, id: str, fn: Callable[[RunRow | None], Changes[T]]) -> T:
+        """Atomically applies changes, including their parent/tree guards (ADR 0065)."""
+        ...
     async def get(self, id: str) -> RunRow | None: ...
+    async def children(self, parent: str) -> list[RunRow]: ...
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]: ...
     async def expired_leases(self, now: int, limit: int) -> list[LeaseRow]: ...
+    async def recoverable(self, run: str, now: int) -> tuple[list[LeaseRow], list[TimerRow]]:
+        """This run's recovery work, read when its parent replay reaches it (ADR 0062)."""
+        ...
     async def renew_leases(self, owner: str, until: int) -> None: ...
     async def expire_leases(self, owner: str, now: int) -> None: ...
     async def remove_finished(self, cutoff: int, limit: int) -> int:
@@ -108,6 +142,51 @@ class Store(Protocol):
         status, created in [since, until), after the run after, at most limit."""
         ...
     async def close(self) -> None: ...
+
+
+class _RetryingStore:
+    """Marks Store operation failures for workflow replay. Errors raised by
+    with_run's pure callback are Kairo semantic errors and pass through
+    unchanged (ADR 0063)."""
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._store, name)
+        if not callable(value):
+            return value
+
+        async def call(*given: Any, **kw: Any) -> Any:
+            args = list(given)
+            callback_error: BaseException | None = None
+            if name == "with_run" and len(args) > 1 and callable(args[1]):
+                fn = args[1]
+
+                def wrapped(*a: Any, **k: Any) -> Any:
+                    nonlocal callback_error
+                    try:
+                        return fn(*a, **k)
+                    except BaseException as e:
+                        callback_error = e
+                        raise
+
+                args[1] = wrapped
+            try:
+                return await value(*args, **kw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if e is callback_error or isinstance(e, (ParentUnavailableError, ChildrenUnsettledError)) or is_workflow_retry(e):
+                    raise
+                raise WorkflowRetryError(f"kairo store: {e}") from e
+
+        return call
+
+
+def retrying_store(store: Store) -> Store:
+    """Returns store with ADR 0063's storage-error marker."""
+    return _RetryingStore(store)  # type: ignore[return-value]
 
 
 def _earliest(*ts: Any) -> int | None:
@@ -226,6 +305,30 @@ def _row(r: Any) -> RunRow | None:
     return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11], r[12], r[13])
 
 
+def _check_parent(parent: RunRow | None, parent_id: str, child_id: str) -> None:
+    reason: str | None = None
+    if parent_id == child_id:
+        reason = "a run cannot be its own parent"
+    elif parent is None:
+        reason = "it does not exist"
+    elif parent.plan != "kairo.workflow" or not parent.workflow:
+        reason = "it is not a workflow"
+    elif parent.status in ("completed", "failed", "cancelled"):
+        reason = "it has finished"
+    if reason is not None:
+        raise ParentUnavailableError(f"parent {parent_id}: {reason}")
+
+
+def _check_tree_settled(db: Any, p: str, ph: str, id: str) -> None:
+    q = f"""WITH RECURSIVE tree(id) AS (
+        SELECT id FROM {p}run WHERE parent = {ph}
+        UNION SELECT r.id FROM {p}run r JOIN tree t ON r.parent = t.id
+    ) SELECT 1 FROM {p}run WHERE id IN (SELECT id FROM tree)
+      AND status NOT IN ('completed','failed','cancelled') LIMIT 1"""
+    if db.execute(q, (id,)).fetchone():
+        raise ChildrenUnsettledError(f"workflow {id}: children changed while it settled")
+
+
 class SQLiteStore:
     """SQLite (the standard library's sqlite3): a file, or ":memory:" (tests).
 
@@ -278,6 +381,11 @@ class SQLiteStore:
         try:
             before = _row(db.execute(f"SELECT {_RUN_COLS} FROM {p}run WHERE id = ?", (id,)).fetchone())
             c = fn(before)
+            if c.guard_parent is not None:
+                parent = _row(db.execute(f"SELECT {_RUN_COLS} FROM {p}run WHERE id = ?", (c.guard_parent,)).fetchone())
+                _check_parent(parent, c.guard_parent, id)
+            if c.guard_tree_settled:
+                _check_tree_settled(db, p, "?", id)
             seq = before.seq if before else 0
             for ev in c.events:
                 db.execute(f"INSERT INTO {p}event (run, seq, body) VALUES (?, ?, ?)", (id, seq, json.dumps(ev)))
@@ -313,6 +421,11 @@ class SQLiteStore:
         assert self.db is not None
         return _row(self.db.execute(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE id = ?", (id,)).fetchone())
 
+    async def children(self, parent: str) -> list[RunRow]:
+        assert self.db is not None
+        rows = self.db.execute(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = ? ORDER BY created_at, id", (parent,)).fetchall()
+        return [row for r in rows if (row := _row(r)) is not None]
+
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
         assert self.db is not None
         rows = self.db.execute(f"SELECT run, timer, act, at FROM {self.p}timer WHERE at <= ? ORDER BY at LIMIT ?", (now, limit)).fetchall()
@@ -324,6 +437,20 @@ class SQLiteStore:
             f"SELECT run, act, attempt, owner, until FROM {self.p}lease WHERE until < ? ORDER BY until LIMIT ?", (now, limit)
         ).fetchall()
         return [LeaseRow(r[0], int(r[1]), int(r[2]), r[3], int(r[4])) for r in rows]
+
+    async def recoverable(self, run: str, now: int) -> tuple[list[LeaseRow], list[TimerRow]]:
+        assert self.db is not None
+        leases = self.db.execute(
+            f"SELECT run, act, attempt, owner, until FROM {self.p}lease WHERE run = ? AND act <> 0 AND until < ? ORDER BY until",
+            (run, now),
+        ).fetchall()
+        timers = self.db.execute(
+            f"SELECT run, timer, act, at FROM {self.p}timer WHERE run = ? AND at <= ? ORDER BY at", (run, now)
+        ).fetchall()
+        return (
+            [LeaseRow(r[0], int(r[1]), int(r[2]), r[3], int(r[4])) for r in leases],
+            [TimerRow(r[0], int(r[1]), int(r[2]), int(r[3])) for r in timers],
+        )
 
     async def renew_leases(self, owner: str, until: int) -> None:
         assert self.db is not None
@@ -410,6 +537,18 @@ class PostgresStore:
                 cur = await conn.execute(f"SELECT {_RUN_COLS} FROM {p}run WHERE id = %s FOR UPDATE", (id,))
                 before = _row(await cur.fetchone())
                 c = fn(before)
+                if c.guard_parent is not None:
+                    cur = await conn.execute(f"SELECT {_RUN_COLS} FROM {p}run WHERE id = %s FOR UPDATE", (c.guard_parent,))
+                    _check_parent(_row(await cur.fetchone()), c.guard_parent, id)
+                if c.guard_tree_settled:
+                    q = f"""WITH RECURSIVE tree(id) AS (
+                        SELECT id FROM {p}run WHERE parent = %s
+                        UNION SELECT r.id FROM {p}run r JOIN tree t ON r.parent = t.id
+                    ) SELECT 1 FROM {p}run WHERE id IN (SELECT id FROM tree)
+                      AND status NOT IN ('completed','failed','cancelled') LIMIT 1"""
+                    cur = await conn.execute(q, (id,))
+                    if await cur.fetchone():
+                        raise ChildrenUnsettledError(f"workflow {id}: children changed while it settled")
                 seq = before.seq if before else 0
                 for ev in c.events:
                     await conn.execute(f"INSERT INTO {p}event (run, seq, body) VALUES (%s, %s, %s)", (id, seq, json.dumps(ev)))
@@ -443,6 +582,10 @@ class PostgresStore:
         rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE id = %s", (id,))
         return _row(rows[0]) if rows else None
 
+    async def children(self, parent: str) -> list[RunRow]:
+        rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = %s ORDER BY created_at, id", (parent,))
+        return [row for r in rows if (row := _row(r)) is not None]
+
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
         rows = await self._exec(f"SELECT run, timer, act, at FROM {self.p}timer WHERE at <= %s ORDER BY at LIMIT %s", (now, limit))
         return [TimerRow(r[0], int(r[1]), int(r[2]), int(r[3])) for r in rows]
@@ -450,6 +593,19 @@ class PostgresStore:
     async def expired_leases(self, now: int, limit: int) -> list[LeaseRow]:
         rows = await self._exec(f"SELECT run, act, attempt, owner, until FROM {self.p}lease WHERE until < %s ORDER BY until LIMIT %s", (now, limit))
         return [LeaseRow(r[0], int(r[1]), int(r[2]), r[3], int(r[4])) for r in rows]
+
+    async def recoverable(self, run: str, now: int) -> tuple[list[LeaseRow], list[TimerRow]]:
+        leases = await self._exec(
+            f"SELECT run, act, attempt, owner, until FROM {self.p}lease WHERE run = %s AND act <> 0 AND until < %s ORDER BY until",
+            (run, now),
+        )
+        timers = await self._exec(
+            f"SELECT run, timer, act, at FROM {self.p}timer WHERE run = %s AND at <= %s ORDER BY at", (run, now)
+        )
+        return (
+            [LeaseRow(r[0], int(r[1]), int(r[2]), r[3], int(r[4])) for r in leases],
+            [TimerRow(r[0], int(r[1]), int(r[2]), int(r[3])) for r in timers],
+        )
 
     async def renew_leases(self, owner: str, until: int) -> None:
         await self._exec(f"UPDATE {self.p}lease SET until = %s WHERE owner = %s", (until, owner))

@@ -26,33 +26,368 @@ type Opener func() kairo.Store
 // Run runs the suite; fresh makes a new database for each test.
 func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 	for name, test := range map[string]func(*testing.T, Opener){
-		"ResumedElsewhereRunsNothingTwice": testResumedElsewhereRunsNothingTwice,
-		"SleepSignalAndChild":              testSleepSignalAndChild,
-		"Cancel":                           testCancel,
-		"ResolveABlockedCall":              testResolveABlockedCall,
-		"LiveOutput":                       testLiveOutput,
-		"ServerlessAcrossInvocations":      testServerlessAcrossInvocations,
-		"FinishedTreesRemoved":             testFinishedTreesRemoved,
-		"StopWaitingIsNotCancel":           testStopWaitingIsNotCancel,
-		"CancelReachesChildren":            testCancelReachesChildren,
-		"PanicIsAFailure":                  testPanicIsAFailure,
-		"StoppedDriverIsTakenUp":           testStoppedDriverIsTakenUp,
-		"LiveDriverIsNotDoubled":           testLiveDriverIsNotDoubled,
-		"SignalBeforeTheWait":              testSignalBeforeTheWait,
-		"WaitTimesOut":                     testWaitTimesOut,
-		"Limits":                           testLimits,
-		"SubmitAwaitAndList":               testSubmitAwaitAndList,
-		"RetriesAndTypedErrors":            testRetriesAndTypedErrors,
-		"Observe":                          testObserve,
-		"VersionsArePinned":                testVersionsArePinned,
-		"SettingsChangeUnderACall":         testSettingsChangeUnderACall,
-		"EffectIsNotWeakened":              testEffectIsNotWeakened,
-		"ChildVersionNotHere":              testChildVersionNotHere,
-		"ParallelTwice":                    testParallelTwice,
-		"WaitInAParallelBranch":            testWaitInAParallelBranch,
-		"DrainKeepsTheOutcome":             testDrainKeepsTheOutcome,
+		"ResumedElsewhereRunsNothingTwice":   testResumedElsewhereRunsNothingTwice,
+		"SleepSignalAndChild":                testSleepSignalAndChild,
+		"Cancel":                             testCancel,
+		"ResolveABlockedCall":                testResolveABlockedCall,
+		"LiveOutput":                         testLiveOutput,
+		"ServerlessAcrossInvocations":        testServerlessAcrossInvocations,
+		"FinishedTreesRemoved":               testFinishedTreesRemoved,
+		"ExternalParent":                     testExternalParent,
+		"ExternalParentRecovery":             testExternalParentRecovery,
+		"ExternalParentSettlementRace":       testExternalParentSettlementRace,
+		"StopWaitingIsNotCancel":             testStopWaitingIsNotCancel,
+		"CancelReachesChildren":              testCancelReachesChildren,
+		"PanicIsAFailure":                    testPanicIsAFailure,
+		"StoppedDriverIsTakenUp":             testStoppedDriverIsTakenUp,
+		"LiveDriverIsNotDoubled":             testLiveDriverIsNotDoubled,
+		"SignalBeforeTheWait":                testSignalBeforeTheWait,
+		"SignalReceiptsAndOnlyIfWaiting":     testSignalReceiptsAndOnlyIfWaiting,
+		"WaitTimesOut":                       testWaitTimesOut,
+		"Limits":                             testLimits,
+		"SubmitAwaitAndList":                 testSubmitAwaitAndList,
+		"RetriesAndTypedErrors":              testRetriesAndTypedErrors,
+		"TransientStoreErrorRetriesWorkflow": testTransientStoreErrorRetriesWorkflow,
+		"Observe":                            testObserve,
+		"VersionsArePinned":                  testVersionsArePinned,
+		"SettingsChangeUnderACall":           testSettingsChangeUnderACall,
+		"EffectIsNotWeakened":                testEffectIsNotWeakened,
+		"ChildVersionNotHere":                testChildVersionNotHere,
+		"ParallelTwice":                      testParallelTwice,
+		"WaitInAParallelBranch":              testWaitInAParallelBranch,
+		"DrainKeepsTheOutcome":               testDrainKeepsTheOutcome,
+		"UnreachedChildIsCancelled":          testUnreachedChildIsCancelled,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
+	}
+}
+
+// Parent settlement and an external child start have one durable order: the
+// child is rejected, or it is in the tree and settled before the parent (ADR 0065).
+func testExternalParentSettlementRace(t *testing.T, open Opener) {
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Mode: kairo.Suspend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	kairo.Workflow(k, "hold", func(ctx *kairo.Context, _ any) (string, error) {
+		return kairo.WaitFor[string](ctx, "go")
+	})
+	kairo.Workflow(k, "quick", func(_ *kairo.Context, _ any) (string, error) { return "done", nil })
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		parent := fmt.Sprintf("settlement-parent-%d", i)
+		child := fmt.Sprintf("settlement-child-%d", i)
+		if _, err := k.Submit(context.Background(), "hold", nil, kairo.WithID(parent)); err != nil {
+			t.Fatal(err)
+		}
+		ready := make(chan struct{})
+		errs := make(chan error, 2)
+		go func() {
+			<-ready
+			errs <- k.Signal(context.Background(), parent, "go", "done")
+		}()
+		go func() {
+			<-ready
+			_, err := k.Submit(context.Background(), "quick", nil, kairo.WithID(child), kairo.Parent(parent))
+			errs <- err
+		}()
+		close(ready)
+		for range 2 {
+			if err := <-errs; err != nil && !errors.Is(err, kairo.ErrParentUnavailable) {
+				t.Fatal(err)
+			}
+		}
+		if out, err := kairo.Run[string](context.Background(), k, "hold", nil, kairo.WithID(parent)); err != nil || out != "done" {
+			t.Fatalf("parent %q: %v", out, err)
+		}
+		got, err := k.Get(context.Background(), child)
+		if err == nil && !got.Finished() {
+			t.Fatalf("unfinished child after parent settlement: %+v", got)
+		}
+		if err != nil && !errors.Is(err, kairo.ErrUnknownRun) {
+			t.Fatal(err)
+		}
+	}
+}
+
+// An expired drive lease alone does not replay a workflow attached from the
+// outside. Re-submitting its id is the new reach (ADR 0065).
+func testExternalParentRecovery(t *testing.T, open Opener) {
+	var replays atomic.Int32
+	start := func(owner string, mode kairo.Mode) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Owner: owner, Lease: 50 * time.Millisecond, Mode: mode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Workflow(k, "hold", func(ctx *kairo.Context, _ any) (string, error) {
+			return kairo.WaitFor[string](ctx, "parent-go")
+		})
+		kairo.Workflow(k, "external-replay", func(ctx *kairo.Context, _ any) (string, error) {
+			replays.Add(1)
+			return kairo.WaitFor[string](ctx, "child-go")
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	k := start("external-parent-recovery-1", kairo.Wait)
+	if _, err := k.Submit(context.Background(), "hold", nil, kairo.WithID("recovery-parent")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.Submit(context.Background(), "external-replay", nil, kairo.WithID("recovery-child"), kairo.Parent("recovery-parent")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return replays.Load() == 1 })
+	if err := k.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	k = start("external-parent-recovery-2", kairo.Suspend)
+	defer k.Close()
+	if _, _, err := k.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := replays.Load(); got != 1 {
+		t.Fatalf("expired drive replayed external child %d times", got)
+	}
+	if _, err := k.Submit(context.Background(), "external-replay", nil, kairo.WithID("recovery-child")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return replays.Load() == 2 })
+	child, err := k.Get(context.Background(), "recovery-child")
+	if err != nil || child.Parent != "recovery-parent" {
+		t.Fatalf("resubmitted child %+v: %v", child, err)
+	}
+	if err := k.Cancel(context.Background(), "recovery-parent"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A workflow started outside another workflow can join its unfinished tree;
+// the relation is immutable and controls retention and cancellation (ADR 0065).
+func testExternalParent(t *testing.T, open Opener) {
+	var skew atomic.Int64
+	k, err := kairo.Open(context.Background(), kairo.Options{
+		Store: open(), KeepFinished: time.Hour,
+		Now: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	kairo.Workflow(k, "hold", func(ctx *kairo.Context, _ any) (string, error) {
+		return kairo.WaitFor[string](ctx, "go")
+	})
+	kairo.Workflow(k, "quick", func(_ *kairo.Context, in string) (string, error) { return in, nil })
+	kairo.Workflow(k, "child-wait", func(ctx *kairo.Context, _ any) (string, error) {
+		return kairo.WaitFor[string](ctx, "child-go")
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitChild := func(parent, plan string) kairo.RunInfo {
+		var found kairo.RunInfo
+		waitUntil(t, func() bool {
+			children, e := k.Children(context.Background(), parent)
+			if e != nil {
+				t.Fatal(e)
+			}
+			for _, child := range children {
+				if child.Plan == plan {
+					found = child
+					return true
+				}
+			}
+			return false
+		})
+		return found
+	}
+
+	if _, err := k.Submit(context.Background(), "hold", nil, kairo.WithID("external-parent")); err != nil {
+		t.Fatal(err)
+	}
+	wait := waitChild("external-parent", "kairo.wait/go")
+	if _, err := k.Submit(context.Background(), "quick", "kept", kairo.WithID("external-child"), kairo.Parent("external-parent")); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := kairo.Await[string](context.Background(), k, "external-child"); err != nil || out != "kept" {
+		t.Fatalf("child result %q: %v", out, err)
+	}
+	child, err := k.Get(context.Background(), "external-child")
+	if err != nil || child.Parent != "external-parent" {
+		t.Fatalf("child %+v: %v", child, err)
+	}
+	if _, err := k.Submit(context.Background(), "quick", "ignored", kairo.WithID("external-child")); err != nil {
+		t.Fatalf("resubmit without parent: %v", err)
+	}
+	roots, err := k.List(context.Background(), kairo.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range roots {
+		if root.RunID == "external-child" {
+			t.Fatal("the attached child was listed as a root")
+		}
+	}
+
+	for _, tc := range []struct {
+		name, parent string
+	}{
+		{name: "missing", parent: "no-parent"},
+		{name: "not-workflow", parent: wait.RunID},
+		{name: "self", parent: "bad-self"},
+	} {
+		id := "bad-" + tc.name
+		if tc.name == "self" {
+			id = tc.parent
+		}
+		if _, err := k.Submit(context.Background(), "quick", "x", kairo.WithID(id), kairo.Parent(tc.parent)); !errors.Is(err, kairo.ErrParentUnavailable) {
+			t.Fatalf("%s parent: %v", tc.name, err)
+		}
+		if _, err := k.Get(context.Background(), id); !errors.Is(err, kairo.ErrUnknownRun) {
+			t.Fatalf("%s child exists: %v", tc.name, err)
+		}
+	}
+	if _, err := kairo.Run[string](context.Background(), k, "quick", "done", kairo.WithID("finished-parent")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.Submit(context.Background(), "quick", "x", kairo.WithID("bad-finished"), kairo.Parent("finished-parent")); !errors.Is(err, kairo.ErrParentUnavailable) {
+		t.Fatalf("finished parent: %v", err)
+	}
+	if _, err := k.Submit(context.Background(), "hold", nil, kairo.WithID("other-parent")); err != nil {
+		t.Fatal(err)
+	}
+	waitChild("other-parent", "kairo.wait/go")
+	if _, err := k.Submit(context.Background(), "quick", "x", kairo.WithID("external-child"), kairo.Parent("other-parent")); !errors.Is(err, kairo.ErrParentUnavailable) {
+		t.Fatalf("changed parent: %v", err)
+	}
+
+	skew.Store(int64(2 * time.Hour))
+	if _, _, err := k.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.Get(context.Background(), "external-child"); err != nil {
+		t.Fatalf("finished child was removed before its parent: %v", err)
+	}
+	if err := k.Signal(context.Background(), "external-parent", "go", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kairo.Await[string](context.Background(), k, "external-parent"); err != nil {
+		t.Fatal(err)
+	}
+	skew.Store(int64(4 * time.Hour))
+	if _, _, err := k.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"external-parent", "external-child"} {
+		if _, err := k.Get(context.Background(), id); !errors.Is(err, kairo.ErrUnknownRun) {
+			t.Fatalf("%s remains after its tree expired: %v", id, err)
+		}
+	}
+
+	if _, err := k.Submit(context.Background(), "hold", nil, kairo.WithID("cancel-external-parent")); err != nil {
+		t.Fatal(err)
+	}
+	waitChild("cancel-external-parent", "kairo.wait/go")
+	if _, err := k.Submit(context.Background(), "child-wait", nil, kairo.WithID("cancel-external-child"), kairo.Parent("cancel-external-parent")); err != nil {
+		t.Fatal(err)
+	}
+	waitChild("cancel-external-child", "kairo.wait/child-go")
+	if err := k.Cancel(context.Background(), "cancel-external-parent"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := k.Get(context.Background(), "cancel-external-child"); err != nil || got.Status != "cancelled" {
+		t.Fatalf("cancelled external child %+v: %v", got, err)
+	}
+}
+
+// A child left by a stopped process is not recovered before its parent
+// replay reaches it. If the replay takes another path, the child is cancelled
+// before the parent records success or failure (ADR 0062).
+func testUnreachedChildIsCancelled(t *testing.T, open Opener) {
+	for _, fail := range []bool{false, true} {
+		name := "success"
+		if fail {
+			name = "failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			var skip atomic.Bool
+			id := "unreached-" + name
+			start := func() *kairo.Kairo {
+				k, err := kairo.Open(context.Background(), kairo.Options{
+					Store: open(), Mode: kairo.Suspend, Owner: "unreached-child-test-" + name,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				kairo.Action(k, "old", kairo.Unprotected, func(tc *kairo.TaskContext, _ any) (string, error) {
+					calls.Add(1)
+					<-tc.Done()
+					return "", tc.Err()
+				})
+				kairo.Workflow(k, "parent", func(ctx *kairo.Context, _ any) (string, error) {
+					if skip.Load() {
+						if fail {
+							return "", errors.New("guard failed")
+						}
+						return "new path", nil
+					}
+					return kairo.Call[string](ctx, "old", nil)
+				})
+				if err := k.Start(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				return k
+			}
+
+			k := start()
+			stopped := make(chan error, 1)
+			go func() {
+				_, err := kairo.Run[string](context.Background(), k, "parent", nil, kairo.WithID(id))
+				stopped <- err
+			}()
+			waitUntil(t, func() bool { return calls.Load() == 1 })
+			if err := k.Close(); err != nil {
+				t.Fatal(err)
+			}
+			<-stopped
+
+			skip.Store(true)
+			k = start() // the named process expires its earlier leases on open
+			defer k.Close()
+			if _, _, err := k.Tick(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("old child ran %d times", calls.Load())
+			}
+			children, err := k.Children(context.Background(), id)
+			if err != nil || len(children) != 1 || children[0].Status != "cancelled" {
+				t.Fatalf("children %+v: %v", children, err)
+			}
+			parent, err := k.Get(context.Background(), id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !parent.Finished() {
+				t.Fatalf("parent status %s", parent.Status)
+			}
+			out, runErr := kairo.Run[string](context.Background(), k, "parent", nil, kairo.WithID(id))
+			var workflowErr *kairo.WorkflowError
+			if fail && !errors.As(runErr, &workflowErr) {
+				t.Fatalf("failure result: %q %v", out, runErr)
+			}
+			if !fail && (runErr != nil || out != "new path") {
+				t.Fatalf("success result: %q %v", out, runErr)
+			}
+		})
 	}
 }
 
@@ -247,7 +582,14 @@ func testCancel(t *testing.T, open Opener) {
 		return nil, tc.Err()
 	})
 	kairo.Workflow(k, "long", func(ctx *kairo.Context, _ any) (any, error) { return kairo.Call[any](ctx, "slow", nil) })
+	kairo.Workflow(k, "quick", func(_ *kairo.Context, _ any) (string, error) { return "done", nil })
 	k.Start(context.Background())
+	if got, err := kairo.Run[string](context.Background(), k, "quick", nil, kairo.WithID("quick-1")); err != nil || got != "done" {
+		t.Fatalf("quick: %q %v", got, err)
+	}
+	if err := k.Cancel(context.Background(), "quick-1"); !errors.Is(err, kairo.ErrRunSettled) {
+		t.Fatalf("cancel completed: %v", err)
+	}
 	res := make(chan error, 1)
 	go func() {
 		_, err := kairo.Run[any](context.Background(), k, "long", nil, kairo.WithID("long-1"))
@@ -256,6 +598,9 @@ func testCancel(t *testing.T, open Opener) {
 	<-started
 	if err := k.Cancel(context.Background(), "long-1"); err != nil {
 		t.Fatal(err)
+	}
+	if err := k.Cancel(context.Background(), "long-1"); err != nil {
+		t.Fatalf("repeated cancel: %v", err)
 	}
 	if err := <-res; !errors.Is(err, kairo.ErrCancelled) {
 		t.Fatalf("%v", err)
@@ -392,7 +737,8 @@ func testServerlessAcrossInvocations(t *testing.T, open Opener) {
 		t.Fatal(err)
 	}
 	if runs.get("write") != 1 {
-		t.Fatalf("write %d", runs.get("write"))
+		kids, _ := k.Children(context.Background(), "sl-1")
+		t.Fatalf("write %d; children %+v", runs.get("write"), kids)
 	}
 	k.Close()
 
@@ -508,18 +854,24 @@ func testCancelReachesChildren(t *testing.T, open Opener) {
 	if err := k.Cancel(context.Background(), "tree-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-res; !errors.Is(err, kairo.ErrCancelled) {
-		t.Fatalf("%v", err)
-	}
-	<-stopped
 	kids, err := k.Children(context.Background(), "tree-1")
 	if err != nil || len(kids) != 1 {
 		t.Fatalf("children: %v %v", kids, err)
 	}
-	waitUntil(t, func() bool {
-		r, err := k.Get(context.Background(), kids[0].RunID)
-		return err == nil && r.Status == "cancelled"
-	})
+	grandkids, err := k.Children(context.Background(), kids[0].RunID)
+	if err != nil || len(grandkids) != 1 {
+		t.Fatalf("grandchildren: %v %v", grandkids, err)
+	}
+	for _, id := range []string{kids[0].RunID, grandkids[0].RunID} {
+		r, err := k.Get(context.Background(), id)
+		if err != nil || r.Status != "cancelled" {
+			t.Fatalf("%s after Cancel: %+v %v", id, r, err)
+		}
+	}
+	if err := <-res; !errors.Is(err, kairo.ErrCancelled) {
+		t.Fatalf("%v", err)
+	}
+	<-stopped
 }
 
 // A workflow that panics fails; the process goes on.
@@ -556,6 +908,79 @@ type deadStore struct {
 	dead atomic.Bool
 }
 
+type onceStore struct {
+	kairo.Store
+	fail atomic.Bool
+}
+
+var errStoreBusy = errors.New("store busy")
+
+func (s *onceStore) WithRun(ctx context.Context, id string, fn func(*kairo.RunRow) (*kairo.Changes, error)) error {
+	if s.fail.Swap(false) {
+		return errStoreBusy
+	}
+	return s.Store.WithRun(ctx, id, fn)
+}
+
+// A transient Store failure gives up only the current drive. The lease
+// expiry replays it, completed calls are reused, and no failure is recorded
+// (ADR 0063). The public marker has the same meaning.
+func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
+	s := &onceStore{Store: open()}
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: s, Lease: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	var first, second, attempts atomic.Int32
+	var armed atomic.Bool
+	kairo.Action(k, "first", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
+		first.Add(1)
+		return "one", nil
+	})
+	kairo.Action(k, "second", kairo.Unprotected, func(*kairo.TaskContext, any) (string, error) {
+		second.Add(1)
+		return "two", nil
+	})
+	kairo.Workflow(k, "store-retry", func(ctx *kairo.Context, _ any) (string, error) {
+		attempts.Add(1)
+		a, err := kairo.Call[string](ctx, "first", nil)
+		if err != nil {
+			return "", err
+		}
+		if armed.CompareAndSwap(false, true) {
+			s.fail.Store(true)
+		}
+		b, err := kairo.Call[string](ctx, "second", nil)
+		return a + b, err
+	})
+	var explicit atomic.Int32
+	kairo.Workflow(k, "explicit-retry", func(*kairo.Context, any) (string, error) {
+		if explicit.Add(1) == 1 {
+			return "", kairo.RetryWorkflow(errors.New("try later"))
+		}
+		return "ok", nil
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := kairo.Run[string](context.Background(), k, "store-retry", nil, kairo.WithID("store-retry-1")); err != nil || out != "onetwo" {
+		t.Fatalf("%q %v", out, err)
+	}
+	if first.Load() != 1 || second.Load() != 1 || attempts.Load() < 2 {
+		t.Fatalf("first %d second %d attempts %d", first.Load(), second.Load(), attempts.Load())
+	}
+	if info, err := k.Get(context.Background(), "store-retry-1"); err != nil || info.Status != "completed" {
+		t.Fatalf("run %+v: %v", info, err)
+	}
+	if out, err := kairo.Run[string](context.Background(), k, "explicit-retry", nil, kairo.WithID("explicit-retry-1")); err != nil || out != "ok" {
+		t.Fatalf("explicit: %q %v", out, err)
+	}
+	if explicit.Load() != 2 {
+		t.Fatalf("explicit attempts %d", explicit.Load())
+	}
+}
+
 var errDead = errors.New("the process stopped")
 
 func (d *deadStore) WithRun(ctx context.Context, id string, fn func(*kairo.RunRow) (*kairo.Changes, error)) error {
@@ -584,6 +1009,10 @@ func (d *deadStore) DueTimers(ctx context.Context, now int64, limit int) ([]kair
 		return nil, errDead
 	}
 	return d.Store.DueTimers(ctx, now, limit)
+}
+
+func (d *deadStore) Recoverable(ctx context.Context, run string, now int64) ([]kairo.LeaseRow, []kairo.TimerRow, error) {
+	return d.Store.Recoverable(ctx, run, now)
 }
 
 func (d *deadStore) EndDrive(ctx context.Context, run, owner string, token int32, now int64, resume bool) error {
@@ -727,6 +1156,232 @@ func testSignalBeforeTheWait(t *testing.T, open Opener) {
 	out, err := kairo.Await[[]string](context.Background(), k, "ahead-1")
 	if err != nil || !equalJSON(out, []string{"first", "second"}) {
 		t.Fatalf("%v %v", out, err)
+	}
+}
+
+func testSignalReceiptsAndOnlyIfWaiting(t *testing.T, open Opener) {
+	gates := map[string]chan struct{}{
+		"only":         make(chan struct{}),
+		"early":        make(chan struct{}),
+		"create":       make(chan struct{}),
+		"create-after": make(chan struct{}),
+		"legacy":       make(chan struct{}),
+	}
+	var gateStarted sync.Map
+	start := func(store kairo.Store) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: store, Lease: 50 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "signal-gate", kairo.Unprotected, func(_ *kairo.TaskContext, key string) (any, error) {
+			gateStarted.Store(key, true)
+			<-gates[key]
+			return nil, nil
+		})
+		kairo.Workflow(k, "signals", func(ctx *kairo.Context, key string) ([]string, error) {
+			a, err := kairo.WaitFor[string](ctx, "message")
+			if err != nil {
+				return nil, err
+			}
+			if _, err := kairo.Call[any](ctx, "signal-gate", key); err != nil {
+				return nil, err
+			}
+			b, err := kairo.WaitFor[string](ctx, "message")
+			return []string{a, b}, err
+		})
+		kairo.Workflow(k, "signal-race", func(ctx *kairo.Context, _ any) ([]string, error) {
+			if _, err := kairo.Call[any](ctx, "signal-gate", "create"); err != nil {
+				return nil, err
+			}
+			a, err := kairo.WaitFor[string](ctx, "message")
+			if err != nil {
+				return nil, err
+			}
+			if _, err := kairo.Call[any](ctx, "signal-gate", "create-after"); err != nil {
+				return nil, err
+			}
+			b, err := kairo.WaitFor[string](ctx, "message")
+			return []string{a, b}, err
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	a, b := start(open()), start(open())
+	defer a.Close()
+	defer b.Close()
+
+	waits := func(id string) []kairo.RunInfo {
+		children, err := a.Children(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []kairo.RunInfo
+		for _, child := range children {
+			if child.Plan == "kairo.wait/message" {
+				out = append(out, child)
+			}
+		}
+		return out
+	}
+	waiting := func(id string, n int) {
+		waitUntil(t, func() bool {
+			ws := waits(id)
+			return len(ws) == n && !ws[n-1].Finished()
+		})
+	}
+	type answer struct {
+		receipt kairo.SignalReceipt
+		payload string
+		err     error
+	}
+	sendTwo := func(id string, only bool) []answer {
+		ready := make(chan struct{})
+		answers := make(chan answer, 2)
+		for i, k := range []*kairo.Kairo{a, b} {
+			payload := fmt.Sprintf("answer-%d", i)
+			go func(k *kairo.Kairo, payload string) {
+				<-ready
+				var r kairo.SignalReceipt
+				var err error
+				if only {
+					r, err = k.SendSignal(context.Background(), id, "message", payload, kairo.OnlyIfWaiting())
+				} else {
+					r, err = k.SendSignal(context.Background(), id, "message", payload)
+				}
+				answers <- answer{receipt: r, payload: payload, err: err}
+			}(k, payload)
+		}
+		close(ready)
+		return []answer{<-answers, <-answers}
+	}
+
+	if _, err := a.Submit(context.Background(), "signals", "only", kairo.WithID("signal-only-1")); err != nil {
+		t.Fatal(err)
+	}
+	waiting("signal-only-1", 1)
+	only := sendTwo("signal-only-1", true)
+	var winner answer
+	notWaiting := 0
+	for _, got := range only {
+		if errors.Is(got.err, kairo.ErrNotWaiting) {
+			notWaiting++
+			continue
+		}
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		winner = got
+		if got.receipt.Index != 0 || got.receipt.Early {
+			t.Fatalf("only receipt %+v", got.receipt)
+		}
+	}
+	if notWaiting != 1 {
+		t.Fatalf("only-if-waiting losers %d: %+v", notWaiting, only)
+	}
+	waitUntil(t, func() bool { _, ok := gateStarted.Load("only"); return ok })
+	if got := len(waits("signal-only-1")); got != 1 {
+		t.Fatalf("only-if-waiting left %d waits", got)
+	}
+	close(gates["only"])
+	waiting("signal-only-1", 2)
+	second, err := a.SendSignal(context.Background(), "signal-only-1", "message", "second", kairo.OnlyIfWaiting())
+	if err != nil || second.Index != 1 || second.Early {
+		t.Fatalf("second %+v: %v", second, err)
+	}
+	if out, err := kairo.Await[[]string](context.Background(), a, "signal-only-1"); err != nil || len(out) != 2 || out[0] != winner.payload || out[1] != "second" {
+		t.Fatalf("only result %#v: %v", out, err)
+	}
+	if _, err := a.SendSignal(context.Background(), "signal-only-1", "message", "late", kairo.OnlyIfWaiting()); !errors.Is(err, kairo.ErrNotWaiting) {
+		t.Fatalf("finished workflow: %v", err)
+	}
+	if _, err := a.SendSignal(context.Background(), "no-such-workflow", "message", "x", kairo.OnlyIfWaiting()); err == nil || errors.Is(err, kairo.ErrNotWaiting) {
+		t.Fatalf("missing workflow: %v", err)
+	}
+
+	if _, err := a.Submit(context.Background(), "signals", "early", kairo.WithID("signal-early-1")); err != nil {
+		t.Fatal(err)
+	}
+	waiting("signal-early-1", 1)
+	early := sendTwo("signal-early-1", false)
+	sort.Slice(early, func(i, j int) bool { return early[i].receipt.Index < early[j].receipt.Index })
+	if early[0].err != nil || early[1].err != nil || early[0].receipt.Index != 0 || early[0].receipt.Early ||
+		early[1].receipt.Index != 1 || !early[1].receipt.Early || early[0].receipt.RunID == early[1].receipt.RunID {
+		t.Fatalf("early receipts %+v", early)
+	}
+	waitUntil(t, func() bool { _, ok := gateStarted.Load("early"); return ok })
+	close(gates["early"])
+	if out, err := kairo.Await[[]string](context.Background(), a, "signal-early-1"); err != nil || len(out) != 2 || out[0] != early[0].payload || out[1] != early[1].payload {
+		t.Fatalf("early result %#v: %v", out, err)
+	}
+
+	if _, err := a.Submit(context.Background(), "signal-race", nil, kairo.WithID("signal-create-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { _, ok := gateStarted.Load("create"); return ok })
+	race := make(chan answer, 1)
+	go func() {
+		r, err := b.SendSignal(context.Background(), "signal-create-1", "message", "raced", kairo.OnlyIfWaiting())
+		race <- answer{receipt: r, payload: "raced", err: err}
+	}()
+	close(gates["create"])
+	raced := <-race
+	first := "raced"
+	if errors.Is(raced.err, kairo.ErrNotWaiting) {
+		waiting("signal-create-1", 1)
+		if _, err := a.SendSignal(context.Background(), "signal-create-1", "message", "manual", kairo.OnlyIfWaiting()); err != nil {
+			t.Fatal(err)
+		}
+		first = "manual"
+	} else if raced.err != nil || raced.receipt.Index != 0 || raced.receipt.Early {
+		t.Fatalf("create race %+v", raced)
+	}
+	waitUntil(t, func() bool { _, ok := gateStarted.Load("create-after"); return ok })
+	if got := len(waits("signal-create-1")); got != 1 {
+		t.Fatalf("create race left %d waits", got)
+	}
+	close(gates["create-after"])
+	waiting("signal-create-1", 2)
+	if _, err := a.SendSignal(context.Background(), "signal-create-1", "message", "second", kairo.OnlyIfWaiting()); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := kairo.Await[[]string](context.Background(), a, "signal-create-1"); err != nil || !equalJSON(out, []string{first, "second"}) {
+		t.Fatalf("create race result %#v: %v", out, err)
+	}
+
+	if _, err := a.Submit(context.Background(), "signals", "legacy", kairo.WithID("signal-legacy-1")); err != nil {
+		t.Fatal(err)
+	}
+	waiting("signal-legacy-1", 1)
+	ready := make(chan struct{})
+	legacy := make(chan answer, 2)
+	for i, k := range []*kairo.Kairo{a, b} {
+		payload := fmt.Sprintf("legacy-%d", i)
+		go func(k *kairo.Kairo, payload string) {
+			<-ready
+			legacy <- answer{payload: payload, err: k.Signal(context.Background(), "signal-legacy-1", "message", payload)}
+		}(k, payload)
+	}
+	close(ready)
+	legacyAnswers := []answer{<-legacy, <-legacy}
+	for _, got := range legacyAnswers {
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+	}
+	waitUntil(t, func() bool { _, ok := gateStarted.Load("legacy"); return ok })
+	if got := len(waits("signal-legacy-1")); got != 2 {
+		t.Fatalf("legacy signal made %d waits", got)
+	}
+	close(gates["legacy"])
+	out, err := kairo.Await[[]string](context.Background(), a, "signal-legacy-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(out)
+	if !equalJSON(out, []string{"legacy-0", "legacy-1"}) {
+		t.Fatalf("legacy result %#v", out)
 	}
 }
 

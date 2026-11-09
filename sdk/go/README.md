@@ -126,22 +126,27 @@ kairo.Workflow(k, "refund", refundV2, kairo.WorkflowVersion("2"))               
 
 A change to an action's settings (timeout, retries, backoff) applies to its calls already under way. One exception: while a real call's attempt is out, the call does not go on under settings that are no longer real (it could run twice). The tick reports it as `run.stuck` (`kairo.ErrEffectWeakened`); restore the action, or settle the call with `k.Resolve`, `k.ResolveFailed` or `k.Cancel`.
 
-A call that fails or is cancelled returns a `*kairo.CallError` (`RunID`, `Action`, `Status`: `failed` or `cancelled`, `Message`); `errors.Is(err, kairo.ErrCancelled)` holds for a cancelled one. A workflow that fails returns a `*kairo.WorkflowError` (`ID`, `Message`; `Err` is the error it failed with, when it failed in this process).
+A call that fails or is cancelled returns a `*kairo.CallError` (`RunID`, `Action`, `Status`: `failed` or `cancelled`, `Message`); `errors.Is(err, kairo.ErrCancelled)` holds for a cancelled one. A workflow that fails returns a `*kairo.WorkflowError` (`ID`, `Message`; `Err` is the error it failed with, when it failed in this process). If completion and cancellation race, `Run` and `Child` return whichever durable outcome was recorded first, both live and after a restart.
+
+A Store operation that fails while a workflow is being driven does not permanently fail that workflow. The current drive gives up without recording an outcome and the embedded runtime replays it after the drive lease expires; completed calls are read from their records. Return `kairo.RetryWorkflow(err)` to request the same behavior for another transient application error. This is separate from `kairo.Retryable`, which retries one action attempt. In suspend mode it returns `kairo.ErrSuspended`; with kairod it returns `kairo.ErrStopped`, and the same run ID resumes it.
+
+With either backend, calls and child workflows belong to their parent's tree. A workflow started outside another workflow can join its unfinished tree with `kairo.Parent(parentID)`; parent validation and creation are atomic. An expired drive lease or a kairod restart alone does not replay such an externally attached workflow: submit the same id again to reach it. After a restart, an ordinary child is recovered only when its parent's replay reaches that same call. Before a parent records success or failure, or `Cancel` returns, every unfinished descendant is durably cancelled. The embedded runtime removes a finished tree together; kairod retains each finished child for its idempotency period.
 
 ### Running
 
 | | |
 |---|---|
-| `kairo.Run[O](ctx, k, name, in, kairo.WithID(id), kairo.WithMeta(m))` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key. In a resident process the workflow is driven in the background: a `ctx` that ends returns `kairo.ErrStopped`, and the workflow goes on |
-| `k.Submit(ctx, name, in, ...)` | Starts workflow `id` and returns its id once the start is durable, without waiting |
+| `kairo.Run[O](ctx, k, name, in, kairo.WithID(id), kairo.WithMeta(m), kairo.Parent(parentID))` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key. `Parent` atomically joins an unfinished workflow's tree (`kairo.ErrParentUnavailable`). In a resident process the workflow is driven in the background: a `ctx` that ends returns `kairo.ErrStopped`, and the workflow goes on |
+| `k.Submit(ctx, name, in, ...)` | Starts workflow `id` and returns its id once the start is durable, without waiting. It also accepts `kairo.Parent(parentID)` |
 | `kairo.Await[O](ctx, k, id)` | The result of workflow `id`, from any process, once it has finished |
 | `k.Signal(ctx, id, name, payload)` | Delivers a signal to the first wait for it; a wait the workflow has not reached yet receives it when it does |
-| `k.Cancel(ctx, id)` | Cancels the workflow, the workflows it made and the calls they wait for |
-| `k.Resolve(ctx, callID, output)`, `k.ResolveFailed(ctx, callID, msg)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above |
+| `k.SendSignal(ctx, id, name, payload, kairo.OnlyIfWaiting())` | Atomically delivers a signal and returns its wait run id, zero-based occurrence and whether it was early. Without `OnlyIfWaiting`, it may make the next wait early; with it, no current wait returns `kairo.ErrNotWaiting`. The embedded runtime only |
+| `k.Cancel(ctx, id)` | Cancels the workflow, the workflows it made and the calls they wait for, and waits for the durable outcome. Repeated cancellation succeeds; a workflow already completed or failed returns `kairo.ErrRunSettled` |
+| `k.Resolve(ctx, callID, output)`, `k.ResolveFailed(ctx, callID, msg)` | Settles a call stopped for review (a real step whose outcome is unknown), over kairod or embedded. Settling one stuck because its effect was weakened is embedded only |
 | `k.List(ctx, kairo.Filter{Workflow, Status, Since, Until, After, Limit})` | Workflows (not child workflows or calls), oldest first, with `Meta`, `Created`, `Updated` |
 | `k.Get(ctx, id)`, `k.Children(ctx, id)` | A run, and the runs it made |
 
-To stop a resident process without leaving a real step to review, `k.Drain(ctx)` before `k.Close()`: no new step starts here (workflows stop at their next call, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. `Close` alone is a process that stops.
+To stop a resident process without leaving a real step to review, `k.Drain(ctx)` before `k.Close()`: no new step starts here (workflows stop at their next call, including while a child run's durable start is still unconfirmed, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. With kairod, its worker first retires its credit and waits until kairod accepts every in-flight result. An older kairod that did not negotiate this capability makes `Drain` return an error matching `protocol.ErrDrainUnsupported`; use `Close` or another shutdown policy. Cancelling a `Run` context also stops an unconfirmed start without recording workflow success or failure. When kairod answers `429`, the SDK honors `Retry-After` and retries that definitely-not-started run with the same RunID; unconfirmed-start and overload retries use stable bounded jitter. `Close` alone is a process that stops.
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires (`Options.Lease`, 30s by default); while the lease lives, a `Run` elsewhere waits instead of running the workflow twice. `Close` hands its leases over at once.
 
@@ -236,7 +241,7 @@ If you can run a resident process, [kairod](https://github.com/r-hashi01/kairo#k
 k, err := kairo.Connect(ctx, "http://127.0.0.1:8420", "/var/lib/kairo/worker.sock", kairo.Options{})
 ```
 
-The workflow code is the same: the runs live in kairod (over its HTTP API), and this process runs its actions' steps (over kairod's worker socket) and drives its workflows. There are no drive leases: a workflow is driven where it is run. Suspend mode, `List`, `Children`, `Resolve`, `Tick` and signals sent before their wait need the embedded runtime (`kairo.ErrNeedsEmbedded`).
+The workflow code is the same: the runs live in kairod (over its HTTP API), and this process runs its actions' steps (over kairod's worker socket) and drives its workflows under fenced leases. `List`, `Children`, review resolution, suspend mode and `Tick` work through kairod. In suspend mode a child call is allowed to become terminal or quiescent before the invocation returns, and `Wake` receives its earliest timer or lease deadline. Signals sent before their wait still need the embedded runtime (`kairo.ErrNeedsEmbedded`).
 
 ## License
 

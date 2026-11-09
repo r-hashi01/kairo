@@ -3,7 +3,8 @@
 // Every message is a 4-byte big-endian length, a 1-byte type and a JSON
 // body; the length counts the type byte and the body.
 //
-//   worker  -> runtime  Hello  {"worker": "ts-1", "actions": [...], "credit": 8, "token": "..."}
+//   worker  -> runtime  Hello  {"worker": "ts-1", "actions": [...], "credit": 8, "capabilities": ["graceful-drain-v1"], "token": "..."}
+//   runtime -> worker   Hello  {"capabilities": ["graceful-drain-v1"]}
 //   runtime -> worker   Task   {task}
 //   worker  -> runtime  Chunk  {"seq": 17, "data": "<base64>"}
 //   worker  -> runtime  Result {"seq": 17, "output": {...}}   (grants 1 credit)
@@ -13,6 +14,7 @@
 //   runtime -> worker   RunEnd {"run_id": "r1"}               (ADR 0044, if asked for)
 
 export const MAX_FRAME = 64 << 20;
+export const CAPABILITY_GRACEFUL_DRAIN = 'graceful-drain-v1';
 
 export const MsgType = {
 	Hello: 1,
