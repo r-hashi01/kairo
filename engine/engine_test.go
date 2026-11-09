@@ -871,6 +871,63 @@ func TestSubmitNotAcceptedWhileQueued(t *testing.T) {
 	}
 }
 
+func TestDurableStartAdmissionRejectsBeforeCreatingRun(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e := newEngine(t, Config{
+		Shards:      1,
+		DefaultTier: TierMemory,
+		Admission:   sched.AdmissionConfig{MaxStarting: 1},
+		Sinks: func(tier Tier, _ int) (wal.Sink, error) {
+			if tier != TierMemory {
+				return nil, nil
+			}
+			return &wal.MemSink{Delay: func() {
+				once.Do(func() { close(entered) })
+				<-release
+			}}, nil
+		},
+	})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	e.Start()
+
+	errs := make(chan error, 5)
+	go func() {
+		_, err := e.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "A", RunID: "start-0"})
+		errs <- err
+	}()
+	<-entered
+	for i := 1; i <= 4; i++ {
+		i := i
+		go func() {
+			_, err := e.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: string(rune('A' + i%2)), RunID: fmt.Sprintf("start-%d", i)})
+			errs <- err
+		}()
+	}
+	waitFor(t, func() bool {
+		st := e.Stats().Starts
+		return len(st) == 1 && st[0].Inflight == 1 && st[0].Queued == 4
+	})
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "w", Tenant: "C", RunID: "rejected"}); !errors.Is(err, sched.ErrOverloaded) {
+		t.Fatalf("sixth start: %v, want ErrOverloaded", err)
+	}
+	if _, err := e.Get(context.Background(), "rejected"); !errors.Is(err, ErrUnknownRun) {
+		t.Fatalf("rejected run exists: %v", err)
+	}
+	close(release)
+	for range 5 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		st := e.Stats().Starts[0]
+		return st.Inflight == 0 && st.Queued == 0 && st.Rejected == 1
+	})
+}
+
 // GetInput gives a run's input back as it was submitted, loading an
 // evicted run for it; Get does not carry it (ADR 0060).
 func TestGetInput(t *testing.T) {

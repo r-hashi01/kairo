@@ -11,7 +11,7 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
 import { Embedded, keepFinished } from './embedded.ts';
-import { SQLiteStore } from './store.ts';
+import { ParentUnavailableError, SQLiteStore } from './store.ts';
 import { Kairo } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
@@ -49,6 +49,99 @@ async function rows(path: string, prefix: string): Promise<{ run: number; event:
 }
 
 describe('removing finished runs (ADR 0054)', { skip: !hasGo }, () => {
+	test('an external child is replayed by re-submission, not an expired drive lease (ADR 0065)', async () => {
+		const path = join(dir, 'external-recovery.db');
+		let replays = 0;
+		const start = async (owner: string, mode: 'wait' | 'suspend') => {
+			const backend = await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, owner, leaseMs: 50 });
+			const k = new Kairo({ backend, mode });
+			k.workflow('hold', async (ctx) => ctx.waitFor<string>('parent-go'));
+			k.workflow('external-replay', async (ctx) => {
+				replays++;
+				return ctx.waitFor<string>('child-go');
+			});
+			await k.start();
+			return k;
+		};
+		let k = await start('external-recovery-1', 'wait');
+		await k.submit('hold', null, { id: 'recovery-parent' });
+		await k.submit('external-replay', null, { id: 'recovery-child', parent: 'recovery-parent' });
+		for (let i = 0; replays !== 1 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		assert.equal(replays, 1);
+		await k.close();
+
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		k = await start('external-recovery-2', 'suspend');
+		await k.tick();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(replays, 1, 'the expired drive lease did not replay the external child');
+		await k.submit('external-replay', null, { id: 'recovery-child' });
+		assert.equal(replays, 2, 're-submission is the new reach');
+		assert.equal((await k.backend.get('recovery-child')).parent, 'recovery-parent');
+		await k.cancel('recovery-parent');
+		await k.close();
+	});
+
+	test('an externally started workflow joins an unfinished parent tree (ADR 0065)', async () => {
+		const path = join(dir, 'external-parent.db');
+		let skew = 0;
+		const backend = await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, now: () => Date.now() + skew, keepFinished: HOUR });
+		const k = new Kairo({ backend, mode: 'suspend' });
+		k.workflow('hold', async (ctx) => ctx.waitFor<string>('go'));
+		k.workflow('quick', async (_ctx, input: string) => input);
+		k.workflow('child-wait', async (ctx) => ctx.waitFor<string>('child-go'));
+		await k.start();
+		await k.submit('hold', null, { id: 'external-parent' });
+		await k.submit('quick', 'kept', { id: 'external-child', parent: 'external-parent' });
+		assert.equal(await k.result('external-child'), 'kept');
+		assert.equal((await backend.get('external-child')).parent, 'external-parent');
+		await k.submit('quick', 'ignored', { id: 'external-child' });
+		assert.ok(!(await k.list()).some((r) => r.run_id === 'external-child'));
+
+		const sqlite = 'node:sqlite';
+		const { DatabaseSync } = (await import(sqlite)) as any;
+		const db = new DatabaseSync(path, { readOnly: true });
+		const wait = db.prepare("SELECT id FROM kairo_run WHERE parent = ? AND plan = 'kairo.wait/go'").get('external-parent').id as string;
+		db.close();
+		for (const [id, parent] of [['bad-missing', 'no-parent'], ['bad-call', wait], ['bad-self', 'bad-self']] as const) {
+			await assert.rejects(k.submit('quick', 'x', { id, parent }), ParentUnavailableError);
+			await assert.rejects(backend.get(id), /no run/);
+		}
+		await k.submit('quick', 'done', { id: 'finished-parent' });
+		await assert.rejects(k.submit('quick', 'x', { id: 'bad-finished', parent: 'finished-parent' }), ParentUnavailableError);
+		await k.submit('hold', null, { id: 'other-parent' });
+		await assert.rejects(k.submit('quick', 'x', { id: 'external-child', parent: 'other-parent' }), ParentUnavailableError);
+		for (let i = 0; i < 5; i++) {
+			const parent = `settlement-parent-${i}`;
+			const child = `settlement-child-${i}`;
+			await k.submit('hold', null, { id: parent });
+			const raced = await Promise.allSettled([
+				k.signal(parent, 'go', 'done'),
+				k.submit('quick', 'x', { id: child, parent }),
+			]);
+			for (const result of raced) if (result.status === 'rejected') assert.ok(result.reason instanceof ParentUnavailableError, `${result.reason}`);
+			assert.equal(await k.run('hold', null, { id: parent }), 'done');
+			const row = await backend.get(child).catch(() => undefined);
+			assert.ok(!row || ['completed', 'failed', 'cancelled'].includes(row.status), `unfinished child: ${JSON.stringify(row)}`);
+		}
+
+		skew = 2 * HOUR;
+		await k.tick();
+		assert.equal((await backend.get('external-child')).parent, 'external-parent', 'the finished child stays with its unfinished parent');
+		await k.signal('external-parent', 'go', 'done');
+		assert.equal(await k.run('hold', null, { id: 'external-parent' }), 'done');
+		skew = 4 * HOUR;
+		await k.tick();
+		await assert.rejects(backend.get('external-parent'), /no run/);
+		await assert.rejects(backend.get('external-child'), /no run/);
+
+		await k.submit('hold', null, { id: 'cancel-external-parent' });
+		await k.submit('child-wait', null, { id: 'cancel-external-child', parent: 'cancel-external-parent' });
+		await k.cancel('cancel-external-parent');
+		assert.equal((await backend.get('cancel-external-child')).status, 'cancelled');
+		await k.close();
+	});
+
 	test('a finished workflow goes with its calls once kept long enough; a removed id starts anew', async () => {
 		const path = join(dir, 'tree.db');
 		let skew = 0;

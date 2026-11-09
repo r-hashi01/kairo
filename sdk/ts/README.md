@@ -84,21 +84,27 @@ k.workflow('refund', refundV2, { version: '2' });                 // new runs; o
 
 A change to an action's settings (timeout, retries, backoff) applies to its calls already under way. One exception: while a real call's attempt is out, the call does not go on under settings that are no longer real (it could run twice). The tick reports it as `run.stuck`; restore the action, or settle the call with `k.resolve`, `k.resolveFailed` or `k.cancel`.
 
-A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status`: `'failed'` or `'cancelled'`, `error`: the failure as recorded); a cancelled one has a `CancelledError` as its `cause`. A workflow whose function throws fails: `run` and `result` throw `WorkflowError` (`id`, `error`; `cause` is what the function threw, when it failed in this process).
+A call that fails or is cancelled throws `CallError` (`runId`, `action`, `status`: `'failed'` or `'cancelled'`, `error`: the failure as recorded); a cancelled one has a `CancelledError` as its `cause`. A workflow whose function throws fails: `run` and `result` throw `WorkflowError` (`id`, `error`; `cause` is what the function threw, when it failed in this process). If completion and cancellation race, `run` and child workflows return whichever durable outcome was recorded first, both live and after a restart.
+
+A Store operation that fails while a workflow is being driven does not permanently fail that workflow. The current drive gives up without recording an outcome and the embedded runtime replays it after the drive lease expires; completed calls are read from their records. Throw `WorkflowRetryError` to request the same behavior for another transient application error. This is separate from `RetryableError`, which retries one action attempt. Suspend mode throws `Suspended`; with kairod it throws `StoppedError`, and the same run ID resumes it.
+
+With either backend, calls and child workflows belong to their parent's tree. A workflow started outside another workflow can join its unfinished tree with `{ parent }`; parent validation and creation are atomic. An expired drive lease or a kairod restart alone does not replay such an externally attached workflow: submit the same id again to reach it. After a restart, an ordinary child is recovered only when its parent's replay reaches that same call. Before a parent records success or failure, or `cancel` returns, every unfinished descendant is durably cancelled. The embedded runtime removes a finished tree together; kairod retains each finished child for its idempotency period.
 
 ### Running
 
 | | |
 |---|---|
-| `k.run(name, input, { id, meta?, signal? })` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key. An aborted `signal` throws `StoppedError`; the workflow goes on |
-| `k.submit(name, input, { id, meta? })` | Starts workflow `id` and returns its id once the start is durable, without waiting |
+| `k.run(name, input, { id, meta?, signal?, parent? })` | Starts workflow `id`, or resumes it, and returns its result. The id is an idempotency key. `parent` atomically joins an unfinished workflow's tree (`ParentUnavailableError`). An aborted `signal` throws `StoppedError`; the workflow goes on |
+| `k.submit(name, input, { id, meta?, parent? })` | Starts workflow `id` and returns its id once the start is durable, without waiting |
 | `k.result(id, { signal? })` | The result of workflow `id`, from any process, once it has finished |
 | `k.signal(id, name, payload)` | Delivers a signal to the first wait for it; a wait the workflow has not reached yet receives it when it does |
-| `k.cancel(id)` | Cancels the workflow and the calls it waits for |
-| `k.resolve(callId, output)`, `k.resolveFailed(callId, message)` | Settles a call stopped for review (a real step whose outcome is unknown), or one stuck as above: it took effect with `output`, or it failed. The embedded runtime only |
+| `k.sendSignal(id, name, payload, { onlyIfWaiting? })` | Atomically delivers a signal and returns its wait `runId`, zero-based `index` and whether it was `early`. By default it may make the next wait early; `onlyIfWaiting` throws `NotWaitingError` when no current wait exists. The embedded runtime only |
+| `k.cancel(id)` | Cancels the workflow and the calls it waits for, and waits for the durable outcome. Repeated cancellation succeeds; a workflow already completed or failed throws `RunSettledError` |
+| `k.resolve(callId, output)`, `k.resolveFailed(callId, message)` | Settles a call stopped for review (a real step whose outcome is unknown), over kairod or embedded: it took effect with `output`, or it failed. Settling one stuck because its effect was weakened is embedded only |
+| `k.children(id)` | The runs made directly by `id`, over kairod or embedded |
 | `k.list({ workflow?, status?, since?, until?, after?, limit? })` | Workflows (not child workflows or calls), oldest first, with `meta`, `createdAt` and `updatedAt` |
 
-To stop a resident process without leaving a real step to review, `await k.drain({ signal? })` before `k.close()`: no new step starts here (workflows stop at their next call, to go on where they are driven next), and the steps already running finish and have their outcomes recorded. An aborted `signal` throws `StoppedError`. `close` alone is a process that stops. The embedded runtime only.
+To stop a resident process without leaving a real step to review, `await k.drain({ signal? })` before `k.close()`: no new step starts here (workflows stop at their next call, including while a child run's durable start is still unconfirmed, to go on where it is driven next), and the steps already running finish and have their outcomes recorded. With kairod, its worker first retires its credit and waits until kairod accepts every in-flight result. An older kairod that did not negotiate this capability throws `DrainUnsupportedError`; use `close` or another shutdown policy. An aborted `signal` throws `StoppedError`; the same signal passed to `run` also stops an unconfirmed start without recording workflow success or failure. When kairod answers `429`, the SDK honors `Retry-After` and retries that definitely-not-started run with the same RunID; unconfirmed-start and overload retries use stable bounded jitter. `close` alone is a process that stops.
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
 
@@ -200,6 +206,8 @@ const k = new Kairo({ url: 'http://127.0.0.1:8420', worker: '/var/lib/kairo/work
 ```
 
 The workflow code is the same.
+
+`mode: 'suspend'` and `k.tick()` also work with kairod. Drivers use fenced leases; before a suspended invocation returns, its current child call is terminal or quiescent. `wake` receives the earliest timer or lease deadline, so the host schedules one future tick instead of polling. Sending a signal before its wait exists remains an embedded-runtime feature.
 
 ## License
 

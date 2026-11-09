@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { test } from 'node:test';
 
-import { FrameReader, MsgType, encodeFrame, resultBody } from './protocol.ts';
-import { Worker, iterationOf, nodeOf } from './worker.ts';
+import { CAPABILITY_GRACEFUL_DRAIN, FrameReader, MsgType, encodeFrame, resultBody } from './protocol.ts';
+import { DrainUnsupportedError, Worker, iterationOf, nodeOf } from './worker.ts';
 
 // A fake runtime: hands out tasks, records what the worker says.
 function runtime(onFrame: (type: number, body: any, send: (t: number, b: unknown) => void) => void) {
@@ -53,7 +53,7 @@ test('hello, tasks, results, chunks and cancellation', async () => {
 	await worker.run({ host: '127.0.0.1', port: rt.port });
 	rt.close();
 
-	assert.deepEqual(seen[0], [MsgType.Hello, { worker: 'ts-1', actions: ['echo', 'slow'], credit: 4, token: 'secret' }]);
+	assert.deepEqual(seen[0], [MsgType.Hello, { worker: 'ts-1', actions: ['echo', 'slow'], credit: 4, token: 'secret', capabilities: [CAPABILITY_GRACEFUL_DRAIN] }]);
 	const results = new Map(seen.filter(([t]) => t === MsgType.Result).map(([, b]) => [b.seq, b]));
 	assert.deepEqual(results.get(1), { seq: 1, output: { echo: { x: 1 }, node: 'a', round: 0 } });
 	assert.deepEqual(results.get(2), { seq: 2, error: 'boom' });
@@ -93,8 +93,63 @@ test('run ends, asked for in the hello', async () => {
 	});
 	await worker.run({ host: '127.0.0.1', port: rt.port });
 	rt.close();
-	assert.deepEqual(seen[0], [MsgType.Hello, { worker: 'ts-2', actions: ['echo'], credit: 1, run_end: true }]);
+	assert.deepEqual(seen[0], [MsgType.Hello, { worker: 'ts-2', actions: ['echo'], credit: 1, run_end: true, capabilities: [CAPABILITY_GRACEFUL_DRAIN] }]);
 	assert.deepEqual(ended, ['r1']);
+});
+
+test('drain waits until running results are accepted', async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let accept!: () => void;
+	const accepted = new Promise<void>((resolve) => {
+		accept = resolve;
+	});
+	const rt = await runtime((type, body, send) => {
+		if (type === MsgType.Hello) {
+			send(MsgType.Hello, { capabilities: [CAPABILITY_GRACEFUL_DRAIN] });
+			send(MsgType.Task, { seq: 4, action: 'echo' });
+		}
+		if (type === MsgType.Credit && body.n === -1) send(MsgType.Credit, { n: 0 });
+		if (type === MsgType.Result) {
+			assert.equal(body.output, 'done');
+			void accepted.then(() => send(MsgType.Credit, { n: 1 }));
+		}
+	});
+	const worker = new Worker({ name: 'ts-drain', actions: ['echo'], concurrency: 1, handler: async () => (await held, { output: 'done' }) });
+	const running = worker.run({ host: '127.0.0.1', port: rt.port });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	let done = false;
+	const draining = worker.drain().then(() => {
+		done = true;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(done, false);
+	release();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(done, false);
+	accept();
+	await draining;
+	worker.stop();
+	await running;
+	rt.close();
+});
+
+test('drain fails promptly when the runtime did not negotiate it', async () => {
+	const seen: Array<[number, any]> = [];
+	const rt = await runtime((type, body, send) => {
+		seen.push([type, body]);
+		if (type === MsgType.Hello) send(MsgType.Cancel, { seq: 5 });
+	});
+	const worker = new Worker({ name: 'old-runtime', actions: ['echo'], concurrency: 1, handler: async () => ({ output: null }) });
+	const running = worker.run({ host: '127.0.0.1', port: rt.port });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	await assert.rejects(worker.drain(), DrainUnsupportedError);
+	assert.equal(seen.some(([type, body]) => type === MsgType.Credit && body.n < 0), false);
+	worker.stop();
+	await running;
+	rt.close();
 });
 
 test('a result that waits', () => {

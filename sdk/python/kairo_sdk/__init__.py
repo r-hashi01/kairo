@@ -26,16 +26,19 @@ from .observe import (
     Observation,
     Observer,
 )
-from .protocol import Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
-from .worker import Task, TaskContext, Worker
-from .store import PostgresStore, SQLiteStore
+from .protocol import CAPABILITY_GRACEFUL_DRAIN, Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
+from .worker import DrainUnsupportedError, Task, TaskContext, Worker
+from .store import ParentUnavailableError, PostgresStore, SQLiteStore, WorkflowRetryError
 from ._version import __version__
 from .workflow import (
     CallError,
     Cancelled,
     Context,
     Kairo,
+    NotWaitingError,
     ResultLostError,
+    RunSettledError,
+    SignalReceipt,
     RetryableError,
     StoppedError,
     Suspended,
@@ -56,6 +59,7 @@ __all__ = [
     "Cancel",
     "CallError",
     "Cancelled",
+    "CAPABILITY_GRACEFUL_DRAIN",
     "Client",
     "Context",
     "Kairo",
@@ -67,6 +71,7 @@ __all__ = [
     "RUN_STUCK",
     "EFFECT_WEAKENED",
     "EffectWeakenedError",
+    "DrainUnsupportedError",
     "STEP_FAILED",
     "STEP_FINISHED",
     "STEP_OK",
@@ -76,11 +81,16 @@ __all__ = [
     "STEP_UNKNOWN",
     "STEP_WAITING",
     "ResultLostError",
+    "RunSettledError",
+    "NotWaitingError",
+    "ParentUnavailableError",
+    "SignalReceipt",
     "RetryableError",
     "StoppedError",
     "TimedOutError",
     "UnknownOutcomeError",
     "WorkflowError",
+    "WorkflowRetryError",
     "Chunk",
     "Credit",
     "Hello",

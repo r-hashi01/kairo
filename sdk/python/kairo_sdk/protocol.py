@@ -3,7 +3,8 @@
 Every message is a 4-byte big-endian length, a 1-byte type and a JSON body;
 the length counts the type byte and the body.
 
-    worker  -> runtime  Hello  {"worker": "py-1", "actions": [...], "credit": 8, "token": "..."}
+    worker  -> runtime  Hello  {"worker": "py-1", "actions": [...], "credit": 8, "capabilities": ["graceful-drain-v1"], "token": "..."}
+    runtime -> worker   Hello  {"capabilities": ["graceful-drain-v1"]}
     runtime -> worker   Task   {task}
     worker  -> runtime  Chunk  {"seq": 17, "data": "<base64>"}
     worker  -> runtime  Result {"seq": 17, "output": {...}}   (grants 1 credit)
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 MAX_FRAME = 64 << 20
+CAPABILITY_GRACEFUL_DRAIN = "graceful-drain-v1"
 
 
 class MsgType(enum.IntEnum):
@@ -42,11 +44,14 @@ class Hello:
     actions: list[str]
     credit: int
     token: str = ""  # the runtime's worker token, if it has one (ADR 0037)
+    capabilities: list[str] = field(default_factory=list)
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"worker": self.worker, "actions": self.actions, "credit": self.credit}
         if self.token:
             b["token"] = self.token
+        if self.capabilities:
+            b["capabilities"] = self.capabilities
         return b
 
 

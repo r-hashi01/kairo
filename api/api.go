@@ -36,13 +36,20 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/nodes", a.postNodes)
 	mux.HandleFunc("POST /v1/plans", a.postPlan)
 	mux.HandleFunc("POST /v1/runs", a.postRun)
+	mux.HandleFunc("GET /v1/runs", a.listRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", a.getRun)
 	mux.HandleFunc("GET /v1/runs/{id}/wait", a.waitRun)
+	mux.HandleFunc("GET /v1/runs/{id}/quiescent", a.quiescentRun)
+	mux.HandleFunc("GET /v1/runs/{id}/children", a.children)
 	mux.HandleFunc("GET /v1/runs/{id}/stream", a.streamRun)
 	mux.HandleFunc("POST /v1/runs/{id}/signals/{name}", a.signal)
 	mux.HandleFunc("POST /v1/runs/{id}/steps/{act}/signals/{name}", a.signal)
 	mux.HandleFunc("POST /v1/runs/{id}/resolve", a.resolve)
+	mux.HandleFunc("POST /v1/runs/{id}/finish", a.finish)
 	mux.HandleFunc("POST /v1/runs/{id}/cancel", a.cancel)
+	mux.HandleFunc("POST /v1/workflow-drives/claim", a.claimWorkflow)
+	mux.HandleFunc("POST /v1/workflow-drives/{id}/renew", a.renewWorkflow)
+	mux.HandleFunc("POST /v1/workflow-drives/{id}/release", a.releaseWorkflow)
 	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) { reply(w, 200, a.E.Stats()) })
 	return mux
 }
@@ -153,6 +160,7 @@ func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 	res, err := a.E.Submit(ctx, req)
 	switch {
 	case errors.Is(err, sched.ErrOverloaded):
+		w.Header().Set("Retry-After", "1")
 		fail(w, 429, err)
 	case errors.Is(err, engine.ErrNotAccepted):
 		w.Header().Set("Retry-After", "1")
@@ -161,6 +169,8 @@ func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 		reply(w, 504, map[string]string{"error": err.Error(), "run_id": res.RunID})
 	case errors.Is(err, engine.ErrUnknownPlan):
 		fail(w, 404, err)
+	case errors.Is(err, engine.ErrParentUnavailable):
+		fail(w, 409, err)
 	case err != nil:
 		fail(w, 400, err)
 	case res.Existing:
@@ -168,6 +178,43 @@ func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 	default:
 		reply(w, 201, res)
 	}
+}
+
+func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := engine.ListFilter{Workflow: q.Get("workflow"), Status: q.Get("status"), After: q.Get("after")}
+	parseTime := func(name string) (time.Time, error) {
+		raw := q.Get(name)
+		if raw == "" {
+			return time.Time{}, nil
+		}
+		ms, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("%s must be unix milliseconds: %w", name, err)
+		}
+		return time.UnixMilli(ms), nil
+	}
+	var err error
+	if f.Since, err = parseTime("since"); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if f.Until, err = parseTime("until"); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	if raw := q.Get("limit"); raw != "" {
+		if f.Limit, err = strconv.Atoi(raw); err != nil {
+			fail(w, 400, fmt.Errorf("limit must be an integer: %w", err))
+			return
+		}
+	}
+	rows, err := a.E.List(r.Context(), f)
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	reply(w, 200, rows)
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
@@ -215,6 +262,232 @@ func (a *API) waitRun(w http.ResponseWriter, r *http.Request) {
 		ri.Output = out
 	}
 	reply(w, 200, ri)
+}
+
+func requestTimeout(r *http.Request, fallback time.Duration) time.Duration {
+	if raw := r.URL.Query().Get("timeout"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
+func (a *API) quiescentRun(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout(r, 30*time.Second))
+	defer cancel()
+	ri, err := a.E.WaitQuiescent(ctx, r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			if cur, getErr := a.E.Get(r.Context(), r.PathValue("id")); getErr == nil {
+				reply(w, http.StatusAccepted, cur)
+				return
+			}
+		}
+		fail(w, http.StatusNotFound, err)
+		return
+	}
+	if out, err := a.E.ResolveInput(ri.Output); err == nil {
+		ri.Output = out
+	}
+	reply(w, http.StatusOK, ri)
+}
+
+type driveClaimRequest struct {
+	RunID     string              `json:"run_id"`
+	Owner     string              `json:"owner"`
+	LeaseMS   int64               `json:"lease_ms"`
+	TimeoutMS int64               `json:"timeout_ms"`
+	Limit     int                 `json:"limit"`
+	Workflows map[string][]string `json:"workflows"`
+}
+
+type driveClaimResponse struct {
+	Claim  *engine.DriveClaim `json:"claim,omitempty"`
+	NextAt int64              `json:"next_at,omitempty"`
+}
+
+func workflowVersion(input json.RawMessage) (string, string, bool) {
+	var in struct {
+		Workflow string `json:"workflow"`
+		Version  string `json:"version"`
+	}
+	if json.Unmarshal(input, &in) != nil || in.Workflow == "" {
+		return "", "", false
+	}
+	return in.Workflow, in.Version, true
+}
+
+func driveMatch(req driveClaimRequest, ri engine.RunInfo) bool {
+	if req.RunID != "" && req.RunID != ri.RunID {
+		return false
+	}
+	name, version, ok := workflowVersion(ri.Input)
+	if !ok {
+		return false
+	}
+	if len(req.Workflows) == 0 {
+		return true
+	}
+	versions, ok := req.Workflows[name]
+	if !ok {
+		return false
+	}
+	for _, v := range versions {
+		if v == version {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req driveClaimRequest
+	if err := readJSON(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Owner == "" || req.LeaseMS <= 0 || req.LeaseMS > int64((24*time.Hour)/time.Millisecond) || req.TimeoutMS < 0 || req.Limit < 0 || req.Limit > 1 {
+		fail(w, http.StatusBadRequest, errors.New("owner, lease_ms (1..86400000), non-negative timeout_ms, and limit 0 or 1 are required"))
+		return
+	}
+	ctx := r.Context()
+	var cancel context.CancelFunc
+	if req.TimeoutMS > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+	for {
+		changed := a.E.DriveChanged()
+		// A process resuming a known workflow names its run. Claim that shard
+		// directly; the all-candidate snapshot below is for process-level Tick.
+		// If the direct claim races or is not ready, fall back so NextAt and
+		// long-poll behavior stay unchanged.
+		if req.RunID != "" {
+			ri, getErr := a.E.GetInput(ctx, req.RunID)
+			if getErr == nil && driveMatch(req, ri) {
+				claim, ok, claimErr := a.E.ClaimWorkflow(ctx, req.RunID, req.Owner, time.Duration(req.LeaseMS)*time.Millisecond)
+				if claimErr != nil {
+					if ctx.Err() != nil {
+						reply(w, http.StatusOK, driveClaimResponse{})
+						return
+					}
+					fail(w, http.StatusInternalServerError, claimErr)
+					return
+				}
+				if ok {
+					claim.Run.Input = ri.Input
+					reply(w, http.StatusOK, driveClaimResponse{Claim: &claim})
+					return
+				}
+			}
+		}
+		rows, err := a.E.DriveCandidates(ctx)
+		if err != nil {
+			reply(w, http.StatusOK, driveClaimResponse{})
+			return
+		}
+		var next int64
+		for _, row := range rows {
+			ri, err := a.E.GetInput(ctx, row.Run.RunID)
+			if err != nil || !driveMatch(req, ri) {
+				continue
+			}
+			if row.Until > 0 && (next == 0 || row.Until < next) {
+				next = row.Until
+			}
+			if !row.Ready {
+				continue
+			}
+			claim, ok, err := a.E.ClaimWorkflow(ctx, row.Run.RunID, req.Owner, time.Duration(req.LeaseMS)*time.Millisecond)
+			if err != nil {
+				if ctx.Err() != nil {
+					reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
+					return
+				}
+				fail(w, http.StatusInternalServerError, err)
+				return
+			}
+			if ok {
+				claim.Run.Input = ri.Input
+				reply(w, http.StatusOK, driveClaimResponse{Claim: &claim})
+				return
+			}
+		}
+		if req.TimeoutMS == 0 {
+			reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
+			return
+		}
+		var timer <-chan time.Time
+		var stop *time.Timer
+		if next > 0 {
+			d := time.Until(time.UnixMilli(next))
+			if d < 0 {
+				d = 0
+			}
+			stop = time.NewTimer(d)
+			timer = stop.C
+		}
+		select {
+		case <-changed:
+		case <-timer:
+		case <-ctx.Done():
+			if stop != nil {
+				stop.Stop()
+			}
+			reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
+			return
+		}
+		if stop != nil {
+			stop.Stop()
+		}
+	}
+}
+
+type driveLeaseRequest struct {
+	Owner   string `json:"owner"`
+	Token   string `json:"token"`
+	LeaseMS int64  `json:"lease_ms"`
+	Retry   bool   `json:"retry"`
+}
+
+func (a *API) renewWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req driveLeaseRequest
+	if err := readJSON(r, &req); err != nil || req.LeaseMS <= 0 {
+		if err == nil {
+			err = errors.New("positive lease_ms is required")
+		}
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	until, ok, err := a.E.RenewWorkflow(r.Context(), r.PathValue("id"), req.Owner, req.Token, time.Duration(req.LeaseMS)*time.Millisecond)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		fail(w, http.StatusConflict, errors.New("workflow drive claim is no longer held"))
+		return
+	}
+	reply(w, http.StatusOK, map[string]int64{"until": until})
+}
+
+func (a *API) releaseWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req driveLeaseRequest
+	if err := readJSON(r, &req); err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	ok, err := a.E.ReleaseWorkflow(r.Context(), r.PathValue("id"), req.Owner, req.Token, req.Retry)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		fail(w, http.StatusConflict, errors.New("workflow drive claim is no longer held"))
+		return
+	}
+	reply(w, http.StatusOK, map[string]bool{"released": true})
 }
 
 // streamRun relays live chunks as server-sent events, then a final "done"
@@ -322,8 +595,50 @@ func (a *API) resolve(w http.ResponseWriter, r *http.Request) {
 	reply(w, 202, map[string]bool{"accepted": true})
 }
 
+func (a *API) children(w http.ResponseWriter, r *http.Request) {
+	rows, err := a.E.Children(r.Context(), r.PathValue("id"))
+	if err != nil {
+		fail(w, 400, err)
+		return
+	}
+	reply(w, 200, rows)
+}
+
+func (a *API) finish(w http.ResponseWriter, r *http.Request) {
+	b, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil || !json.Valid(b) {
+		if err == nil {
+			err = errors.New("finish payload must be JSON")
+		}
+		fail(w, 400, err)
+		return
+	}
+	if err := a.E.FinishWorkflow(r.Context(), r.PathValue("id"), b); err != nil {
+		if errors.Is(err, engine.ErrChildrenUnsettled) {
+			fail(w, 409, err)
+		} else if errors.Is(err, engine.ErrUnknownRun) {
+			fail(w, 404, err)
+		} else {
+			fail(w, 400, err)
+		}
+		return
+	}
+	reply(w, 202, map[string]bool{"accepted": true})
+}
+
 func (a *API) cancel(w http.ResponseWriter, r *http.Request) {
-	a.E.Cancel(r.PathValue("id"), "cancelled via API")
+	if err := a.E.CancelTree(r.Context(), r.PathValue("id"), "cancelled via API"); err != nil {
+		if errors.Is(err, engine.ErrChildrenUnsettled) {
+			fail(w, 409, err)
+			return
+		}
+		// Preserve repeated cancel of a finished run as accepted; the SDK
+		// reads its durable outcome with /wait.
+		if !errors.Is(err, engine.ErrUnknownRun) {
+			fail(w, 400, err)
+			return
+		}
+	}
 	reply(w, 202, map[string]bool{"accepted": true})
 }
 
@@ -339,8 +654,21 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

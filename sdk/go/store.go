@@ -3,6 +3,8 @@ package kairo
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 )
 
 // Where the embedded runtime keeps runs (ADR 0051): per run its state (the
@@ -65,10 +67,16 @@ type LeaseRow struct {
 // Changes is what a transaction on a run writes, computed from the row as
 // read.
 type Changes struct {
-	Events       []json.RawMessage
-	Row          *RunRow
-	SetTimers    []TimerRow
-	DeleteTimers []uint32
+	Events []json.RawMessage
+	Row    *RunRow
+	// GuardParent atomically requires this run to be an unfinished workflow
+	// before a new child row is written (ADR 0065).
+	GuardParent string
+	// GuardTreeSettled requires every descendant to be finished before this
+	// workflow's terminal state is written (ADR 0062, 0065).
+	GuardTreeSettled bool
+	SetTimers        []TimerRow
+	DeleteTimers     []uint32
 	// Clear drops every timer and lease of the run (it ended).
 	Clear     bool
 	SetLeases []LeaseRow
@@ -78,9 +86,35 @@ type Changes struct {
 	Notify bool
 }
 
+// ErrParentUnavailable means a run cannot safely be added to the requested
+// parent's tree (ADR 0065).
+var ErrParentUnavailable = errors.New("kairo: parent workflow is unavailable")
+
+var errChildrenUnsettled = errors.New("kairo: children changed while settling the workflow")
+
+func checkParent(parent *RunRow, parentID, childID string) error {
+	var reason string
+	switch {
+	case parentID == childID:
+		reason = "a run cannot be its own parent"
+	case parent == nil:
+		reason = "it does not exist"
+	case parent.Plan != planWorkflow || parent.Workflow == "":
+		reason = "it is not a workflow"
+	case doneStatus[parent.Status]:
+		reason = "it has finished"
+	default:
+		return nil
+	}
+	return fmt.Errorf("%w: %s: %s", ErrParentUnavailable, parentID, reason)
+}
+
 // Store keeps runs. WithRun locks a run's row (nil when absent), lets fn
-// compute the changes and writes them, in one transaction. Implementations
-// must be safe for concurrent use.
+// compute the changes and writes them, in one transaction. GuardParent and
+// GuardTreeSettled are part of that transaction's contract (ADR 0065).
+// Implementations must be safe for concurrent use. Open marks operation
+// errors from custom stores with RetryWorkflow; errors returned by fn remain
+// semantic errors.
 type Store interface {
 	Init(ctx context.Context) error
 	WithRun(ctx context.Context, id string, fn func(row *RunRow) (*Changes, error)) error
@@ -89,6 +123,9 @@ type Store interface {
 	Children(ctx context.Context, parent string) ([]RunRow, error)
 	DueTimers(ctx context.Context, now int64, limit int) ([]TimerRow, error)
 	ExpiredLeases(ctx context.Context, now int64, limit int) ([]LeaseRow, error)
+	// Recoverable returns this run's expired step leases and due timers. A
+	// parent replay calls it when it reaches the same child again (ADR 0062).
+	Recoverable(ctx context.Context, run string, now int64) ([]LeaseRow, []TimerRow, error)
 	RenewLeases(ctx context.Context, owner string, until int64) error
 	// ExpireLeases ends owner's leases now (a process that knows its
 	// earlier self stopped).
@@ -118,6 +155,102 @@ type Store interface {
 // processes (PostgreSQL's LISTEN/NOTIFY, sdk/go/pgnotify).
 type Notifier interface {
 	Listen(ctx context.Context, settled func(runID string)) (stop func(), err error)
+}
+
+// retryStore marks failures of Store operations for workflow replay (ADR
+// 0063). Errors returned by WithRun's pure callback are Kairo semantic
+// errors, not storage failures, and pass through unchanged.
+type retryStore struct{ Store }
+
+func storeRetry(ctx context.Context, err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrParentUnavailable) || errors.Is(err, errChildrenUnsettled) || retryWorkflow(err) {
+		return err
+	}
+	return RetryWorkflow(fmt.Errorf("kairo: store: %w", err))
+}
+
+func wrapStore(store Store) Store {
+	r := retryStore{Store: store}
+	if n, ok := store.(Notifier); ok {
+		return retryNotifierStore{retryStore: r, notifier: n}
+	}
+	return r
+}
+
+func (s retryStore) Init(ctx context.Context) error { return storeRetry(ctx, s.Store.Init(ctx)) }
+func (s retryStore) WithRun(ctx context.Context, id string, fn func(*RunRow) (*Changes, error)) error {
+	var callbackErr error
+	err := s.Store.WithRun(ctx, id, func(row *RunRow) (*Changes, error) {
+		ch, err := fn(row)
+		if err != nil {
+			callbackErr = err
+		}
+		return ch, err
+	})
+	if callbackErr != nil {
+		return err
+	}
+	return storeRetry(ctx, err)
+}
+func (s retryStore) Get(ctx context.Context, id string) (*RunRow, error) {
+	r, err := s.Store.Get(ctx, id)
+	return r, storeRetry(ctx, err)
+}
+func (s retryStore) Children(ctx context.Context, parent string) ([]RunRow, error) {
+	r, err := s.Store.Children(ctx, parent)
+	return r, storeRetry(ctx, err)
+}
+func (s retryStore) DueTimers(ctx context.Context, now int64, limit int) ([]TimerRow, error) {
+	r, err := s.Store.DueTimers(ctx, now, limit)
+	return r, storeRetry(ctx, err)
+}
+func (s retryStore) ExpiredLeases(ctx context.Context, now int64, limit int) ([]LeaseRow, error) {
+	r, err := s.Store.ExpiredLeases(ctx, now, limit)
+	return r, storeRetry(ctx, err)
+}
+func (s retryStore) Recoverable(ctx context.Context, run string, now int64) ([]LeaseRow, []TimerRow, error) {
+	l, t, err := s.Store.Recoverable(ctx, run, now)
+	return l, t, storeRetry(ctx, err)
+}
+func (s retryStore) RenewLeases(ctx context.Context, owner string, until int64) error {
+	return storeRetry(ctx, s.Store.RenewLeases(ctx, owner, until))
+}
+func (s retryStore) ExpireLeases(ctx context.Context, owner string, now int64) error {
+	return storeRetry(ctx, s.Store.ExpireLeases(ctx, owner, now))
+}
+func (s retryStore) HandOver(ctx context.Context, l LeaseRow) error {
+	return storeRetry(ctx, s.Store.HandOver(ctx, l))
+}
+func (s retryStore) NextWake(ctx context.Context) (int64, bool, error) {
+	at, ok, err := s.Store.NextWake(ctx)
+	return at, ok, storeRetry(ctx, err)
+}
+func (s retryStore) RemoveFinished(ctx context.Context, cutoff int64, limit int) (int, error) {
+	n, err := s.Store.RemoveFinished(ctx, cutoff, limit)
+	return n, storeRetry(ctx, err)
+}
+func (s retryStore) ClaimDrive(ctx context.Context, l LeaseRow, now int64) (bool, error) {
+	ok, err := s.Store.ClaimDrive(ctx, l, now)
+	return ok, storeRetry(ctx, err)
+}
+func (s retryStore) EndDrive(ctx context.Context, run, owner string, token int32, now int64, resume bool) error {
+	return storeRetry(ctx, s.Store.EndDrive(ctx, run, owner, token, now, resume))
+}
+func (s retryStore) List(ctx context.Context, f ListFilter) ([]RunRow, error) {
+	r, err := s.Store.List(ctx, f)
+	return r, storeRetry(ctx, err)
+}
+func (s retryStore) Close() error { return storeRetry(context.Background(), s.Store.Close()) }
+
+type retryNotifierStore struct {
+	retryStore
+	notifier Notifier
+}
+
+func (s retryNotifierStore) Listen(ctx context.Context, settled func(string)) (func(), error) {
+	stop, err := s.notifier.Listen(ctx, settled)
+	return stop, storeRetry(ctx, err)
 }
 
 var doneStatus = map[string]bool{"completed": true, "failed": true, "cancelled": true}

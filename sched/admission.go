@@ -16,6 +16,9 @@ type AdmissionConfig struct {
 	// MaxActivePerTenant returns the per-tenant cap (0 = unlimited).
 	MaxActivePerTenant func(tenant string) int
 	MaxQueued          int // runs waiting for admission; beyond this Submit is rejected
+	// MaxStarting is a safety ceiling for the adaptive durable-start window
+	// of each shard and tier; 0 leaves it adaptive (ADR 0074).
+	MaxStarting int
 }
 
 // Admission is admission control with round-robin fairness between tenants

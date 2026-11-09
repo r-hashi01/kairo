@@ -44,6 +44,28 @@ func (m *MemStore) WithRun(_ context.Context, id string, fn func(*RunRow) (*Chan
 	if err != nil || ch == nil {
 		return err
 	}
+	if ch.GuardParent != "" {
+		if err := checkParent(m.runs[ch.GuardParent], ch.GuardParent, id); err != nil {
+			return err
+		}
+	}
+	if ch.GuardTreeSettled {
+		var unfinished func(string) bool
+		unfinished = func(parent string) bool {
+			for _, row := range m.runs {
+				if row.Parent != parent {
+					continue
+				}
+				if !doneStatus[row.Status] || unfinished(row.ID) {
+					return true
+				}
+			}
+			return false
+		}
+		if unfinished(id) {
+			return errChildrenUnsettled
+		}
+	}
 	m.events[id] = append(m.events[id], ch.Events...)
 	if ch.Row != nil {
 		r := copyRow(ch.Row)
@@ -136,6 +158,26 @@ func (m *MemStore) ExpiredLeases(_ context.Context, now int64, limit int) ([]Lea
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (m *MemStore) Recoverable(_ context.Context, run string, now int64) ([]LeaseRow, []TimerRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var leases []LeaseRow
+	for _, l := range m.leases[run] {
+		if l.Act != 0 && l.Until < now {
+			leases = append(leases, l)
+		}
+	}
+	var timers []TimerRow
+	for _, t := range m.timers[run] {
+		if t.At <= now {
+			timers = append(timers, t)
+		}
+	}
+	sort.Slice(leases, func(i, j int) bool { return leases[i].Until < leases[j].Until })
+	sort.Slice(timers, func(i, j int) bool { return timers[i].At < timers[j].At })
+	return leases, timers, nil
 }
 
 func (m *MemStore) setUntil(owner string, until int64) {

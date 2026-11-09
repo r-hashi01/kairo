@@ -155,7 +155,7 @@ func Child[O any](ctx *Context, name string, in any) (O, error) {
 	if err != nil {
 		return zero, err
 	}
-	out, err := ctx.k.runAs(ctx, name, raw, ctx.next("kairo.workflow/"+name, canon), ctx.id, ctx.cancelled)
+	out, err := ctx.k.runChildAs(ctx, name, raw, ctx.next("kairo.workflow/"+name, canon), ctx.id, ctx.cancelled)
 	if err != nil {
 		return zero, err
 	}

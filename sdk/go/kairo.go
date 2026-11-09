@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,8 +57,39 @@ var ErrCancelled = errors.New("kairo: cancelled")
 // process is closing. The workflow is not cancelled: it goes on (ADR 0059).
 var ErrStopped = errors.New("kairo: stopped waiting for the workflow")
 
+// WorkflowRetryError asks the current workflow drive to stop without
+// recording an outcome, so the same run can be replayed later (ADR 0063).
+// It is distinct from Retryable, which retries one action attempt.
+type WorkflowRetryError struct{ err error }
+
+func (e *WorkflowRetryError) Error() string { return e.err.Error() }
+func (e *WorkflowRetryError) Unwrap() error { return e.err }
+
+// RetryWorkflow marks err as a transient reason to replay the workflow
+// later without recording success or failure. A nil error stays nil.
+func RetryWorkflow(err error) error {
+	if err == nil {
+		return nil
+	}
+	var retry *WorkflowRetryError
+	if errors.As(err, &retry) {
+		return err
+	}
+	return &WorkflowRetryError{err: err}
+}
+
+func retryWorkflow(err error) bool {
+	var retry *WorkflowRetryError
+	return errors.As(err, &retry)
+}
+
 // ErrTimedOut: a wait's timeout came before its signal (WaitTimeout).
 var ErrTimedOut = errors.New("kairo: the wait timed out")
+
+// ErrRunSettled: Cancel did not change the workflow because it had already
+// completed or failed. A workflow already cancelled is an idempotent success
+// (ADR 0061).
+var ErrRunSettled = errors.New("kairo: the workflow had already settled")
 
 // CallError is a call that did not complete: it failed (its action's
 // failure, after its retries) or was cancelled (errors.Is ErrCancelled).
@@ -170,24 +202,27 @@ type Options struct {
 
 // Kairo declares actions and workflows and drives them.
 type Kairo struct {
-	rt      *runtime
-	runs    runs    // where the runs live: rt, or remote
-	remote  *remote // Connect: kairod (ADR 0058)
-	mode    Mode
-	wake    func(time.Time) error
-	nowFn   func() time.Time
-	closing atomic.Bool
-	http    HTTPOptions
-	client  *http.Client
+	rt       *runtime
+	runs     runs    // where the runs live: rt, or remote
+	remote   *remote // Connect: kairod (ADR 0058)
+	mode     Mode
+	wake     func(time.Time) error
+	nowFn    func() time.Time
+	closing  atomic.Bool
+	http     HTTPOptions
+	client   *http.Client
+	tickSlot chan struct{}
 
-	mu         sync.Mutex
-	actions    map[string]*actionDef
-	workflows  map[string]*workflowDef
-	planned    map[string]bool
-	driving    map[*drive]struct{}
-	drivingIDs map[string]bool
-	again      map[string]bool
-	stopHook   func()
+	mu           sync.Mutex
+	actions      map[string]*actionDef
+	workflows    map[string]*workflowDef
+	planned      map[string]bool
+	driving      map[*drive]struct{}
+	drivingIDs   map[string]bool
+	redriving    map[string]bool
+	again        map[string]bool
+	stopHook     func()
+	driveChanged chan struct{}
 
 	draining atomic.Bool // Drain
 
@@ -209,7 +244,16 @@ type Kairo struct {
 	limits      map[string]*limiter // by destination
 }
 
-type drive struct{ cancel context.CancelFunc }
+type drive struct {
+	id        string
+	cancel    context.CancelFunc
+	cancelReq *cancelRequest
+}
+
+type cancelRequest struct {
+	done chan struct{}
+	ok   bool
+}
 
 type workflowFn func(ctx *Context, in json.RawMessage) (any, error)
 
@@ -246,6 +290,15 @@ func workflowInput(name, version string, in json.RawMessage) map[string]any {
 		m["version"] = version
 	}
 	return m
+}
+
+// externallyAttached reports whether this workflow was started from outside
+// another workflow with Parent (ADR 0065).
+func externallyAttached(input json.RawMessage) bool {
+	var w struct {
+		ExternalParent bool `json:"external_parent"`
+	}
+	return json.Unmarshal(input, &w) == nil && w.ExternalParent
 }
 
 // workflowOf reads a workflow run's input.
@@ -333,8 +386,9 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 		return nil, err
 	}
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
-		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, again: map[string]bool{},
-		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}}
+		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, redriving: map[string]bool{}, again: map[string]bool{},
+		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
+	k.tickSlot <- struct{}{}
 	k.runs = rt
 	k.bgCtx, k.bgCancel = context.WithCancel(context.Background())
 	k.redriveCond = sync.NewCond(&k.redriveMu)
@@ -588,7 +642,7 @@ func (k *Kairo) Start(ctx context.Context) error {
 		return err
 	}
 	k.rt.mu.Lock()
-	k.rt.lostDrive, k.rt.missingPlan = k.lostDrive, k.missingPlan
+	k.rt.lostDrive, k.rt.missingPlan, k.rt.wakeParent = k.lostDrive, k.missingPlan, k.redrive
 	k.rt.leaseParents = k.mode == Suspend
 	k.rt.mu.Unlock()
 	if k.remote != nil {
@@ -743,8 +797,9 @@ func (k *Kairo) runHandler(a *actionDef, tc *TaskContext, action string, in json
 type RunOption func(*runOpts)
 
 type runOpts struct {
-	id   string
-	meta map[string]any
+	id     string
+	meta   map[string]any
+	parent string
 }
 
 // WithID runs the workflow as execution id (an idempotency key): running it
@@ -755,6 +810,10 @@ func WithID(id string) RunOption { return func(o *runOpts) { o.id = id } }
 // returned by List; set when it starts (ADR 0059).
 func WithMeta(meta map[string]any) RunOption { return func(o *runOpts) { o.meta = meta } }
 
+// Parent keeps this externally started workflow in parentID's tree. The
+// parent must be an unfinished workflow in the same backend (ADR 0065, 0067).
+func Parent(parentID string) RunOption { return func(o *runOpts) { o.parent = parentID } }
+
 // Run runs workflow name, or resumes it, and returns its result: calls that
 // finished return their recorded results. In wait mode the workflow is
 // driven in the background (by this process, or by whichever process holds
@@ -762,13 +821,13 @@ func WithMeta(meta map[string]any) RunOption { return func(o *runOpts) { o.meta 
 // suspend mode it is driven here until it waits: ErrSuspended.
 func Run[O any](ctx context.Context, k *Kairo, name string, in any, opts ...RunOption) (O, error) {
 	var out O
-	id, token, raw, err := k.start(ctx, name, in, opts)
+	id, token, raw, parent, err := k.start(ctx, name, in, opts)
 	if err != nil {
 		return out, err
 	}
 	var res json.RawMessage
 	if k.mode == Suspend {
-		res, err = k.drive(ctx, id, name, raw, "", token)
+		res, err = k.drive(ctx, id, name, raw, parent, token)
 		if errors.Is(err, errDrivenElsewhere) {
 			err = ErrSuspended
 		}
@@ -776,7 +835,7 @@ func Run[O any](ctx context.Context, k *Kairo, name string, in any, opts ...RunO
 			err = werr
 		}
 	} else {
-		k.driveBackground(id, name, raw, "", token)
+		k.driveBackground(id, name, raw, parent, token)
 		res, err = k.await(ctx, id)
 	}
 	if err != nil {
@@ -793,16 +852,16 @@ func Run[O any](ctx context.Context, k *Kairo, name string, in any, opts ...RunO
 // process. In wait mode it is driven in the background; in suspend mode it
 // is driven here until it waits. The id is an idempotency key, as in Run.
 func (k *Kairo) Submit(ctx context.Context, name string, in any, opts ...RunOption) (string, error) {
-	id, token, raw, err := k.start(ctx, name, in, opts)
+	id, token, raw, parent, err := k.start(ctx, name, in, opts)
 	if err != nil {
 		return "", err
 	}
 	if k.mode == Wait {
-		k.driveBackground(id, name, raw, "", token)
+		k.driveBackground(id, name, raw, parent, token)
 		return id, nil
 	}
 	// Its outcome (suspended, failed, ...) is recorded: Await reads it.
-	_, _ = k.drive(ctx, id, name, raw, "", token)
+	_, _ = k.drive(ctx, id, name, raw, parent, token)
 	return id, k.wakeUp(ctx)
 }
 
@@ -848,7 +907,7 @@ func (k *Kairo) await(ctx context.Context, id string) (json.RawMessage, error) {
 
 // start makes workflow name's run (or finds it). A new one is leased to
 // this process to drive in the same transaction: token (0: it existed).
-func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption) (id string, token int32, raw json.RawMessage, err error) {
+func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption) (id string, token int32, raw json.RawMessage, parent string, err error) {
 	o := runOpts{}
 	for _, f := range opts {
 		f(&o)
@@ -858,30 +917,60 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 	}
 	version, ok := k.currentVersion(name)
 	if !ok {
-		return "", 0, nil, fmt.Errorf("kairo: no workflow %s", name)
+		return "", 0, nil, "", fmt.Errorf("kairo: no workflow %s", name)
 	}
 	if raw, err = json.Marshal(in); err != nil {
-		return "", 0, nil, err
+		return "", 0, nil, "", err
 	}
 	var meta json.RawMessage
 	if o.meta != nil {
 		if meta, err = json.Marshal(o.meta); err != nil {
-			return "", 0, nil, err
+			return "", 0, nil, "", err
 		}
 	}
 	if err := k.planWorkflow(); err != nil {
-		return "", 0, nil, err
+		return "", 0, nil, "", err
 	}
 	token = newToken()
-	existing, err := k.runs.run(ctx, planWorkflow, workflowInput(name, version, raw), o.id, runSpec{
-		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, workflow: name, meta: meta, drive: token})
-	if err != nil {
-		return "", 0, nil, err
+	workflowIn := workflowInput(name, version, raw)
+	if o.parent != "" {
+		workflowIn["external_parent"] = true
 	}
+	existing, err := k.runs.run(ctx, planWorkflow, workflowIn, o.id, runSpec{
+		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: o.parent, guardParent: o.parent != "", workflow: name, meta: meta, drive: token})
+	if err != nil {
+		return "", 0, nil, "", err
+	}
+	parent = o.parent
 	if existing {
 		token = 0
+		if k.remote == nil {
+			ri, getErr := k.runs.get(ctx, o.id)
+			if getErr != nil {
+				return "", 0, nil, "", getErr
+			}
+			parent = ri.Parent
+			if o.parent != "" && o.parent != parent {
+				return "", 0, nil, "", fmt.Errorf("%w: %s: run %s already belongs to parent %q", ErrParentUnavailable, o.parent, o.id, parent)
+			}
+			if parent != "" && !ri.Finished() {
+				p, parentErr := k.runs.get(ctx, parent)
+				if errors.Is(parentErr, ErrUnknownRun) {
+					return "", 0, nil, "", fmt.Errorf("%w: %s: it does not exist", ErrParentUnavailable, parent)
+				}
+				if parentErr != nil {
+					return "", 0, nil, "", parentErr
+				}
+				if p.Plan != planWorkflow || p.Workflow == "" {
+					return "", 0, nil, "", fmt.Errorf("%w: %s: it is not a workflow", ErrParentUnavailable, parent)
+				}
+				if p.Finished() {
+					return "", 0, nil, "", fmt.Errorf("%w: %s: it has finished", ErrParentUnavailable, parent)
+				}
+			}
+		}
 	}
-	return o.id, token, raw, nil
+	return o.id, token, raw, parent, nil
 }
 
 // drive runs workflow id's function here, holding its drive lease (ADR
@@ -891,8 +980,39 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 // expired lease when it stopped otherwise (a tick takes it up).
 func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, parent string, token int32) (json.RawMessage, error) {
 	if k.remote != nil {
-		// kairod: no drive leases; driven where it is run.
-		return k.runAs(ctx, name, in, id, parent, nil)
+		ri, getErr := k.runs.getInput(ctx, id)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if ri.Finished() {
+			return done(id, ri)
+		}
+		claim, _, err := k.remote.claim(ctx, id, k.supportedWorkflows(), 0)
+		if err != nil {
+			return nil, err
+		}
+		if claim == nil {
+			return nil, errDrivenElsewhere
+		}
+		k.remote.hold(*claim)
+		res, err := k.runAs(ctx, name, in, id, parent, nil)
+		if ctx.Err() != nil || errors.Is(err, ErrStopped) {
+			// Graceful process stop hands it back for replay. A crash is covered
+			// by the same claim's ordinary expiry.
+			_ = k.remote.release(context.Background(), *claim, true)
+			return res, err
+		}
+		if releaseErr := k.remote.release(context.Background(), *claim, retryWorkflow(err)); releaseErr != nil && err == nil {
+			return nil, releaseErr
+		}
+		if retryWorkflow(err) {
+			k.rt.logger.Warn("kairo: retrying a workflow after a transient error", "workflow", id, "err", err)
+			if k.mode == Suspend {
+				return nil, fmt.Errorf("%w: %v", ErrSuspended, err)
+			}
+			return nil, fmt.Errorf("workflow %s: %w: %v", id, ErrStopped, err)
+		}
+		return res, err
 	}
 	if token == 0 {
 		ri, err := k.runs.get(ctx, id)
@@ -919,12 +1039,78 @@ func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, 
 	defer k.rt.driving(false)
 	res, err := k.runAs(ctx, name, in, id, parent, nil)
 	if err != nil {
+		if retryWorkflow(err) {
+			retryAt := k.rt.now() + k.rt.leaseMs
+			// RenewLeases updates every lease owned by this process. Hand this
+			// one to nobody so unrelated work cannot keep it alive; its ordinary
+			// expiry then drives the replay (ADR 0063).
+			if eerr := k.rt.store.HandOver(context.Background(), LeaseRow{Run: id, Attempt: token, Owner: "", Until: retryAt}); eerr != nil {
+				k.rt.logger.Warn("kairo: handing over a workflow for retry", "workflow", id, "err", eerr)
+			}
+			k.rt.logger.Warn("kairo: retrying a workflow after a transient error", "workflow", id, "err", err, "retry_at", time.UnixMilli(retryAt))
+			if k.mode == Suspend {
+				return nil, fmt.Errorf("%w: %v", ErrSuspended, err)
+			}
+			return nil, err
+		}
 		resume := !errors.Is(err, ErrSuspended)
 		if eerr := k.rt.store.EndDrive(context.Background(), id, k.rt.owner, token, k.rt.now(), resume); eerr != nil {
 			k.rt.logger.Warn("kairo: ending a drive lease", "workflow", id, "err", eerr)
 		}
 	}
 	return res, err
+}
+
+func (k *Kairo) supportedWorkflows() map[string][]string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	out := make(map[string][]string, len(k.workflows))
+	for name, d := range k.workflows {
+		versions := make([]string, 0, len(d.versions))
+		for version := range d.versions {
+			versions = append(versions, version)
+		}
+		sort.Strings(versions)
+		out[name] = versions
+	}
+	return out
+}
+
+// runChildAs creates/reaches a child before claiming it. Top-level Run has
+// already done that in start; a Child call reaches it during parent replay.
+func (k *Kairo) runChildAs(ctx context.Context, name string, in json.RawMessage, id, parent string, parentCancelled func() bool) (json.RawMessage, error) {
+	if k.remote == nil {
+		return k.runAs(ctx, name, in, id, parent, parentCancelled)
+	}
+	version, ok := k.currentVersion(name)
+	if !ok {
+		return nil, fmt.Errorf("kairo: no workflow %s", name)
+	}
+	if err := k.planWorkflow(); err != nil {
+		return nil, err
+	}
+	if _, err := k.runs.run(ctx, planWorkflow, workflowInput(name, version, in), id, runSpec{
+		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, drive: newToken(),
+	}); err != nil {
+		return nil, err
+	}
+	claim, _, err := k.remote.claim(ctx, id, k.supportedWorkflows(), 0)
+	if err != nil {
+		return nil, err
+	}
+	if claim == nil {
+		return nil, errDrivenElsewhere
+	}
+	k.remote.hold(*claim)
+	res, runErr := k.runAs(ctx, name, in, id, parent, parentCancelled)
+	if ctx.Err() != nil || errors.Is(runErr, ErrStopped) {
+		_ = k.remote.release(context.Background(), *claim, true)
+		return res, runErr
+	}
+	if releaseErr := k.remote.release(context.Background(), *claim, retryWorkflow(runErr)); releaseErr != nil && runErr == nil {
+		return nil, releaseErr
+	}
+	return res, runErr
 }
 
 // driveBackground, in wait mode, drives workflow id in the background,
@@ -946,6 +1132,7 @@ func (k *Kairo) driveBackground(id, name string, in json.RawMessage, parent stri
 			k.mu.Unlock()
 		}()
 		if _, err := k.drive(k.bgCtx, id, name, in, parent, token); err != nil && !errors.Is(err, errDrivenElsewhere) && !errors.Is(err, errUnknownPlan) &&
+			!retryWorkflow(err) &&
 			!errors.Is(err, ErrStopped) && !errors.Is(err, ErrCancelled) && k.bgCtx.Err() == nil { // not the process closing
 			k.rt.logger.Warn("kairo: driving a workflow", "workflow", id, "err", err)
 		}
@@ -967,6 +1154,11 @@ func (k *Kairo) lostDrive(ctx context.Context, l LeaseRow) error {
 	if !ok {
 		return nil
 	}
+	if externallyAttached(ri.Input) {
+		// An external re-submission is this workflow's replay reach. A drive
+		// lease expiring by itself must not invent that reach (ADR 0065).
+		return k.rt.store.EndDrive(ctx, l.Run, l.Owner, l.Attempt, k.rt.now(), false)
+	}
 	if k.fnFor(name, version) == nil {
 		return notHere(name, version) // another process's
 	}
@@ -981,6 +1173,10 @@ func (k *Kairo) lostDrive(ctx context.Context, l LeaseRow) error {
 // runAs drives workflow id. parentCancelled reports whether the workflow
 // that made this one was cancelled in kairo (nil for a top-level one).
 func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, parent string, parentCancelled func() bool) (json.RawMessage, error) {
+	if k.remote == nil && parent != "" {
+		k.rt.reach(id, true)
+		defer k.rt.reach(id, false)
+	}
 	current, ok := k.currentVersion(name)
 	if !ok {
 		return nil, fmt.Errorf("kairo: no workflow %s", name)
@@ -1010,21 +1206,30 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	d := &drive{cancel: cancel}
+	d := &drive{id: id, cancel: cancel}
 	k.mu.Lock()
 	k.driving[d] = struct{}{}
 	k.drivingIDs[id] = true
+	close(k.driveChanged)
+	k.driveChanged = make(chan struct{})
 	k.mu.Unlock()
 	defer func() {
 		k.mu.Lock()
 		delete(k.driving, d)
 		delete(k.drivingIDs, id)
+		close(k.driveChanged)
+		k.driveChanged = make(chan struct{})
 		k.mu.Unlock()
 	}()
 	// Cancelled in kairo (its run, or a workflow above it): only then are
 	// its calls cancelled. A context that ends only stops the driving here.
 	var self atomic.Bool
-	cancelled := func() bool { return self.Load() || (parentCancelled != nil && parentCancelled()) }
+	cancelled := func() bool {
+		k.mu.Lock()
+		requested := d.cancelReq != nil
+		k.mu.Unlock()
+		return self.Load() || requested || (parentCancelled != nil && parentCancelled())
+	}
 	if k.mode == Wait {
 		// The workflow's own run ends when it is cancelled: stop the calls.
 		go func() {
@@ -1037,6 +1242,9 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	c := &Context{Context: cctx, k: k, id: id, seen: map[string]int{}, cancelled: cancelled}
 	value, err := callWorkflow(fn, c, in)
 	if err != nil {
+		k.mu.Lock()
+		cancelReq := d.cancelReq
+		k.mu.Unlock()
 		switch {
 		case errors.Is(err, ErrSuspended):
 			return nil, ErrSuspended // goes on later
@@ -1044,6 +1252,19 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 			// A child workflow of a version not here (ADR 0060): not this
 			// workflow's failure; a process with both versions drives it.
 			return nil, err
+		case errors.Is(err, ErrEffectWeakened):
+			// The call stays for an operator to resolve (ADR 0060).
+			return nil, err
+		case retryWorkflow(err):
+			// A transient store or application error leaves this workflow and
+			// its descendants unfinished for the same run's replay (ADR 0063).
+			return nil, err
+		case cancelReq != nil:
+			<-cancelReq.done
+			if cancelReq.ok {
+				return k.workflowOutcome(ctx, id, nil)
+			}
+			return nil, fmt.Errorf("workflow %s: %w", id, ErrStopped)
 		case cancelled():
 			if !self.Load() {
 				// Cancelled with the workflow above it: so is its run.
@@ -1054,17 +1275,102 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 			// Not driven here any more; the workflow stays, to go on later.
 			return nil, fmt.Errorf("workflow %s: %w", id, ErrStopped)
 		}
-		_ = k.runs.signal(context.Background(), id, "done", map[string]any{"ok": false, "error": err.Error()})
-		return nil, &WorkflowError{ID: id, Message: err.Error(), Err: err}
+		cancel() // no branch left may start another child while the tree settles
+		if signalErr := k.finishWorkflow(ctx, id, map[string]any{"ok": false, "error": err.Error()}); signalErr != nil {
+			return nil, signalErr
+		}
+		return k.workflowOutcome(ctx, id, err)
 	}
 	js, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	if err := k.runs.signal(context.Background(), id, "done", map[string]any{"ok": true, "value": json.RawMessage(js)}); err != nil {
+	cancel() // no branch left may start another child while the tree settles
+	if err := k.finishWorkflow(ctx, id, map[string]any{"ok": true, "value": json.RawMessage(js)}); err != nil {
 		return nil, err
 	}
-	return js, nil
+	return k.workflowOutcome(ctx, id, nil)
+}
+
+// finishWorkflow closes the race between the last descendant scan and the
+// terminal event. A child that entered first makes the store reject that
+// event; settle it, then try the terminal transaction again (ADR 0065).
+func (k *Kairo) finishWorkflow(ctx context.Context, id string, payload any) error {
+	for {
+		if err := k.settleDescendants(ctx, id); err != nil {
+			return err
+		}
+		var err error
+		if k.remote != nil {
+			err = k.remote.finish(ctx, id, payload)
+		} else {
+			err = k.runs.signal(ctx, id, "done", payload)
+		}
+		if errors.Is(err, errChildrenUnsettled) {
+			continue
+		}
+		return err
+	}
+}
+
+// settleDescendants cancels every unfinished run under workflow id, deepest
+// first, before the workflow records its own outcome (ADR 0062).
+func (k *Kairo) settleDescendants(ctx context.Context, id string) error {
+	for {
+		var rows []RunInfo
+		var walk func(string) error
+		walk = func(parent string) error {
+			children, err := k.Children(ctx, parent)
+			if err != nil {
+				return err
+			}
+			for i := range children {
+				if err := walk(children[i].RunID); err != nil {
+					return err
+				}
+				rows = append(rows, children[i])
+			}
+			return nil
+		}
+		if err := walk(id); err != nil {
+			return err
+		}
+		unfinished := 0
+		for i := range rows {
+			if rows[i].Finished() {
+				continue
+			}
+			unfinished++
+			if err := k.runs.cancel(ctx, rows[i].RunID); err != nil {
+				if errors.Is(err, errChildrenUnsettled) {
+					continue
+				}
+				return err
+			}
+			if _, err := k.runs.waitDone(ctx, rows[i].RunID); err != nil {
+				return err
+			}
+		}
+		if unfinished == 0 {
+			return nil
+		}
+	}
+}
+
+// workflowOutcome returns only the durable outcome of id, never the local
+// function's outcome when cancellation won the race (ADR 0061). cause is
+// retained when this drive recorded the workflow's failure.
+func (k *Kairo) workflowOutcome(ctx context.Context, id string, cause error) (json.RawMessage, error) {
+	ri, err := k.runs.wait(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	out, err := done(id, ri)
+	var we *WorkflowError
+	if cause != nil && errors.As(err, &we) && we.Message == cause.Error() {
+		we.Err = cause
+	}
+	return out, err
 }
 
 // callWorkflow runs a workflow's function; a panic is its failure.
@@ -1106,6 +1412,10 @@ func done(id string, ri RunInfo) (json.RawMessage, error) {
 
 // callRun runs one call: a run of its own, found again by its id.
 func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, runID string) (json.RawMessage, error) {
+	if k.remote == nil {
+		k.rt.reach(runID, true)
+		defer k.rt.reach(runID, false)
+	}
 	if k.draining.Load() {
 		// Draining: no new call starts here (its step would be
 		// dispatched); one already made is waited for as before.
@@ -1122,13 +1432,24 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 	if _, err := k.runs.run(c, plan, map[string]any{"in": in}, runID, runSpec{parent: c.id}); err != nil {
 		return nil, err
 	}
+	if k.remote == nil {
+		if err := k.rt.resumeReached(c, runID); err != nil {
+			return nil, err
+		}
+	}
 	var r RunInfo
 	var err error
 	if k.mode == Suspend {
 		// Whatever this process can do for the call is done once it is
 		// idle; a call still going then waits for a timer or a signal.
-		k.rt.idle()
-		if r, err = k.runs.get(c, runID); err != nil {
+		if k.remote == nil {
+			k.rt.idle()
+			r, err = k.runs.get(c, runID)
+		} else {
+			r, err = k.runs.waitQuiescent(c, runID)
+			k.remote.noteNext(r.nextAt)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if !r.Finished() {
@@ -1169,25 +1490,21 @@ func calledAction(plan string) string {
 // not received one. A wait the workflow has not reached yet receives it
 // when it does (ADR 0059): signals of one name go to its waits in order.
 func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error {
+	if k.remote == nil {
+		_, err := k.SendSignal(ctx, id, name, payload)
+		return err
+	}
+	// kairod has no synchronous applied/ignored answer. Keep the existing
+	// API: signal an existing wait, and do not send ahead.
 	if err := k.plan(planWait+name, waitRoot(name, 0), nil); err != nil {
 		return err
 	}
+	var signaled string
 	for n := 0; ; n++ {
 		runID := callID(id, planWait+name, "null", n)
 		r, err := k.runs.get(ctx, runID)
 		if errors.Is(err, ErrUnknownRun) {
-			if k.remote != nil {
-				return fmt.Errorf("kairo: workflow %s does not wait for %s (signals sent ahead: %w)", id, name, ErrNeedsEmbedded)
-			}
-			made, err := k.signalAhead(ctx, id, name, runID, payload)
-			if err != nil {
-				return err
-			}
-			if !made {
-				n-- // the workflow made the wait meanwhile: signal it
-				continue
-			}
-			break
+			return fmt.Errorf("kairo: workflow %s does not wait for %s (signals sent ahead: %w)", id, name, ErrNeedsEmbedded)
 		}
 		if err != nil {
 			return err
@@ -1198,13 +1515,114 @@ func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error 
 		if err := k.runs.signal(ctx, runID, name, payload); err != nil {
 			return err
 		}
+		signaled = runID
 		break
 	}
 	if k.mode == Suspend {
-		k.settle()
-		return k.wakeUp(ctx)
+		if _, err := k.remote.waitDone(ctx, signaled); err != nil {
+			return err
+		}
+		_, _, err := k.Tick(ctx)
+		return err
 	}
 	return nil
+}
+
+// ErrNotWaiting means SendSignal was asked not to send ahead and the
+// workflow had no current wait for that signal (ADR 0064).
+var ErrNotWaiting = errors.New("kairo: workflow is not waiting for the signal")
+
+// SignalReceipt identifies the wait that accepted a signal. Index is the
+// zero-based occurrence of WaitFor with that name. Early says this send
+// created the wait before the workflow function reached it.
+type SignalReceipt struct {
+	RunID string
+	Index int
+	Early bool
+}
+
+type signalOpts struct{ onlyIfWaiting bool }
+
+// SignalOption configures SendSignal.
+type SignalOption func(*signalOpts)
+
+// OnlyIfWaiting makes SendSignal return ErrNotWaiting instead of keeping the
+// signal for a future wait.
+func OnlyIfWaiting() SignalOption { return func(o *signalOpts) { o.onlyIfWaiting = true } }
+
+// SendSignal atomically sends to the first wait for name and reports which
+// one accepted it. It needs the embedded runtime; Signal remains the
+// compatible API for kairod (ADR 0064).
+func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, opts ...SignalOption) (SignalReceipt, error) {
+	var receipt SignalReceipt
+	if k.remote != nil {
+		return receipt, ErrNeedsEmbedded
+	}
+	o := signalOpts{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if err := k.plan(planWait+name, waitRoot(name, 0), nil); err != nil {
+		return receipt, err
+	}
+	for n := 0; ; n++ {
+		runID := callID(id, planWait+name, "null", n)
+		r, err := k.runs.get(ctx, runID)
+		if errors.Is(err, ErrUnknownRun) {
+			// Linearize "not present now" with a no-op event transaction. If
+			// the workflow made the wait first, the signal is applied here.
+			applied, applyErr := k.rt.signalApplied(ctx, runID, name, payload)
+			if applyErr != nil {
+				return receipt, applyErr
+			}
+			if applied {
+				receipt = SignalReceipt{RunID: runID, Index: n}
+				break
+			}
+			if o.onlyIfWaiting {
+				wf, wfErr := k.runs.get(ctx, id)
+				if errors.Is(wfErr, ErrUnknownRun) || (wfErr == nil && wf.Plan != planWorkflow) {
+					return receipt, fmt.Errorf("kairo: no workflow %s", id)
+				}
+				if wfErr != nil {
+					return receipt, wfErr
+				}
+				return receipt, fmt.Errorf("workflow %s: %w: %s", id, ErrNotWaiting, name)
+			}
+			made, aheadErr := k.signalAhead(ctx, id, name, runID, payload)
+			if aheadErr != nil {
+				return receipt, aheadErr
+			}
+			if !made {
+				n-- // a concurrent wait or signal made this number; inspect it
+				continue
+			}
+			receipt = SignalReceipt{RunID: runID, Index: n, Early: true}
+			break
+		}
+		if err != nil {
+			return receipt, err
+		}
+		if r.Finished() {
+			continue
+		}
+		applied, err := k.rt.signalApplied(ctx, runID, name, payload)
+		if err != nil {
+			return receipt, err
+		}
+		if applied {
+			receipt = SignalReceipt{RunID: runID, Index: n}
+			break
+		}
+		// A concurrent signal, timeout or cancellation won. Try the next wait.
+	}
+	if k.mode == Suspend {
+		k.settle()
+		if err := k.wakeUp(ctx); err != nil {
+			return SignalReceipt{}, err
+		}
+	}
+	return receipt, nil
 }
 
 // signalAhead makes wait runID of workflow id, as the workflow will when
@@ -1251,7 +1669,7 @@ type Filter struct {
 // workflows, not calls), in the order they were created (ADR 0059).
 func (k *Kairo) List(ctx context.Context, f Filter) ([]RunInfo, error) {
 	if k.remote != nil {
-		return nil, ErrNeedsEmbedded
+		return k.remote.list(ctx, f)
 	}
 	lf := ListFilter{Workflow: f.Workflow, Status: f.Status, After: f.After, Limit: f.Limit}
 	if !f.Since.IsZero() {
@@ -1272,7 +1690,60 @@ func (k *Kairo) List(ctx context.Context, f Filter) ([]RunInfo, error) {
 }
 
 // Cancel cancels workflow id: the calls it waits for are cancelled with it.
-func (k *Kairo) Cancel(ctx context.Context, id string) error { return k.runs.cancel(ctx, id) }
+// It returns only once the durable outcome is known. A workflow already
+// cancelled is an idempotent success; one already completed or failed returns
+// ErrRunSettled (ADR 0061).
+func (k *Kairo) Cancel(ctx context.Context, id string) (retErr error) {
+	// Stop this process's replay first, so a child cancellation cannot make
+	// the function record a failure before the durable parent cancellation.
+	k.mu.Lock()
+	var req *cancelRequest
+	created := false
+	for d := range k.driving {
+		if d.id == id {
+			if d.cancelReq == nil {
+				d.cancelReq = &cancelRequest{done: make(chan struct{})}
+				created = true
+			}
+			req = d.cancelReq
+			d.cancel()
+			break
+		}
+	}
+	k.mu.Unlock()
+	settled := false
+	if created {
+		defer func() {
+			req.ok = settled
+			close(req.done)
+		}()
+	}
+	for {
+		if err := k.settleDescendants(ctx, id); err != nil {
+			return err
+		}
+		err := k.runs.cancel(ctx, id)
+		if errors.Is(err, errChildrenUnsettled) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		break
+	}
+	if err := k.settleDescendants(ctx, id); err != nil {
+		return err
+	}
+	ri, err := k.runs.wait(ctx, id)
+	if err != nil {
+		return err
+	}
+	settled = true
+	if ri.Status == "cancelled" {
+		return nil
+	}
+	return fmt.Errorf("workflow %s is %s: %w", id, ri.Status, ErrRunSettled)
+}
 
 // Get describes run id (a workflow or a call).
 func (k *Kairo) Get(ctx context.Context, id string) (RunInfo, error) { return k.runs.get(ctx, id) }
@@ -1281,7 +1752,7 @@ func (k *Kairo) Get(ctx context.Context, id string) (RunInfo, error) { return k.
 // workflows (ADR 0058).
 func (k *Kairo) Children(ctx context.Context, id string) ([]RunInfo, error) {
 	if k.remote != nil {
-		return nil, ErrNeedsEmbedded
+		return k.remote.children(ctx, id)
 	}
 	rows, err := k.rt.store.Children(ctx, id)
 	if err != nil {
@@ -1298,7 +1769,14 @@ func (k *Kairo) Children(ctx context.Context, id string) ([]RunInfo, error) {
 // outcome was unknown) with the output it had: it did take effect.
 func (k *Kairo) Resolve(ctx context.Context, callID string, output any) error {
 	if k.remote != nil {
-		return ErrNeedsEmbedded
+		if err := k.remote.resolve(ctx, callID, output, ""); err != nil {
+			return err
+		}
+		if k.mode == Suspend {
+			_, _, err := k.Tick(ctx)
+			return err
+		}
+		return nil
 	}
 	return k.rt.resolve(ctx, callID, output, "")
 }
@@ -1306,11 +1784,18 @@ func (k *Kairo) Resolve(ctx context.Context, callID string, output any) error {
 // ResolveFailed settles a call stopped for review as not done: it failed
 // with msg.
 func (k *Kairo) ResolveFailed(ctx context.Context, callID string, msg string) error {
-	if k.remote != nil {
-		return ErrNeedsEmbedded
-	}
 	if msg == "" {
 		msg = "resolved as failed"
+	}
+	if k.remote != nil {
+		if err := k.remote.resolve(ctx, callID, nil, msg); err != nil {
+			return err
+		}
+		if k.mode == Suspend {
+			_, _, err := k.Tick(ctx)
+			return err
+		}
+		return nil
 	}
 	return k.rt.resolve(ctx, callID, nil, msg)
 }
@@ -1326,8 +1811,51 @@ func (k *Kairo) Subscribe(id string) (chunks <-chan Chunk, stop func()) {
 // stopped, drives on the workflows whose calls settle, and returns once
 // that is done, with when something is next to do (ok false: nothing).
 func (k *Kairo) Tick(ctx context.Context) (next time.Time, ok bool, err error) {
+	select {
+	case <-ctx.Done():
+		return time.Time{}, false, ctx.Err()
+	case <-k.tickSlot:
+	}
+	defer func() { k.tickSlot <- struct{}{} }()
 	if k.remote != nil {
-		return time.Time{}, false, ErrNeedsEmbedded
+		k.remote.clearDue(k.nowFn().UnixMilli())
+		for {
+			claim, _, claimErr := k.remote.claim(ctx, "", k.supportedWorkflows(), 0)
+			if claimErr != nil {
+				return time.Time{}, false, claimErr
+			}
+			if claim == nil {
+				break
+			}
+			name, _, input, valid := workflowOf(claim.Run.Input)
+			if !valid {
+				_ = k.remote.release(context.Background(), *claim, false)
+				continue
+			}
+			k.remote.hold(*claim)
+			_, driveErr := k.runAs(ctx, name, input, claim.Run.RunID, claim.Run.Parent, nil)
+			if ctx.Err() != nil || errors.Is(driveErr, ErrStopped) {
+				k.remote.drop(claim.Run.RunID)
+				return time.Time{}, false, driveErr
+			}
+			if releaseErr := k.remote.release(context.Background(), *claim, retryWorkflow(driveErr)); releaseErr != nil {
+				return time.Time{}, false, releaseErr
+			}
+			if driveErr != nil && !errors.Is(driveErr, ErrSuspended) && !retryWorkflow(driveErr) && !errors.Is(driveErr, errUnknownPlan) {
+				return time.Time{}, false, driveErr
+			}
+		}
+		at := k.remote.nextWake()
+		if at == 0 {
+			return time.Time{}, false, nil
+		}
+		next = time.UnixMilli(at)
+		if k.mode == Suspend && k.wake != nil {
+			if err := k.wake(next); err != nil {
+				return time.Time{}, false, err
+			}
+		}
+		return next, true, nil
 	}
 	if err := k.rt.tick(ctx); err != nil {
 		return time.Time{}, false, err
@@ -1348,6 +1876,12 @@ func (k *Kairo) Tick(ctx context.Context) (next time.Time, ok bool, err error) {
 // wakeUp, in suspend mode, tells Wake when something is next to do.
 func (k *Kairo) wakeUp(ctx context.Context) error {
 	if k.mode != Suspend || k.wake == nil {
+		return nil
+	}
+	if k.remote != nil {
+		if at := k.remote.nextWake(); at != 0 {
+			return k.wake(time.UnixMilli(at))
+		}
 		return nil
 	}
 	at, ok, err := k.rt.nextWake(ctx)
@@ -1380,17 +1914,25 @@ func (k *Kairo) settle() {
 // driven now).
 func (k *Kairo) redrive(id string) {
 	k.mu.Lock()
-	if k.drivingIDs[id] {
+	if k.redriving[id] {
 		k.again[id] = true
 		k.mu.Unlock()
 		return
 	}
+	if k.drivingIDs[id] {
+		k.mu.Unlock()
+		return
+	}
+	k.redriving[id] = true
 	k.mu.Unlock()
 	k.redriveMu.Lock()
 	k.redrivesN++
 	k.redriveMu.Unlock()
 	go func() {
 		defer func() {
+			k.mu.Lock()
+			delete(k.redriving, id)
+			k.mu.Unlock()
 			k.redriveMu.Lock()
 			k.redrivesN--
 			if k.redrivesN == 0 {
@@ -1433,17 +1975,41 @@ func (k *Kairo) redrive(id string) {
 // Drain returns, whatever ctx did; it may be called again to wait. After
 // Drain, Close.
 func (k *Kairo) Drain(ctx context.Context) error {
-	if k.remote != nil {
-		return ErrNeedsEmbedded
-	}
 	k.draining.Store(true)
-	k.rt.draining.Store(true)
-	k.rt.stopTimers()
+	if k.remote == nil {
+		k.rt.draining.Store(true)
+		k.rt.stopTimers()
+	}
 	k.mu.Lock()
 	for d := range k.driving {
 		d.cancel() // stops at its next call; its drive lease is handed over
 	}
 	k.mu.Unlock()
+	if k.remote != nil {
+		k.mu.Lock()
+		drives := len(k.driving)
+		k.mu.Unlock()
+		k.rt.logger.Info("kairo: draining kairod worker", "worker_tasks", k.remote.inflight(), "workflow_drives", drives)
+		if err := k.remote.drain(ctx); err != nil {
+			k.rt.logger.Warn("kairo: draining kairod worker", "err", err)
+			return err
+		}
+		for {
+			k.mu.Lock()
+			if len(k.driving) == 0 {
+				k.mu.Unlock()
+				k.rt.logger.Info("kairo: kairod worker drained")
+				return nil
+			}
+			changed := k.driveChanged
+			k.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-changed:
+			}
+		}
+	}
 	return k.rt.waitIdle(ctx)
 }
 
@@ -1462,12 +2028,18 @@ func (k *Kairo) Close() error {
 		close(k.sweepStop)
 	}
 	k.bgCancel()
+	if k.remote != nil {
+		k.remote.stopStarts()
+	}
 	k.mu.Lock()
 	for d := range k.driving {
 		d.cancel()
 	}
 	k.mu.Unlock()
 	k.bgWG.Wait()
+	if k.remote != nil {
+		k.remote.releaseAll()
+	}
 	return k.rt.close()
 }
 

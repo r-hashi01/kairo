@@ -53,6 +53,7 @@ type RunInfo struct {
 	Updated  time.Time       `json:"updated_at"`
 	// trimmed: finished, its result no longer kept (kairod, ADR 0027).
 	trimmed bool
+	nextAt  int64 // kairod quiescent response (ADR 0069)
 }
 
 // Finished reports whether the run is over (completed, failed or
@@ -126,6 +127,7 @@ type runtime struct {
 	nextHook  int
 	timers    map[string]*time.Timer
 	running   map[string]context.CancelFunc
+	reached   map[string]int // child runs reached by workflow functions here
 	subs      map[int]*subscription
 	nextSub   int
 	closed    bool
@@ -152,6 +154,7 @@ type runtime struct {
 	draining    atomic.Bool
 	lostDrive   func(ctx context.Context, l LeaseRow) error
 	missingPlan func(name string) bool
+	wakeParent  func(id string)
 }
 
 type subscription struct {
@@ -162,9 +165,9 @@ type subscription struct {
 const removePerTick = 100
 
 func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int64) *runtime {
-	r := &runtime{core: wasmcore.New(), store: store, now: now, owner: owner, leaseMs: leaseMs, keepMs: keepMs,
+	r := &runtime{core: wasmcore.New(), store: wrapStore(store), now: now, owner: owner, leaseMs: leaseMs, keepMs: keepMs,
 		plans: map[string]wasmcore.Compiled{}, waiters: map[string]map[chan RunInfo]struct{}{}, hooks: map[int]func(RunInfo){},
-		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, subs: map[int]*subscription{}}
+		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, reached: map[string]int{}, subs: map[int]*subscription{}}
 	r.busyCond = sync.NewCond(&r.busyMu)
 	r.logger = slog.Default()
 	return r
@@ -303,10 +306,13 @@ type startInfo struct {
 
 // runSpec is what a new run starts with, besides its plan and input.
 type runSpec struct {
-	vars     map[string]any
-	parent   string
-	workflow string
-	meta     json.RawMessage
+	vars   map[string]any
+	parent string
+	// guardParent atomically requires parent to be an unfinished workflow
+	// when this run is first created (ADR 0065).
+	guardParent bool
+	workflow    string
+	meta        json.RawMessage
 	// drive, for a workflow run: its drive lease, set with its start
 	// (token; 0: none).
 	drive int32
@@ -443,12 +449,17 @@ func (r *runtime) settledElsewhere(runID string) {
 }
 
 func (r *runtime) signal(ctx context.Context, runID, name string, payload any) error {
+	_, err := r.signalApplied(ctx, runID, name, payload)
+	return err
+}
+
+func (r *runtime) signalApplied(ctx context.Context, runID, name string, payload any) (bool, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = r.process(ctx, runID, []wasmcore.Event{{Kind: "signal", At: r.now(), Name: name, Data: data}}, nil)
-	return err
+	report, err := r.processReported(ctx, runID, []wasmcore.Event{{Kind: "signal", At: r.now(), Name: name, Data: data}}, nil)
+	return report.applied, err
 }
 
 func (r *runtime) cancel(ctx context.Context, runID string) error {
@@ -511,11 +522,16 @@ func (r *runtime) tick(ctx context.Context) error {
 		var err error
 		if l.Act == 0 {
 			// A workflow's driver stopped (ADR 0059).
-			if r.lostDrive != nil {
+			var ok bool
+			ok, err = r.mayAdvance(ctx, l.Run)
+			if err == nil && ok && r.lostDrive != nil {
 				err = skipUnknownPlan(r.lostDrive(ctx, l))
 			}
 		} else {
 			err = skipUnknownPlan(r.recover(ctx, l))
+		}
+		if errors.Is(err, errParentNotReached) {
+			continue
 		}
 		if err != nil && ctx.Err() == nil {
 			r.stuck(l.Run, err)
@@ -534,6 +550,9 @@ func (r *runtime) tick(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if err := skipUnknownPlan(r.fire(ctx, t)); err != nil && ctx.Err() == nil {
+			if errors.Is(err, errParentNotReached) {
+				continue
+			}
 			r.stuck(t.Run, err)
 			t.At = r.now() + r.leaseMs
 			if serr := r.store.WithRun(ctx, t.Run, func(row *RunRow) (*Changes, error) {
@@ -648,14 +667,99 @@ func skipUnknownPlan(err error) error {
 
 // recover: the process that ran l's step stopped; its outcome is unknown.
 func (r *runtime) recover(ctx context.Context, l LeaseRow) error {
-	_, err := r.process(ctx, l.Run, []wasmcore.Event{{Kind: "step_err", At: r.now(), Act: l.Act, Attempt: l.Attempt, Unknown: true,
+	ok, err := r.mayAdvance(ctx, l.Run)
+	if err != nil || !ok {
+		return err
+	}
+	_, err = r.process(ctx, l.Run, []wasmcore.Event{{Kind: "step_err", At: r.now(), Act: l.Act, Attempt: l.Attempt, Unknown: true,
 		Retryable: true, Err: "the process running the step stopped", ErrType: "process_lost"}}, nil)
 	return err
 }
 
 func (r *runtime) fire(ctx context.Context, t TimerRow) error {
-	_, err := r.process(ctx, t.Run, []wasmcore.Event{{Kind: "timer", At: r.now(), Act: t.Act, Timer: t.Timer}}, nil)
+	ok, err := r.mayAdvance(ctx, t.Run)
+	if err != nil || !ok {
+		return err
+	}
+	_, err = r.process(ctx, t.Run, []wasmcore.Event{{Kind: "timer", At: r.now(), Act: t.Act, Timer: t.Timer}}, nil)
 	return err
+}
+
+// resumeReached processes only the recovery work of run. The parent calls it
+// after its replay has opened the same child again (ADR 0062).
+func (r *runtime) resumeReached(ctx context.Context, runID string) error {
+	leases, timers, err := r.store.Recoverable(ctx, runID, r.now())
+	if err != nil {
+		return err
+	}
+	for _, l := range leases {
+		if err := skipUnknownPlan(r.recover(ctx, l)); err != nil {
+			r.stuck(runID, err)
+			l.Owner, l.Until = "", r.now()+r.leaseMs
+			if herr := r.store.HandOver(ctx, l); herr != nil {
+				r.logger.Warn("kairo: putting off a lease", "run", runID, "err", herr)
+			}
+			return err
+		}
+	}
+	for _, t := range timers {
+		if err := skipUnknownPlan(r.fire(ctx, t)); err != nil {
+			r.stuck(runID, err)
+			t.At = r.now() + r.leaseMs
+			if serr := r.store.WithRun(ctx, runID, func(row *RunRow) (*Changes, error) {
+				if row == nil {
+					return nil, nil
+				}
+				return &Changes{SetTimers: []TimerRow{t}}, nil
+			}); serr != nil {
+				r.logger.Warn("kairo: putting off a timer", "run", runID, "err", serr)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+var errParentNotReached = errors.New("kairo: the parent replay has not reached this child")
+
+func (r *runtime) reach(runID string, on bool) {
+	r.mu.Lock()
+	if on {
+		r.reached[runID]++
+	} else if r.reached[runID] <= 1 {
+		delete(r.reached, runID)
+	} else {
+		r.reached[runID]--
+	}
+	r.mu.Unlock()
+}
+
+// mayAdvance gates recovery of a child run on its parent's current replay.
+func (r *runtime) mayAdvance(ctx context.Context, runID string) (bool, error) {
+	row, err := r.store.Get(ctx, runID)
+	if err != nil || row == nil || row.Parent == "" {
+		return true, err
+	}
+	for parent := row.Parent; parent != ""; {
+		p, err := r.store.Get(ctx, parent)
+		if err != nil {
+			return false, err
+		}
+		if p == nil || doneStatus[p.Status] {
+			return false, r.cancel(ctx, runID)
+		}
+		parent = p.Parent
+	}
+	r.mu.Lock()
+	reached := r.reached[runID] > 0
+	r.mu.Unlock()
+	if !reached {
+		if r.wakeParent != nil {
+			r.wakeParent(row.Parent)
+		}
+		return false, errParentNotReached
+	}
+	return true, nil
 }
 
 // close stops as a process that stops: no new step starts, timers are
@@ -728,11 +832,21 @@ func (r *runtime) renew() {
 // process applies events to run runID in one transaction, then carries out
 // the commands. With start, a new run of that plan (or the existing one:
 // existing says which).
+type processReport struct {
+	existing bool
+	applied  bool
+}
+
 func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo) (bool, error) {
+	report, err := r.processReported(ctx, runID, events, start)
+	return report.existing, err
+}
+
+func (r *runtime) processReported(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo) (processReport, error) {
 	var (
-		existing, settled bool
-		commands          []wasmcore.Command
-		newRow            *RunRow
+		existing, settled, applied bool
+		commands                   []wasmcore.Command
+		newRow                     *RunRow
 	)
 	err := r.store.WithRun(ctx, runID, func(row *RunRow) (*Changes, error) {
 		existing, settled, commands, newRow = false, false, nil, nil
@@ -813,6 +927,7 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 		if len(recorded) == 0 {
 			return &Changes{EndLeases: endLeases}, nil
 		}
+		applied = true
 		at := r.now()
 		if start != nil {
 			at = start.at
@@ -827,6 +942,12 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 			}
 		}
 		ch := &Changes{Events: recorded, Row: next, EndLeases: endLeases, Clear: doneStatus[status]}
+		if row == nil && start.guardParent {
+			ch.GuardParent = start.parent
+		}
+		if next.Workflow != "" && doneStatus[status] {
+			ch.GuardTreeSettled = true
+		}
 		if row == nil && start.drive != 0 && !ch.Clear {
 			// Driven by this process from its start (ADR 0059).
 			ch.SetLeases = append(ch.SetLeases, LeaseRow{Run: runID, Act: 0, Attempt: start.drive, Owner: r.owner, Until: at + r.leaseMs})
@@ -848,7 +969,10 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 		}
 		settled = settledStatus(status) && status != was
 		ch.Notify = settled
-		if settled && next.Parent != "" && r.leaseParents {
+		r.mu.Lock()
+		parentIsDriving := r.reached[runID] > 0
+		r.mu.Unlock()
+		if settled && next.Parent != "" && r.leaseParents && !parentIsDriving {
 			// Its workflow is to be driven on: by this process, or, if it
 			// stops first, by whichever takes the lease up (ADR 0059).
 			ch.SetLeases = append(ch.SetLeases, LeaseRow{Run: next.Parent, Act: 0, Attempt: newToken(), Owner: r.owner, Until: at + r.leaseMs})
@@ -857,10 +981,10 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 		return ch, nil
 	})
 	if err != nil {
-		return false, err
+		return processReport{}, err
 	}
 	if r.isClosed() {
-		return existing, nil
+		return processReport{existing: existing, applied: applied}, nil
 	}
 	if start != nil && !existing && newRow != nil {
 		r.observe(Observation{Kind: ObsRunStarted, RunID: runID, Parent: newRow.Parent, Plan: newRow.Plan, Workflow: newRow.Workflow})
@@ -883,7 +1007,7 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 			}
 		})
 	}
-	return existing, nil
+	return processReport{existing: existing, applied: applied}, nil
 }
 
 func (r *runtime) carryOut(runID string, c wasmcore.Command) {
@@ -907,7 +1031,7 @@ func (r *runtime) carryOut(runID string, c wasmcore.Command) {
 			r.mu.Unlock()
 			if !closed {
 				r.track(func() {
-					if err := skipUnknownPlan(r.fire(context.Background(), t)); err != nil {
+					if err := skipUnknownPlan(r.fire(context.Background(), t)); err != nil && !errors.Is(err, errParentNotReached) {
 						r.logger.Warn("kairo: firing a timer", "run", runID, "err", err)
 					}
 				})

@@ -2,8 +2,11 @@ package kairo
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -58,5 +61,79 @@ func TestKeepFinishedSetting(t *testing.T) {
 	}
 	if _, err := keepFinished(0, "a week"); err == nil {
 		t.Error("a bad value was taken")
+	}
+}
+
+// cancelBeforeDone serializes a cancellation immediately before the workflow
+// driver sends done. It makes the ADR 0061 race deterministic.
+type cancelBeforeDone struct {
+	runs
+	once sync.Once
+	err  error
+}
+
+func (r *cancelBeforeDone) signal(ctx context.Context, runID, name string, payload any) error {
+	if name == "done" {
+		r.once.Do(func() {
+			r.err = r.runs.cancel(ctx, runID)
+			if r.err == nil {
+				_, r.err = r.runs.wait(ctx, runID)
+			}
+		})
+		if r.err != nil {
+			return r.err
+		}
+	}
+	return r.runs.signal(ctx, runID, name, payload)
+}
+
+func TestCancellationRecordedBeforeDoneWins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fn   func(*Context, any) (string, error)
+	}{
+		{name: "success", fn: func(*Context, any) (string, error) { return "local value", nil }},
+		{name: "failure", fn: func(*Context, any) (string, error) { return "", errors.New("local failure") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k, err := Open(context.Background(), Options{Store: NewMemStore()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer k.Close()
+			Workflow(k, "race", tc.fn)
+			if err := k.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			k.runs = &cancelBeforeDone{runs: k.runs}
+			id := "cancel-before-done-" + tc.name
+			if _, err := Run[string](context.Background(), k, "race", nil, WithID(id)); !errors.Is(err, ErrCancelled) {
+				t.Fatalf("live result: %v", err)
+			}
+			if _, err := Run[string](context.Background(), k, "race", nil, WithID(id)); !errors.Is(err, ErrCancelled) {
+				t.Fatalf("recorded result: %v", err)
+			}
+			if err := k.Cancel(context.Background(), id); err != nil {
+				t.Fatalf("repeated cancellation: %v", err)
+			}
+		})
+	}
+}
+
+func TestCancelAfterCompletionReportsSettled(t *testing.T) {
+	k, err := Open(context.Background(), Options{Store: NewMemStore()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	Workflow(k, "quick", func(*Context, any) (string, error) { return "done", nil })
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Run[string](context.Background(), k, "quick", nil, WithID("already-complete")); err != nil || got != "done" {
+		t.Fatalf("run: %q %v", got, err)
+	}
+	if err := k.Cancel(context.Background(), "already-complete"); !errors.Is(err, ErrRunSettled) {
+		t.Fatalf("cancel: %v", err)
 	}
 }

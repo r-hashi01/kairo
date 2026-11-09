@@ -5,6 +5,35 @@
 
 import type { CoreEvent } from './core.ts';
 
+/**
+ * Stops the current workflow drive without recording an outcome, so the
+ * same run can be replayed later (ADR 0063). This is not an action's
+ * RetryableError.
+ */
+export class WorkflowRetryError extends Error {
+	override name = 'WorkflowRetryError';
+}
+
+/** A run cannot safely be added to the requested parent's tree (ADR 0065). */
+export class ParentUnavailableError extends Error {
+	override name = 'ParentUnavailableError';
+}
+
+/** A child appeared or remained unfinished while its workflow was settling. */
+export class ChildrenUnsettledError extends Error {
+	override name = 'ChildrenUnsettledError';
+}
+
+/** Whether error or one of its causes asks for workflow replay. */
+export function isWorkflowRetry(error: unknown): boolean {
+	const seen = new Set<unknown>();
+	for (let e = error; e instanceof Error && !seen.has(e); e = e.cause) {
+		if (e instanceof WorkflowRetryError) return true;
+		seen.add(e);
+	}
+	return false;
+}
+
 export interface RunRow {
 	id: string;
 	plan: string;
@@ -61,6 +90,10 @@ export interface TimerRow {
 export interface Changes<T> {
 	events: CoreEvent[];
 	row?: RunRow;
+	/** Atomically require this unfinished workflow before writing a new child. */
+	guardParent?: string;
+	/** Require every descendant to be finished before writing a terminal workflow state. */
+	guardTreeSettled?: boolean;
 	setTimers?: TimerRow[];
 	deleteTimers?: number[];
 	/** Drop every timer and lease of the run (it ended). */
@@ -75,13 +108,16 @@ export interface Changes<T> {
 
 export interface Store {
 	init(): Promise<void>;
-	/** Locks run id's row (absent: undefined), computes the changes, writes them. */
+	/** Locks run id's row (absent: undefined), computes and atomically writes changes including their parent/tree guards. */
 	withRun<T>(id: string, fn: (row: RunRow | undefined) => Changes<T>): Promise<T>;
 	get(id: string): Promise<RunRow | undefined>;
+	children(parent: string): Promise<RunRow[]>;
 	/** Timers due at now, oldest first. */
 	dueTimers(now: number, limit: number): Promise<TimerRow[]>;
 	/** Leases past their time at now: steps whose process stopped. */
 	expiredLeases(now: number, limit: number): Promise<LeaseRow[]>;
+	/** This run's recovery work, read when its parent replay reaches it (ADR 0062). */
+	recoverable(run: string, now: number): Promise<{ leases: LeaseRow[]; timers: TimerRow[] }>;
 	/**
 	 * When something is next to do (ADR 0053): the earliest timer, or the
 	 * earliest lease to expire; null if neither.
@@ -119,6 +155,41 @@ export interface Store {
 	/** Root runs (no parent) in creation order (ADR 0059). */
 	list(f: ListFilter): Promise<RunRow[]>;
 	close(): Promise<void>;
+}
+
+/**
+ * Marks failures of Store operations for workflow replay. An error thrown
+ * by withRun's pure callback is a Kairo semantic error and passes through
+ * unchanged (ADR 0063).
+ */
+export function retryingStore(store: Store): Store {
+	return new Proxy(store, {
+		get(target, prop) {
+			const value = Reflect.get(target, prop, target) as unknown;
+			if (typeof value !== 'function') return value;
+			return async (...given: unknown[]) => {
+				const args = [...given];
+				let callbackError: unknown;
+				if (prop === 'withRun' && typeof args[1] === 'function') {
+					const fn = args[1] as (...a: unknown[]) => unknown;
+					args[1] = (...a: unknown[]) => {
+						try {
+							return fn(...a);
+						} catch (e) {
+							callbackError = e;
+							throw e;
+						}
+					};
+				}
+				try {
+					return await Reflect.apply(value, target, args);
+				} catch (e) {
+					if (e === callbackError || e instanceof ParentUnavailableError || e instanceof ChildrenUnsettledError || isWorkflowRetry(e)) throw e;
+					throw new WorkflowRetryError(`kairo store: ${String((e as Error)?.message ?? e)}`, { cause: e });
+				}
+			};
+		},
+	});
 }
 
 const DDL = (p: string, blob: string, big: string) => [
@@ -192,6 +263,24 @@ function runRow(r: any): RunRow | undefined {
 }
 
 const DONE_SQL = `('completed', 'failed', 'cancelled')`;
+const DONE = new Set(['completed', 'failed', 'cancelled']);
+
+function checkParent(parent: RunRow | undefined, parentId: string, childId: string): void {
+	let reason: string | undefined;
+	if (parentId === childId) reason = 'a run cannot be its own parent';
+	else if (!parent) reason = 'it does not exist';
+	else if (parent.plan !== 'kairo.workflow' || !parent.workflow) reason = 'it is not a workflow';
+	else if (DONE.has(parent.status)) reason = 'it has finished';
+	if (reason) throw new ParentUnavailableError(`parent ${parentId}: ${reason}`);
+}
+
+function checkTreeSettled(db: { prepare(sql: string): any }, p: string, id: string): void {
+	const q = `WITH RECURSIVE tree(id) AS (
+		SELECT id FROM ${p}run WHERE parent = ?
+		UNION SELECT r.id FROM ${p}run r JOIN tree t ON r.parent = t.id
+	) SELECT 1 AS found FROM ${p}run WHERE id IN (SELECT id FROM tree) AND status NOT IN ${DONE_SQL} LIMIT 1`;
+	if (db.prepare(q).get(id)) throw new ChildrenUnsettledError(`workflow ${id}: children changed while it settled`);
+}
 
 /** Roots of finished trees: no parent, or its parent gone (oldest first). */
 const ROOTS = (p: string, at: string, lim: string) =>
@@ -240,6 +329,9 @@ export class SQLiteStore implements Store {
 		const p = this.p;
 		this.q = {
 			get: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = ?`),
+			children: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE parent = ? ORDER BY created_at, id`),
+			recoverableTimers: this.db.prepare(`SELECT run, timer, act, at FROM ${p}timer WHERE run = ? AND at <= ? ORDER BY at`),
+			recoverableLeases: this.db.prepare(`SELECT run, act, attempt, owner, until FROM ${p}lease WHERE run = ? AND act <> 0 AND until < ? ORDER BY until`),
 			put: this.db.prepare(PUT(p, qmark)),
 			claim: this.db.prepare(CLAIM(p, qmark)),
 			endDrive: this.db.prepare(`DELETE FROM ${p}lease ${DRIVE_WHERE(qmark, 1)}`),
@@ -299,6 +391,8 @@ export class SQLiteStore implements Store {
 		try {
 			const before = this.row(this.q.get.get(id));
 			const c = fn(before);
+			if (c.guardParent) checkParent(this.row(this.q.get.get(c.guardParent)), c.guardParent, id);
+			if (c.guardTreeSettled) checkTreeSettled(this.db, this.p, id);
 			let seq = before?.seq ?? 0;
 			for (const ev of c.events) this.q.event.run(id, seq++, JSON.stringify(ev));
 			if (c.row) {
@@ -325,12 +419,23 @@ export class SQLiteStore implements Store {
 		return this.row(this.q.get.get(id));
 	}
 
+	async children(parent: string): Promise<RunRow[]> {
+		return this.q.children.all(parent).map((r: any) => runRow(r)!);
+	}
+
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {
 		return this.q.due.all(now, limit).map((t: any) => ({ run: t.run, timer: Number(t.timer), act: Number(t.act), at: Number(t.at) }));
 	}
 
 	async expiredLeases(now: number, limit: number): Promise<LeaseRow[]> {
 		return this.q.expired.all(now, limit).map(lease);
+	}
+
+	async recoverable(run: string, now: number): Promise<{ leases: LeaseRow[]; timers: TimerRow[] }> {
+		return {
+			leases: this.q.recoverableLeases.all(run, now).map(lease),
+			timers: this.q.recoverableTimers.all(run, now).map((t: any) => ({ run: t.run, timer: Number(t.timer), act: Number(t.act), at: Number(t.at) })),
+		};
 	}
 
 	async renewLeases(owner: string, until: number): Promise<void> {
@@ -446,6 +551,17 @@ export class PostgresStore implements Store {
 			await c.query('BEGIN');
 			const before = this.row((await c.query(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = $1 FOR UPDATE`, [id])).rows[0]);
 			const ch = fn(before);
+			if (ch.guardParent) {
+				const parent = this.row((await c.query(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = $1 FOR UPDATE`, [ch.guardParent])).rows[0]);
+				checkParent(parent, ch.guardParent, id);
+			}
+			if (ch.guardTreeSettled) {
+				const unsettled = (await c.query(`WITH RECURSIVE tree(id) AS (
+					SELECT id FROM ${p}run WHERE parent = $1
+					UNION SELECT r.id FROM ${p}run r JOIN tree t ON r.parent = t.id
+				) SELECT 1 FROM ${p}run WHERE id IN (SELECT id FROM tree) AND status NOT IN ${DONE_SQL} LIMIT 1`, [id])).rows[0];
+				if (unsettled) throw new ChildrenUnsettledError(`workflow ${id}: children changed while it settled`);
+			}
 			let seq = before?.seq ?? 0;
 			for (const ev of ch.events) await c.query(`INSERT INTO ${p}event (run, seq, body) VALUES ($1, $2, $3)`, [id, seq++, JSON.stringify(ev)]);
 			if (ch.row) {
@@ -483,6 +599,10 @@ export class PostgresStore implements Store {
 		return this.row((await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE id = $1`, [id])).rows[0]);
 	}
 
+	async children(parent: string): Promise<RunRow[]> {
+		return (await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE parent = $1 ORDER BY created_at, id`, [parent])).rows.map((r: any) => runRow(r)!);
+	}
+
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {
 		const r = await this.pool.query(`SELECT run, timer, act, at FROM ${this.p}timer WHERE at <= $1 ORDER BY at LIMIT $2`, [now, limit]);
 		return r.rows.map((t: any) => ({ run: t.run, timer: Number(t.timer), act: Number(t.act), at: Number(t.at) }));
@@ -491,6 +611,18 @@ export class PostgresStore implements Store {
 	async expiredLeases(now: number, limit: number): Promise<LeaseRow[]> {
 		const r = await this.pool.query(`SELECT run, act, attempt, owner, until FROM ${this.p}lease WHERE until < $1 ORDER BY until LIMIT $2`, [now, limit]);
 		return r.rows.map(lease);
+	}
+
+	async recoverable(run: string, now: number): Promise<{ leases: LeaseRow[]; timers: TimerRow[] }> {
+		const leases = await this.pool.query(
+			`SELECT run, act, attempt, owner, until FROM ${this.p}lease WHERE run = $1 AND act <> 0 AND until < $2 ORDER BY until`,
+			[run, now],
+		);
+		const timers = await this.pool.query(`SELECT run, timer, act, at FROM ${this.p}timer WHERE run = $1 AND at <= $2 ORDER BY at`, [run, now]);
+		return {
+			leases: leases.rows.map(lease),
+			timers: timers.rows.map((t: any) => ({ run: t.run, timer: Number(t.timer), act: Number(t.act), at: Number(t.at) })),
+		};
 	}
 
 	async renewLeases(owner: string, until: number): Promise<void> {

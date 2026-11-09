@@ -33,7 +33,7 @@ from .client import KairoError
 from .core import Core
 from .observe import LOGGER, RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
-from .store import Changes, LeaseRow, RunRow, Store, TimerRow
+from .store import Changes, LeaseRow, RunRow, Store, TimerRow, retrying_store
 from .worker import Task, TaskContext
 
 #: Runs the action of a dispatched step here (it may block: it runs on a thread).
@@ -54,6 +54,10 @@ PLAN_WORKFLOW = "kairo.workflow"
 
 #: EffectWeakenedError's message, without the run.
 EFFECT_WEAKENED = "a real attempt is out and its action is no longer real"
+
+
+class _ParentNotReached(Exception):
+    pass
 
 
 class EffectWeakenedError(KairoError):
@@ -164,7 +168,7 @@ class Embedded:
         self.logger = logger or LOGGER
         self.observer = observe
         self.core = Core(wasm)
-        self.store = store
+        self.store = retrying_store(store)
         self.now = now
         self._manual_timers = manual_timers
         self.lease_ms = lease_ms
@@ -177,6 +181,7 @@ class Embedded:
         self._hooks: set[Callable[[dict[str, Any]], None]] = set()
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._running: dict[str, TaskContext] = {}
+        self._reached: dict[str, int] = {}
         self._busy: set[asyncio.Future[Any]] = set()
         self._renewal: asyncio.Task[None] | None = None
         self._last_sweep = 0
@@ -195,6 +200,7 @@ class Embedded:
         # wait made elsewhere). admit lets a dispatched step run (limits).
         self.lease_parents = False
         self.lost_drive: Callable[[LeaseRow], Awaitable[None]] | None = None
+        self.wake_parent: Callable[[str], None] | None = None
         self.plan_for: Callable[[str], dict[str, Any] | None] | None = None
         self.admit: Admit | None = None
 
@@ -265,6 +271,7 @@ class Embedded:
         run_id: str,
         vars: dict[str, Any] | None = None,
         parent: str | None = None,
+        guard_parent: bool = False,
         workflow: str | None = None,
         meta: dict[str, Any] | None = None,
         drive: int = 0,
@@ -283,7 +290,14 @@ class Embedded:
         ev: dict[str, Any] = {"kind": "start", "at": at, "data": input}
         if vars:
             ev["vars"] = vars
-        begin = {"plan": p, "parent": parent, "workflow": workflow, "meta": None if meta is None else json.dumps(meta), "drive": drive}
+        begin = {
+            "plan": p,
+            "parent": parent,
+            "guard_parent": guard_parent,
+            "workflow": workflow,
+            "meta": None if meta is None else json.dumps(meta),
+            "drive": drive,
+        }
         try:
             existing = await self._process(run_id, [ev] + [dict(e, at=at) for e in then or ()], begin=begin)
         except Exception:
@@ -312,6 +326,12 @@ class Embedded:
         """Ends a drive lease (this process's, unless owner is given): removed,
         or (resume) left expired, for a tick to take up."""
         await self.store.end_drive(run, self.owner if owner is None else owner, token, self.now(), resume)
+
+    async def retry_drive(self, run: str, token: int) -> int:
+        """Leaves a drive ownerless until its ordinary lease expiry (ADR 0063)."""
+        at = self.now() + self.lease_ms
+        await self.store.hand_over(LeaseRow(run, 0, token, "", at))
+        return at
 
     def driving(self, on: bool) -> None:
         """Counts a workflow driven here (its lease renewed) while it is."""
@@ -343,6 +363,50 @@ class Embedded:
             raise KairoError(404, f"no run {run_id}")
         return info(row)
 
+    async def children(self, run_id: str) -> list[dict[str, Any]]:
+        return [info(row) for row in await self.store.children(run_id)]
+
+    def reach(self, run_id: str, on: bool) -> None:
+        n = self._reached.get(run_id, 0)
+        if on:
+            self._reached[run_id] = n + 1
+        elif n <= 1:
+            self._reached.pop(run_id, None)
+        else:
+            self._reached[run_id] = n - 1
+
+    async def resume_reached(self, run_id: str) -> None:
+        """Processes this child's recovery work after its parent replay reaches it."""
+        leases, timers = await self.store.recoverable(run_id, self.now())
+        for lease in leases:
+            try:
+                await self._recover(lease)
+            except Exception as e:
+                self._record_stuck(run_id, e)
+                try:
+                    await self.store.hand_over(LeaseRow(lease.run, lease.act, lease.attempt, "", self.now() + self.lease_ms))
+                except Exception as put_off:
+                    self.logger.warning("kairo: run %s: putting off a lease: %s", run_id, put_off)
+                raise
+        for timer in timers:
+            try:
+                await self._fire(timer)
+            except Exception as e:
+                self._record_stuck(run_id, e)
+                later = TimerRow(timer.run, timer.timer, timer.act, self.now() + self.lease_ms)
+
+                def put_off(row: RunRow | None) -> Changes[None]:
+                    ch: Changes[None] = Changes(None)
+                    if row is not None:
+                        ch.set_timers.append(later)
+                    return ch
+
+                try:
+                    await self.store.with_run(run_id, put_off)
+                except Exception as put_off_error:
+                    self.logger.warning("kairo: run %s: putting off a timer: %s", run_id, put_off_error)
+                raise
+
     async def wait(self, run_id: str) -> dict[str, Any]:
         """Waits until the run has finished or stopped for review (in this
         process's view, and other processes' with a store that listens)."""
@@ -362,7 +426,12 @@ class Embedded:
                     del self._waiters[run_id]
 
     async def signal(self, run_id: str, name: str, payload: Any = None) -> None:
-        await self._process(run_id, [{"kind": "signal", "at": self.now(), "name": name, "data": payload}])
+        await self.signal_applied(run_id, name, payload)
+
+    async def signal_applied(self, run_id: str, name: str, payload: Any = None) -> bool:
+        """Applies a signal and says whether its event was recorded (ADR 0064)."""
+        out = await self._process_report(run_id, [{"kind": "signal", "at": self.now(), "name": name, "data": payload}])
+        return bool(out["applied"])
 
     async def cancel(self, run_id: str) -> None:
         await self._process(run_id, [{"kind": "cancel", "at": self.now(), "error": "cancelled"}])
@@ -407,7 +476,13 @@ class Embedded:
             if self._closed:
                 return
             # A workflow's driver stopped (ADR 0059).
-            aw = self._recover(lease) if lease.act else (self.lost_drive(lease) if self.lost_drive is not None else None)
+            aw = (
+                self._recover(lease)
+                if lease.act
+                else self._advance(lease.run, lambda lease=lease: self.lost_drive(lease))
+                if self.lost_drive is not None
+                else None
+            )
             if aw is not None and await self._stuck(lease.run, aw):
                 try:
                     await self.store.hand_over(LeaseRow(lease.run, lease.act, lease.attempt, "", self.now() + self.lease_ms))
@@ -465,6 +540,8 @@ class Embedded:
         async def run() -> None:
             try:
                 await _skip_unknown_plan(aw)
+            except _ParentNotReached:
+                return
             except Exception as e:
                 self.logger.warning(msg + ": %s", *args, e)
 
@@ -525,10 +602,15 @@ class Embedded:
         try:
             await _skip_unknown_plan(aw)
             return False
+        except _ParentNotReached:
+            return False
         except Exception as e:
-            self.logger.warning("kairo: run %s cannot go on: %s", run_id, e)
-            self._observe(Observation(RUN_STUCK, run_id=run_id, error=str(e)))
+            self._record_stuck(run_id, e)
             return True
+
+    def _record_stuck(self, run_id: str, error: Exception) -> None:
+        self.logger.warning("kairo: run %s cannot go on: %s", run_id, error)
+        self._observe(Observation(RUN_STUCK, run_id=run_id, error=str(error)))
 
     def _adoptable(self, run_id: str, plan: dict[str, Any], row: RunRow, events: list[dict[str, Any]]) -> None:
         """Raises unless run row, which started under another version of plan,
@@ -549,10 +631,10 @@ class Embedded:
         does not treat as real (ADR 0060)."""
         return _sdk_plan(plan["name"]) and not _strictly_real(plan) and bool(self.core.inspect(row.state).get("intent_durable"))
 
-    def _recover(self, lease: LeaseRow) -> Awaitable[bool]:
-        return self._process(
+    async def _recover(self, lease: LeaseRow) -> bool:
+        return await self._advance(
             lease.run,
-            [
+            lambda: self._process(lease.run, [
                 {
                     "kind": "step_err",
                     "at": self.now(),
@@ -563,13 +645,36 @@ class Embedded:
                     "error": "the process running the step stopped",
                     "error_type": "process_lost",
                 }
-            ],
+            ]),
         )
 
     async def _fire(self, t: TimerRow) -> None:
-        await self._process(t.run, [{"kind": "timer", "at": self.now(), "act": t.act, "timer": t.timer}])
+        await self._advance(t.run, lambda: self._process(t.run, [{"kind": "timer", "at": self.now(), "act": t.act, "timer": t.timer}]))
+
+    async def _advance(self, run_id: str, apply: Callable[[], Awaitable[Any]]) -> Any:
+        row = await self.store.get(run_id)
+        if row is None or not row.parent:
+            return await apply()
+        parent = row.parent
+        while parent:
+            p = await self.store.get(parent)
+            if p is None or p.status in DONE:
+                await self.cancel(run_id)
+                return False
+            parent = p.parent
+        if run_id not in self._reached:
+            if self.wake_parent is not None:
+                self.wake_parent(row.parent)
+            raise _ParentNotReached("the parent replay has not reached this child")
+        return await apply()
 
     async def _process(self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None) -> bool:
+        out = await self._process_report(run_id, events, begin)
+        return bool(out["existing"])
+
+    async def _process_report(
+        self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None
+    ) -> dict[str, bool]:
         """Applies events to run_id in one transaction, then carries out the
         commands. With begin, a new run of its plan (or the existing one: the
         answer says which)."""
@@ -579,9 +684,9 @@ class Embedded:
             # A step's outcome ends its lease, applied or not (a stale one).
             end_leases = [e["act"] for e in events if e["kind"] in OUTCOMES and e.get("act") is not None]
             if row is not None and start is not None:
-                return Changes({"existing": True, "started": False, "settled": False, "commands": [], "row": row})
+                return Changes({"existing": True, "applied": False, "started": False, "settled": False, "commands": [], "row": row})
             if row is None and start is None:
-                return Changes({"existing": False, "started": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
+                return Changes({"existing": False, "applied": False, "started": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
             plan = start if start is not None else self._plan(row.plan)  # type: ignore[union-attr]
             if plan is None:
                 raise KairoError(404, f"run {run_id}: plan {row.plan} is not registered here")  # type: ignore[union-attr]
@@ -614,7 +719,7 @@ class Embedded:
             for ev in events:
                 apply(ev)
             if not recorded:
-                return Changes({"existing": False, "started": False, "settled": False, "commands": commands, "row": row}, end_leases=end_leases)
+                return Changes({"existing": False, "applied": False, "started": False, "settled": False, "commands": commands, "row": row}, end_leases=end_leases)
             at = self.now()
             nxt = RunRow(
                 id=run_id,
@@ -634,9 +739,11 @@ class Embedded:
             )
             settled = res["status"] in SETTLED and res["status"] != (row.status if row else None)
             ch: Changes[dict[str, Any]] = Changes(
-                {"existing": False, "started": row is None, "settled": settled, "commands": commands, "row": nxt},
+                {"existing": False, "applied": True, "started": row is None, "settled": settled, "commands": commands, "row": nxt},
                 events=recorded,
                 row=nxt,
+                guard_parent=begin["parent"] if row is None and begin is not None and begin["guard_parent"] else None,
+                guard_tree_settled=bool(nxt.workflow and res["status"] in DONE),
                 clear=res["status"] in DONE,
                 end_leases=end_leases,
                 notify=settled,
@@ -655,13 +762,13 @@ class Embedded:
                 ch.set_leases.append(LeaseRow(run_id, 0, begin["drive"], self.owner, at + self.lease_ms))
             # Its workflow is to be driven on: by this process, or, if it
             # stops first, by whichever takes the lease up (ADR 0059).
-            if settled and nxt.parent and self.lease_parents:
+            if settled and nxt.parent and self.lease_parents and run_id not in self._reached:
                 ch.set_leases.append(LeaseRow(nxt.parent, 0, new_token(), self.owner, at + self.lease_ms))
             return ch
 
         out = await self.store.with_run(run_id, change)
         if self._closed:
-            return out["existing"]
+            return {"existing": bool(out["existing"]), "applied": bool(out["applied"])}
         row = out["row"]
         if out["started"] and row is not None:
             self._observe(Observation(RUN_STARTED, run_id=run_id, parent=row.parent or "", plan=row.plan, workflow=row.workflow or ""))
@@ -689,7 +796,7 @@ class Embedded:
         # Along the way: what no process is doing (at most once a lease period).
         if self.now() - self._last_sweep >= self.lease_ms and not self._draining:
             self._background(self.tick(), "kairo: sweeping")
-        return out["existing"]
+        return {"existing": bool(out["existing"]), "applied": bool(out["applied"])}
 
     def _carry_out(self, run_id: str, c: dict[str, Any]) -> None:
         kind = c["kind"]

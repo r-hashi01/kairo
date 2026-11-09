@@ -6,15 +6,15 @@ id comes from the call: running the function again with the same workflow
 id returns the calls that finished, and runs nothing twice.
 
 The calls run on kairod (HttpBackend, the default) or on the runtime
-embedded in this process with a database (EmbeddedBackend, ADR 0051). With
-the embedded runtime, mode="suspend" serves hosts that do not stay up
+embedded in this process with a database (EmbeddedBackend, ADR 0051).
+With either backend, mode="suspend" serves hosts that do not stay up
 (serverless): a workflow goes as far as it can now, and tick() and signal()
 drive it on.
 
-With the embedded runtime, the process that drives a workflow holds a
-lease on it (ADR 0059): if the process stops, another one that has the
-workflow takes it up once the lease expires. The same behaviour as the
-TypeScript and Go SDKs (sdk/ts/src/workflow.ts, sdk/go).
+The process that drives a workflow holds a lease on it (ADR 0059, 0069):
+if the process stops, another one that has the workflow takes it up once
+the lease expires. The same behaviour as the TypeScript and Go SDKs
+(sdk/ts/src/workflow.ts, sdk/go).
 """
 
 from __future__ import annotations
@@ -39,11 +39,11 @@ from typing import Any
 
 from .backend import Backend, HttpBackend
 from .client import KairoError, finished
-from .embedded import Embedded, new_token
+from .embedded import EffectWeakenedError, Embedded, new_token
 from .http import SignatureError, check_url, post, sign, verify
 from .observe import LOGGER, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
-from .store import LeaseRow
+from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, WorkflowRetryError, is_workflow_retry
 from .worker import Task, TaskContext
 
 PLAN_CALL = "kairo.call/"
@@ -61,6 +61,10 @@ class Cancelled(Exception):
     """The workflow was cancelled."""
 
 
+class RunSettledError(Exception):
+    """Cancel did not change the workflow because it completed or failed."""
+
+
 class Suspended(Exception):
     """The workflow waits (a timer, a signal): tick() or signal() drives it on."""
 
@@ -71,8 +75,21 @@ class StoppedError(Exception):
     (ADR 0059)."""
 
 
+class NotWaitingError(Exception):
+    """send_signal(only_if_waiting=True) found no current wait (ADR 0064)."""
+
+
 class TimedOutError(Exception):
     """A wait's timeout came before its signal (wait_for's timeout, ADR 0059)."""
+
+
+@dataclass(frozen=True)
+class SignalReceipt:
+    """The wait that atomically accepted a signal (ADR 0064)."""
+
+    run_id: str
+    index: int  # zero-based occurrence of wait_for with this signal name
+    early: bool  # this send made the wait before the workflow reached it
 
 
 class RetryableError(Exception):
@@ -169,13 +186,19 @@ class _WorkflowDef:
         self.currents = 0
 
 
-def _workflow_input(name: str, version: str, input: Any) -> dict[str, Any]:
+def _workflow_input(name: str, version: str, input: Any, external_parent: bool = False) -> dict[str, Any]:
     """A workflow run's input: the workflow, its version (when it has one)
     and the input it was given."""
     w: dict[str, Any] = {"workflow": name, "input": input}
     if version:
         w["version"] = version
+    if external_parent:
+        w["external_parent"] = True
     return w
+
+
+def _externally_attached(input: Any) -> bool:
+    return isinstance(input, dict) and input.get("external_parent") is True
 
 
 def _workflow_of(input: Any) -> tuple[str, str, Any] | None:
@@ -348,6 +371,7 @@ class Kairo:
         tenant: str = "default",
         idempotency_ttl: float = 24 * 3600,
         concurrency: int | None = None,
+        request_timeout: float = 90.0,
         backend: Backend | None = None,
         mode: str = "wait",
         secret: str | None = None,
@@ -385,7 +409,14 @@ class Kairo:
         time and trace them). It is called in the runtime, as it works (on
         the event loop; with kairod, on the worker's threads, and only for
         the steps it runs here): it must not block."""
-        self.backend: Any = backend or HttpBackend(url, worker=worker, token=token, tenant=tenant, concurrency=concurrency)
+        self.backend: Any = backend or HttpBackend(
+            url,
+            worker=worker,
+            token=token,
+            tenant=tenant,
+            concurrency=concurrency,
+            request_timeout=request_timeout,
+        )
         self._ttl = idempotency_ttl
         self._concurrency = concurrency
         self._actions: dict[str, _Action] = {}
@@ -393,6 +424,8 @@ class Kairo:
         self._planned: set[str] = set()
         # The stops of the workflows driven here: set when the process closes.
         self._stops: set[asyncio.Future[None]] = set()
+        self._stops_by_id: dict[str, asyncio.Future[None]] = {}
+        self._cancel_requests: dict[str, asyncio.Future[bool]] = {}
         # Closing: calls interrupted now go on in kairo, to be resumed (not cancelled).
         self._closing = False
         # Draining (drain): no new call starts here.
@@ -400,10 +433,11 @@ class Kairo:
         if mode not in ("wait", "suspend"):
             raise ValueError(f"mode {mode}: wait or suspend")
         self.suspend = mode == "suspend"
-        if self.suspend and not hasattr(self.backend, "idle"):
-            raise ValueError("suspend mode needs the embedded backend")
+        if self.suspend and not (hasattr(self.backend, "idle") or isinstance(self.backend, HttpBackend)):
+            raise ValueError("suspend mode needs the embedded backend or kairod")
         # Suspend mode: workflows being driven on here, and those to drive again after.
         self._driving_ids: set[str] = set()
+        self._redriving: set[str] = set()
         self._again: set[str] = set()
         self._redrives: set[asyncio.Future[Any]] = set()
         self._stop_hook: Callable[[], None] | None = None
@@ -415,6 +449,7 @@ class Kairo:
         self._tick_secret = tick_secret
         self._wake = wake
         self._background: set[asyncio.Future[Any]] = set()
+        self._tick_lock = asyncio.Lock()
         # The embedded runtime, when that is the backend (drive leases, ADR 0059).
         rt = getattr(self.backend, "runtime", None)
         self._rt: Embedded | None = rt if isinstance(rt, Embedded) else None
@@ -432,6 +467,8 @@ class Kairo:
         # Wait mode: workflows driven in the background here (by id), and their drives.
         self._owned: set[str] = set()
         self._drives: set[asyncio.Future[Any]] = set()
+        self._drives_idle = asyncio.Event()
+        self._drives_idle.set()
         # Ends with the process (close): what waits in it stops.
         self._life: asyncio.Future[None] | None = None
         # Wait mode: the sweep, once a lease period, of what stopped processes left (ADR 0059).
@@ -559,9 +596,10 @@ class Kairo:
         await self._plan_workflow()
         if rt is not None:
             rt.lost_drive = self._lost_drive
+            rt.wake_parent = self._redrive
             rt.plan_for = _wait_plan
             rt.lease_parents = self.suspend
-        if self.suspend:
+        if self.suspend and rt is not None:
             # A call that settles drives its workflow on (its id is the
             # workflow's id, "/", the call's key).
             def settled(r: dict[str, Any]) -> None:
@@ -608,15 +646,28 @@ class Kairo:
         stops waiting first (its task cancelled, or timed out: asyncio.timeout)
         leaves them running, and close then stops what still runs, as a
         process that stops (a real step then waits for review in the next
-        process). After drain, close. The embedded runtime only."""
+        process). After drain, close."""
         rt = self._rt
-        if rt is None:
-            raise RuntimeError("drain needs the embedded backend")
         self._draining = True
-        rt.drain()
+        if rt is not None:
+            rt.drain()
         for stop in list(self._stops):
             _set(stop)  # stops at its next call; its drive lease is handed over
-        await rt.wait_idle()
+        if rt is not None:
+            await rt.wait_idle()
+        else:
+            self._logger.info(
+                "kairo: draining kairod worker: worker_tasks=%d workflow_drives=%d",
+                getattr(self.backend, "inflight", 0),
+                len(self._stops),
+            )
+            try:
+                await self.backend.drain()
+                await self._drives_idle.wait()
+            except asyncio.CancelledError:
+                self._logger.warning("kairo: kairod worker drain stopped")
+                raise
+            self._logger.info("kairo: kairod worker drained")
 
     async def close(self) -> None:
         """Stops serving actions and driving workflows, as a process that stops
@@ -639,9 +690,38 @@ class Kairo:
         drives on the workflows whose calls settle, and returns once that is
         done (call it from a scheduler). Returns when something is next to
         do (unix ms), or None."""
-        await self.backend.tick()
+        async with self._tick_lock:
+            return await self._tick()
+
+    async def _tick(self) -> int | None:
+        if isinstance(self.backend, HttpBackend):
+            self.backend.clear_due(self._now())
+            while True:
+                claim = await self.backend.claim(self._supported_workflows())
+                if claim is None:
+                    break
+                run = claim["run"]
+                w = _workflow_of(run.get("input"))
+                if w is None:
+                    await self.backend.release(claim)
+                    continue
+                try:
+                    await self._run_as(w[0], w[2], run["run_id"], run.get("parent"))
+                except (Suspended, _NotHere):
+                    await self.backend.release(claim)
+                except BaseException as e:
+                    await self.backend.release(claim, is_workflow_retry(e))
+                    if not is_workflow_retry(e):
+                        raise
+                else:
+                    await self.backend.release(claim)
+        else:
+            await self.backend.tick()
         await self._settle()
         return await self._wake_up()
+
+    def _supported_workflows(self) -> dict[str, list[str]]:
+        return {name: sorted(d.versions) for name, d in self._workflows.items()}
 
     async def _wake_up(self) -> int | None:
         """Suspend mode: tells wake when something is next to do (ADR 0053); returns it."""
@@ -654,6 +734,8 @@ class Kairo:
 
     async def _settle(self) -> None:
         """Returns once the work started here and the workflows driven on are done."""
+        if not hasattr(self.backend, "idle"):
+            return
         while True:
             await self.backend.idle()
             # Finished ones are dropped here, whether or not their done
@@ -668,28 +750,35 @@ class Kairo:
 
     def _redrive(self, id: str) -> None:
         """Suspend mode: drives workflow id on (again, if it is being driven now)."""
-        if id in self._driving_ids:
+        if id in self._redriving:
             self._again.add(id)
             return
+        if id in self._driving_ids:
+            return
+
+        self._redriving.add(id)
 
         async def drive() -> None:
-            while True:
-                self._again.discard(id)
-                try:
-                    info = await self.backend.get(id)
-                except KairoError:
-                    return
-                w = _workflow_of(info.get("input"))
-                if info.get("plan") != PLAN_WORKFLOW or finished(info) or w is None:
-                    return
-                try:
-                    await self._drive(id, w[0], w[2], info.get("parent"), 0)
-                except Exception:
-                    # Suspended again, failed (recorded), cancelled, driven
-                    # elsewhere, or of a version not here.
-                    pass
-                if id not in self._again:
-                    return
+            try:
+                while True:
+                    self._again.discard(id)
+                    try:
+                        info = await self.backend.get(id)
+                    except KairoError:
+                        return
+                    w = _workflow_of(info.get("input"))
+                    if info.get("plan") != PLAN_WORKFLOW or finished(info) or w is None:
+                        return
+                    try:
+                        await self._drive(id, w[0], w[2], info.get("parent"), 0)
+                    except Exception:
+                        # Suspended again, failed (recorded), cancelled, driven
+                        # elsewhere, or of a version not here.
+                        pass
+                    if id not in self._again:
+                        return
+            finally:
+                self._redriving.discard(id)
 
         fut = asyncio.ensure_future(drive())
         self._redrives.add(fut)
@@ -953,7 +1042,15 @@ class Kairo:
             self._wait_until(fut)
         return 202, {"accepted": True}
 
-    async def run(self, name: str, input: Any = None, *, id: str | None = None, meta: dict[str, Any] | None = None) -> Any:
+    async def run(
+        self,
+        name: str,
+        input: Any = None,
+        *,
+        id: str | None = None,
+        meta: dict[str, Any] | None = None,
+        parent: str | None = None,
+    ) -> Any:
         """Runs workflow name as execution id, or resumes it: calls that
         finished return their recorded results. Returns its result.
 
@@ -967,16 +1064,16 @@ class Kairo:
         (its info's "meta", list)."""
         id = id or str(uuid.uuid4())
         try:
-            token = await self._begin(name, input, id, meta)
+            token, actual_parent = await self._begin(name, input, id, meta, parent)
             if self.suspend:
                 try:
-                    return await self._drive(id, name, input, None, token)
+                    return await self._drive(id, name, input, actual_parent, token)
                 except _DrivenElsewhere as e:
                     raise Suspended(str(e)) from None
             # kairod: driven here, as the caller waits.
             if self._rt is None:
-                return await self._drive(id, name, input, None, 0)
-            self._drive_background(id, name, input, None, token)
+                return await self._drive(id, name, input, actual_parent, 0)
+            self._drive_background(id, name, input, actual_parent, token)
             return await self.result(id)
         except asyncio.CancelledError:
             if self.suspend:
@@ -985,19 +1082,27 @@ class Kairo:
         finally:
             await self._wake_up()
 
-    async def submit(self, name: str, input: Any = None, *, id: str | None = None, meta: dict[str, Any] | None = None) -> str:
+    async def submit(
+        self,
+        name: str,
+        input: Any = None,
+        *,
+        id: str | None = None,
+        meta: dict[str, Any] | None = None,
+        parent: str | None = None,
+    ) -> str:
         """Starts workflow name and returns its id once the start is recorded,
         without waiting for it (ADR 0059): result(id) gives its result, from
         any process. In wait mode it is driven in the background; in suspend
         mode it is driven here until it waits (what it comes to is recorded:
         nothing is raised). The id is an idempotency key, as in run."""
         id = id or str(uuid.uuid4())
-        token = await self._begin(name, input, id, meta)
+        token, actual_parent = await self._begin(name, input, id, meta, parent)
         if not self.suspend:
-            self._drive_background(id, name, input, None, token)
+            self._drive_background(id, name, input, actual_parent, token)
             return id
         try:
-            await self._drive(id, name, input, None, token)
+            await self._drive(id, name, input, actual_parent, token)
         except Exception:
             pass
         await self._wake_up()
@@ -1040,12 +1145,16 @@ class Kairo:
         workflows, not calls), in the order they were created (ADR 0059): of
         workflow, in status, created in [since, until) (unix ms or datetime),
         after the run after, at most limit. Each with its "meta",
-        "created_at" and "updated_at" (unix ms). The embedded runtime only."""
-        if self._rt is None:
-            raise RuntimeError("list needs the embedded backend")
-        return await self._rt.list(workflow=workflow, status=status, since=_ms(since), until=_ms(until), after=after, limit=limit)
+        "created_at" and "updated_at" (unix ms)."""
+        return await self.backend.list(workflow=workflow, status=status, since=_ms(since), until=_ms(until), after=after, limit=limit)
 
-    async def _begin(self, name: str, input: Any, id: str, meta: dict[str, Any] | None) -> int:
+    async def children(self, id: str) -> list[dict[str, Any]]:
+        """Runs made directly by id: calls, waits and child workflows."""
+        return await self.backend.children(id)
+
+    async def _begin(
+        self, name: str, input: Any, id: str, meta: dict[str, Any] | None, requested_parent: str | None = None
+    ) -> tuple[int, str | None]:
         """Makes workflow name's run as id (or finds it). A new one is leased to
         this process to drive, in the same transaction: its token (0: it
         existed, or no leases here)."""
@@ -1053,17 +1162,38 @@ class Kairo:
         if version is None:
             raise KeyError(f"no workflow {name}")
         await self._plan_workflow()
-        token = new_token() if self._rt is not None else 0
+        token = new_token() if self._rt is not None or isinstance(self.backend, HttpBackend) else 0
         started = await self.backend.run(
             PLAN_WORKFLOW,
-            _workflow_input(name, version, input),
+            _workflow_input(name, version, input, requested_parent is not None),
             run_id=id,
             vars={"started_at": self._now()},
+            parent=requested_parent,
+            guard_parent=requested_parent is not None,
             workflow=name,
             meta=meta,
             drive=token,
         )
-        return 0 if started.get("existing") else token
+        if not started.get("existing"):
+            return token, requested_parent
+        info = await self.backend.get(id)
+        actual_parent = info.get("parent")
+        if requested_parent is not None and requested_parent != actual_parent:
+            raise ParentUnavailableError(
+                f"parent {requested_parent}: run {id} already belongs to parent {actual_parent!r}"
+            )
+        if actual_parent is not None and not finished(info):
+            try:
+                p = await self.backend.get(actual_parent)
+            except KairoError as e:
+                if e.status == 404:
+                    raise ParentUnavailableError(f"parent {actual_parent}: it does not exist") from None
+                raise
+            if p.get("plan") != PLAN_WORKFLOW or not p.get("workflow"):
+                raise ParentUnavailableError(f"parent {actual_parent}: it is not a workflow")
+            if finished(p):
+                raise ParentUnavailableError(f"parent {actual_parent}: it has finished")
+        return 0, actual_parent
 
     async def _drive(self, id: str, name: str, input: Any, parent: str | None, token: int) -> Any:
         """Runs workflow id's function here, holding its drive lease (ADR
@@ -1072,6 +1202,15 @@ class Kairo:
         lease when it waits (suspend mode: what it waits for drives it on),
         an expired lease when it stopped otherwise (a tick takes it up)."""
         rt = self._rt
+        remote = self.backend if isinstance(self.backend, HttpBackend) else None
+        claim: dict[str, Any] | None = None
+        if remote is not None:
+            info = await self.backend.get(id, input=True)
+            if finished(info):
+                return _done(id, info)
+            claim = await remote.claim(self._supported_workflows(), id, 0 if self.suspend else 60_000)
+            if claim is None:
+                raise _DrivenElsewhere(f"workflow {id} is driven by another process")
         if rt is not None and token == 0:
             info = await self.backend.get(id)
             if finished(info):
@@ -1087,15 +1226,41 @@ class Kairo:
         try:
             return await self._run_as(name, input, id, parent)
         except BaseException as e:
+            if (self._draining or self._closing) and remote is not None and claim is not None:
+                await remote.release(claim, True)
+                claim = None
+                raise StoppedError(f"workflow {id}: not driven here any more") from e
+            if is_workflow_retry(e):
+                if remote is not None:
+                    await remote.release(claim, True)
+                    claim = None
+                    self._logger.warning("kairo: workflow %s: retrying after a transient error: %s", id, e)
+                    if self.suspend:
+                        raise Suspended(f"workflow {id}: suspended after a transient error") from e
+                    raise StoppedError(f"workflow {id}: stopped for a transient error") from e
+                retry_at = self._now() + rt.lease
+                try:
+                    retry_at = await rt.retry_drive(id, token)
+                except Exception as ee:
+                    self._logger.warning("kairo: workflow %s: handing it over for retry: %s", id, ee)
+                self._logger.warning("kairo: workflow %s: retrying after a transient error at %s: %s", id, retry_at, e)
+                if self.suspend:
+                    raise Suspended(f"workflow {id}: suspended after a transient error") from e
+                raise
             if rt is not None:
                 try:
                     await rt.end_drive(id, token, not isinstance(e, Suspended))
                 except Exception as ee:
                     self._logger.warning("kairo: workflow %s: ending its drive lease: %s", id, ee)
+            if remote is not None and claim is not None:
+                await remote.release(claim, isinstance(e, StoppedError))
+                claim = None
             raise
         finally:
             if rt is not None:
                 rt.driving(False)
+            if remote is not None and claim is not None:
+                await remote.release(claim)
 
     def _drive_background(self, id: str, name: str, input: Any, parent: str | None, token: int) -> None:
         """Wait mode: drives workflow id in the background, unless this process drives it already."""
@@ -1109,7 +1274,8 @@ class Kairo:
             except (_DrivenElsewhere, StoppedError, Cancelled, _NotHere):
                 pass  # stopped, cancelled, driven elsewhere, or of a version not here: nothing to do here
             except Exception as e:
-                self._logger.warning("kairo: workflow %s: %s", id, e)
+                if not is_workflow_retry(e):
+                    self._logger.warning("kairo: workflow %s: %s", id, e)
             finally:
                 self._owned.discard(id)
 
@@ -1134,6 +1300,10 @@ class Kairo:
         w = _workflow_of(info.get("input"))
         if w is None:
             return
+        if _externally_attached(info.get("input")):
+            # An external re-submission is this workflow's replay reach.
+            await rt.end_drive(lease.run, lease.attempt, False, lease.owner)
+            return
         if self._fn_for(w[0], w[1]) is None:
             raise _NotHere(w[0], w[1])  # another process's
         if self.suspend:
@@ -1147,6 +1317,9 @@ class Kairo:
         reached yet receives it when it does (ADR 0059): signals of one name
         go to its waits in order. LookupError: no such workflow, or it has
         finished (kairod: it does not wait for the signal)."""
+        if self._rt is not None:
+            await self.send_signal(id, name, payload)
+            return
         # The waits' plan, which this process may not have needed yet.
         await self._plan(PLAN_WAIT + name, _wait_root(name))
         n = 0
@@ -1157,19 +1330,68 @@ class Kairo:
             except KairoError as e:
                 if e.status != 404:
                     raise
-                if self._rt is None:
-                    raise LookupError(f"workflow {id} does not wait for {name}") from None
-                if await self._signal_ahead(id, name, run_id, payload):
-                    break
-                continue  # the workflow made the wait meanwhile: signal it
+                raise LookupError(f"workflow {id} does not wait for {name}") from None
             if finished(r):
                 n += 1
                 continue
             await self.backend.signal(run_id, name, payload)
             break
         if self.suspend:
+            await self.backend.wait(run_id)
+            await self.tick()
+
+    async def send_signal(
+        self, id: str, name: str, payload: Any = None, *, only_if_waiting: bool = False
+    ) -> SignalReceipt:
+        """Atomically sends a signal and reports which wait accepted it.
+        Embedded runtime only. only_if_waiting refuses to keep an early
+        signal (ADR 0064)."""
+        rt = self._rt
+        if rt is None:
+            raise RuntimeError("send_signal needs the embedded runtime")
+        await self._plan(PLAN_WAIT + name, _wait_root(name))
+        n = 0
+        receipt: SignalReceipt | None = None
+        while True:
+            run_id = _call_id(id, PLAN_WAIT + name, None, n)
+            try:
+                row = await self.backend.get(run_id)
+            except KairoError as e:
+                if e.status != 404:
+                    raise
+                row = None
+            if row is None:
+                # This no-op transaction is the linearization point for
+                # "not present now". A wait created first accepts it here.
+                if await rt.signal_applied(run_id, name, payload):
+                    receipt = SignalReceipt(run_id, n, False)
+                    break
+                if only_if_waiting:
+                    try:
+                        workflow = await self.backend.get(id)
+                    except KairoError as e:
+                        if e.status == 404:
+                            raise LookupError(f"no workflow {id}") from None
+                        raise
+                    if workflow.get("plan") != PLAN_WORKFLOW:
+                        raise LookupError(f"no workflow {id}")
+                    raise NotWaitingError(f"workflow {id} is not waiting for {name}")
+                if not await self._signal_ahead(id, name, run_id, payload):
+                    continue  # a concurrent wait or signal made this number
+                receipt = SignalReceipt(run_id, n, True)
+                break
+            if finished(row):
+                n += 1
+                continue
+            if await rt.signal_applied(run_id, name, payload):
+                receipt = SignalReceipt(run_id, n, False)
+                break
+            n += 1  # a concurrent signal, timeout or cancellation won
+        if self.suspend:
             await self._settle()
             await self._wake_up()
+        assert receipt is not None
+        return receipt
 
     async def _signal_ahead(self, id: str, name: str, run_id: str, payload: Any) -> bool:
         """Makes wait run_id of workflow id, as the workflow will when it
@@ -1191,14 +1413,41 @@ class Kairo:
 
     async def cancel(self, id: str) -> None:
         """Cancels workflow id: the calls it is waiting for are cancelled with it
-        (suspend mode: it stops when it is driven next)."""
-        await self.backend.cancel(id)
+        (suspend mode: it stops when it is driven next). Waits for the durable
+        outcome; an already cancelled workflow is an idempotent success, while
+        one already completed or failed raises RunSettledError (ADR 0061)."""
+        # Stop this process's replay first, so a child cancellation cannot
+        # make the function record a failure before the durable parent one.
+        stop = self._stops_by_id.get(id)
+        request = self._cancel_requests.get(id)
+        if request is None and stop is not None:
+            request = asyncio.get_running_loop().create_future()
+            self._cancel_requests[id] = request
+        if stop is not None:
+            _set(stop)
+        settled = False
+        try:
+            while True:
+                await self._settle_descendants(id)
+                try:
+                    await self.backend.cancel(id)
+                    break
+                except ChildrenUnsettledError:
+                    pass
+            await self._settle_descendants(id)
+            info = await self.backend.wait(id)
+            settled = True
+            if info.get("status") != "cancelled":
+                raise RunSettledError(f"workflow {id} is {info.get('status')}")
+        finally:
+            if request is not None and not request.done():
+                request.set_result(settled)
 
     async def resolve(self, call_id: str, output: Any = None) -> None:
         """Settles call call_id, stopped for review (blocked: a real step whose
         outcome was unknown) or with a real attempt out that cannot go on (its
         action is no longer real, ADR 0060), with the output it had: it did
-        take effect. The embedded runtime only."""
+        take effect. A normal review can also be settled over kairod."""
         await self._settle_call(call_id, output, None)
 
     async def resolve_failed(self, call_id: str, message: str = "resolved as failed") -> None:
@@ -1208,15 +1457,44 @@ class Kairo:
     async def _settle_call(self, call_id: str, output: Any, error: str | None) -> None:
         resolve = getattr(self.backend, "resolve", None)
         if resolve is None:
-            raise RuntimeError("resolve needs the embedded backend")
+            raise RuntimeError("resolve is not supported by this backend")
         await resolve(call_id, output, error)
         if self.suspend:
-            await self._settle()
-            await self._wake_up()
+            if isinstance(self.backend, HttpBackend):
+                await self.tick()
+            else:
+                await self._settle()
+                await self._wake_up()
 
     async def _run_as(self, name: str, input: Any, id: str, parent: str | None = None, up: Context | None = None) -> Any:
         """Drives workflow id here. parent: the workflow that made it, if any;
         up, its context when it runs inside it (a child workflow)."""
+        if self._rt is not None and parent is not None:
+            self._rt.reach(id, True)
+        try:
+            return await self._run_as_reached(name, input, id, parent, up)
+        finally:
+            if self._rt is not None and parent is not None:
+                self._rt.reach(id, False)
+
+    async def _run_child_as(self, name: str, input: Any, id: str, parent: str, up: Context) -> Any:
+        if not isinstance(self.backend, HttpBackend):
+            return await self._run_as(name, input, id, parent, up)
+        current = self._current_version(name)
+        if current is None:
+            raise KeyError(f"no workflow {name}")
+        await self._plan_workflow()
+        await self.backend.run(
+            PLAN_WORKFLOW,
+            _workflow_input(name, current, input),
+            run_id=id,
+            vars={"started_at": self._now()},
+            parent=parent,
+            drive=new_token(),
+        )
+        return await self._drive(id, name, input, parent, 0)
+
+    async def _run_as_reached(self, name: str, input: Any, id: str, parent: str | None = None, up: Context | None = None) -> Any:
         current = self._current_version(name)
         if current is None:
             raise KeyError(f"no workflow {name}")
@@ -1252,6 +1530,8 @@ class Kairo:
         # later.
         stop: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._stops.add(stop)
+        self._drives_idle.clear()
+        self._stops_by_id[id] = stop
         if self._closing:
             _set(stop)
         unlink: Callable[[], None] | None = None
@@ -1268,7 +1548,7 @@ class Kairo:
         me = {"cancelled": False}
 
         def cancelled() -> bool:
-            return me["cancelled"] or (up is not None and up.cancelled())
+            return me["cancelled"] or id in self._cancel_requests or (up is not None and up.cancelled())
 
         watcher: asyncio.Future[None] | None = None
         if not self.suspend:
@@ -1299,6 +1579,11 @@ class Kairo:
                 _set(stop)
             if not body.done():
                 body.cancel()
+                request = self._cancel_requests.get(id)
+                if request is not None:
+                    if await request:
+                        return await self._workflow_outcome(id)
+                    raise StoppedError(f"workflow {id}: not driven here any more")
                 if cancelled():
                     # Cancelled with the workflow above it: so is its run.
                     if not me["cancelled"]:
@@ -1308,6 +1593,9 @@ class Kairo:
                             pass
                     raise Cancelled(f"workflow {id} cancelled")
                 raise StoppedError(f"workflow {id}: not driven here any more")
+            failed = False
+            cause: BaseException | None = None
+            value: Any = None
             try:
                 value = body.result()
             except Suspended:
@@ -1316,8 +1604,17 @@ class Kairo:
                 # A child workflow whose version is not here: this one is left
                 # to another process, not failed (ADR 0060).
                 raise
+            except EffectWeakenedError:
+                raise
             except (Exception, asyncio.CancelledError) as e:
+                if is_workflow_retry(e):
+                    raise
                 if stop.done():
+                    request = self._cancel_requests.get(id)
+                    if request is not None:
+                        if await request:
+                            return await self._workflow_outcome(id, e)
+                        raise StoppedError(f"workflow {id}: not driven here any more") from e
                     # Stopped (the process closes, the caller stopped waiting)
                     # or cancelled, at the same time as the function ended:
                     # with that, not with the error it ended with (a child
@@ -1331,16 +1628,23 @@ class Kairo:
                         raise Cancelled(f"workflow {id} cancelled") from e
                     raise StoppedError(f"workflow {id}: not driven here any more") from e
                 # (A CancelledError here is not this driver's: the function's own.)
-                error = str(e) or type(e).__name__
-                try:
-                    await self.backend.signal(id, "done", {"ok": False, "error": error})
-                except Exception:
-                    pass
-                raise WorkflowError(id, error) from e
-            await self.backend.signal(id, "done", {"ok": True, "value": value})
-            return value
+                failed, cause = True, e
+            if failed:
+                assert cause is not None
+                error = str(cause) or type(cause).__name__
+                _set(stop)
+                await self._finish_workflow(id, {"ok": False, "error": error})
+                return await self._workflow_outcome(id, cause)
+            _set(stop)
+            await self._finish_workflow(id, {"ok": True, "value": value})
+            return await self._workflow_outcome(id)
         finally:
             self._stops.discard(stop)
+            if not self._stops:
+                self._drives_idle.set()
+            if self._stops_by_id.get(id) is stop:
+                del self._stops_by_id[id]
+            self._cancel_requests.pop(id, None)
             self._driving_ids.discard(id)
             if unlink is not None:
                 unlink()
@@ -1348,7 +1652,65 @@ class Kairo:
                 watcher.cancel()
             _set(stop)
 
+    async def _finish_workflow(self, id: str, payload: Any) -> None:
+        """Atomically finishes after the last descendant scan (ADR 0065)."""
+        while True:
+            await self._settle_descendants(id)
+            try:
+                await self.backend.finish(id, payload)
+                return
+            except ChildrenUnsettledError:
+                pass
+
+    async def _workflow_outcome(
+        self,
+        id: str,
+        cause: BaseException | None = None,
+    ) -> Any:
+        """Returns the durable outcome, even when cancellation beat the local
+        workflow function (ADR 0061)."""
+        try:
+            info = await self.backend.wait(id)
+        except asyncio.CancelledError:
+            raise StoppedError(f"workflow {id}: not driven here any more") from None
+        return _done(id, info, cause)
+
+    async def _settle_descendants(self, id: str) -> None:
+        """Cancels unfinished descendants deepest first before their parent settles."""
+        while True:
+            rows: list[dict[str, Any]] = []
+
+            async def walk(parent: str) -> None:
+                for child in await self.backend.children(parent):
+                    await walk(child["run_id"])
+                    rows.append(child)
+
+            await walk(id)
+            unfinished = 0
+            for row in rows:
+                if finished(row):
+                    continue
+                unfinished += 1
+                try:
+                    await self.backend.cancel(row["run_id"])
+                except ChildrenUnsettledError:
+                    continue
+                await self.backend.wait(row["run_id"])
+            if not unfinished:
+                return
+
     async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
+        if self._rt is not None:
+            self._rt.reach(run_id, True)
+        try:
+            return await self._call_run_reached(plan, root, input, run_id, parent)
+        finally:
+            if self._rt is not None:
+                self._rt.reach(run_id, False)
+
+    async def _call_run_reached(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
+        if self._closing:
+            raise StoppedError(f"call {run_id}: stopped before it started")
         if self._draining:
             # Draining: no new call starts here (its step would be
             # dispatched); one already made is waited for as before.
@@ -1362,11 +1724,16 @@ class Kairo:
             await self._plan(plan, root)
         # Kept and removed with the workflow that makes it (ADR 0054).
         await self.backend.run(plan, {"in": input}, run_id=run_id, parent=parent)
+        if self._rt is not None:
+            await self._rt.resume_reached(run_id)
         if self.suspend:
             # Whatever this process can do for the call is done once it is
             # idle; a call still going then waits for a timer or a signal.
-            await self.backend.idle()
-            r = await self.backend.get(run_id)
+            if isinstance(self.backend, HttpBackend):
+                r = await self.backend.wait_quiescent(run_id)
+            else:
+                await self.backend.idle()
+                r = await self.backend.get(run_id)
             if not finished(r) and r.get("status") != "blocked":
                 raise Suspended(f"call {run_id} waits")
         else:
@@ -1417,16 +1784,21 @@ def _duration_ms(d: str | None) -> int | None:
     return int(float(m.group(1)) * {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}[m.group(2)])
 
 
-def _done(id: str, info: dict[str, Any]) -> Any:
+def _done(id: str, info: dict[str, Any], cause: BaseException | None = None) -> Any:
     if info.get("trimmed"):
         raise ResultLostError(f"workflow {id} finished, but kairo no longer keeps its result")
     if info.get("status") == "cancelled":
         raise Cancelled(f"workflow {id} cancelled")
     out = (info.get("output") or {}).get("payload")
     if not out:
-        raise WorkflowError(id, f"{info.get('status')}: {info.get('error', '')}")
+        error = WorkflowError(id, f"{info.get('status')}: {info.get('error', '')}")
+        raise error
     if not out.get("ok"):
-        raise WorkflowError(id, str(out.get("error")))
+        message = str(out.get("error"))
+        error = WorkflowError(id, message)
+        if cause is not None and (str(cause) or type(cause).__name__) == message:
+            raise error from cause
+        raise error
     return out.get("value")
 
 
@@ -1530,6 +1902,8 @@ class Context:
         return _call_id(self.id, kind, input, n)
 
     async def _run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str) -> Any:
+        if self._stop.done():
+            raise StoppedError(f"call {run_id}: stopped before it started")
         try:
             return await self._k._call_run(plan, root, input, run_id, self.id)
         except asyncio.CancelledError:
@@ -1575,4 +1949,4 @@ class Context:
 
     async def workflow(self, name: str, input: Any = None) -> Any:
         """Runs workflow name as a child of this one."""
-        return await self._k._run_as(name, input, self._next("kairo.workflow/" + name, input), self.id, self)
+        return await self._k._run_child_as(name, input, self._next("kairo.workflow/" + name, input), self.id, self)

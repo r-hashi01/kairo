@@ -6,7 +6,8 @@
 // tasks it can hold and grants one credit back per finished task, so the
 // runtime never pushes more work than a worker asked for.
 //
-//	worker -> runtime   Hello  {"worker":"py-1","actions":["code.run"],"credit":8,"token":"..."}
+//	worker -> runtime   Hello  {"worker":"py-1","actions":["code.run"],"credit":8,"capabilities":["graceful-drain-v1"],"token":"..."}
+//	runtime -> worker   Hello  {"capabilities":["graceful-drain-v1"]} (only when the worker offered capabilities)
 //	runtime -> worker   Task   {task}
 //	worker -> runtime   Chunk  {"seq":17,"data":"<base64>"}      (live output)
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
@@ -15,9 +16,18 @@
 //	runtime -> worker   Cancel {"seq":17}                         (the step was abandoned)
 //	runtime -> worker   RunEnd {"run_id":"r1"}                    (the run finished)
 //
+// A worker starts a graceful drain with a negative Credit only after the
+// runtime selected CapabilityGracefulDrain in its Hello response. The
+// runtime answers with zero after it has stopped delivery, then acknowledges
+// each accepted draining Result with a positive Credit (ADR 0073, 0075).
+//
 // Cancel is a request (ADR 0026): the worker should stop the task and must
 // still send its Result, which releases the task's concurrency slot and
 // credit. Workers that predate Cancel skip it like any unknown type.
+//
+// A negative Credit stops delivery on that connection and returns tasks not
+// written yet to the dispatcher. This reuses the credit frame so old workers
+// continue to skip the replies and the wire format does not grow.
 //
 // RunEnd goes only to workers whose Hello asked for it ("run_end": true),
 // once per run they were sent a task of, after those tasks (ADR 0044): a
@@ -53,13 +63,33 @@ const (
 
 const maxFrame = 64 << 20
 
+// CapabilityGracefulDrain selects the negative/zero/positive Credit drain
+// handshake of ADR 0073. Capabilities are negotiated per connection.
+const CapabilityGracefulDrain = "graceful-drain-v1"
+
 type Hello struct {
-	Worker  string   `json:"worker"`
-	Actions []string `json:"actions"`
-	Credit  int      `json:"credit"`
-	Token   string   `json:"token,omitempty"`
+	Worker       string   `json:"worker"`
+	Actions      []string `json:"actions"`
+	Credit       int      `json:"credit"`
+	Token        string   `json:"token,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
 	// RunEnd asks for a RunEnd per run the worker was sent a task of.
 	RunEnd bool `json:"run_end,omitempty"`
+}
+
+// Welcome is the runtime's Hello response. It is sent only to workers that
+// offered capabilities, before any work on that connection (ADR 0075).
+type Welcome struct {
+	Capabilities []string `json:"capabilities"`
+}
+
+func hasCapability(capabilities []string, want string) bool {
+	for _, capability := range capabilities {
+		if capability == want {
+			return true
+		}
+	}
+	return false
 }
 
 type Result struct {

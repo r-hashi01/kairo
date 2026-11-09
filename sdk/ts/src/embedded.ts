@@ -21,7 +21,7 @@ import type { Result, Task } from './protocol.ts';
 import { randomInt, randomUUID } from 'node:crypto';
 
 import { consoleLogger, observe, stepStatus, type Logger, type Observation, type Observer } from './observe.ts';
-import type { LeaseRow, ListFilter, RunRow, Store, TimerRow } from './store.ts';
+import { retryingStore, type LeaseRow, type ListFilter, type RunRow, type Store, type TimerRow } from './store.ts';
 import type { TaskContext } from './worker.ts';
 
 /** Runs the actions of dispatched steps in this process. */
@@ -80,6 +80,8 @@ const DONE = new Set(['completed', 'failed', 'cancelled']);
 const SETTLED = new Set([...DONE, 'blocked']);
 const OUTCOMES = new Set(['step_ok', 'step_err', 'step_wait']);
 
+class ParentNotReached extends Error {}
+
 /**
  * A call's action is no longer real while a real attempt of it is out (ADR
  * 0060). The call waits: restore the action, or settle the call with
@@ -110,6 +112,7 @@ export class Embedded {
 	private readonly settledHooks = new Set<(r: RunInfo) => void>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly running = new Map<string, AbortController>();
+	private readonly reached = new Map<string, number>();
 	/** Work started by this runtime (steps, timers): close waits for it. */
 	private readonly busy = new Set<Promise<unknown>>();
 	private closed = false;
@@ -131,6 +134,7 @@ export class Embedded {
 	 */
 	leaseParents = false;
 	lostDrive?: (l: LeaseRow) => Promise<void>;
+	wakeParent?: (id: string) => void;
 	planFor?: (name: string) => { name: string; [k: string]: unknown } | undefined;
 	/** Set by Kairo when given (KairoOptions.logger, observe). */
 	logger: Logger;
@@ -138,7 +142,7 @@ export class Embedded {
 
 	private constructor(core: Core, opts: EmbeddedOptions) {
 		this.core = core;
-		this.store = opts.store;
+		this.store = retryingStore(opts.store);
 		this.now = opts.now ?? Date.now;
 		this.manualTimers = !!opts.manualTimers;
 		this.owner = opts.owner ?? randomUUID();
@@ -155,6 +159,7 @@ export class Embedded {
 	/** Tracks background work p, logging what goes wrong in it (but a run whose plan is another process's). */
 	private background(p: Promise<unknown>, msg: string, attrs: Record<string, unknown> = {}): void {
 		this.track(p.catch((e) => {
+			if (e instanceof ParentNotReached) return;
 			try {
 				skipUnknownPlan(e);
 			} catch {
@@ -165,12 +170,12 @@ export class Embedded {
 
 	static async open(opts: EmbeddedOptions): Promise<Embedded> {
 		const core = await Core.load(opts.wasm ?? fileURLToPath(new URL('../wasm/kairo.wasm', import.meta.url)));
-		await opts.store.init();
 		const e = new Embedded(core, opts);
+		await e.store.init();
 		// A process of the same name that stopped: its steps are not running.
-		if (opts.owner) await opts.store.expireLeases(opts.owner, e.now());
+		if (opts.owner) await e.store.expireLeases(opts.owner, e.now());
 		// Runs that settle in other processes wake the waits here.
-		if (opts.store.listen) e.unlisten = await opts.store.listen((id) => e.settledElsewhere(id));
+		if (e.store.listen) e.unlisten = await e.store.listen((id) => e.settledElsewhere(id));
 		return e;
 	}
 
@@ -262,6 +267,12 @@ export class Embedded {
 		return this.store.endDrive(run, owner, token, this.now(), resume);
 	}
 
+	/** Leaves a drive ownerless until its ordinary lease expiry (ADR 0063). */
+	retryDrive(run: string, token: number): { at: number; done: Promise<void> } {
+		const at = this.now() + this.leaseMs;
+		return { at, done: this.store.handOver({ run, act: 0, attempt: token, owner: '', until: at }) };
+	}
+
 	/** Counts a workflow driven here (its lease renewed) while it is. */
 	driving(on: boolean): void {
 		this.drives += on ? 1 : -1;
@@ -271,6 +282,44 @@ export class Embedded {
 	/** Root runs in creation order (ADR 0059). */
 	async list(f: ListFilter): Promise<RunInfo[]> {
 		return (await this.store.list(f)).map(info);
+	}
+
+	/** Direct children of runId (ADR 0054, 0062). */
+	async children(runId: string): Promise<RunInfo[]> {
+		return (await this.store.children(runId)).map(info);
+	}
+
+	reach(runId: string, on: boolean): void {
+		const n = this.reached.get(runId) ?? 0;
+		if (on) this.reached.set(runId, n + 1);
+		else if (n <= 1) this.reached.delete(runId);
+		else this.reached.set(runId, n - 1);
+	}
+
+	/** Processes this child's recovery work after its parent replay reaches it. */
+	async resumeReached(runId: string): Promise<void> {
+		const pending = await this.store.recoverable(runId, this.now());
+		for (const l of pending.leases) {
+			try {
+				await this.recover(l);
+			} catch (e) {
+				this.recordStuck(runId, e);
+				await this.store.handOver({ ...l, owner: '', until: this.now() + this.leaseMs })
+					.catch((putOff) => this.logger.warn('kairo: putting off a lease', { run: runId, err: putOff }));
+				throw e;
+			}
+		}
+		for (const t of pending.timers) {
+			try {
+				await this.fire(t);
+			} catch (e) {
+				this.recordStuck(runId, e);
+				const later = { ...t, at: this.now() + this.leaseMs };
+				await this.store.withRun(runId, (row) => ({ events: [], setTimers: row ? [later] : [], result: undefined }))
+					.catch((putOff) => this.logger.warn('kairo: putting off a timer', { run: runId, err: putOff }));
+				throw e;
+			}
+		}
 	}
 
 	/** Without listen, reads the runs waited for here: one may have settled in another process (ADR 0059). */
@@ -316,7 +365,12 @@ export class Embedded {
 	}
 
 	async signal(runId: string, name: string, payload: unknown = null): Promise<void> {
-		await this.process(runId, [{ kind: 'signal', at: this.now(), name, data: payload }]);
+		await this.signalApplied(runId, name, payload);
+	}
+
+	/** Applies a signal and says whether its event was recorded (ADR 0064). */
+	async signalApplied(runId: string, name: string, payload: unknown = null): Promise<boolean> {
+		return (await this.processReported(runId, [{ kind: 'signal', at: this.now(), name, data: payload }])).applied;
 	}
 
 	async cancel(runId: string): Promise<void> {
@@ -366,7 +420,9 @@ export class Embedded {
 		for (const l of await this.store.expiredLeases(this.now(), 1000)) {
 			if (this.closed) return;
 			// A workflow's driver stopped (ADR 0059).
-			const p = l.act === 0 ? this.lostDrive?.(l) : this.recover(l);
+			const p = l.act === 0
+				? this.advance(l.run, async () => { await this.lostDrive?.(l); })
+				: this.recover(l);
 			if (await this.stuck(l.run, p))
 				await this.store.handOver({ ...l, owner: '', until: this.now() + this.leaseMs }).catch((e) => this.logger.warn('kairo: putting off a lease', { run: l.run, err: e }));
 		}
@@ -391,21 +447,44 @@ export class Embedded {
 			await p;
 			return false;
 		} catch (e) {
+			if (e instanceof ParentNotReached) return false;
 			try {
 				skipUnknownPlan(e);
 				return false;
 			} catch {
-				this.logger.warn('kairo: a run cannot go on', { run: runId, err: e });
-				this.observe({ kind: 'run.stuck', runId, error: String((e as Error)?.message ?? e) });
+				this.recordStuck(runId, e);
 				return true;
 			}
 		}
 	}
 
+	private recordStuck(runId: string, e: unknown): void {
+		this.logger.warn('kairo: a run cannot go on', { run: runId, err: e });
+		this.observe({ kind: 'run.stuck', runId, error: String((e as Error)?.message ?? e) });
+	}
+
 	/** The process that ran l's step stopped: its outcome is unknown. */
 	private recover(l: LeaseRow): Promise<boolean> {
-		return this.process(l.run, [{ kind: 'step_err', at: this.now(), act: l.act, attempt: l.attempt, unknown: true, retryable: true,
-			error: 'the process running the step stopped', error_type: 'process_lost' }]);
+		return this.advance(l.run, () => this.process(l.run, [{ kind: 'step_err', at: this.now(), act: l.act, attempt: l.attempt, unknown: true, retryable: true,
+			error: 'the process running the step stopped', error_type: 'process_lost' }]));
+	}
+
+	private async advance<T>(runId: string, apply: () => Promise<T>): Promise<T | false> {
+		const row = await this.store.get(runId);
+		if (!row?.parent) return apply();
+		for (let parent: string | null = row.parent; parent; ) {
+			const p = await this.store.get(parent);
+			if (!p || DONE.has(p.status)) {
+				await this.cancel(runId);
+				return false;
+			}
+			parent = p.parent;
+		}
+		if (!this.reached.has(runId)) {
+			this.wakeParent?.(row.parent);
+			throw new ParentNotReached('the parent replay has not reached this child');
+		}
+		return apply();
 	}
 
 	/**
@@ -448,12 +527,20 @@ export class Embedded {
 	 * answer says which).
 	 */
 	private async process(runId: string, events: CoreEvent[], start?: RunStart & { plan: Compiled; at: number }): Promise<boolean> {
+		return (await this.processReported(runId, events, start)).existing;
+	}
+
+	private async processReported(
+		runId: string,
+		events: CoreEvent[],
+		start?: RunStart & { plan: Compiled; at: number },
+	): Promise<{ existing: boolean; applied: boolean }> {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
-			if (row && start) return { events: [], result: { existing: true, started: false, settled: false, commands: [] as CoreCommand[], row } };
+			if (row && start) return { events: [], result: { existing: true, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row } };
 			if (!row && !start)
-				return { events: [], endLeases, result: { existing: false, started: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
+				return { events: [], endLeases, result: { existing: false, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plan(row!.plan);
 			if (!plan) throw new KairoError(404, `run ${runId}: plan ${row!.plan} is not registered here`);
 			// Goes on under the current plan, if it may (ADR 0060): next has its hash.
@@ -475,7 +562,7 @@ export class Embedded {
 				}
 			};
 			for (const ev of events) apply(ev);
-			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, started: false, settled: false, commands, row } };
+			if (recorded.length === 0) return { events: [], endLeases, result: { existing: false, applied: false, started: false, settled: false, commands, row } };
 			const at = start?.at ?? this.now();
 			const next: RunRow = {
 				id: runId,
@@ -508,21 +595,23 @@ export class Embedded {
 			const settled = SETTLED.has(res.status) && res.status !== row?.status;
 			// Its workflow is to be driven on: by this process, or, if it
 			// stops first, by whichever takes the lease up (ADR 0059).
-			if (settled && next.parent && this.leaseParents)
+			if (settled && next.parent && this.leaseParents && !this.reached.has(runId))
 				setLeases.push({ run: next.parent, act: 0, attempt: newToken(), owner: this.owner, until: at + this.leaseMs });
 			return {
 				notify: settled,
 				events: recorded,
 				row: next,
+				...(!row && start?.guardParent && start.parent ? { guardParent: start.parent } : {}),
+				...(next.workflow && done ? { guardTreeSettled: true } : {}),
 				setTimers,
 				deleteTimers,
 				clearTimers: done,
 				endLeases,
 				setLeases,
-				result: { existing: false, started: !row, settled, commands, row: next },
+				result: { existing: false, applied: true, started: !row, settled, commands, row: next },
 			};
 		});
-		if (this.closed) return out.existing;
+		if (this.closed) return { existing: out.existing, applied: out.applied };
 		const row = out.row;
 		if (out.started && row) this.observe({ kind: 'run.started', runId, ...runAttrs(row) });
 		for (const c of out.commands) this.carryOut(runId, c);
@@ -535,7 +624,7 @@ export class Embedded {
 		}
 		// Along the way: what no process is doing (at most once a lease period).
 		if (this.now() - this.lastSweep >= this.leaseMs && !this.draining) this.background(this.tick(), 'kairo: sweeping');
-		return out.existing;
+		return { existing: out.existing, applied: out.applied };
 	}
 
 	/**
@@ -587,7 +676,7 @@ export class Embedded {
 	}
 
 	private async fire(t: TimerRow): Promise<void> {
-		await this.process(t.run, [{ kind: 'timer', at: this.now(), act: t.act, timer: t.timer }]);
+		await this.advance(t.run, () => this.process(t.run, [{ kind: 'timer', at: this.now(), act: t.act, timer: t.timer }])).then(() => {});
 	}
 
 	/** Runs a dispatched step here and applies its outcome. */
@@ -661,9 +750,13 @@ function runAttrs(row: RunRow): { parent?: string; plan: string; workflow?: stri
 /** What a new run starts with, besides its plan and input. */
 export interface RunStart {
 	runId: string;
+	/** Stops only confirmation of this start; the run may already exist durably. */
+	signal?: AbortSignal;
 	vars?: Record<string, unknown>;
 	/** The run that makes this one: kept and removed with it (ADR 0054). */
 	parent?: string;
+	/** Atomically require parent to be an unfinished workflow when creating this run (ADR 0065). */
+	guardParent?: boolean;
 	/** A workflow run's workflow, and what the application gave it (ADR 0059). Set once. */
 	workflow?: string;
 	meta?: Record<string, unknown>;
