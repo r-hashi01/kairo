@@ -15,6 +15,7 @@ import (
 
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/ir"
+	opmetrics "github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/wal"
 )
@@ -56,7 +57,13 @@ func TestWriteJSONConcurrentAtomicReplace(t *testing.T) {
 }
 
 func TestClaimWorkflowByRunID(t *testing.T) {
-	e, err := engine.New(engine.Config{Shards: 2, NoSync: true})
+	measured := make(chan opmetrics.Measurement, 4)
+	e, err := engine.New(engine.Config{Shards: 2, NoSync: true, Metrics: opmetrics.SinkFunc(func(batch []opmetrics.Measurement) error {
+		for _, metric := range batch {
+			measured <- metric
+		}
+		return nil
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,6 +97,21 @@ func TestClaimWorkflowByRunID(t *testing.T) {
 	}
 	if got.Claim == nil || got.Claim.Run.RunID != "target" || got.Claim.Until <= time.Now().UnixMilli() {
 		t.Fatalf("claim: %+v", got)
+	}
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case metric := <-measured:
+			if metric.Labels.Path != "direct" || metric.Labels.Outcome != "claimed" {
+				t.Fatalf("claim measurement = %+v", metric)
+			}
+			seen[metric.Name] = true
+		case <-time.After(time.Second):
+			t.Fatalf("claim measurements = %v", seen)
+		}
+	}
+	if !seen[opmetrics.WorkflowClaim] || !seen[opmetrics.WorkflowClaimDuration] {
+		t.Fatalf("claim measurements = %v", seen)
 	}
 }
 

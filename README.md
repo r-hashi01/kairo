@@ -235,7 +235,7 @@ The full list, with the tests behind each, is in [AGENTS.md](AGENTS.md). Every d
 | `core/` `ir/` | the pure state machine, the plan compiler and its graph IR |
 | `wasmcore/` `cmd/kairo-wasm/` | the core as a WASM module for the SDKs |
 | `sdk/ts/` `sdk/python/` `sdk/go/` | the SDKs: the embedded runtime, workflows as code, HTTP actions, scheduler entry points, test environments (Go runs the core natively) |
-| `engine/` `sched/` `wal/` `timerwheel/` | kairod's engine: shards, admission and quotas, write-ahead log, timers |
+| `engine/` `sched/` `wal/` `timerwheel/` `metrics/` | kairod's engine: shards, admission and quotas, write-ahead log, timers, bounded operational measurements |
 | `cmd/kairod/` `api/` `protocol/` | the daemon, its HTTP API and the worker protocol |
 | `store/` | SQL backends for kairod (each a module of its own) |
 | `httpaction/` `executor/` | actions over HTTP(S) in Go; built-in executors (HTTP, [TypeSafe Jev](docs/jev.md)) |

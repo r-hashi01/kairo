@@ -358,6 +358,7 @@ func (s *Server) handle(c net.Conn) {
 	if len(lost) > 0 {
 		log.Printf("kairo: worker %q disconnected with %d tasks outstanding", h.Worker, len(lost))
 	}
+	s.E.ObserveWorkerDisconnect(len(lost))
 	for _, o := range lost {
 		o.stop()
 		// The task may or may not have run.

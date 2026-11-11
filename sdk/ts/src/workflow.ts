@@ -12,6 +12,7 @@ import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } fr
 import { EffectWeakenedError, Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
 import { consoleLogger, observe, stepStatus, type Logger, type Observer } from './observe.ts';
+import { MetricEmitter, MetricName, type MetricSink } from './metrics.ts';
 import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, type LeaseRow } from './store.ts';
 import type { Address, TaskContext } from './worker.ts';
 
@@ -157,6 +158,8 @@ export interface KairoOptions {
 	 * kairod (HttpBackend), only the steps this process's worker runs.
 	 */
 	observe?: Observer;
+	/** Receives bounded-cardinality operational measurements asynchronously. */
+	metrics?: MetricSink;
 }
 
 /** The workflow ran into a call whose result kairo no longer keeps. */
@@ -374,12 +377,16 @@ export class Kairo {
 	private readonly clock: () => number;
 	/** Tick drains process-wide work; concurrent callers take turns. */
 	private tickTail = Promise.resolve();
+	private readonly metrics?: MetricEmitter;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
-		this.backend = opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
+		this.metrics = opts.metrics ? new MetricEmitter(opts.metrics) : undefined;
+		this.backend =
+			opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
+		if (this.backend instanceof HttpBackend && this.metrics) this.backend.setMetrics(this.metrics);
 		this.suspend = opts.mode === 'suspend';
-		if (this.suspend && !this.backend.idle && !(this.backend instanceof HttpBackend))
+		if (this.suspend && !(this.backend as Backend).idle && !(this.backend instanceof HttpBackend))
 			throw new Error('suspend mode needs the embedded backend or kairod');
 		const rt = (this.backend as { runtime?: unknown }).runtime;
 		if (rt instanceof Embedded) {
@@ -390,6 +397,11 @@ export class Kairo {
 		this.logger = opts.logger ?? this.rt?.logger ?? consoleLogger;
 		const rtNow = this.rt?.now;
 		this.clock = rtNow ? () => rtNow() : Date.now;
+	}
+
+	/** Measurements dropped before delivery, and sink failures. */
+	get metricStats(): { dropped: number; failed: number } {
+		return { dropped: this.metrics?.dropped ?? 0, failed: this.metrics?.failed ?? 0 };
 	}
 
 	defineAction<I, O>(name: string, def: ActionDef<I, O>): void {
@@ -522,6 +534,37 @@ export class Kairo {
 	 * review in the next process). After drain, close.
 	 */
 	async drain(opts: { signal?: AbortSignal } = {}): Promise<void> {
+		const started = this.metrics ? performance.now() : 0;
+		this.metrics?.emit({
+			name: MetricName.drainStartingTasks,
+			kind: 'histogram',
+			unit: '{task}',
+			value: this.backend instanceof HttpBackend ? this.backend.inflight : 0,
+		});
+		this.metrics?.emit({ name: MetricName.drainStartingDrives, kind: 'histogram', unit: '{drive}', value: this.driving.size });
+		let outcome = 'failed';
+		try {
+			await this.drainInner(opts);
+			outcome = 'completed';
+		} catch (error) {
+			if (opts.signal?.aborted || error instanceof StoppedError)
+				outcome = opts.signal?.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled';
+			else if ((error as Error)?.name === 'DrainUnsupportedError') outcome = 'unsupported';
+			throw error;
+		} finally {
+			const labels = { outcome };
+			this.metrics?.emit({ name: MetricName.drain, kind: 'counter', unit: '{event}', value: 1, labels });
+			this.metrics?.emit({
+				name: MetricName.drainDuration,
+				kind: 'histogram',
+				unit: 's',
+				value: (performance.now() - started) / 1000,
+				labels,
+			});
+		}
+	}
+
+	private async drainInner(opts: { signal?: AbortSignal } = {}): Promise<void> {
 		const rt = this.rt;
 		this.draining = true;
 		rt?.drain();

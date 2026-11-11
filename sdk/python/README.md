@@ -119,6 +119,8 @@ What goes wrong in the runtime's background work (lease renewals, sweeps, timers
 
 `Kairo(..., observe=fn)` gives `fn` an `Observation` (a dataclass) as each thing happens, to count, time and trace runs (metrics, OpenTelemetry) without kairo depending on either. It is called inside the runtime, so it must not block; one that raises is logged and the runtime goes on.
 
+`Kairo(..., metrics=fn)` gives `fn` bounded-cardinality `Metric` values for start confirmation and Drain on a process-level background handoff. It is disabled by default and never includes a run id or payload. Names, units and finite labels are defined by ADR 0076.
+
 ```python
 k = Kairo(backend=backend, observe=lambda o: metrics.record(o))
 ```

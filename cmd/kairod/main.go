@@ -22,6 +22,7 @@ import (
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/executor/httpexec"
 	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/obs"
 	"github.com/r-hashi01/kairo/protocol"
 	"github.com/r-hashi01/kairo/sched"
@@ -37,6 +38,7 @@ func main() {
 		nodesFile   = flag.String("nodes", "", "JSON file with an array of node specs")
 		limitFile   = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
 		obsFile     = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
+		metricsFile = flag.String("metrics", "", "write bounded operational measurements as JSON lines to this file (- for stdout)")
 		tierName    = flag.String("tier", "none", "default durability tier: none|memory|file")
 		noSync      = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
 		maxActive   = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
@@ -88,6 +90,19 @@ func main() {
 		defer f.Close()
 		sink = obs.NewJSONLines(f)
 	}
+	var metricSink metrics.Sink
+	switch *metricsFile {
+	case "":
+	case "-":
+		metricSink = metrics.NewJSONLines(os.Stdout)
+	default:
+		f, err := os.OpenFile(*metricsFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		metricSink = metrics.NewJSONLines(f)
+	}
 
 	e, err := engine.New(engine.Config{
 		Shards:         *shards,
@@ -102,6 +117,7 @@ func main() {
 		},
 		Limits:  func(dest string) sched.DestLimits { return limits[dest] },
 		Observe: sink,
+		Metrics: metricSink,
 	})
 	if err != nil {
 		log.Fatal(err)

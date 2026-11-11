@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	opmetrics "github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/protocol"
 	ktask "github.com/r-hashi01/kairo/task"
 )
@@ -76,7 +77,7 @@ func Connect(ctx context.Context, url, worker string, opts Options) (*Kairo, err
 	startCtx, startCancel := context.WithCancel(context.Background())
 	k.remote = &remote{url: strings.TrimSuffix(url, "/"), worker: worker, token: opts.WorkerToken, concurrency: conc,
 		client: &http.Client{Timeout: 90 * time.Second}, owner: k.rt.owner, lease: time.Duration(k.rt.leaseMs) * time.Millisecond,
-		claims: map[string]remoteDriveClaim{}, startCtx: startCtx, startCancel: startCancel, startChanged: make(chan struct{})}
+		claims: map[string]remoteDriveClaim{}, startCtx: startCtx, startCancel: startCancel, startChanged: make(chan struct{}), metrics: k.rt.metrics}
 	k.runs = k.remote
 	return k, nil
 }
@@ -97,6 +98,7 @@ type remote struct {
 	startCancel        context.CancelFunc
 	starts             int
 	startChanged       chan struct{}
+	metrics            *metricEmitter
 }
 
 type remoteDriveClaim struct {
@@ -250,7 +252,21 @@ func (m *remote) waitStarts(ctx context.Context) error {
 	}
 }
 
-func (m *remote) run(ctx context.Context, plan string, input any, runID string, spec runSpec) (bool, error) {
+func (m *remote) run(ctx context.Context, plan string, input any, runID string, spec runSpec) (existing bool, retErr error) {
+	var started time.Time
+	if m.metrics != nil {
+		started = time.Now()
+		defer func() {
+			outcome := "failed"
+			if retErr == nil {
+				outcome = "confirmed"
+			} else if errors.Is(retErr, context.Canceled) || errors.Is(retErr, context.DeadlineExceeded) || errors.Is(retErr, ErrStopped) {
+				outcome = "cancelled"
+			}
+			m.metrics.emit(Metric{Name: opmetrics.RunStartConfirmation, Kind: opmetrics.Histogram, Unit: "s", Value: time.Since(started).Seconds(),
+				Labels: MetricLabels{Outcome: outcome}})
+		}()
+	}
 	ctx, end, err := m.beginStart(ctx)
 	if err != nil {
 		return false, err
@@ -290,6 +306,7 @@ func (m *remote) run(ctx context.Context, plan string, input any, runID string, 
 			return out.Existing, nil
 		}
 		minimum := time.Duration(0)
+		cause := "unconfirmed"
 		if err != nil {
 			var re *remoteError
 			if errors.As(err, &re) && re.status == http.StatusConflict {
@@ -297,18 +314,27 @@ func (m *remote) run(ctx context.Context, plan string, input any, runID string, 
 			}
 			if errors.As(err, &re) && re.status == http.StatusTooManyRequests {
 				minimum = re.retryAfter
+				cause = "overloaded"
 			} else {
 				var transport *remoteTransportError
 				if !errors.As(err, &transport) {
 					return false, err
 				}
+				cause = "transport"
+				m.metrics.emit(Metric{Name: opmetrics.RunStartUnconfirmed, Kind: opmetrics.Counter, Unit: "{event}", Value: 1,
+					Labels: MetricLabels{Cause: "transport_ambiguity"}})
 			}
 		} else if out.RunID != runID {
 			return false, fmt.Errorf("kairod: unconfirmed run %q, want %q", out.RunID, runID)
+		} else {
+			m.metrics.emit(Metric{Name: opmetrics.RunStartUnconfirmed, Kind: opmetrics.Counter, Unit: "{event}", Value: 1,
+				Labels: MetricLabels{Cause: "durability_timeout"}})
 		}
 		if ctx.Err() != nil {
 			return false, context.Cause(ctx)
 		}
+		m.metrics.emit(Metric{Name: opmetrics.RunStartRetries, Kind: opmetrics.Counter, Unit: "{event}", Value: 1,
+			Labels: MetricLabels{Cause: cause}})
 		timer := time.NewTimer(retryDelay(backoff, minimum, runID, attempt))
 		select {
 		case <-ctx.Done():

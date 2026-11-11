@@ -158,6 +158,8 @@ What goes wrong in the runtime's background work (lease renewals, sweeps, timers
 
 `Options.Observe` is given a `kairo.Observation` as each thing happens, to count, time and trace runs (metrics, OpenTelemetry) without kairo depending on either. It is called inside the runtime, so it must not block; one that panics is logged and the runtime goes on.
 
+`Options.Metrics` receives bounded-cardinality `kairo.Metric` batches for start confirmation and Drain. It is disabled by default; enabled measurements cross a bounded non-blocking buffer, and `MetricStats` reports drops and failed batches. Names, units and finite labels are defined by ADR 0076; metrics never include a RunID or payload.
+
 | `Kind` | When | With |
 |---|---|---|
 | `kairo.ObsRunStarted` | This process made a new run | `RunID`, `Plan`, `Parent`, `Workflow` |

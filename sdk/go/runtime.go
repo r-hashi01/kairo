@@ -148,6 +148,7 @@ type runtime struct {
 	leaseParents bool
 	logger       *slog.Logger
 	observer     func(Observation)
+	metrics      *metricEmitter
 	manualTimers bool
 	// draining (Kairo.Drain): no timer is armed here and no sweep runs; the
 	// steps already dispatched run to their end.

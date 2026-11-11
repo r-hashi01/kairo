@@ -34,6 +34,7 @@ wal/         シャードごとの追記ログ、group commit、差し替え可�
 blob/        内容ハッシュで参照するブロブ、原子的な置き換え（スナップショット用）
 timerwheel/  階層タイミングホイール（挿入・取消 O(1)、空なら OS タイマーを張らない）
 obs/         可観測性ストリーム（非同期・バッチ・溢れたら捨てる）
+metrics/     有界 cardinality の運用測定（非同期・非耐久・既定は無効）
 live/        ライブストリーム（トークン中継。記録もイベント化もしない）
 protocol/    ワーカープロトコル（UNIX ソケット / TCP、pull 型、クレジット制）と Go 版 SDK
 executor/httpexec/  組み込み HTTP 実行器（HTTP/2 多重化、SSE 中継）
@@ -63,7 +64,7 @@ cmd/kairod/  デーモン
 | FR5 スケジューラ | `sched/admission.go`（実行全体の上限）と `sched/start_admission.go`（shard・耐久性 tier ごとの開始確認 window、テナント間ラウンドロビン、有界キュー、溢れたら 429）、`sched/dispatcher.go`（宛先ごとの RPM/TPM トークンバケット、テナント同時実行数、実際のトークン数での精算） |
 | FR6 耐久性ログ | `wal/`。シャード×ティアごとの追記ログで、処理中に溜まった書き込みを1回にまとめる group commit です。`Sink` インターフェースが要求するのは「追記して、障害範囲の外から ack を返す」ことだけです。ファイル実装は起動のたびに新しいセグメントを作り、既存のバイトは書き換えません |
 | 実の命令の順序ルール | 1. 意図を記録し、そこまで耐久化されてから解放します（`engine/shard.go` の `dispatch` と `hold`）。2. 結果はログに記録します。完了の通知もログが耐久化されてから返します。3. 結果不明のときは、`idempotent_retry` の宣言があれば同じキーで再試行し、なければ `blocked`（要確認）で止めます。`POST /v1/runs/{id}/resolve` で人が決着させます |
-| FR7 可観測性 | `obs/`。有界チャネルに入れ、あふれたら捨てて数を数えます。送り先は `obs.Sink` で差し替えられます |
+| FR7 可観測性 | `obs/` は個別実行の詳細観測、`metrics/` は開始確認・claim・WAL・Drain・worker切断・blockedの有界cardinalityな運用測定です。どちらも有界チャネルに入れ、あふれたら捨てて数を数えます。運用測定は既定で無効で、kairodは `-metrics FILE`（`-` は標準出力）でJSON Linesとして出せます（ADR 0076） |
 | FR8 ライブストリーム | `live/`。購読者ごとの有界バッファで、`Next` がまとめて返します。ログには残しません |
 | FR9 タイマーと長時間待機 | `timerwheel/` と `engine/shard.go` の `maybeEvict` / `load`。ホイールが空なら OS タイマーを張らないので、待機中のシャードは一切起きません |
 | FR10 組み込み形態 | ライブラリとしては `engine.New` → `RegisterPlan` / `RegisterExecutor` → `Start`。デーモンは `cmd/kairod`、他言語からは `protocol` を使います |

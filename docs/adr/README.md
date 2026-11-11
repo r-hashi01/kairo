@@ -80,5 +80,6 @@
 | [0073](0073-drain-kairod-workers-before-planned-shutdown.md) | 計画停止では、kairod のworkerが新しい仕事を止め、実行中の結果を記録してから閉じる | 承認 |
 | [0074](0074-adapt-durable-start-admission-to-storage.md) | 耐久開始の受け付けを保存先の処理能力に合わせ、開始前に過負荷を返す | 承認 |
 | [0075](0075-negotiate-graceful-worker-drain-capability.md) | worker と kairod は graceful Drain の能力を接続ごとに合意してから使う | 承認 |
+| [0076](0076-operational-measurements-are-nondurable-and-bounded.md) | 運用指標は実行記録から分離し、有界 cardinality の非耐久な計数・分布として公開する | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

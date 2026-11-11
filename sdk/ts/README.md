@@ -116,6 +116,8 @@ What goes wrong in the runtime's background work (lease renewals, sweeps, timers
 
 `observe` on `Kairo` is given an `Observation` as each thing happens, to count, time and trace runs (metrics, OpenTelemetry) without kairo depending on either. It is called inside the runtime, so it must not block; one that throws is logged and the runtime goes on.
 
+`metrics` on `Kairo` receives bounded-cardinality `Metric` values for start confirmation and Drain through a bounded asynchronous handoff. It is disabled by default and never includes a run id or payload. Names, units and finite labels are defined by ADR 0076.
+
 ```ts
 const k = new Kairo({ backend, observe: (o) => metrics.record(o) });
 ```

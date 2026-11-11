@@ -92,3 +92,40 @@ func TestStartAdmissionDecreaseNeverLeavesInflightAboveWindow(t *testing.T) {
 		t.Fatalf("slow successful round did not halve: %+v", st)
 	}
 }
+
+func TestStartAdmissionEmitsBoundedMeasurements(t *testing.T) {
+	now := time.Unix(0, 0)
+	a := NewStartAdmission(1, func() time.Time { return now })
+	var got []StartObservation
+	a.SetObserver(func(o StartObservation) { got = append(got, o) })
+	key := StartKey{Shard: 3, Tier: 2}
+	first, err := a.Admit(key, "one", func(*StartTicket) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := a.Admit(key, "two", func(*StartTicket) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Millisecond)
+	a.ObserveInbox(first, now)
+	now = now.Add(3 * time.Millisecond)
+	a.ConfirmRound(key, 1, []*StartTicket{first}, now)
+	if queued.e.state != 1 {
+		t.Fatal("queued start was not admitted")
+	}
+	want := map[StartObservationKind]bool{StartGauge: false, StartQueueWait: false, StartInboxWait: false, StartWALWait: false}
+	for _, o := range got {
+		if _, ok := want[o.Kind]; ok {
+			want[o.Kind] = true
+		}
+		if o.Key != key {
+			t.Fatalf("observation key = %+v", o.Key)
+		}
+	}
+	for kind, seen := range want {
+		if !seen {
+			t.Fatalf("observation kind %d missing: %#v", kind, got)
+		}
+	}
+}

@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	opmetrics "github.com/r-hashi01/kairo/metrics"
+	"github.com/r-hashi01/kairo/protocol"
 	"github.com/r-hashi01/kairo/wasmcore"
 )
 
@@ -187,6 +189,9 @@ type Options struct {
 	// start and settle, steps' attempts that start and finish. It is called
 	// on the runtime's goroutines: it must not block.
 	Observe func(Observation)
+	// Metrics receives non-durable, bounded-cardinality operational
+	// measurements outside the runtime's execution path (ADR 0076).
+	Metrics MetricSink
 	// HTTP configures actions over HTTP(S) and /tick (ADR 0052, 0053).
 	HTTP HTTPOptions
 	// Now is the clock (tests).
@@ -386,6 +391,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	if err := rt.open(ctx, opts.Owner != ""); err != nil {
 		return nil, err
 	}
+	rt.metrics = newMetricEmitter(opts.Metrics)
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
@@ -2003,7 +2009,39 @@ func (k *Kairo) redrive(id string) {
 // step then waits for review in the next process). Draining has begun when
 // Drain returns, whatever ctx did; it may be called again to wait. After
 // Drain, Close.
-func (k *Kairo) Drain(ctx context.Context) error {
+func (k *Kairo) Drain(ctx context.Context) (retErr error) {
+	if k.rt.metrics != nil {
+		started := time.Now()
+		k.mu.Lock()
+		drives := len(k.driving)
+		k.mu.Unlock()
+		tasks := 0
+		if k.remote != nil {
+			tasks = k.remote.inflight()
+		} else {
+			k.rt.mu.Lock()
+			tasks = len(k.rt.running)
+			k.rt.mu.Unlock()
+		}
+		k.rt.metrics.emit(Metric{Name: opmetrics.DrainStartingTasks, Kind: opmetrics.Histogram, Unit: "{task}", Value: float64(tasks)})
+		k.rt.metrics.emit(Metric{Name: opmetrics.DrainStartingDrives, Kind: opmetrics.Histogram, Unit: "{drive}", Value: float64(drives)})
+		defer func() {
+			outcome := "failed"
+			switch {
+			case retErr == nil:
+				outcome = "completed"
+			case errors.Is(retErr, context.DeadlineExceeded):
+				outcome = "timeout"
+			case errors.Is(retErr, context.Canceled):
+				outcome = "cancelled"
+			case errors.Is(retErr, protocol.ErrDrainUnsupported):
+				outcome = "unsupported"
+			}
+			labels := MetricLabels{Outcome: outcome}
+			k.rt.metrics.emit(Metric{Name: opmetrics.Drain, Kind: opmetrics.Counter, Unit: "{event}", Value: 1, Labels: labels})
+			k.rt.metrics.emit(Metric{Name: opmetrics.DrainDuration, Kind: opmetrics.Histogram, Unit: "s", Value: time.Since(started).Seconds(), Labels: labels})
+		}()
+	}
 	k.draining.Store(true)
 	if k.remote == nil {
 		k.rt.draining.Store(true)
@@ -2069,8 +2107,14 @@ func (k *Kairo) Close() error {
 	if k.remote != nil {
 		k.remote.releaseAll()
 	}
-	return k.rt.close()
+	err := k.rt.close()
+	k.rt.metrics.close()
+	return err
 }
+
+// MetricStats reports operational measurements dropped before export and
+// measurements in batches whose sink failed.
+func (k *Kairo) MetricStats() (dropped, failed uint64) { return k.rt.metrics.stats() }
 
 // destination is the key an action's limits are counted by.
 func destination(name string, a *actionDef) string {
