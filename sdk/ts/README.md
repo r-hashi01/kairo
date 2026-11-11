@@ -49,13 +49,14 @@ An action is a function your workflows call. You declare what it does to the wor
 | `'unprotected'` | Safe to repeat: an LLM call, a read, a computation | It runs again |
 | `'real'` (the default) | Acts on the world: a payment, an email, a write | It stops for review (`blocked`). It is never re-run blindly |
 
-A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`'30s'`, `'5m'`), `destination` (a rate-limit key), `maxAttempts` and `backoff` (below), and `url` for [actions over HTTP(S)](#actions-over-https).
+A real step is dispatched only after its intent is committed to the database. Options: `timeout` (`'30s'`, `'5m'`), `destination` (a fixed rate-limit key), `maxAttempts` and `backoff` (below), `limit`, `rate` and `weightRate`, and `url` for [actions over HTTP(S)](#actions-over-https).
 
 A handler that throws fails its step for good. To say otherwise, throw one of these:
 
 | Thrown | Means | The step |
 |---|---|---|
 | `RetryableError` | It did not take effect: try again | Is retried up to `maxAttempts` (default 3; 1 for a real action), `backoff` apart (default `'200ms'`, doubled each time) |
+| `RetryAfterError(message, ms)` | It definitely did not take effect; the destination asked to wait | Is retried no sooner than both `backoff` and `ms`; other work for that destination waits too |
 | `UnknownOutcomeError` | It may have taken effect | Is never taken for success: a real step stops for review, an unprotected one is retried |
 
 ### Workflows
@@ -67,6 +68,7 @@ k.workflow('name', async (ctx, input) => { ... });
 | In a workflow | Does |
 |---|---|
 | `ctx.call(action, input)` | Runs an action once, however often the workflow runs again |
+| `ctx.call(action, input, { destination })` | Selects this call's destination; it is part of the durable call identity |
 | `ctx.parallel([() => ctx.call(...), ...])` | Runs calls at once |
 | `ctx.sleep(ms)` | Waits in the database, not in memory: the process may stop meanwhile |
 | `ctx.waitFor(signal, { timeout? })` | Waits for `k.signal(id, signal, payload)` and returns the payload; past `timeout` (ms) it throws `TimedOutError` |
@@ -108,7 +110,7 @@ To stop a resident process without leaving a real step to review, `await k.drain
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
 
-Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit` (steps at once) and `rate` (starts a minute) on an action, counted by its `destination` when it has one.
+Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit`, `rate` and `weightRate` on an action. `destinationLimits(destination)` may resolve current limits at admission; positive action and resolved limits use the stricter value. An action calls `ctx.setWeight(n)` to report actual non-negative weight; debt delays later work.
 
 ### Logging and observing
 

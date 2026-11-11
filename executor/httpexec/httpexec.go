@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,9 +138,9 @@ func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte))
 		msg := fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 		switch resp.StatusCode {
 		case 429:
-			return task.Result{Err: msg, Retryable: true, RateLimited: true}
+			return task.Result{Err: msg, Retryable: true, RateLimited: true, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now()).Milliseconds()}
 		case 502, 503, 504:
-			return task.Result{Err: msg, Retryable: true}
+			return task.Result{Err: msg, Retryable: true, RetryAfter: retryAfter(resp.Header.Get("Retry-After"), time.Now()).Milliseconds()}
 		}
 		return task.Result{Err: msg}
 	}
@@ -155,6 +156,16 @@ func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte))
 	}
 	out, _ := json.Marshal(map[string]any{"status": resp.StatusCode, "body": string(b)})
 	return task.Result{Output: out}
+}
+
+func retryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }
 
 // readSSE relays each "data:" payload to the live stream and returns the

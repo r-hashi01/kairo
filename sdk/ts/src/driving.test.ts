@@ -15,7 +15,7 @@ import { EmbeddedBackend } from './backend.ts';
 import { finished } from './client.ts';
 import { PostgresStore, SQLiteStore, WorkflowRetryError, type Store } from './store.ts';
 import { ObservationKind, type Observation } from './observe.ts';
-import { CallError, CancelledError, Kairo, NotWaitingError, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions, type SignalReceipt } from './workflow.ts';
+import { CallError, CancelledError, Kairo, NotWaitingError, RetryAfterError, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions, type SignalReceipt } from './workflow.ts';
 import { EFFECT_WEAKENED } from './embedded.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
@@ -500,6 +500,55 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		// began (a start that comes late does not fail this); 1ms for timers
 		// that fire early by their rounding.
 		starts.forEach((s, i) => assert.ok(s - began >= i * 100 - 1, `paced start ${i} came ${s - began}ms after the workflow began`));
+		await k.close();
+	});
+
+	test('runtime destinations share actual weight and retry-after', async () => {
+		const resolved: string[] = [];
+		const k = await open(join(dir, 'runtime-destinations.db'), {
+			destinationLimits: (destination) => (resolved.push(destination), { weightPerMinute: 60_000 }),
+		});
+		let runs = 0;
+		let firstFinished = 0;
+		let secondStarted = 0;
+		k.defineAction('metered', {
+			effect: 'unprotected',
+			handler: async (input: string, ctx) => {
+				runs++;
+				if (input === 'first') {
+					ctx.setWeight(10_100);
+					firstFinished = performance.now();
+				} else if (input === 'second') secondStarted = performance.now();
+				return runs;
+			},
+		});
+		let retryAttempts = 0;
+		let retryBegan = 0;
+		k.defineAction('retry-after', {
+			effect: 'unprotected', maxAttempts: 2, backoff: '1ms',
+			handler: async () => {
+				retryAttempts++;
+				if (retryAttempts === 1) {
+					retryBegan = performance.now();
+					throw new RetryAfterError('busy', 80);
+				}
+				return performance.now() - retryBegan;
+			},
+		});
+		k.workflow('w', async (ctx) => {
+			const a = await ctx.call<number>('metered', 'same', { destination: 'provider-a' });
+			const b = await ctx.call<number>('metered', 'same', { destination: 'provider-b' });
+			await ctx.call('metered', 'first', { destination: 'provider-a' });
+			await ctx.call('metered', 'second', { destination: 'provider-a' });
+			const retryDelay = await ctx.call<number>('retry-after', null, { destination: 'provider-a' });
+			return { a, b, retryDelay };
+		});
+		await k.start();
+		const out = await k.run<{ a: number; b: number; retryDelay: number }>('w', null, { id: 'runtime-destinations-1' });
+		assert.notEqual(out.a, out.b, 'different destinations must have different call identities');
+		assert.ok(resolved.includes('provider-a') && resolved.includes('provider-b'));
+		assert.ok(secondStarted - firstFinished >= 75, `weight debt waited ${secondStarted - firstFinished}ms`);
+		assert.ok(out.retryDelay >= 60, `retry-after waited ${out.retryDelay}ms`);
 		await k.close();
 	});
 

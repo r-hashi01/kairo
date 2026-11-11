@@ -107,10 +107,12 @@ type Result struct {
 	Retryable bool            `json:"retryable,omitempty"`
 	Unknown   bool            `json:"unknown,omitempty"`
 	Tokens    int             `json:"tokens,omitempty"`
+	Weight    int             `json:"weight,omitempty"`
 	ErrType   string          `json:"error_type,omitempty"`
 	Meta      json.RawMessage `json:"meta,omitempty"`
 	// RateLimited: the destination refused the task for its limits (ADR 0039).
-	RateLimited bool `json:"rate_limited,omitempty"`
+	RateLimited bool  `json:"rate_limited,omitempty"`
+	RetryAfter  int64 `json:"retry_after_ms,omitempty"`
 	// Wait: wait until a deadline, then end with an output (ADR 0045).
 	Wait *task.Wait `json:"wait,omitempty"`
 	// Pending is valid only on a negotiated callback-capable connection and

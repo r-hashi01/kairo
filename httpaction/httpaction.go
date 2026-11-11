@@ -46,6 +46,7 @@ type Request struct {
 	Act            uint32          `json:"act"`
 	Attempt        int32           `json:"attempt"`
 	Action         string          `json:"action"`
+	Destination    string          `json:"destination,omitempty"`
 	Input          json.RawMessage `json:"input"`
 	IdempotencyKey string          `json:"idempotency_key"`
 	Callback       string          `json:"callback,omitempty"`
@@ -53,11 +54,13 @@ type Request struct {
 
 // Result is an outcome as the 200 answer carries it.
 type Result struct {
-	Output    json.RawMessage `json:"output,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Retryable bool            `json:"retryable,omitempty"`
-	ErrorType string          `json:"error_type,omitempty"`
-	Wait      *task.Wait      `json:"wait,omitempty"`
+	Output     json.RawMessage `json:"output,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Retryable  bool            `json:"retryable,omitempty"`
+	ErrorType  string          `json:"error_type,omitempty"`
+	Weight     int             `json:"weight,omitempty"`
+	RetryAfter int64           `json:"retry_after_ms,omitempty"`
+	Wait       *task.Wait      `json:"wait,omitempty"`
 }
 
 func mac(secret string, t int64, body []byte) string {
@@ -110,11 +113,11 @@ func FromTask(r task.Result) (res Result, unknown bool) {
 	case r.Unknown:
 		return Result{Error: r.Err, ErrorType: r.ErrType}, true
 	case r.Err != "":
-		return Result{Error: r.Err, Retryable: r.Retryable, ErrorType: r.ErrType}, false
+		return Result{Error: r.Err, Retryable: r.Retryable, ErrorType: r.ErrType, Weight: r.Weight, RetryAfter: r.RetryAfter}, false
 	case r.Wait != nil:
-		return Result{Wait: r.Wait}, false
+		return Result{Wait: r.Wait, Weight: r.Weight}, false
 	default:
-		return Result{Output: r.Output}, false
+		return Result{Output: r.Output, Weight: r.Weight}, false
 	}
 }
 
@@ -153,7 +156,7 @@ func Handler(secret string, serve func(ctx context.Context, t *task.Task, emit f
 		}
 		res, unknown := FromTask(serve(r.Context(), &task.Task{
 			RunID: req.RunID, StepID: req.StepID, Act: req.Act, Attempt: req.Attempt,
-			IdemKey: req.IdempotencyKey, Action: req.Action, Input: req.Input,
+			IdemKey: req.IdempotencyKey, Action: req.Action, Destination: req.Destination, Input: req.Input,
 		}, func([]byte) {}))
 		if unknown {
 			answer(http.StatusBadGateway, res)

@@ -60,6 +60,8 @@ export interface Result {
 	retryable?: boolean;
 	unknown?: boolean;
 	tokens?: number;
+	weight?: number;
+	retryAfter?: number;
 	errorType?: string;
 	meta?: unknown;
 	rateLimited?: boolean;
@@ -83,6 +85,8 @@ export function resultBody(seq: number, r: Result): Record<string, unknown> {
 	if (r.retryable) b.retryable = true;
 	if (r.unknown) b.unknown = true;
 	if (r.tokens) b.tokens = r.tokens;
+	if (r.weight) b.weight = r.weight;
+	if (r.retryAfter) b.retry_after_ms = Math.floor(r.retryAfter);
 	if (r.errorType) b.error_type = r.errorType;
 	if (r.meta !== undefined) b.meta = r.meta;
 	if (r.rateLimited) b.rate_limited = true;

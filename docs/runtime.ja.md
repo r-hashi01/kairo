@@ -29,7 +29,7 @@
 ir/          実行計画（IR）。定義 JSON、ノード仕様（作用の型）、コンパイラ
 core/        純粋な状態遷移コア (状態, イベント) → (新状態, 命令)。スナップショットの符号化
 engine/      シャード（1コア1イベントループ）、耐久化の順序制御、退避・復元、リカバリ
-sched/       アドミッション制御、テナント間ラウンドロビン、宛先ごとの RPM/TPM
+sched/       アドミッション制御、テナント間ラウンドロビン、宛先ごとの RPM/重み
 wal/         シャードごとの追記ログ、group commit、差し替え可能な Sink
 blob/        内容ハッシュで参照するブロブ、原子的な置き換え（スナップショット用）
 timerwheel/  階層タイミングホイール（挿入・取消 O(1)、空なら OS タイマーを張らない）
@@ -61,7 +61,7 @@ cmd/kairod/  デーモン
 | FR2 状態遷移コア | `core/apply.go`。時刻はイベントに含めて渡します。map の走査順に依存しません。同じイベント列から同じバイト列の状態が得られることをテストしています。実行内の並列は「複数の命令が同時に出ている状態」として表します。シャードは実行 ID の FNV ハッシュで決め、再起動しても変わりません |
 | FR3 命令と作用の型 | `ir.Effect` のゼロ値は `EffectReal` です。宣言のないアクションは実として扱います。命令は `run_id` / `step_id` / `attempt` / `idempotency_key` を持ちます。冪等キーは map の添字と loop の回数を含む `step_id` から作るので、試行をまたいでも変わりません |
 | FR4 実行器プロトコル | `protocol/`。長さ付きフレームと JSON を使う pull 型で、クレジット制のフロー制御をします。ワーカーが切断したら、未送信の命令はキューに戻し、送信済みの命令は「結果不明」として扱います |
-| FR5 スケジューラ | `sched/admission.go`（実行全体の上限）と `sched/start_admission.go`（shard・耐久性 tier ごとの開始確認 window、テナント間ラウンドロビン、有界キュー、溢れたら 429）、`sched/dispatcher.go`（宛先ごとの RPM/TPM トークンバケット、テナント同時実行数、実際のトークン数での精算） |
+| FR5 スケジューラ | `sched/admission.go`（実行全体の上限）と `sched/start_admission.go`（shard・耐久性 tier ごとの開始確認 window、テナント間ラウンドロビン、有界キュー、溢れたら 429）、`sched/dispatcher.go`（実行時の宛先ごとの RPM/重みトークンバケット、テナント同時実行数、完了後の実績での精算、Retry-After の共有） |
 | FR6 耐久性ログ | `wal/`。シャード×ティアごとの追記ログで、処理中に溜まった書き込みを1回にまとめる group commit です。`Sink` インターフェースが要求するのは「追記して、障害範囲の外から ack を返す」ことだけです。ファイル実装は起動のたびに新しいセグメントを作り、既存のバイトは書き換えません |
 | 実の命令の順序ルール | 1. 意図を記録し、そこまで耐久化されてから解放します（`engine/shard.go` の `dispatch` と `hold`）。2. 結果はログに記録します。完了の通知もログが耐久化されてから返します。3. 結果不明のときは、`idempotent_retry` の宣言があれば同じキーで再試行し、なければ `blocked`（要確認）で止めます。`POST /v1/runs/{id}/resolve` で人が決着させます |
 | FR7 可観測性 | `obs/` は個別実行の詳細観測、`metrics/` は開始確認・claim・WAL・Drain・worker切断・blockedの有界cardinalityな運用測定です。どちらも有界チャネルに入れ、あふれたら捨てて数を数えます。運用測定は既定で無効で、kairodは `-metrics FILE`（`-` は標準出力）でJSON Linesとして出せます（ADR 0076） |
@@ -119,7 +119,7 @@ curl localhost:8420/v1/runs/<id>/wait
 curl -N localhost:8420/v1/runs/<id>/stream     # SSE でライブ出力を受け取る
 ```
 
-宛先ごとのクォータは `-limits limits.json`（`{"openai":{"RPM":500,"TPM":200000,"TenantConcurrency":50}}`）で指定します。外部ワーカーは `<data>/worker.sock` に接続します。Go からは `protocol.Worker` を使います。
+宛先ごとのクォータは `-limits limits.json`（`{"openai":{"RPM":500,"WPM":200000,"TenantConcurrency":50}}`）で指定します。`WPM` がなければ互換性のため `TPM` を重み上限として使います。ノード仕様の `destination_from` は解決済み入力のトップレベルフィールドから実行時の宛先を選び、未指定・`null` なら固定 `destination`（それもなければ action 名）へ戻ります。worker と HTTP action は結果の `weight` で実績を、確定した再試行可能な失敗の `retry_after_ms` で最短待ちを返せます。外部ワーカーは `<data>/worker.sock` に接続します。Go からは `protocol.Worker` を使います。
 
 ## 開発
 

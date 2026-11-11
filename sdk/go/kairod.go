@@ -815,7 +815,8 @@ func (m *remote) registerPlan(ctx context.Context, def json.RawMessage) error {
 
 // serveRemote runs a step kairod gave this process's worker.
 func (k *Kairo) serveRemote(ctx context.Context, t *ktask.Task, emit func([]byte)) ktask.Result {
-	in := task{RunID: t.RunID, StepID: t.StepID, Action: t.Action, IdemKey: t.IdemKey, Act: t.Act, Attempt: t.Attempt, Input: t.Input}
+	in := task{RunID: t.RunID, StepID: t.StepID, Action: t.Action, Destination: t.Destination,
+		IdemKey: t.IdemKey, Act: t.Act, Attempt: t.Attempt, Input: t.Input}
 	if t.Callback != nil {
 		in.Callback = t.Callback.URL
 	}
@@ -831,7 +832,7 @@ func (k *Kairo) serveRemote(ctx context.Context, t *ktask.Task, emit func([]byte
 	k.rt.observe(Observation{Kind: ObsStepFinished, RunID: t.RunID, Action: t.Action, StepID: t.StepID, Attempt: t.Attempt,
 		Status: stepStatus(res), Error: res.Err, Duration: time.Since(began)})
 	out := ktask.Result{RunID: t.RunID, Act: t.Act, Attempt: t.Attempt, Output: res.Output, Err: res.Err, Retryable: res.Retryable,
-		Unknown: res.Unknown, ErrType: res.ErrType}
+		Unknown: res.Unknown, ErrType: res.ErrType, Weight: res.Weight, RetryAfter: res.RetryAfter, RateLimited: res.RateLimited}
 	if res.Pending != nil {
 		out.Pending = true
 	}

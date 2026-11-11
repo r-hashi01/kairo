@@ -41,7 +41,7 @@ ActionHandler = Callable[[Task, TaskContext], Result]
 
 #: Lets a dispatched step run (ADR 0059: limits): waits, on the event loop, and
 #: returns what gives its slots back, or a Result if it stopped waiting.
-Admit = Callable[[Task, TaskContext], Awaitable["Callable[[], None] | Result"]]
+Admit = Callable[[Task, TaskContext], Awaitable["Callable[[Result], None] | Result"]]
 
 DONE = {"completed", "failed", "cancelled"}
 SETTLED = DONE | {"blocked"}  # will not go on by itself
@@ -842,6 +842,7 @@ class Embedded:
             attempt=c.get("attempt", 0),
             idempotency_key=c.get("idempotency_key", ""),
             action=c.get("action", ""),
+            destination=c.get("destination", c.get("action", "")),
             input=c.get("input"),
         )
         step = {"run_id": run_id, "action": task.action, "step_id": task.step_id, "attempt": task.attempt}
@@ -861,7 +862,7 @@ class Embedded:
             res = Result(error=f"{type(e).__name__}: {e}", error_type=type(e).__name__)
         finally:
             if release is not None:
-                release()
+                release(res)
             self._running.pop(key, None)
             self._renew()
         if began:
@@ -898,6 +899,8 @@ def _outcome(res: Result, act: int, attempt: int, at: int) -> dict[str, Any]:
               "retryable": res.retryable, "unknown": res.unknown}
         if res.error_type:
             ev["error_type"] = res.error_type
+        if res.retryable and not res.unknown and res.retry_after_ms > 0:
+            ev["retry_after_ms"] = res.retry_after_ms
         return ev
     if res.wait is not None:
         return {"kind": "step_wait", "at": at, "act": act, "attempt": attempt, "deadline": int(res.wait["until"]), "data": res.wait.get("output")}

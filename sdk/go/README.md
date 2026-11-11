@@ -89,16 +89,17 @@ An action is a function your workflows call. You declare what it does to the wor
 | `kairo.Unprotected` | Safe to repeat: an LLM call, a read, a computation | It runs again |
 | `kairo.Real` | Acts on the world: a payment, an email, a write | It stops for review (`blocked`). It is never re-run blindly |
 
-A real step is dispatched only after its intent is committed to the database. Options: `Timeout(d)`, `Destination(name)` (a rate-limit key), `MaxAttempts(n)` and `Backoff(d)` (below), `IdempotentRetry()` (a real action that may run again with the same idempotency key, `TaskContext.IdempotencyKey`), `Limit(n)` and `Rate(perMinute)`, and `URL(url, async)` for [actions over HTTP(S)](#actions-over-https).
+A real step is dispatched only after its intent is committed to the database. Options: `Timeout(d)`, `Destination(name)` (a fixed rate-limit key), `MaxAttempts(n)` and `Backoff(d)` (below), `IdempotentRetry()` (a real action that may run again with the same idempotency key, `TaskContext.IdempotencyKey`), `Limit(n)`, `Rate(perMinute)` and `WeightRate(perMinute)`, and `URL(url, async)` for [actions over HTTP(S)](#actions-over-https).
 
 A handler that returns an error fails its step for good. To say otherwise, wrap the error:
 
 | Returned | Means | The step |
 |---|---|---|
 | `kairo.Retryable(err)` | It did not take effect: try again | Is retried up to `MaxAttempts` (default 3; 1 for a real action), `Backoff` apart (default 200ms, doubled each time) |
+| `kairo.RetryAfter(err, d)` | It definitely did not take effect; the destination asked to wait | Is retried no sooner than both `Backoff` and `d`; other work for that destination waits too |
 | `kairo.Unknown(err)` | It may have taken effect | Is never taken for success: a real step stops for review, an unprotected one is retried |
 
-`TaskContext` is a `context.Context`, done when the step is aborted (its timeout, its workflow cancelled, the process closing). `t.Emit(chunk)` sends live output to `k.Subscribe(id)`; it is not recorded.
+`TaskContext` is a `context.Context`, done when the step is aborted (its timeout, its workflow cancelled, the process closing). `t.Emit(chunk)` sends live output to `k.Subscribe(id)`; it is not recorded. `t.SetWeight(n)` reports the attempt's actual non-negative admission weight.
 
 ### Workflows
 
@@ -109,6 +110,7 @@ kairo.Workflow(k, "name", func(ctx *kairo.Context, in In) (Out, error) { ... })
 | In a workflow | Does |
 |---|---|
 | `kairo.Call[O](ctx, action, in)` | Runs an action once, however often the workflow runs again |
+| `kairo.Call[O](ctx, action, in, kairo.CallDestination(name))` | Selects this call's destination; it is part of the durable call identity |
 | `kairo.Parallel(ctx, fns...)` | Runs calls at once; each function gets its branch's `Context` |
 | `ctx.Sleep(d)` | Waits in the database, not in memory: the process may stop meanwhile |
 | `kairo.WaitFor[P](ctx, signal, kairo.WaitTimeout(d))` | Waits for `k.Signal(ctx, id, signal, payload)` and returns the payload; past the timeout it returns `kairo.ErrTimedOut` |
@@ -150,7 +152,7 @@ To stop a resident process without leaving a real step to review, `k.Drain(ctx)`
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires (`Options.Lease`, 30s by default); while the lease lives, a `Run` elsewhere waits instead of running the workflow twice. `Close` hands its leases over at once.
 
-Limits, per process: `Options.Concurrency` (steps at once), and `Limit` and `Rate` on an action, counted by its `Destination` when it has one.
+Limits, per process: `Options.Concurrency` (steps at once), and `Limit`, `Rate` and `WeightRate` on an action. `Options.DestinationLimits` may resolve current limits when each runtime destination is admitted; positive action and resolved limits use the stricter value. Actual weight can put the bucket into debt and delay later work.
 
 ### Logging and observing
 

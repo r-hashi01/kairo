@@ -134,6 +134,10 @@ type NodeSpec struct {
 	// Destination is the rate-limit key (e.g. "openai/gpt-4o").
 	// Defaults to Action.
 	Destination string `json:"destination,omitempty"`
+	// DestinationFrom names a top-level field of the resolved step input.
+	// A non-empty string there overrides Destination for this dispatch
+	// (ADR 0077). Missing or null keeps the fixed destination.
+	DestinationFrom string `json:"destination_from,omitempty"`
 	// Outputs declares typed fields of the node's output object. Typed
 	// fields stay inline in the run state even when the payload is moved
 	// out to a blob, so conditions can always be evaluated.

@@ -8,6 +8,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/core"
@@ -107,7 +108,13 @@ func (e *Engine) runTask(ex Executor, dl sched.Delivery) {
 // goroutine: moving a large output into the blob store happens here, off
 // the shard loop.
 func (e *Engine) Complete(t *task.Task, res task.Result) {
-	e.disp.Finish(t, sched.Outcome{Tokens: res.Tokens, RateLimited: res.RateLimited, TimedOut: timedOut(res)})
+	weight := max(res.Weight, 0)
+	retryAfter := time.Duration(0)
+	if res.Retryable && !res.Unknown && res.RetryAfter > 0 {
+		retryAfter = time.Duration(res.RetryAfter) * time.Millisecond
+	}
+	e.disp.Finish(t, sched.Outcome{Tokens: res.Tokens, Weight: weight, RateLimited: res.RateLimited,
+		TimedOut: timedOut(res), RetryAfter: retryAfter})
 	ev, err := e.resultEvent(t, res, false)
 	if err != nil {
 		ev = core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "storing output: " + err.Error(), Retryable: true}
@@ -162,6 +169,9 @@ func (e *Engine) resultEvent(t *task.Task, res task.Result, callback bool) (core
 			ev.Err = "outcome unknown"
 		}
 		ev.Retryable, ev.Unknown, ev.ErrType = res.Retryable, res.Unknown, res.ErrType
+		if res.Retryable && !res.Unknown && res.RetryAfter > 0 {
+			ev.RetryAfter = res.RetryAfter
+		}
 	} else {
 		ev.Kind = okKind
 		ev.Data = res.Output

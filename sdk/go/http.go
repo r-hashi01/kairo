@@ -85,7 +85,7 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	if callback == "" && k.remote == nil {
 		callback = k.http.CallbackURL
 	}
-	body, err := json.Marshal(httpaction.Request{RunID: t.RunID, StepID: t.StepID, Act: t.Act, Attempt: t.Attempt, Action: t.Action,
+	body, err := json.Marshal(httpaction.Request{RunID: t.RunID, StepID: t.StepID, Act: t.Act, Attempt: t.Attempt, Action: t.Action, Destination: t.Destination,
 		Input: orNull(in), IdempotencyKey: t.IdemKey, Callback: callback})
 	if err != nil {
 		return result{Err: err.Error()}
@@ -135,13 +135,19 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 }
 
 func fromWire(w httpaction.Result) result {
+	weight := max(w.Weight, 0)
+	retryAfter := int64(0)
+	if w.Retryable && w.RetryAfter > 0 {
+		retryAfter = w.RetryAfter
+	}
 	if w.Error != "" {
-		return result{Err: w.Error, Retryable: w.Retryable, ErrType: w.ErrorType}
+		return result{Err: w.Error, Retryable: w.Retryable, ErrType: w.ErrorType, Weight: weight,
+			RetryAfter: retryAfter, RateLimited: retryAfter > 0}
 	}
 	if w.Wait != nil {
-		return result{Wait: &waitResult{Until: w.Wait.Until, Output: w.Wait.Output}}
+		return result{Wait: &waitResult{Until: w.Wait.Until, Output: w.Wait.Output}, Weight: weight}
 	}
-	return result{Output: orNull(w.Output)}
+	return result{Output: orNull(w.Output), Weight: weight}
 }
 
 func toWire(r result) (w httpaction.Result, unknown bool) {
@@ -149,9 +155,9 @@ func toWire(r result) (w httpaction.Result, unknown bool) {
 	case r.Unknown:
 		return httpaction.Result{Error: r.Err, ErrorType: r.ErrType}, true
 	case r.Err != "":
-		return httpaction.Result{Error: r.Err, Retryable: r.Retryable, ErrorType: r.ErrType}, false
+		return httpaction.Result{Error: r.Err, Retryable: r.Retryable, ErrorType: r.ErrType, Weight: r.Weight, RetryAfter: r.RetryAfter}, false
 	default:
-		return httpaction.Result{Output: orNull(r.Output)}, false
+		return httpaction.Result{Output: orNull(r.Output), Weight: r.Weight}, false
 	}
 }
 

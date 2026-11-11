@@ -21,7 +21,7 @@ from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.embedded import EFFECT_WEAKENED
 from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation
 from kairo_sdk.store import SQLiteStore, WorkflowRetryError
-from kairo_sdk.workflow import CallError, Cancelled, Kairo, NotWaitingError, RetryableError, SignalReceipt, StoppedError, Suspended, TimedOutError, WorkflowError
+from kairo_sdk.workflow import CallError, Cancelled, DestinationLimits, Kairo, NotWaitingError, RetryAfterError, RetryableError, SignalReceipt, StoppedError, Suspended, TimedOutError, WorkflowError
 
 try:
     from .test_workflow import HAS_GO, HAS_WASMTIME, build_wasm
@@ -603,6 +603,55 @@ class DrivingTest(unittest.TestCase):
             # fail this); 1ms for timers that fire early by their rounding.
             for i, s in enumerate(starts):
                 self.assertGreaterEqual(s - began, i * 0.1 - 0.001, f"paced start {i} came {(s - began) * 1000:.0f}ms after the workflow began")
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_runtime_destinations_share_actual_weight_and_retry_after(self) -> None:
+        async def main() -> None:
+            resolved: list[str] = []
+
+            def limits(destination: str) -> DestinationLimits:
+                resolved.append(destination)
+                return DestinationLimits(weight_per_minute=60_000)
+
+            k = await self.open(self.path("runtime-destinations.db"), destination_limits=limits)
+            state = {"runs": 0, "first_finished": 0.0, "second_started": 0.0, "retry_attempts": 0, "retry_began": 0.0}
+
+            @k.action("metered", effect="unprotected")
+            def metered(value, ctx):
+                state["runs"] += 1
+                if value == "first":
+                    ctx.set_weight(10_100)
+                    state["first_finished"] = time.monotonic()
+                elif value == "second":
+                    state["second_started"] = time.monotonic()
+                return state["runs"]
+
+            @k.action("retry-after", effect="unprotected", max_attempts=2, backoff="1ms")
+            def retry_after(_value, _ctx):
+                state["retry_attempts"] += 1
+                if state["retry_attempts"] == 1:
+                    state["retry_began"] = time.monotonic()
+                    raise RetryAfterError("busy", 0.08)
+                return time.monotonic() - state["retry_began"]
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                a = await ctx.call("metered", "same", destination="provider-a")
+                b = await ctx.call("metered", "same", destination="provider-b")
+                await ctx.call("metered", "first", destination="provider-a")
+                await ctx.call("metered", "second", destination="provider-a")
+                retry_delay = await ctx.call("retry-after", None, destination="provider-a")
+                return {"a": a, "b": b, "retry_delay": retry_delay}
+
+            await k.start()
+            out = await k.run("w", None, id="runtime-destinations-1")
+            self.assertNotEqual(out["a"], out["b"], "different destinations must have different call identities")
+            self.assertIn("provider-a", resolved)
+            self.assertIn("provider-b", resolved)
+            self.assertGreaterEqual(state["second_started"] - state["first_finished"], 0.075)
+            self.assertGreaterEqual(out["retry_delay"], 0.06)
             await k.close()
 
         asyncio.run(main())

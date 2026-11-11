@@ -693,14 +693,20 @@ export class Embedded {
 			attempt: c.attempt ?? 0,
 			idempotency_key: c.idempotency_key ?? '',
 			action: c.action ?? '',
+			destination: c.destination ?? c.action ?? '',
 			input: c.input ?? null,
 		} as Task;
 		const step = { runId, action: task.action, stepId: task.step_id, attempt: task.attempt };
 		this.observe({ kind: 'step.started', ...step });
 		const began = performance.now();
 		let res: Result;
+		let weight = 0;
 		try {
-			res = await this.handler(task, { signal: abort.signal, emit: () => {} });
+			res = await this.handler(task, { signal: abort.signal, emit: () => {}, setWeight: (n) => {
+				if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
+				weight = n;
+			} });
+			if (res.weight === undefined && weight > 0) res = { ...res, weight };
 		} catch (e) {
 			res = { error: String((e as Error)?.message ?? e), errorType: (e as Error)?.name };
 		} finally {
@@ -736,7 +742,8 @@ export class Embedded {
 function outcome(res: Result, act: number, attempt: number, at: number): CoreEvent {
 	if (res.error !== undefined || res.unknown) {
 		return { kind: 'step_err', at, act, attempt, error: res.error || 'outcome unknown', retryable: !!res.retryable, unknown: !!res.unknown,
-			...(res.errorType ? { error_type: res.errorType } : {}) };
+			...(res.errorType ? { error_type: res.errorType } : {}),
+			...(res.retryable && !res.unknown && res.retryAfter ? { retry_after_ms: Math.floor(res.retryAfter) } : {}) };
 	}
 	if (res.wait) return { kind: 'step_wait', at, act, attempt, deadline: Math.floor(res.wait.until), data: res.wait.output ?? null };
 	return { kind: 'step_ok', at, act, attempt, data: res.output ?? null };

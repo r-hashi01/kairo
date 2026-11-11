@@ -25,6 +25,9 @@ type Task struct {
 	// EstTokens is the token estimate used for TPM accounting until the
 	// executor reports actual usage.
 	EstTokens int `json:"est_tokens,omitempty"`
+	// EstWeight is a generic admission weight estimate (ADR 0077). When it
+	// is zero, schedulers fall back to EstTokens for compatibility.
+	EstWeight int `json:"est_weight,omitempty"`
 
 	// Seq is assigned by the dispatcher for tracking outstanding tasks.
 	Seq uint64 `json:"seq"`
@@ -63,6 +66,9 @@ type Result struct {
 	Unknown bool `json:"unknown,omitempty"`
 	// Tokens actually consumed, for TPM accounting.
 	Tokens int `json:"tokens,omitempty"`
+	// Weight is the actual generic admission weight. When it is zero,
+	// runtimes fall back to Tokens for compatibility (ADR 0077).
+	Weight int `json:"weight,omitempty"`
 	// ErrType classifies a failure; it becomes error_type of a step that
 	// fails into its on_error strategy (ADR 0030).
 	ErrType string `json:"error_type,omitempty"`
@@ -73,6 +79,9 @@ type Result struct {
 	// HTTP 429, a provider's rate limit error). It lowers the destination's
 	// concurrency (ADR 0039); it does not change the failure itself.
 	RateLimited bool `json:"rate_limited,omitempty"`
+	// RetryAfter is the minimum wait requested by a definite retryable
+	// failure, in milliseconds (ADR 0077).
+	RetryAfter int64 `json:"retry_after_ms,omitempty"`
 	// Wait: the step waits until a deadline and then ends with an output
 	// (ADR 0045). Not with Err or Output.
 	Wait *Wait `json:"wait,omitempty"`
