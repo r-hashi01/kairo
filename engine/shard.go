@@ -91,6 +91,7 @@ const (
 	hEvict
 	hCheckpoint // a checkpoint record became durable: advance the run's base
 	hStarted    // the start is durable: answer Submit
+	hCallback   // a callback decision is durable: answer its HTTP request
 )
 
 type held struct {
@@ -99,6 +100,7 @@ type held struct {
 	run     *run
 	task    *task.Task
 	snapLSN uint64 // hCheckpoint
+	reply   chan error
 }
 
 type run struct {
@@ -116,8 +118,8 @@ type run struct {
 	snap     []byte // encoded state while evicted (in memory, or pending write)
 	onDisk   bool   // evicted and the snapshot is in the snapshot store
 	loading  bool
-	writing  bool         // a snapshot write is in progress
-	pending  []core.Event // events that arrived while loading
+	writing  bool           // a snapshot write is in progress
+	pending  []pendingEvent // events that arrived while loading
 	timers   map[uint32]timerwheel.Handle
 	lastLSN  uint64
 	// Log retention (ADR 0016). Before its first durable checkpoint a run
@@ -152,6 +154,11 @@ type driveState struct {
 	token string
 	owner string
 	until int64
+}
+
+type pendingEvent struct {
+	ev    core.Event
+	reply chan error // non-nil for a callback waiting for durability
 }
 
 type timerRef struct {
@@ -220,6 +227,7 @@ const (
 	mDriveClaim
 	mDriveRenew
 	mDriveRelease
+	mCallback
 )
 
 type listItem struct {
@@ -533,6 +541,17 @@ func (s *shard) handle(m *msg) {
 			return
 		}
 		s.event(r, m.ev)
+	case mCallback:
+		r := s.runs[m.runID]
+		if r == nil {
+			if s.e.Finished(m.runID) {
+				m.errReply <- nil
+			} else {
+				m.errReply <- ErrUnknownRun
+			}
+			return
+		}
+		s.eventReply(r, m.ev, m.errReply)
 	case mAck:
 		s.ack(m.tier, m.lsn, m.err)
 	case mDoneAck:
@@ -822,11 +841,16 @@ func (s *shard) logFor(r *run) *shardLog {
 
 // event applies ev to r: the only place where run state changes.
 func (s *shard) event(r *run, ev core.Event) {
+	s.eventReply(r, ev, nil)
+}
+
+func (s *shard) eventReply(r *run, ev core.Event, reply chan error) {
 	if r.done {
+		s.ackEvent(r, reply)
 		return
 	}
 	if r.st == nil {
-		r.pending = append(r.pending, ev)
+		r.pending = append(r.pending, pendingEvent{ev: ev, reply: reply})
 		s.load(r)
 		return
 	}
@@ -841,6 +865,7 @@ func (s *shard) event(r *run, ev core.Event) {
 	}
 	s.cmds = out[:0]
 	if err != nil {
+		s.ackEvent(r, reply)
 		return // ignored (stale) events are not logged
 	}
 	if ev.Kind == core.EvStart && r.created == 0 {
@@ -848,6 +873,7 @@ func (s *shard) event(r *run, ev core.Event) {
 	}
 	r.updated = ev.At
 	s.record(r, &ev)
+	s.ackEvent(r, reply)
 	if s.e.feed != nil && len(s.traces) > 0 {
 		// Before the commands: a task's chunks must not overtake the trace
 		// of its start.
@@ -873,6 +899,17 @@ func (s *shard) event(r *run, ev core.Event) {
 	if !r.done {
 		s.maybeEvict(r)
 	}
+}
+
+func (s *shard) ackEvent(r *run, reply chan error) {
+	if reply == nil {
+		return
+	}
+	if l := s.logFor(r); l != nil {
+		s.holdAt(l, held{lsn: r.lastLSN, kind: hCallback, run: r, reply: reply})
+		return
+	}
+	reply <- nil
 }
 
 // record appends ev to r's log; the record is written by the next flush.
@@ -923,7 +960,7 @@ func (s *shard) dispatch(r *run, c *core.Command) {
 	t := &task.Task{
 		RunID: r.id, StepID: c.StepID, Act: c.Act, Attempt: c.Attempt, IdemKey: c.IdemKey,
 		Action: n.Spec.Action, Destination: n.Spec.Destination, Tenant: r.tenant,
-		Effect: n.Spec.Effect, Input: c.Input, Params: n.Params,
+		Effect: n.Spec.Effect, Input: c.Input, Params: n.Params, Deadline: c.At,
 	}
 	t.EstTokens = s.e.cfg.EstimateTokens(t)
 	t.Depth = int(r.st.Depth)
@@ -1023,6 +1060,8 @@ func (s *shard) release(h held) {
 			w <- startReply{existing: i > 0} // the first waiter submitted it
 		}
 		r.startWait = nil
+	case hCallback:
+		h.reply <- nil
 	case hCheckpoint:
 		r, snap := h.run, h.snapLSN
 		if r.done || snap < r.cpLSN {
@@ -1339,6 +1378,12 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 				reply <- queryReply{info: s.info(r), found: true}
 			}
 		}
+		for _, p := range r.pending {
+			if p.reply != nil {
+				p.reply <- err
+			}
+		}
+		r.pending = nil
 		return
 	}
 	defer s.answerInputs(r)
@@ -1348,14 +1393,14 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 	s.evicted.Add(-1)
 	pending := r.pending
 	r.pending = nil
-	for _, ev := range pending {
+	for _, p := range pending {
 		if r.st == nil {
 			// Evicted again while replaying queued events.
-			r.pending = append(r.pending, ev)
+			r.pending = append(r.pending, p)
 			s.load(r)
 			continue
 		}
-		s.event(r, ev)
+		s.eventReply(r, p.ev, p.reply)
 	}
 	if s.quietWaits != nil {
 		s.answerQuiet(r)

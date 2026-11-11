@@ -39,16 +39,20 @@ func (s RunStatus) MarshalText() ([]byte, error) { return []byte(s.String()), ni
 type EventKind uint8
 
 const (
-	EvStart    EventKind = iota + 1 // Data = run input; Name = entry node of a root graph ("" = all)
-	EvStepOK                        // Act, Attempt, Data = output
-	EvStepErr                       // Act, Attempt, Err, Retryable, Unknown
-	EvTimer                         // Act, Timer
-	EvSignal                        // Name, Data = payload
-	EvIntent                        // Act, Attempt: intent to execute a real command is durable
-	EvRecover                       // the process restarted; re-issue what was in flight
-	EvResolve                       // Act, Data or Err: operator resolution of a needs-review step
-	EvCancel                        // Err = reason
-	EvStepWait                      // Act, Attempt, Deadline, Data = the output at the deadline (ADR 0045)
+	EvStart        EventKind = iota + 1 // Data = run input; Name = entry node of a root graph ("" = all)
+	EvStepOK                            // Act, Attempt, Data = output
+	EvStepErr                           // Act, Attempt, Err, Retryable, Unknown
+	EvTimer                             // Act, Timer
+	EvSignal                            // Name, Data = payload
+	EvIntent                            // Act, Attempt: intent to execute a real command is durable
+	EvRecover                           // the process restarted; re-issue what was in flight
+	EvResolve                           // Act, Data or Err: operator resolution of a needs-review step
+	EvCancel                            // Err = reason
+	EvStepWait                          // Act, Attempt, Deadline, Data = the output at the deadline (ADR 0045)
+	EvStepPending                       // Act, Attempt, Deadline: the same attempt continues outside its executor (ADR 0070)
+	EvCallbackOK                        // Act, Attempt, Data: authenticated async action result (ADR 0070)
+	EvCallbackErr                       // Act, Attempt, Err: authenticated async action failure (ADR 0070)
+	EvCallbackWait                      // Act, Attempt, Deadline, Data: authenticated async action wait (ADR 0070)
 )
 
 // Event is an input to the core. Everything the core needs, including the
@@ -112,6 +116,7 @@ const (
 	fSignalWait
 	fFailBranch // finished as an exception that takes the fail-branch edges
 	fStepWait   // a step waiting for its deadline; Results[0] is its output (ADR 0045)
+	fPending    // the attempt continues outside its executor; callback or deadline settles it (ADR 0070)
 )
 
 // Act is one activation of a plan node.

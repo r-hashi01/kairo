@@ -12,6 +12,7 @@
 //	worker -> runtime   Chunk  {"seq":17,"data":"<base64>"}      (live output)
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
 //	                           {"seq":17,"wait":{"until":<ms>,"output":{...}}} (ADR 0045)
+//	                           {"seq":17,"pending":true}          (ADR 0070, negotiated only)
 //	worker -> runtime   Credit {"n":4}                            (optional extra credit)
 //	runtime -> worker   Cancel {"seq":17}                         (the step was abandoned)
 //	runtime -> worker   RunEnd {"run_id":"r1"}                    (the run finished)
@@ -67,12 +68,19 @@ const maxFrame = 64 << 20
 // handshake of ADR 0073. Capabilities are negotiated per connection.
 const CapabilityGracefulDrain = "graceful-drain-v1"
 
+// CapabilityAsyncActionCallback selects daemon-owned callbacks and pending
+// results for the Hello's CallbackActions (ADR 0070).
+const CapabilityAsyncActionCallback = "async-action-callback-v1"
+
 type Hello struct {
 	Worker       string   `json:"worker"`
 	Actions      []string `json:"actions"`
 	Credit       int      `json:"credit"`
 	Token        string   `json:"token,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// CallbackActions are URL-backed actions for which this worker can hand
+	// a 202 response to the daemon (ADR 0070).
+	CallbackActions []string `json:"callback_actions,omitempty"`
 	// RunEnd asks for a RunEnd per run the worker was sent a task of.
 	RunEnd bool `json:"run_end,omitempty"`
 }
@@ -105,6 +113,9 @@ type Result struct {
 	RateLimited bool `json:"rate_limited,omitempty"`
 	// Wait: wait until a deadline, then end with an output (ADR 0045).
 	Wait *task.Wait `json:"wait,omitempty"`
+	// Pending is valid only on a negotiated callback-capable connection and
+	// with a callback in the corresponding task (ADR 0070).
+	Pending bool `json:"pending,omitempty"`
 }
 
 type Cancel struct {

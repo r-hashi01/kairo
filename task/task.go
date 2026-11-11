@@ -31,6 +31,12 @@ type Task struct {
 	// Depth is the nesting depth of the run (ADR 0030). A worker that
 	// starts a workflow from this task submits it with Depth+1.
 	Depth int `json:"depth,omitempty"`
+	// Deadline is the step timeout used inside the runtime. It is not sent
+	// directly; a callback capability carries its own Until (ADR 0070).
+	Deadline int64 `json:"-"`
+	// Callback is present only after the worker and daemon negotiated async
+	// HTTP action handoff for this action (ADR 0070).
+	Callback *Callback `json:"callback,omitempty"`
 }
 
 // Key identifies a task attempt.
@@ -70,6 +76,15 @@ type Result struct {
 	// Wait: the step waits until a deadline and then ends with an output
 	// (ADR 0045). Not with Err or Output.
 	Wait *Wait `json:"wait,omitempty"`
+	// Pending says the same attempt was accepted by an external HTTP action
+	// and will answer through Task.Callback (ADR 0070).
+	Pending bool `json:"pending,omitempty"`
+}
+
+// Callback is the daemon-owned result destination of an async HTTP action.
+type Callback struct {
+	URL   string `json:"url"`
+	Until int64  `json:"until"` // unix milliseconds
 }
 
 // Wait is a step's result that waits (ADR 0045).

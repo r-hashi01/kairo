@@ -108,6 +108,32 @@ func (e *Engine) runTask(ex Executor, dl sched.Delivery) {
 // the shard loop.
 func (e *Engine) Complete(t *task.Task, res task.Result) {
 	e.disp.Finish(t, sched.Outcome{Tokens: res.Tokens, RateLimited: res.RateLimited, TimedOut: timedOut(res)})
+	ev, err := e.resultEvent(t, res, false)
+	if err != nil {
+		ev = core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "storing output: " + err.Error(), Retryable: true}
+	}
+	e.shardFor(t.RunID).inbox.Push(msg{kind: mEvent, runID: t.RunID, ev: ev})
+}
+
+// Callback applies an authenticated async HTTP action outcome and answers
+// only after the resulting decision is durable for the run's tier (ADR 0070).
+// A retry after an ambiguous HTTP response is idempotent.
+func (e *Engine) Callback(ctx context.Context, t *task.Task, res task.Result) error {
+	ev, err := e.resultEvent(t, res, true)
+	if err != nil {
+		return err
+	}
+	reply := make(chan error, 1)
+	e.shardFor(t.RunID).inbox.Push(msg{kind: mCallback, runID: t.RunID, ev: ev, errReply: reply})
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Engine) resultEvent(t *task.Task, res task.Result, callback bool) (core.Event, error) {
 	ev := core.Event{Act: t.Act, Attempt: t.Attempt, Meta: res.Meta}
 	if len(ev.Meta) > e.cfg.BlobThreshold {
 		// Like a large output: the log keeps only a reference (ADR 0034).
@@ -118,30 +144,41 @@ func (e *Engine) Complete(t *task.Task, res task.Result) {
 			ev.Meta = nil
 		}
 	}
+	if res.Pending {
+		if t.Callback == nil || t.Callback.Until <= 0 {
+			return core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "async action did not receive a daemon callback", Retryable: true, Unknown: true, ErrType: "unsupported"}, nil
+		}
+		ev.Kind, ev.Deadline = core.EvStepPending, t.Callback.Until
+		return ev, nil
+	}
+	okKind, errKind, waitKind := core.EvStepOK, core.EvStepErr, core.EvStepWait
+	if callback {
+		okKind, errKind, waitKind = core.EvCallbackOK, core.EvCallbackErr, core.EvCallbackWait
+	}
 	if res.Err != "" || res.Unknown {
-		ev.Kind = core.EvStepErr
+		ev.Kind = errKind
 		ev.Err = res.Err
 		if ev.Err == "" {
 			ev.Err = "outcome unknown"
 		}
 		ev.Retryable, ev.Unknown, ev.ErrType = res.Retryable, res.Unknown, res.ErrType
 	} else {
-		ev.Kind = core.EvStepOK
+		ev.Kind = okKind
 		ev.Data = res.Output
 		if res.Wait != nil {
 			// Wait until the deadline, then end with this output (ADR 0045).
-			ev.Kind, ev.Deadline, ev.Data = core.EvStepWait, res.Wait.Until, res.Wait.Output
+			ev.Kind, ev.Deadline, ev.Data = waitKind, res.Wait.Until, res.Wait.Output
 		}
 		if len(ev.Data) > e.cfg.BlobThreshold {
 			env, err := e.externalize(t, ev.Data)
 			if err != nil {
-				ev = core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "storing output: " + err.Error(), Retryable: true}
+				return core.Event{}, err
 			} else {
 				ev.Data = env
 			}
 		}
 	}
-	e.shardFor(t.RunID).inbox.Push(msg{kind: mEvent, runID: t.RunID, ev: ev})
+	return ev, nil
 }
 
 // deleteBlobs drops a finished run's blobs (ADR 0024). Stores that cannot

@@ -448,10 +448,14 @@ export class Kairo {
 		}));
 		for (const action of Object.values(BUILTIN)) specs.push({ action, effect: 'unprotected' });
 		if ([...this.actions.values()].some((d) => d.url)) {
-			// Actions over HTTP(S) (ADR 0052) take their outcomes on the callback.
-			if (!this.opts.secret || !this.opts.callbackUrl) throw new Error('actions with a url need secret and callbackUrl');
-			checkURL(this.opts.callbackUrl, this.opts.allowInsecure);
-			if (!this.backend.complete) throw new Error('actions with a url need the embedded backend');
+			if (!this.opts.secret) throw new Error('actions with a url need secret');
+			if (this.backend instanceof HttpBackend) {
+				this.backend.callbackActions = [...this.actions].filter(([, d]) => d.url).map(([name]) => name);
+			} else {
+				if (!this.opts.callbackUrl) throw new Error('actions with a url need callbackUrl with the embedded runtime');
+				checkURL(this.opts.callbackUrl, this.opts.allowInsecure);
+				if (!this.backend.complete) throw new Error('actions with a url need the embedded backend or kairod');
+			}
 		}
 		for (const [name, def] of this.actions) {
 			if (!def.limit && !def.rate) continue;
@@ -794,6 +798,7 @@ export class Kairo {
 
 	/** Calls an action over HTTP(S) (ADR 0052). */
 	private async callRemote(task: Task, def: ActionDef, input: unknown): Promise<Result> {
+		const callback = task.callback?.url ?? (this.rt ? this.opts.callbackUrl : undefined);
 		const body = JSON.stringify({
 			run_id: task.run_id,
 			step_id: task.step_id,
@@ -802,7 +807,7 @@ export class Kairo {
 			action: task.action,
 			input: input ?? null,
 			idempotency_key: task.idempotency_key,
-			callback: this.opts.callbackUrl,
+			callback,
 		});
 		const leaseMs = durationMs(def.timeout) ?? 15 * 60 * 1000;
 		let res;
@@ -816,7 +821,10 @@ export class Kairo {
 			// It may have run: unknown (invariant 5).
 			return { error: `calling ${def.url}: ${(e as Error).message}`, unknown: true, retryable: true, errorType: 'http' };
 		}
-		if (res.status === 202) return { pending: { owner: `remote:${def.url}`, leaseMs } };
+		if (res.status === 202) {
+			if (!callback) return { error: 'the async action did not receive a callback', unknown: true, retryable: true, errorType: 'unsupported' };
+			return { pending: { owner: `remote:${def.url}`, leaseMs } };
+		}
 		if (res.status >= 200 && res.status < 300) {
 			try {
 				return fromWire(JSON.parse(res.body));

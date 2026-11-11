@@ -613,12 +613,18 @@ func (k *Kairo) Start(ctx context.Context) error {
 	}
 	k.mu.Unlock()
 	if remote {
-		// Actions over HTTP(S) (ADR 0052) take their outcomes on the callback.
-		if k.http.Secret == "" || k.http.CallbackURL == "" {
-			return errors.New("kairo: actions with a URL need HTTP.Secret and HTTP.CallbackURL")
+		if k.http.Secret == "" {
+			return errors.New("kairo: actions with a URL need HTTP.Secret")
 		}
-		if err := checkURL(k.http.CallbackURL, k.http.AllowInsecure); err != nil {
-			return err
+		// An embedded runtime owns its callback endpoint. With kairod the
+		// daemon supplies a capability URL on each negotiated task (ADR 0070).
+		if k.remote == nil {
+			if k.http.CallbackURL == "" {
+				return errors.New("kairo: actions with a URL need HTTP.CallbackURL with the embedded runtime")
+			}
+			if err := checkURL(k.http.CallbackURL, k.http.AllowInsecure); err != nil {
+				return err
+			}
 		}
 	}
 	for _, b := range []string{builtinNow, builtinRand, builtinSleep} {

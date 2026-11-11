@@ -75,6 +75,7 @@ type task struct {
 	Act                            uint32
 	Attempt                        int32
 	Input                          json.RawMessage
+	Callback                       string
 }
 
 // result is a step's outcome.

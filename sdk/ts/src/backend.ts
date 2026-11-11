@@ -80,6 +80,7 @@ export class HttpBackend implements Backend {
 	private activeStarts = 0;
 	private startIdleWaiters: Array<() => void> = [];
 	private metrics?: MetricEmitter;
+	callbackActions: string[] = [];
 
 	constructor(opts: HttpBackendOptions = {}) {
 		this.opts = opts;
@@ -102,6 +103,7 @@ export class HttpBackend implements Backend {
 			actions: specs.map((s) => s.action),
 			token: this.opts.token,
 			concurrency: this.opts.concurrency,
+			callbackActions: this.callbackActions,
 			handler: serve,
 		});
 		const addr = this.opts.worker;

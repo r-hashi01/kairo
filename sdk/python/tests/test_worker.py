@@ -7,7 +7,18 @@ import socket
 import threading
 import unittest
 
-from kairo_sdk import CAPABILITY_GRACEFUL_DRAIN, DrainUnsupportedError, MsgType, Result, Task, TaskContext, Worker, read_frame, write_frame
+from kairo_sdk import (
+    CAPABILITY_ASYNC_ACTION_CALLBACK,
+    CAPABILITY_GRACEFUL_DRAIN,
+    DrainUnsupportedError,
+    MsgType,
+    Result,
+    Task,
+    TaskContext,
+    Worker,
+    read_frame,
+    write_frame,
+)
 
 
 class FakeRuntime:
@@ -64,6 +75,25 @@ class WorkerTest(unittest.TestCase):
         serve(Worker("w", ["x"], lambda t, c: Result(), 1, token="s3"), rt)
         _, hello = rt.recv()
         self.assertEqual(hello["token"], "s3")
+
+    def test_async_callback_capability_and_pending_result(self) -> None:
+        seen: list[Task] = []
+
+        def handler(task: Task, _ctx: TaskContext) -> Result:
+            seen.append(task)
+            return Result(pending={"owner": "remote:x", "lease_ms": 1000})
+
+        rt = FakeRuntime()
+        serve(Worker("w", ["x"], handler, 1, callback_actions=["x"]), rt)
+        _, hello = rt.recv()
+        self.assertIn(CAPABILITY_ASYNC_ACTION_CALLBACK, hello["capabilities"])
+        self.assertEqual(hello["callback_actions"], ["x"])
+        rt.send(MsgType.HELLO, {"capabilities": [CAPABILITY_ASYNC_ACTION_CALLBACK]})
+        callback = {"url": "https://callbacks.example/token", "until": 123}
+        rt.send(MsgType.TASK, {"seq": 8, "action": "x", "callback": callback})
+        typ, body = rt.recv()
+        self.assertEqual((typ, body), (MsgType.RESULT, {"seq": 8, "pending": True}))
+        self.assertEqual(seen[0].callback, callback)
 
     def test_cancel_reaches_the_handler(self) -> None:
         started = threading.Event()

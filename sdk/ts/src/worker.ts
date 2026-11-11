@@ -3,7 +3,16 @@
 import net from 'node:net';
 import os from 'node:os';
 
-import { CAPABILITY_GRACEFUL_DRAIN, FrameReader, MsgType, encodeFrame, resultBody, type Result, type Task } from './protocol.ts';
+import {
+	CAPABILITY_ASYNC_ACTION_CALLBACK,
+	CAPABILITY_GRACEFUL_DRAIN,
+	FrameReader,
+	MsgType,
+	encodeFrame,
+	resultBody,
+	type Result,
+	type Task,
+} from './protocol.ts';
 
 /** What a handler gets besides the task. */
 export interface TaskContext {
@@ -34,6 +43,8 @@ export interface WorkerOptions {
 	token?: string;
 	/** What a task mostly uses: "io" (the default) or "cpu". */
 	resource?: 'io' | 'cpu';
+	/** URL-backed actions that can return 202 through a daemon callback. */
+	callbackActions?: string[];
 	/**
 	 * Called when a run this worker was sent a task of has finished, after
 	 * its tasks (ADR 0044): to let go of what the worker keeps per run. Not
@@ -102,7 +113,12 @@ export class Worker {
 				};
 				if (this.opts.token) hello.token = this.opts.token;
 				if (this.opts.onRunEnd) hello.run_end = true;
-				hello.capabilities = [CAPABILITY_GRACEFUL_DRAIN];
+				const capabilities = [CAPABILITY_GRACEFUL_DRAIN];
+				if (this.opts.callbackActions?.length) {
+					capabilities.push(CAPABILITY_ASYNC_ACTION_CALLBACK);
+					hello.callback_actions = this.opts.callbackActions;
+				}
+				hello.capabilities = capabilities;
 				send(MsgType.Hello, hello);
 			});
 			socket.on('data', (data: Buffer) => {

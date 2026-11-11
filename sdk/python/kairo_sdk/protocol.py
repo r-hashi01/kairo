@@ -23,6 +23,7 @@ from typing import Any, BinaryIO
 
 MAX_FRAME = 64 << 20
 CAPABILITY_GRACEFUL_DRAIN = "graceful-drain-v1"
+CAPABILITY_ASYNC_ACTION_CALLBACK = "async-action-callback-v1"
 
 
 class MsgType(enum.IntEnum):
@@ -45,6 +46,7 @@ class Hello:
     credit: int
     token: str = ""  # the runtime's worker token, if it has one (ADR 0037)
     capabilities: list[str] = field(default_factory=list)
+    callback_actions: list[str] = field(default_factory=list)
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"worker": self.worker, "actions": self.actions, "credit": self.credit}
@@ -52,6 +54,8 @@ class Hello:
             b["token"] = self.token
         if self.capabilities:
             b["capabilities"] = self.capabilities
+        if self.callback_actions:
+            b["callback_actions"] = self.callback_actions
         return b
 
 
@@ -76,13 +80,15 @@ class Result:
     # wait: {"until": <unix ms>, "output": ...}: the step waits until then
     # and ends with that output (ADR 0045).
     wait: dict[str, Any] | None = None
-    # Embedded runtime only (ADR 0052): the step runs elsewhere and its
-    # outcome comes later (Embedded.complete): {"owner": ..., "lease_ms": ...}.
+    # The step runs elsewhere and its outcome comes later. Embedded uses
+    # the lease value; the worker protocol serializes this as pending=true.
     pending: dict[str, Any] | None = None
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"seq": self.seq}
-        if self.error or self.unknown:
+        if self.pending is not None:
+            b["pending"] = True
+        elif self.error or self.unknown:
             b["error"] = self.error
         elif self.wait is not None:
             b["wait"] = {"until": int(self.wait["until"]), "output": self.wait.get("output")}

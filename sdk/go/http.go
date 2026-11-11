@@ -81,8 +81,12 @@ func (k *Kairo) httpClient() *http.Client {
 
 // callRemote calls an action over HTTP(S).
 func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.RawMessage) result {
+	callback := t.Callback
+	if callback == "" && k.remote == nil {
+		callback = k.http.CallbackURL
+	}
 	body, err := json.Marshal(httpaction.Request{RunID: t.RunID, StepID: t.StepID, Act: t.Act, Attempt: t.Attempt, Action: t.Action,
-		Input: orNull(in), IdempotencyKey: t.IdemKey, Callback: k.http.CallbackURL})
+		Input: orNull(in), IdempotencyKey: t.IdemKey, Callback: callback})
 	if err != nil {
 		return result{Err: err.Error()}
 	}
@@ -110,6 +114,9 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, httpaction.MaxBody))
 	switch {
 	case resp.StatusCode == http.StatusAccepted:
+		if callback == "" {
+			return result{Err: "the async action did not receive a callback", Unknown: true, Retryable: true, ErrType: "unsupported"}
+		}
 		return result{Pending: &pending{Owner: "remote:" + a.url, LeaseMs: lease.Milliseconds()}}
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		var w httpaction.Result

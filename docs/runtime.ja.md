@@ -95,6 +95,13 @@ race 検出器付きの `go test -race ./...` も通っています。
 go build -o kairod ./cmd/kairod
 ./kairod -data ./data -tier file
 
+# HTTP action が 202 を返す場合。公開 HTTPS は callback 専用 listener へ中継する。
+# 鍵は 32 byte 以上を unpadded base64url にしたもの。先頭が発行用、残りも検証に使う。
+KAIRO_CALLBACK_KEYS="$CURRENT_KEY,$PREVIOUS_KEY" \
+  ./kairod -data ./data -tier file \
+  -callback-url https://callbacks.example.com/kairo \
+  -callback-http 127.0.0.1:8421
+
 # http.* のアクションは組み込み HTTP 実行器が担当する
 curl -XPOST localhost:8420/v1/nodes -d '{"action":"http.classify","effect":"unprotected",
   "outputs":{"label":{"type":"enum","values":["refund","other"]}},"destination":"openai"}'

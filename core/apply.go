@@ -71,14 +71,14 @@ func (m *machine) apply(ev *Event) error {
 		m.start(0, 0, 0, 0)
 		return nil
 
-	case EvStepOK, EvStepErr:
-		a := s.Acts[ev.Act]
-		if a == nil || m.p.Nodes[a.Node].Kind != ir.KStep || a.Flags&fDispatched == 0 || a.Attempt != ev.Attempt {
+	case EvStepOK, EvStepErr, EvCallbackOK, EvCallbackErr:
+		callback := ev.Kind == EvCallbackOK || ev.Kind == EvCallbackErr
+		a := m.outcomeAct(ev, callback)
+		if a == nil {
 			return ErrIgnored
 		}
-		m.undispatch(a)
-		m.cancelTimer(a)
-		if ev.Kind == EvStepOK {
+		m.settleAttempt(a)
+		if ev.Kind == EvStepOK || ev.Kind == EvCallbackOK {
 			out := ev.Data
 			if len(out) == 0 {
 				out = null
@@ -89,15 +89,14 @@ func (m *machine) apply(ev *Event) error {
 		m.stepFailed(ev.Act, a, ev.Err, ev.ErrType, ev.Retryable, ev.Unknown)
 		return nil
 
-	case EvStepWait:
+	case EvStepWait, EvCallbackWait:
 		// The step's result: wait until the deadline, then end with this
 		// output (ADR 0045). A definite result, also for real steps.
-		a := s.Acts[ev.Act]
-		if a == nil || m.p.Nodes[a.Node].Kind != ir.KStep || a.Flags&fDispatched == 0 || a.Attempt != ev.Attempt {
+		a := m.outcomeAct(ev, ev.Kind == EvCallbackWait)
+		if a == nil {
 			return ErrIgnored
 		}
-		m.undispatch(a)
-		m.cancelTimer(a)
+		m.settleAttempt(a)
 		out := ev.Data
 		if len(out) == 0 {
 			out = null
@@ -112,6 +111,22 @@ func (m *machine) apply(ev *Event) error {
 		// The executor's metadata goes with the wait: the end at the deadline
 		// comes from a timer, which has none.
 		m.trace(Trace{Kind: TrNodeWait, Act: ev.Act, Node: a.Node, StepID: m.stepID(ev.Act, a), Attempt: a.Attempt, Until: ev.Deadline, Meta: m.meta})
+		return nil
+
+	case EvStepPending:
+		a := s.Acts[ev.Act]
+		if a == nil || m.p.Nodes[a.Node].Kind != ir.KStep || a.Flags&fDispatched == 0 || a.Attempt != ev.Attempt {
+			return ErrIgnored
+		}
+		m.undispatch(a)
+		m.cancelTimer(a)
+		a.Flags |= fPending
+		if ev.Deadline <= m.at {
+			a.Flags &^= fPending
+			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true)
+			return nil
+		}
+		m.armTimer(ev.Act, a, ev.Deadline)
 		return nil
 
 	case EvIntent:
@@ -145,6 +160,9 @@ func (m *machine) apply(ev *Event) error {
 			out := a.Results[0]
 			a.Results = nil
 			m.complete(ev.Act, a, out)
+		case a.Flags&fPending != 0:
+			a.Flags &^= fPending
+			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true)
 		case a.Flags&fRetryWait != 0:
 			a.Flags &^= fRetryWait
 			m.dispatch(ev.Act, a)
@@ -378,6 +396,10 @@ func (m *machine) nodeIndex(n *ir.Node) int32 {
 
 func (m *machine) dispatch(id uint32, a *Act) {
 	n := &m.p.Nodes[a.Node]
+	var deadline int64
+	if n.Spec.Timeout > 0 {
+		deadline = m.at + time.Duration(n.Spec.Timeout).Milliseconds()
+	}
 	a.Attempt++
 	a.Flags |= fDispatched
 	a.Flags &^= fIntent
@@ -392,12 +414,13 @@ func (m *machine) dispatch(id uint32, a *Act) {
 		StepID:  stepID,
 		IdemKey: m.s.RunID + "/" + stepID,
 		Input:   in,
+		At:      deadline,
 	})
 	if a.Attempt == 1 {
 		m.traceStart(id, a, n, in) // retries are TrNodeRetry
 	}
-	if n.Spec.Timeout > 0 {
-		m.armTimer(id, a, m.at+time.Duration(n.Spec.Timeout).Milliseconds())
+	if deadline > 0 {
+		m.armTimer(id, a, deadline)
 	}
 }
 
@@ -406,6 +429,32 @@ func (m *machine) undispatch(a *Act) {
 		a.Flags &^= fDispatched
 		m.s.Inflight--
 	}
+}
+
+// outcomeAct returns the current attempt that may take an executor result or
+// an authenticated callback. A callback may also settle the same attempt
+// after a disconnect/restart put it in review (ADR 0070).
+func (m *machine) outcomeAct(ev *Event, callback bool) *Act {
+	a := m.s.Acts[ev.Act]
+	if a == nil || m.p.Nodes[a.Node].Kind != ir.KStep || a.Attempt != ev.Attempt {
+		return nil
+	}
+	if a.Flags&fDispatched != 0 || callback && a.Flags&(fPending|fReview) != 0 {
+		return a
+	}
+	return nil
+}
+
+func (m *machine) settleAttempt(a *Act) {
+	if a.Flags&fDispatched != 0 {
+		m.undispatch(a)
+	}
+	a.Flags &^= fPending
+	if a.Flags&fReview != 0 {
+		a.Flags &^= fReview
+		m.refreshBlocked()
+	}
+	m.cancelTimer(a)
 }
 
 // stepID is the node id plus the map indices and loop iterations of every
@@ -649,6 +698,10 @@ func (m *machine) recover() {
 		switch {
 		case a.Flags&fReview != 0:
 			m.out = append(m.out, Command{Kind: CmdReview, Act: id, Node: a.Node, Attempt: a.Attempt, StepID: m.stepID(id, a)})
+		case a.Flags&fPending != 0:
+			if a.Timer != 0 {
+				m.out = append(m.out, Command{Kind: CmdTimer, Act: id, Node: a.Node, Timer: a.Timer, At: a.TimerAt})
+			}
 		case a.Flags&fDispatched != 0:
 			if a.Timer != 0 {
 				// A step timeout timer; the step is re-issued below.

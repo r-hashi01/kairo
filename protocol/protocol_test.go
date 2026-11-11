@@ -21,6 +21,10 @@ import (
 )
 
 func setup(t *testing.T) (*engine.Engine, string) {
+	return setupServer(t, nil)
+}
+
+func setupServer(t *testing.T, configure func(*Server)) (*engine.Engine, string) {
 	t.Helper()
 	reg := ir.NewRegistry()
 	reg.Register(ir.NodeSpec{Action: "code.run", Effect: ir.EffectUnprotected})
@@ -37,12 +41,66 @@ func setup(t *testing.T) (*engine.Engine, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { l.Close() })
-	go (&Server{E: e}).Serve(l)
+	s := &Server{E: e}
+	if configure != nil {
+		configure(s)
+	}
+	go s.Serve(l)
 	if err := e.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.Close)
 	return e, sock
+}
+
+func TestAsyncCallbackCapabilityCompletesPendingTask(t *testing.T) {
+	e, sock := setupServer(t, func(s *Server) {
+		s.Callback = func(*task.Task) *task.Callback {
+			return &task.Callback{URL: "https://callbacks.example/v1/action-results/token", Until: time.Now().Add(time.Minute).UnixMilli()}
+		}
+	})
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"call","action":"send"}}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := make(chan *task.Task, 1)
+	wk := &Worker{Name: "async", Actions: []string{"send"}, CallbackActions: []string{"send"}, Concurrency: 1,
+		Handler: func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
+			copy := *tk
+			seen <- &copy
+			return task.Result{Pending: true}
+		}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tk *task.Task
+	select {
+	case tk = <-seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not receive the task")
+	}
+	if tk.Callback == nil || !strings.Contains(tk.Callback.URL, "/v1/action-results/") {
+		t.Fatalf("callback = %+v", tk.Callback)
+	}
+	// The SDK process can disappear before its pending result reaches the
+	// daemon. The authenticated callback still settles the same real attempt,
+	// whether the shard sees it before or after the disconnect outcome.
+	cancel()
+	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`{"ok":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	wctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	ri, err := e.Wait(wctx, id)
+	if err != nil || string(ri.Output) != `{"ok":true}` {
+		t.Fatalf("wait = %+v, %v", ri, err)
+	}
+	// A callback retry after an ambiguous response is accepted and does not
+	// alter the already-settled run.
+	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`{"ok":false}`)}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func plan(t *testing.T, e *engine.Engine, js string) {

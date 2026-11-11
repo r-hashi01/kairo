@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { test } from 'node:test';
 
-import { CAPABILITY_GRACEFUL_DRAIN, FrameReader, MsgType, encodeFrame, resultBody } from './protocol.ts';
+import { CAPABILITY_ASYNC_ACTION_CALLBACK, CAPABILITY_GRACEFUL_DRAIN, FrameReader, MsgType, encodeFrame, resultBody } from './protocol.ts';
 import { DrainUnsupportedError, Worker, iterationOf, nodeOf } from './worker.ts';
 
 // A fake runtime: hands out tasks, records what the worker says.
@@ -38,6 +38,7 @@ test('hello, tasks, results, chunks and cancellation', async () => {
 	worker = new Worker({
 		name: 'ts-1',
 		actions: ['echo', 'slow'],
+		callbackActions: ['echo'],
 		concurrency: 4,
 		token: 'secret',
 		handler: async (task, ctx) => {
@@ -53,7 +54,10 @@ test('hello, tasks, results, chunks and cancellation', async () => {
 	await worker.run({ host: '127.0.0.1', port: rt.port });
 	rt.close();
 
-	assert.deepEqual(seen[0], [MsgType.Hello, { worker: 'ts-1', actions: ['echo', 'slow'], credit: 4, token: 'secret', capabilities: [CAPABILITY_GRACEFUL_DRAIN] }]);
+	assert.deepEqual(seen[0], [MsgType.Hello, {
+		worker: 'ts-1', actions: ['echo', 'slow'], credit: 4, token: 'secret', callback_actions: ['echo'],
+		capabilities: [CAPABILITY_GRACEFUL_DRAIN, CAPABILITY_ASYNC_ACTION_CALLBACK],
+	}]);
 	const results = new Map(seen.filter(([t]) => t === MsgType.Result).map(([, b]) => [b.seq, b]));
 	assert.deepEqual(results.get(1), { seq: 1, output: { echo: { x: 1 }, node: 'a', round: 0 } });
 	assert.deepEqual(results.get(2), { seq: 2, error: 'boom' });
@@ -158,4 +162,5 @@ test('a result that waits', () => {
 		wait: { until: 1700000000000, output: [[{ json: { a: 1 } }]] },
 	});
 	assert.deepEqual(resultBody(5, { wait: { until: 1.7 } }), { seq: 5, wait: { until: 1, output: null } });
+	assert.deepEqual(resultBody(6, { pending: { owner: 'remote:x', leaseMs: 1000 } }), { seq: 6, pending: true });
 });

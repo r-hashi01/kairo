@@ -211,6 +211,8 @@ k = Kairo("http://127.0.0.1:8420", worker="/var/lib/kairo/worker.sock")
 
 `mode="suspend"` and `await k.tick()` also work with kairod. Drivers use fenced leases; before a suspended invocation returns, its current child call is terminal or quiescent. `wake` receives the earliest timer or lease deadline, so the host schedules one future tick instead of polling. Sending a signal before its wait exists remains an embedded-runtime feature.
 
+For URL-backed actions, pass `secret` as usual, but omit `callback_url`: a configured kairod negotiates async callback support with the SDK worker and supplies a short-lived, attempt-scoped callback URL on each eligible task. `callback_url` remains required with the embedded backend.
+
 ### Workers
 
 To serve kairod's graph plans (not workflows written as code), a worker pulls tasks over kairod's worker protocol. It is the standard library only.

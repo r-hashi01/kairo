@@ -4,9 +4,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -21,34 +23,50 @@ import (
 	"github.com/r-hashi01/kairo/api"
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/executor/httpexec"
+	"github.com/r-hashi01/kairo/httpaction"
 	"github.com/r-hashi01/kairo/ir"
 	"github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/obs"
 	"github.com/r-hashi01/kairo/protocol"
 	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
 )
 
 func main() {
 	var (
-		dataDir     = flag.String("data", "./kairo-data", "data directory (logs, snapshots, blobs, plans)")
-		shards      = flag.Int("shards", 0, "number of shards (default: GOMAXPROCS; fixed per data directory)")
-		httpAddr    = flag.String("http", "127.0.0.1:8420", "control API listen address")
-		sockPath    = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
-		tcpAddr     = flag.String("worker-tcp", "", "optional TCP address for workers")
-		nodesFile   = flag.String("nodes", "", "JSON file with an array of node specs")
-		limitFile   = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
-		obsFile     = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
-		metricsFile = flag.String("metrics", "", "write bounded operational measurements as JSON lines to this file (- for stdout)")
-		tierName    = flag.String("tier", "none", "default durability tier: none|memory|file")
-		noSync      = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
-		maxActive   = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
-		maxQueued   = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
-		perTenant   = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
-		maxStarting = flag.Int("max-starting", 0, "admission: safety ceiling per shard/tier for starts awaiting durable acknowledgement (0 = adaptive)")
-		httpConc    = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
-		idemTTL     = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
+		dataDir      = flag.String("data", "./kairo-data", "data directory (logs, snapshots, blobs, plans)")
+		shards       = flag.Int("shards", 0, "number of shards (default: GOMAXPROCS; fixed per data directory)")
+		httpAddr     = flag.String("http", "127.0.0.1:8420", "control API listen address")
+		callbackURL  = flag.String("callback-url", "", "public HTTPS base for daemon-owned action callbacks (enables callbacks; keys come from KAIRO_CALLBACK_KEYS)")
+		callbackAddr = flag.String("callback-http", "127.0.0.1:8421", "callback-only listen address, normally behind the callback URL's TLS proxy")
+		sockPath     = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
+		tcpAddr      = flag.String("worker-tcp", "", "optional TCP address for workers")
+		nodesFile    = flag.String("nodes", "", "JSON file with an array of node specs")
+		limitFile    = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
+		obsFile      = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
+		metricsFile  = flag.String("metrics", "", "write bounded operational measurements as JSON lines to this file (- for stdout)")
+		tierName     = flag.String("tier", "none", "default durability tier: none|memory|file")
+		noSync       = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
+		maxActive    = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
+		maxQueued    = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
+		perTenant    = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
+		maxStarting  = flag.Int("max-starting", 0, "admission: safety ceiling per shard/tier for starts awaiting durable acknowledgement (0 = adaptive)")
+		httpConc     = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
+		idemTTL      = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
+
+	var callbacks *httpaction.CallbackCapabilities
+	if *callbackURL != "" {
+		keys, err := callbackKeys(os.Getenv("KAIRO_CALLBACK_KEYS"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		callbacks, err = httpaction.NewCallbackCapabilities(*callbackURL, keys, time.Now)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	var tier engine.Tier
 	if err := tier.UnmarshalText([]byte(*tierName)); err != nil {
@@ -147,6 +165,15 @@ func main() {
 	}
 
 	ws := &protocol.Server{E: e}
+	if callbacks != nil {
+		ws.Callback = func(t *task.Task) *task.Callback {
+			until := t.Deadline
+			if until == 0 {
+				until = time.Now().Add(15 * time.Minute).UnixMilli()
+			}
+			return callbacks.Issue(t, until)
+		}
+	}
 	if *sockPath == "" {
 		*sockPath = filepath.Join(*dataDir, "worker.sock")
 	}
@@ -170,6 +197,16 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
+	var callbackSrv *http.Server
+	if callbacks != nil {
+		callbackSrv = &http.Server{Addr: *callbackAddr, Handler: (&api.ActionCallbacks{E: e, Capabilities: callbacks}).Handler()}
+		go func() {
+			if err := callbackSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal(err)
+			}
+		}()
+		log.Printf("kairod: callback-only API on http://%s", *callbackAddr)
+	}
 	log.Printf("kairod: api on http://%s, workers on unix:%s, data in %s", *httpAddr, *sockPath, *dataDir)
 
 	sig := make(chan os.Signal, 1)
@@ -179,6 +216,25 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
+	if callbackSrv != nil {
+		callbackSrv.Shutdown(ctx)
+	}
 	ul.Close()
 	e.Close()
+}
+
+func callbackKeys(raw string) ([][]byte, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("KAIRO_CALLBACK_KEYS is required with -callback-url")
+	}
+	parts := strings.Split(raw, ",")
+	keys := make([][]byte, 0, len(parts))
+	for i, part := range parts {
+		key, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("KAIRO_CALLBACK_KEYS key %d is not unpadded base64url: %w", i, err)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }

@@ -245,6 +245,8 @@ k, err := kairo.Connect(ctx, "http://127.0.0.1:8420", "/var/lib/kairo/worker.soc
 
 The workflow code is the same: the runs live in kairod (over its HTTP API), and this process runs its actions' steps (over kairod's worker socket) and drives its workflows under fenced leases. `List`, `Children`, review resolution, suspend mode and `Tick` work through kairod. In suspend mode a child call is allowed to become terminal or quiescent before the invocation returns, and `Wake` receives its earliest timer or lease deadline. Signals sent before their wait still need the embedded runtime (`kairo.ErrNeedsEmbedded`).
 
+For URL-backed actions, set `HTTP.Secret` as usual. Do not set `HTTP.CallbackURL` with kairod: a configured kairod negotiates async callback support with the SDK worker and supplies a short-lived, attempt-scoped callback URL on each eligible task. `HTTP.CallbackURL` remains required with the embedded runtime.
+
 ## License
 
 MIT

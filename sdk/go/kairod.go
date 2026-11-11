@@ -660,10 +660,14 @@ func (m *remote) start(ctx context.Context, k *Kairo, specs []map[string]any) er
 		return err
 	}
 	actions := make([]string, len(specs))
+	callbackActions := make([]string, 0, len(specs))
 	for i, s := range specs {
 		actions[i] = s["action"].(string)
+		if _, ok := s["$url"].(string); ok {
+			callbackActions = append(callbackActions, actions[i])
+		}
 	}
-	w := &protocol.Worker{Name: "kairo-sdk-go-" + k.rt.owner[:8], Actions: actions, Concurrency: m.concurrency, Token: m.token,
+	w := &protocol.Worker{Name: "kairo-sdk-go-" + k.rt.owner[:8], Actions: actions, CallbackActions: callbackActions, Concurrency: m.concurrency, Token: m.token,
 		Handler: func(ctx context.Context, t *ktask.Task, emit func([]byte)) ktask.Result {
 			return k.serveRemote(ctx, t, emit)
 		}}
@@ -785,19 +789,25 @@ func (m *remote) registerPlan(ctx context.Context, def json.RawMessage) error {
 // serveRemote runs a step kairod gave this process's worker.
 func (k *Kairo) serveRemote(ctx context.Context, t *ktask.Task, emit func([]byte)) ktask.Result {
 	in := task{RunID: t.RunID, StepID: t.StepID, Action: t.Action, IdemKey: t.IdemKey, Act: t.Act, Attempt: t.Attempt, Input: t.Input}
+	if t.Callback != nil {
+		in.Callback = t.Callback.URL
+	}
 	k.rt.observe(Observation{Kind: ObsStepStarted, RunID: t.RunID, Action: t.Action, StepID: t.StepID, Attempt: t.Attempt})
 	began := time.Now()
 	res := k.rt.call(ctx, k.serve, in)
 	_ = emit // live output goes to this process's subscribers (Subscribe)
 	if res.Pending != nil {
-		// An action answering later on a callback (ADR 0052) needs the
-		// embedded runtime: kairod's step cannot be handed over.
-		res = result{Err: "an async URL action needs the embedded runtime", Unknown: true, Retryable: true, ErrType: "unsupported"}
+		if t.Callback == nil {
+			res = result{Err: "the async action did not receive a daemon callback", Unknown: true, Retryable: true, ErrType: "unsupported"}
+		}
 	}
 	k.rt.observe(Observation{Kind: ObsStepFinished, RunID: t.RunID, Action: t.Action, StepID: t.StepID, Attempt: t.Attempt,
 		Status: stepStatus(res), Error: res.Err, Duration: time.Since(began)})
 	out := ktask.Result{RunID: t.RunID, Act: t.Act, Attempt: t.Attempt, Output: res.Output, Err: res.Err, Retryable: res.Retryable,
 		Unknown: res.Unknown, ErrType: res.ErrType}
+	if res.Pending != nil {
+		out.Pending = true
+	}
 	if res.Wait != nil {
 		out.Wait = &ktask.Wait{Until: res.Wait.Until, Output: res.Wait.Output}
 	}

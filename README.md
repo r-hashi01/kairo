@@ -191,6 +191,17 @@ The embedded runtime needs nothing but a database. If you can run a resident pro
 - graphs defined in JSON over an HTTP API, with live token streaming over SSE
 - storage in files, or SQLite, PostgreSQL, MySQL, TiDB or Oracle, with optional encryption at rest
 
+For URL-backed actions that may answer `202`, kairod owns the result callback. Configure a public HTTPS base and one or more 256-bit, unpadded base64url MAC keys (the first signs; all verify during rotation):
+
+```sh
+KAIRO_CALLBACK_KEYS="$CURRENT_KEY,$PREVIOUS_KEY" \
+  ./kairod -data ./data -tier file \
+  -callback-url https://callbacks.example.com/kairo \
+  -callback-http 127.0.0.1:8421
+```
+
+Route only `/kairo/v1/action-results/*` to the callback listener. It intentionally does not expose the control API on `:8420`. SDK workers negotiate this capability per connection; URL-backed actions receive an attempt-scoped callback URL, while other actions and older workers keep the existing protocol.
+
 ## Performance
 
 **Embedded runtime** (Apple M4 Max). Per event = decode the state, apply, encode it again.

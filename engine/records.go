@@ -16,6 +16,9 @@ const (
 	recStart      byte = 1 // run metadata; followed by the EvStart event record
 	recEvent      byte = 2
 	recCheckpoint byte = 3 // run metadata + LSN of a stored snapshot (ADR 0016)
+	// recEventV2 makes binaries predating ADR 0070 reject records with its
+	// event kinds instead of decoding and silently ignoring them.
+	recEventV2 byte = 4
 )
 
 var errBadRecord = errors.New("engine: bad log record")
@@ -103,7 +106,11 @@ func encodeCheckpoint(b []byte, m *startMeta, snapLSN uint64) []byte {
 }
 
 func encodeEvent(b []byte, runID string, ev *core.Event) []byte {
-	b = append(b, recEvent)
+	kind := recEvent
+	if ev.Kind >= core.EvStepPending {
+		kind = recEventV2
+	}
+	b = append(b, kind)
 	b = appendStr(b, runID)
 	b = append(b, byte(ev.Kind))
 	b = binary.AppendVarint(b, ev.At)
@@ -245,7 +252,7 @@ func decodeRecord(rec []byte) (record, error) {
 		out.meta = decodeMeta(r)
 		out.runID = out.meta.RunID
 		out.snapLSN = r.u()
-	case recEvent:
+	case recEvent, recEventV2:
 		out.runID = r.str()
 		e := &core.Event{}
 		e.Kind = core.EventKind(r.byte1())
