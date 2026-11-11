@@ -104,6 +104,44 @@ func TestFiveNodeRun(t *testing.T) {
 	}
 }
 
+func TestInitialSignalRecoversWithItsWaitAndDeduplicates(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *Engine {
+		e := newEngine(t, Config{Shards: 2, DataDir: dir, NoSync: true})
+		mustPlan(t, e, `{"name":"kairo.workflow","root":{"kind":"wait","id":"done","signal":"done"}}`)
+		mustPlan(t, e, `{"name":"kairo.wait/approve","root":{"kind":"wait","id":"w","signal":"approve"}}`)
+		if err := e.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	tier := TierFile
+	e := open()
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "kairo.workflow", Input: json.RawMessage(`null`), Tenant: "t", Tier: &tier, RunID: "workflow-1"}); err != nil {
+		t.Fatal(err)
+	}
+	initial := &SignalRequest{Name: "approve", Payload: json.RawMessage(`{"by":"alice"}`), ID: "signal-1"}
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "kairo.wait/approve", Input: json.RawMessage(`{"in":null}`), Tenant: "t", Tier: &tier,
+		RunID: "wait-1", Parent: "workflow-1", KeepOutput: true, InitialSignal: initial}); err != nil {
+		t.Fatal(err)
+	}
+	if ri := wait(t, e, "wait-1"); ri.Status != "completed" || !strings.Contains(string(ri.Output), `"signal-1"`) {
+		t.Fatalf("before restart: %+v", ri)
+	}
+	e.Close()
+
+	e = open()
+	defer e.Close()
+	ri, err := e.Get(context.Background(), "wait-1")
+	if err != nil || ri.Status != "completed" || !strings.Contains(string(ri.Output), `"signal-1"`) {
+		t.Fatalf("after restart: %+v %v", ri, err)
+	}
+	res, err := e.ApplySignal(context.Background(), "wait-1", *initial)
+	if err != nil || !res.Applied || !res.Duplicate || !res.Early {
+		t.Fatalf("duplicate after restart: %+v %v", res, err)
+	}
+}
+
 // Real commands must never be released before their intent (and everything
 // before it) is durable. The sink here acknowledges slowly; the executor
 // checks the durable log contents at the moment it receives the command.

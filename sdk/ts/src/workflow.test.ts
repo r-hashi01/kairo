@@ -199,6 +199,8 @@ function suite(name: string, backend: () => Promise<Backend>) {
 		const unknownCalls: string[] = [];
 		let hang = true;
 		let slowAborted = false;
+		let signalGateEntered: (() => void) | undefined;
+		let signalGateRelease: Promise<void> | undefined;
 
 		async function kairo(): Promise<Kairo> {
 			const k = new Kairo({
@@ -235,6 +237,14 @@ function suite(name: string, backend: () => Promise<Backend>) {
 					throw new UnknownOutcomeError('connection lost');
 				},
 			});
+			k.defineAction('signal-gate', {
+				effect: 'unprotected',
+				handler: async () => {
+					signalGateEntered?.();
+					await signalGateRelease;
+					return null;
+				},
+			});
 			k.workflow('edit', async (ctx, input: { files: string[] }) => {
 				const answers = await Promise.all(input.files.map((f) => ctx.call('llm', { q: f })));
 				const w = await ctx.call('write', { path: input.files[0] });
@@ -248,6 +258,10 @@ function suite(name: string, backend: () => Promise<Backend>) {
 				const t1 = await ctx.now();
 				const approval = await ctx.waitFor<{ by: string }>('approve');
 				return { slept: t1 - t0, by: approval.by };
+			});
+			k.workflow('early-signal', async (ctx) => {
+				await ctx.call('signal-gate', null);
+				return ctx.waitFor<string>('message');
 			});
 			k.workflow('long', async (ctx) => ctx.call('slow', null));
 			k.workflow('parent', async (ctx, n: number) => ctx.workflow('child', n));
@@ -305,6 +319,26 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			assert.ok(out.slept >= 300, `slept ${out.slept}ms`);
 			assert.equal(out.by, 'alice');
 			await k.close();
+		});
+
+		test('signal-ahead receipt is idempotent', { skip: name !== 'kairod' }, async () => {
+			let entered!: () => void;
+			let release!: () => void;
+			const enteredPromise = new Promise<void>((r) => (entered = r));
+			signalGateRelease = new Promise<void>((r) => (release = r));
+			signalGateEntered = entered;
+			const k = await kairo();
+			const done = k.run('early-signal', null, { id: 'ts-remote-signal-1' });
+			await enteredPromise;
+			const first = await k.sendSignal('ts-remote-signal-1', 'message', 'hello', { signalId: 'ts-logical-signal-1' });
+			assert.deepEqual({ index: first.index, early: first.early }, { index: 0, early: true });
+			assert.deepEqual(await k.sendSignal('ts-remote-signal-1', 'message', 'hello', { signalId: 'ts-logical-signal-1' }), first);
+			await assert.rejects(k.sendSignal('ts-remote-signal-1', 'message', 'different', { signalId: 'ts-logical-signal-1' }), /conflicts/);
+			release();
+			assert.equal(await done, 'hello');
+			await k.close();
+			signalGateEntered = undefined;
+			signalGateRelease = undefined;
 		});
 
 		test('resolves an unknown call', { skip: name !== 'kairod' }, async () => {

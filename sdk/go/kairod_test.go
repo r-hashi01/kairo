@@ -3,6 +3,7 @@ package kairo_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -47,6 +48,133 @@ func startKairod(t *testing.T) (url, sock string) {
 		e.Close()
 	})
 	return srv.URL, sock
+}
+
+func TestKairodSignalAheadReceiptIsIdempotent(t *testing.T) {
+	url, sock := startKairod(t)
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	connect := func() *kairo.Kairo {
+		k, err := kairo.Connect(context.Background(), url, sock, kairo.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "signal-gate", kairo.Unprotected, func(_ *kairo.TaskContext, _ any) (any, error) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-gate
+			return nil, nil
+		})
+		kairo.Workflow(k, "early-signal", func(ctx *kairo.Context, _ any) (string, error) {
+			if _, err := kairo.Call[any](ctx, "signal-gate", nil); err != nil {
+				return "", err
+			}
+			return kairo.WaitFor[string](ctx, "message")
+		})
+		kairo.Workflow(k, "one-signal", func(ctx *kairo.Context, _ any) (string, error) {
+			return kairo.WaitFor[string](ctx, "message")
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	a, b := connect(), connect()
+	defer a.Close()
+	defer b.Close()
+
+	type outcome struct {
+		value string
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		value, err := kairo.Run[string](context.Background(), a, "early-signal", nil, kairo.WithID("remote-signal-1"))
+		done <- outcome{value: value, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("gate did not start")
+	}
+
+	first, err := b.SendSignal(context.Background(), "remote-signal-1", "message", "hello", kairo.SignalID("logical-signal-1"))
+	if err != nil || first.Index != 0 || !first.Early {
+		t.Fatalf("first receipt %+v: %v", first, err)
+	}
+	retry, err := a.SendSignal(context.Background(), "remote-signal-1", "message", "hello", kairo.SignalID("logical-signal-1"))
+	if err != nil || retry != first {
+		t.Fatalf("retry receipt %+v, want %+v: %v", retry, first, err)
+	}
+	if _, err := a.SendSignal(context.Background(), "remote-signal-1", "message", "different", kairo.SignalID("logical-signal-1")); err == nil {
+		t.Fatal("same logical signal id accepted a different payload")
+	}
+	close(gate)
+	select {
+	case got := <-done:
+		if got.err != nil || got.value != "hello" {
+			t.Fatalf("workflow result %q: %v", got.value, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("workflow did not finish")
+	}
+
+	one := make(chan outcome, 1)
+	go func() {
+		value, err := kairo.Run[string](context.Background(), a, "one-signal", nil, kairo.WithID("remote-signal-only-1"))
+		one <- outcome{value: value, err: err}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		children, err := a.Children(context.Background(), "remote-signal-only-1")
+		if err == nil && len(children) == 1 && !children[0].Finished() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("current wait did not appear")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	type answer struct {
+		receipt kairo.SignalReceipt
+		err     error
+	}
+	answers := make(chan answer, 2)
+	for i, k := range []*kairo.Kairo{a, b} {
+		go func(i int, k *kairo.Kairo) {
+			r, err := k.SendSignal(context.Background(), "remote-signal-only-1", "message", fmt.Sprintf("answer-%d", i),
+				kairo.OnlyIfWaiting(), kairo.SignalID(fmt.Sprintf("only-signal-%d", i)))
+			answers <- answer{receipt: r, err: err}
+		}(i, k)
+	}
+	won, notWaiting := 0, 0
+	for range 2 {
+		got := <-answers
+		switch {
+		case got.err == nil:
+			won++
+			if got.receipt.Index != 0 || got.receipt.Early {
+				t.Fatalf("only-if-waiting receipt %+v", got.receipt)
+			}
+		case errors.Is(got.err, kairo.ErrNotWaiting):
+			notWaiting++
+		default:
+			t.Fatal(got.err)
+		}
+	}
+	if won != 1 || notWaiting != 1 {
+		t.Fatalf("only-if-waiting winners=%d not-waiting=%d", won, notWaiting)
+	}
+	select {
+	case got := <-one:
+		if got.err != nil || !strings.HasPrefix(got.value, "answer-") {
+			t.Fatalf("only-if-waiting result %q: %v", got.value, got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("only-if-waiting workflow did not finish")
+	}
 }
 
 // The same workflow code on kairod (Connect, ADR 0058): calls, a sleep, a

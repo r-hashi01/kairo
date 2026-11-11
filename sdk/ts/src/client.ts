@@ -59,6 +59,7 @@ export interface RunOptions {
 	workflow?: string;
 	meta?: Record<string, unknown>;
 	drive?: boolean;
+	initialSignal?: { name: string; payload: unknown; signal_id: string; only_if_waiting?: boolean };
 	/** Cancels the HTTP request while its durable start is still unconfirmed. */
 	signal?: AbortSignal;
 }
@@ -146,6 +147,7 @@ export class Client {
 		if (opts.workflow) body.workflow = opts.workflow;
 		if (opts.meta) body.meta = opts.meta;
 		if (opts.drive) body.drive = true;
+		if (opts.initialSignal) body.initial_signal = opts.initialSignal;
 		const [status, data] = await this.call('POST', '/v1/runs', body, opts.signal);
 		if (status === 504) throw new KairoError(504, `run ${data.run_id}: start not confirmed`);
 		return data;
@@ -202,6 +204,22 @@ export class Client {
 	/** Delivers a signal to a run (a wait node named name receives it). */
 	async signal(runId: string, name: string, payload: unknown = null): Promise<void> {
 		await this.call('POST', `/v1/runs/${encodeURIComponent(runId)}/signals/${encodeURIComponent(name)}`, payload);
+	}
+
+	async applySignal(
+		runId: string,
+		name: string,
+		payload: unknown,
+		signalId: string,
+		onlyIfWaiting: boolean,
+	): Promise<{ applied: boolean; duplicate?: boolean; early?: boolean }> {
+		return (
+			await this.call('POST', `/v1/runs/${encodeURIComponent(runId)}/signals/${encodeURIComponent(name)}/apply`, {
+				payload: payload ?? null,
+				signal_id: signalId,
+				only_if_waiting: onlyIfWaiting,
+			})
+		)[1];
 	}
 
 	async cancel(runId: string): Promise<void> {

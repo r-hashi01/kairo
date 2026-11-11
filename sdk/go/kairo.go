@@ -26,6 +26,7 @@ import (
 	mrand "math/rand/v2"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1531,42 +1532,8 @@ func calledAction(plan string) string {
 // not received one. A wait the workflow has not reached yet receives it
 // when it does (ADR 0059): signals of one name go to its waits in order.
 func (k *Kairo) Signal(ctx context.Context, id, name string, payload any) error {
-	if k.remote == nil {
-		_, err := k.SendSignal(ctx, id, name, payload)
-		return err
-	}
-	// kairod has no synchronous applied/ignored answer. Keep the existing
-	// API: signal an existing wait, and do not send ahead.
-	if err := k.plan(planWait+name, waitRoot(name, 0), nil); err != nil {
-		return err
-	}
-	var signaled string
-	for n := 0; ; n++ {
-		runID := callID(id, planWait+name, "null", n)
-		r, err := k.runs.get(ctx, runID)
-		if errors.Is(err, ErrUnknownRun) {
-			return fmt.Errorf("kairo: workflow %s does not wait for %s (signals sent ahead: %w)", id, name, ErrNeedsEmbedded)
-		}
-		if err != nil {
-			return err
-		}
-		if r.Finished() {
-			continue
-		}
-		if err := k.runs.signal(ctx, runID, name, payload); err != nil {
-			return err
-		}
-		signaled = runID
-		break
-	}
-	if k.mode == Suspend {
-		if _, err := k.remote.waitDone(ctx, signaled); err != nil {
-			return err
-		}
-		_, _, err := k.Tick(ctx)
-		return err
-	}
-	return nil
+	_, err := k.SendSignal(ctx, id, name, payload)
+	return err
 }
 
 // ErrNotWaiting means SendSignal was asked not to send ahead and the
@@ -1582,7 +1549,11 @@ type SignalReceipt struct {
 	Early bool
 }
 
-type signalOpts struct{ onlyIfWaiting bool }
+type signalOpts struct {
+	onlyIfWaiting bool
+	id            string
+	idSet         bool
+}
 
 // SignalOption configures SendSignal.
 type SignalOption func(*signalOpts)
@@ -1591,17 +1562,22 @@ type SignalOption func(*signalOpts)
 // signal for a future wait.
 func OnlyIfWaiting() SignalOption { return func(o *signalOpts) { o.onlyIfWaiting = true } }
 
+// SignalID reuses one logical signal identity after an ambiguous response.
+// Callers retrying from another process must provide the same id (ADR 0071).
+func SignalID(id string) SignalOption { return func(o *signalOpts) { o.id, o.idSet = id, true } }
+
 // SendSignal atomically sends to the first wait for name and reports which
-// one accepted it. It needs the embedded runtime; Signal remains the
-// compatible API for kairod (ADR 0064).
+// one accepted it (ADR 0064, ADR 0071).
 func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, opts ...SignalOption) (SignalReceipt, error) {
 	var receipt SignalReceipt
-	if k.remote != nil {
-		return receipt, ErrNeedsEmbedded
-	}
 	o := signalOpts{}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if !o.idSet {
+		o.id = newID()
+	} else if o.id == "" || len(o.id) > 256 {
+		return receipt, errors.New("kairo: signal id must be non-empty and at most 256 bytes")
 	}
 	if err := k.plan(planWait+name, waitRoot(name, 0), nil); err != nil {
 		return receipt, err
@@ -1612,12 +1588,12 @@ func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, op
 		if errors.Is(err, ErrUnknownRun) {
 			// Linearize "not present now" with a no-op event transaction. If
 			// the workflow made the wait first, the signal is applied here.
-			applied, applyErr := k.rt.signalApplied(ctx, runID, name, payload)
+			applied, early, applyErr := k.applySignal(ctx, runID, name, payload, o)
 			if applyErr != nil {
 				return receipt, applyErr
 			}
 			if applied {
-				receipt = SignalReceipt{RunID: runID, Index: n}
+				receipt = SignalReceipt{RunID: runID, Index: n, Early: early}
 				break
 			}
 			if o.onlyIfWaiting {
@@ -1630,7 +1606,7 @@ func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, op
 				}
 				return receipt, fmt.Errorf("workflow %s: %w: %s", id, ErrNotWaiting, name)
 			}
-			made, aheadErr := k.signalAhead(ctx, id, name, runID, payload)
+			made, aheadErr := k.signalAhead(ctx, id, name, runID, payload, o.id)
 			if aheadErr != nil {
 				return receipt, aheadErr
 			}
@@ -1645,19 +1621,36 @@ func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, op
 			return receipt, err
 		}
 		if r.Finished() {
+			matched, early, matchErr := matchRecordedSignal(r.Output, payload, o)
+			if matchErr != nil {
+				return receipt, matchErr
+			}
+			if matched {
+				receipt = SignalReceipt{RunID: runID, Index: n, Early: early}
+				break
+			}
 			continue
 		}
-		applied, err := k.rt.signalApplied(ctx, runID, name, payload)
+		applied, early, err := k.applySignal(ctx, runID, name, payload, o)
 		if err != nil {
 			return receipt, err
 		}
 		if applied {
-			receipt = SignalReceipt{RunID: runID, Index: n}
+			receipt = SignalReceipt{RunID: runID, Index: n, Early: early}
 			break
 		}
 		// A concurrent signal, timeout or cancellation won. Try the next wait.
 	}
 	if k.mode == Suspend {
+		if k.remote != nil {
+			if _, err := k.remote.waitDone(ctx, receipt.RunID); err != nil {
+				return SignalReceipt{}, err
+			}
+			if _, _, err := k.Tick(ctx); err != nil {
+				return SignalReceipt{}, err
+			}
+			return receipt, nil
+		}
 		k.settle()
 		if err := k.wakeUp(ctx); err != nil {
 			return SignalReceipt{}, err
@@ -1666,9 +1659,41 @@ func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, op
 	return receipt, nil
 }
 
+func (k *Kairo) applySignal(ctx context.Context, runID, name string, payload any, o signalOpts) (bool, bool, error) {
+	if k.remote != nil {
+		res, err := k.remote.applySignal(ctx, runID, name, payload, o.id, o.onlyIfWaiting)
+		return res.Applied, res.Early, err
+	}
+	applied, err := k.rt.signalApplied(ctx, runID, name, payload)
+	return applied, false, err
+}
+
+func matchRecordedSignal(output json.RawMessage, payload any, o signalOpts) (bool, bool, error) {
+	var out struct {
+		Payload json.RawMessage `json:"payload"`
+		Signal  *struct {
+			ID            string `json:"id"`
+			Early         bool   `json:"early"`
+			OnlyIfWaiting bool   `json:"only_if_waiting"`
+		} `json:"_kairo_signal"`
+	}
+	if json.Unmarshal(output, &out) != nil || out.Signal == nil || out.Signal.ID != o.id {
+		return false, false, nil
+	}
+	want, err := json.Marshal(payload)
+	if err != nil {
+		return false, false, err
+	}
+	var a, b any
+	if json.Unmarshal(out.Payload, &a) != nil || json.Unmarshal(want, &b) != nil || !reflect.DeepEqual(a, b) || out.Signal.OnlyIfWaiting != o.onlyIfWaiting {
+		return false, false, fmt.Errorf("kairo: logical signal id %q conflicts with its recorded outcome", o.id)
+	}
+	return true, out.Signal.Early, nil
+}
+
 // signalAhead makes wait runID of workflow id, as the workflow will when
 // it reaches it, with the signal applied in the same transaction.
-func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload any) (bool, error) {
+func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload any, signalID string) (bool, error) {
 	wf, err := k.runs.get(ctx, id)
 	if errors.Is(err, ErrUnknownRun) || (err == nil && wf.Plan != planWorkflow) {
 		return false, fmt.Errorf("kairo: no workflow %s", id)
@@ -1683,8 +1708,13 @@ func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload
 	if err != nil {
 		return false, err
 	}
-	existing, err := k.runs.run(ctx, planWait+name, map[string]any{"in": nil}, runID, runSpec{parent: id,
-		then: []wasmcore.Event{{Kind: "signal", At: k.rt.now(), Name: name, Data: data}}})
+	spec := runSpec{parent: id}
+	if k.remote != nil {
+		spec.initialSignal = &remoteSignalRequest{Name: name, Payload: data, ID: signalID}
+	} else {
+		spec.then = []wasmcore.Event{{Kind: "signal", At: k.rt.now(), Name: name, Data: data}}
+	}
+	existing, err := k.runs.run(ctx, planWait+name, map[string]any{"in": nil}, runID, spec)
 	return !existing, err
 }
 

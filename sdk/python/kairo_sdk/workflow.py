@@ -250,6 +250,17 @@ def _canonical(v: Any) -> str:
     return "".join(out)
 
 
+def _recorded_signal(output: Any, payload: Any, signal_id: str, only_if_waiting: bool) -> bool | None:
+    if not isinstance(output, dict) or not isinstance(output.get("_kairo_signal"), dict):
+        return None
+    meta = output["_kairo_signal"]
+    if meta.get("id") != signal_id:
+        return None
+    if _canonical(output.get("payload")) != _canonical(payload) or bool(meta.get("only_if_waiting")) != only_if_waiting:
+        raise ValueError(f"logical signal id {signal_id!r} conflicts with its recorded outcome")
+    return bool(meta.get("early"))
+
+
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -1375,42 +1386,29 @@ class Kairo:
 
     async def signal(self, id: str, name: str, payload: Any = None) -> None:
         """Sends a signal to the first wait for it in workflow id that has not
-        received one. With the embedded runtime, a wait the workflow has not
-        reached yet receives it when it does (ADR 0059): signals of one name
-        go to its waits in order. LookupError: no such workflow, or it has
-        finished (kairod: it does not wait for the signal)."""
-        if self._rt is not None:
-            await self.send_signal(id, name, payload)
-            return
-        # The waits' plan, which this process may not have needed yet.
-        await self._plan(PLAN_WAIT + name, _wait_root(name))
-        n = 0
-        while True:
-            run_id = _call_id(id, PLAN_WAIT + name, None, n)
-            try:
-                r = await self.backend.get(run_id)
-            except KairoError as e:
-                if e.status != 404:
-                    raise
-                raise LookupError(f"workflow {id} does not wait for {name}") from None
-            if finished(r):
-                n += 1
-                continue
-            await self.backend.signal(run_id, name, payload)
-            break
-        if self.suspend:
-            await self.backend.wait(run_id)
-            await self.tick()
+        received one. A wait the workflow has not reached yet receives it when
+        it does (ADR 0059, 0071): signals of one name go to its waits in order.
+        LookupError: no such workflow."""
+        await self.send_signal(id, name, payload)
 
     async def send_signal(
-        self, id: str, name: str, payload: Any = None, *, only_if_waiting: bool = False
+        self,
+        id: str,
+        name: str,
+        payload: Any = None,
+        *,
+        only_if_waiting: bool = False,
+        signal_id: str | None = None,
     ) -> SignalReceipt:
         """Atomically sends a signal and reports which wait accepted it.
-        Embedded runtime only. only_if_waiting refuses to keep an early
-        signal (ADR 0064)."""
+        only_if_waiting refuses to keep an early signal (ADR 0064, 0071)."""
         rt = self._rt
-        if rt is None:
-            raise RuntimeError("send_signal needs the embedded runtime")
+        if rt is None and not hasattr(self.backend, "apply_signal"):
+            raise RuntimeError("kairod does not support durable signal receipts")
+        if signal_id is None:
+            signal_id = str(uuid.uuid4())
+        elif not signal_id or len(signal_id.encode()) > 256:
+            raise ValueError("signal_id must be non-empty and at most 256 bytes")
         await self._plan(PLAN_WAIT + name, _wait_root(name))
         n = 0
         receipt: SignalReceipt | None = None
@@ -1425,8 +1423,15 @@ class Kairo:
             if row is None:
                 # This no-op transaction is the linearization point for
                 # "not present now". A wait created first accepts it here.
-                if await rt.signal_applied(run_id, name, payload):
-                    receipt = SignalReceipt(run_id, n, False)
+                applied = (
+                    {"applied": await rt.signal_applied(run_id, name, payload), "early": False}
+                    if rt is not None
+                    else await self.backend.apply_signal(
+                        run_id, name, payload, signal_id=signal_id, only_if_waiting=only_if_waiting
+                    )
+                )
+                if applied.get("applied"):
+                    receipt = SignalReceipt(run_id, n, bool(applied.get("early")))
                     break
                 if only_if_waiting:
                     try:
@@ -1438,24 +1443,39 @@ class Kairo:
                     if workflow.get("plan") != PLAN_WORKFLOW:
                         raise LookupError(f"no workflow {id}")
                     raise NotWaitingError(f"workflow {id} is not waiting for {name}")
-                if not await self._signal_ahead(id, name, run_id, payload):
+                if not await self._signal_ahead(id, name, run_id, payload, signal_id):
                     continue  # a concurrent wait or signal made this number
                 receipt = SignalReceipt(run_id, n, True)
                 break
             if finished(row):
+                early = _recorded_signal(row.get("output"), payload, signal_id, only_if_waiting)
+                if early is not None:
+                    receipt = SignalReceipt(run_id, n, early)
+                    break
                 n += 1
                 continue
-            if await rt.signal_applied(run_id, name, payload):
-                receipt = SignalReceipt(run_id, n, False)
+            applied = (
+                {"applied": await rt.signal_applied(run_id, name, payload), "early": False}
+                if rt is not None
+                else await self.backend.apply_signal(
+                    run_id, name, payload, signal_id=signal_id, only_if_waiting=only_if_waiting
+                )
+            )
+            if applied.get("applied"):
+                receipt = SignalReceipt(run_id, n, bool(applied.get("early")))
                 break
             n += 1  # a concurrent signal, timeout or cancellation won
         if self.suspend:
-            await self._settle()
-            await self._wake_up()
+            if self._rt is None:
+                await self.backend.wait(receipt.run_id)
+                await self.tick()
+            else:
+                await self._settle()
+                await self._wake_up()
         assert receipt is not None
         return receipt
 
-    async def _signal_ahead(self, id: str, name: str, run_id: str, payload: Any) -> bool:
+    async def _signal_ahead(self, id: str, name: str, run_id: str, payload: Any, signal_id: str) -> bool:
         """Makes wait run_id of workflow id, as the workflow will when it
         reaches it, with the signal applied in the same transaction."""
         try:
@@ -1468,9 +1488,12 @@ class Kairo:
             raise LookupError(f"no workflow {id}")
         if finished(wf):
             raise LookupError(f"workflow {id} has finished")
-        r = await self.backend.run(
-            PLAN_WAIT + name, {"in": None}, run_id=run_id, parent=id, then=[{"kind": "signal", "name": name, "data": payload}]
+        kw = (
+            {"then": [{"kind": "signal", "name": name, "data": payload}]}
+            if self._rt is not None
+            else {"initial_signal": {"name": name, "payload": payload, "signal_id": signal_id}}
         )
+        r = await self.backend.run(PLAN_WAIT + name, {"in": None}, run_id=run_id, parent=id, **kw)
         return not r.get("existing")
 
     async def cancel(self, id: str) -> None:

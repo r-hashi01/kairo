@@ -49,6 +49,7 @@ class Backend(Protocol):
         meta: dict[str, Any] | None = None,
         drive: int = 0,
         then: list[dict[str, Any]] | None = None,
+        initial_signal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Starts a run, or finds it: the run id is an idempotency key. Runs are durable.
         parent: the unfinished workflow that owns this run (ADR 0054, 0067).
@@ -63,6 +64,9 @@ class Backend(Protocol):
 
     async def wait(self, run_id: str) -> dict[str, Any]: ...
     async def signal(self, run_id: str, name: str, payload: Any) -> None: ...
+    async def apply_signal(
+        self, run_id: str, name: str, payload: Any, *, signal_id: str, only_if_waiting: bool
+    ) -> dict[str, Any]: ...
     async def children(self, run_id: str) -> list[dict[str, Any]]: ...
     async def list(self, **opts: Any) -> list[dict[str, Any]]: ...
     async def finish(self, run_id: str, payload: Any) -> None: ...
@@ -148,6 +152,7 @@ class HttpBackend:
         workflow: str | None = None,
         meta: dict[str, Any] | None = None,
         drive: int = 0,
+        initial_signal: dict[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         # Kept after they finish (ADR 0050): a workflow resumed after kairod
@@ -179,6 +184,7 @@ class HttpBackend:
                             workflow=workflow if not parent else None,
                             meta=meta if not parent else None,
                             drive=drive != 0,
+                            initial_signal=initial_signal,
                         )
                     )
                     outcome = "confirmed"
@@ -292,6 +298,18 @@ class HttpBackend:
     async def signal(self, run_id: str, name: str, payload: Any) -> None:
         await asyncio.to_thread(self.client.signal, run_id, name, payload)
 
+    async def apply_signal(
+        self, run_id: str, name: str, payload: Any, *, signal_id: str, only_if_waiting: bool
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.client.apply_signal,
+            run_id,
+            name,
+            payload,
+            signal_id=signal_id,
+            only_if_waiting=only_if_waiting,
+        )
+
     async def children(self, run_id: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.client.children, run_id)
 
@@ -396,6 +414,11 @@ class EmbeddedBackend:
 
     async def signal(self, run_id: str, name: str, payload: Any) -> None:
         await self.runtime.signal(run_id, name, payload)
+
+    async def apply_signal(
+        self, run_id: str, name: str, payload: Any, *, signal_id: str, only_if_waiting: bool
+    ) -> dict[str, Any]:
+        return {"applied": await self.runtime.signal_applied(run_id, name, payload), "early": False}
 
     async def children(self, run_id: str) -> list[dict[str, Any]]:
         return await self.runtime.children(run_id)

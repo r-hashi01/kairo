@@ -1,91 +1,108 @@
-# 0071. kairod の Signal を耐久化まで同期し、先取りの wait と receipt を原子的に作る
+# 0071. kairod の論理 Signal は耐久化した wait outcome を receipt とし、再送で二重配送しない
 
-- 状態: 提案
+- 状態: 承認（2026-11-11）
 - 日付: 2026-11-09
-- 関連: 不変条件 2・3・6 / ADR 0023（冪等な Submit）、0041（実行ごとの費用）、0059（先取り signal）、0064（receipt と only-if-waiting）、0067（kairod の親子）、0069（kairod の suspend）/ GitHub Issue #12
 
 ## 背景
 
-埋め込みランタイムの `SendSignal` は、同じ名前の wait を番号順に調べ、現在の wait へ原子的に届けるか、まだ到達していない次の wait を signal 済みの子実行として先に作る。receipt は wait の run ID、番号、先取りかどうかを返す。`OnlyIfWaiting` は現在の wait がなければ何も残さない（ADR 0059・0064）。
+コードで書くワークフローでは、同じ名前の `WaitFor` を繰り返せる。各 wait はワークフロー、signal 名、0 から始まる出現番号で決まる子実行である。埋め込みランタイムは、若い番号から現在の wait を探し、まだ到達していなければ次の wait を signal 済みで先に作る。送信側には、受理した wait の実行 ID、出現番号、先取りかどうかを receipt として返す。
 
-kairod の signal API は、event を shard inbox に入れた時点で 202 を返す。適用されたか、別の signal / timeout / cancel が先だったか、ログが耐久化したかを呼び出し側へ返さない。SDK は既存の wait だけを探して非同期 signal を送り、wait がまだない場合は `ErrNeedsEmbedded` とする。このため、serverless や複数クライアントでは、承認が wait より先に来る場合と、同時の回答を現在の wait だけに限定する場合に、埋め込みと同じ契約を使えない。
+kairod の既存の signal 要求は、event を shard の inbox に渡した時点で成功を返す。呼び出し側は、その event が wait に適用されたか、別の signal・timeout・取り消しが先だったか、必要なログが耐久化したかを区別できない。このため、現在の wait だけに届ける判断、先取りの作成、受理した wait の receipt を、複数 process から同じ意味で使えない。
 
-先取りは単なる親への signal ではない。後で `WaitFor` が使う決定的な run ID で子 wait を作り、親の木へ付け、signal event とともに耐久化する必要がある。同時送信の勝者は、対象 child shard の event 順序で一つに決めなければならない。
+HTTP 応答が失われる場合も考慮が要る。payload だけでは、同じ payload を持つ別の送信と自分の再送を区別できない。応答を確認できないまま次の番号へ進むと、1 つの論理 signal が複数の wait に届きうる。一方、すべての workflow に signal queue や対応表を常設すると、signal が来ない実行にも費用を足し、wait child と別の真実を作る。
+
+先取りでは、親 workflow と wait child が異なる shard に置かれうる。親への attach と子の作成全体を 1 つの保存先トランザクションにはできない。親の終端との順序は親 shard が決め、子 shard では「先取りの wait と最初の signal」を分離して復旧しない性質が必要になる。
 
 ## 決定
 
-### 1. event の適用と耐久化を返す engine 経路を足す
+### 決定項 1（受理した signal の判断を耐久化してから成功を返す）
 
-`Engine.ApplySignal(ctx, runID, name, payload)` を足し、次を返す。
+kairod に、1 つの wait child を対象として signal の適用結果を同期して返す経路を設ける。
 
-- `applied = true`: signal event がコアに受け付けられ、ログがその event まで耐久化した。
-- `applied = false`: 実行がない、signal 名が違う、または別の signal / timeout / cancel / 終端が先で event が無視された。無視された event はログへ書かない（不変条件 3）。
+signal が wait を終わらせた場合は、signal event と receipt の再現に必要な情報が、その実行の tier が求めるところまで耐久化してから成功を返す。別の signal、timeout、取り消し、終端が先で signal を受理しなかった場合は、従来どおり event を記録しない。存在しない wait への不受理も、将来の signal を作らない時点判断とする。
 
-要求と返答は対象 run の shard inbox を通す。shard loop は I/O を待たず、通常の log ack の hold に小さな応答を結び付ける。tier が none の場合は適用時点、memory / file はその tier の ack 後に返す。context が切れても event は適用済みかもしれないため、呼び出し側は同じ payload を同じ探索手順で再試行する。
+要求の context が成功応答より先に終了した場合、signal は受理済みかもしれない。呼び出し側は、決定項 2 の同じ論理 signal ID で再送して結果を確定する。
 
-既存の非同期 `Engine.Signal` と HTTP 202 API は互換のため残す。新しい同期 API を使った要求だけが応答用の state を払い、通常の event hot path に waiter を割り当てない。
+### 決定項 2（論理 signal ID を受理した wait outcome に残す）
 
-### 2. HTTP に receipt 用の同期 signal を足す
+receipt を要する送信には、payload とは別の論理 signal ID を持たせる。SDK は送信ごとに衝突しにくい ID を 1 つ作り、内部の通信再試行では同じ ID を使う。process の再起動や別 process から同じ送信を再試行する利用者は、同じ ID を指定できる。
 
-`POST /v1/runs/{run_id}/signals/{name}/apply` は JSON payload を受け、`{"applied":true|false}` を返す。適用と必要な耐久化が終わってから 200 を返す。存在しない run も探索上の通常結果として `applied=false` とし、通信エラーと区別する。
+wait が signal を受理した outcome には、利用者へ渡す payload を変えずに、論理 signal ID と先取りかどうかを残す。この outcome と決定的な wait の実行 ID から、同じ ID の再送は最初と同じ receipt を返す。別の ID は、その wait を既に決着させた別の送信として次の番号を調べる。
 
-body 上限と JSON の規則は既存 signal API と同じにする。この endpoint は一つの wait run だけを対象にし、workflow の番号探索や先取り作成は行わない。
+同じ論理 signal ID は、最初の payload と送信方式に結び付ける。異なる内容での再利用は新しい signal とみなさず、競合として拒否する。再送保証の保持期間は、wait child の結果を冪等に読める期間と同じにする。その期間を過ぎた ID を新しい送信へ再利用してよいとはしない。
 
-### 3. 先取りの wait は Submit の initial signal と同じ durable batch で作る
+### 決定項 3（wait の出現順で勝者を決め、only-if-waiting は先取りを作らない）
 
-`engine.SubmitRequest` と `POST /v1/runs` に、SDK 内部の wait plan だけが使える任意の `initial_signal`（name と payload）を足す。新しい run の start event に続けて signal event を同じ shard の batch に適用し、両方が耐久化してから Submit を返す。
+3 つの SDK は同じ signal 名の wait を出現番号順に調べる。未完了の wait では、その wait の shard が signal の受理と不受理の順序を決める。自分の論理 signal ID を持つ完了済みの wait を見つけた場合は、その receipt を再び返す。
 
-次を検査する。
+only-if-waiting の送信は、現在の wait が signal を受理した場合だけ成功する。現在の wait がなくなった時点で `NotWaiting` とし、将来の wait、mailbox、予約を作らない。`NotWaiting` はその時点の状態を表し、将来も同じ結果を予約する記録ではない。確定した `NotWaiting` の後に改めて送る操作は、新しい時点の判断になる。
 
-- plan 名は `kairo.wait/<name>` で、root もその signal を待つ既登録 plan である。
-- parent は未完了の `kairo.workflow` run である。
-- run ID は 3 SDK 共通の call ID 規則で SDK が作った値である。engine は hash の再実装をせず、親子 attach と RunID の冪等性を信頼境界にする。
+先取りを許す送信は、次の出現番号の wait child を signal 済みで作る。同じ番号を競合して作った別の送信は、作成済みの outcome を読み、自分の ID でなければ次の番号へ進む。これにより、各論理 signal は高々 1 つの wait にだけ受理される。
 
-同じ run ID がすでにあれば、最初の start と initial signal を変更せず `existing=true` を返す。呼び出し側はその番号を読み直して同期 signal を試す。新しい run なら、親への attach、start、signal の順に一つの作成として扱う。start / signal の既存 event と record 形式を使い、新しい event 種類は足さない。
+### 決定項 4（先取りの wait と最初の signal を 1 つの復旧単位にする）
 
-### 4. 3 SDK は埋め込みと同じ番号探索を kairod でも行う
+先取りで新しく作る wait child は、その開始と最初の signal を子 shard 上の 1 つの復旧単位として保存する。障害後に見える状態は、signal 済みの wait が存在するか、その wait 自体が存在しないかのどちらかにする。payload のない空の先取り wait だけを復旧してはならない。
 
-Go の `SendSignal`、TypeScript の `sendSignal`、Python の `send_signal` を kairod 接続でも使えるようにする。
+親 workflow への attach は、既存の親 shard の guard を先に通す。親の終端が先なら child を作らず、attach が先なら child の耐久メタデータから親子関係を再構築する。これは親 shard と子 shard をまたぐ原子トランザクションを追加する判断ではない。
 
-同じ名前について番号 0 から繰り返す。
+この復旧単位を表すために保存形式を拡張してよい。新しい reader は既存のログと snapshot を読み続ける。形式の具体的な符号化はこの ADR では固定しない。
 
-1. 決定的な wait run ID を `Get` する。未完了なら同期 signal を試し、`applied=true` なら `early=false` の receipt を返す。false なら次の番号へ進む。
-2. run がなければ、まず同期 signal を送る。対象 shard で wait の作成が先なら true になり、通常 receipt を返す。false が「この順序では存在しなかった」の線形化点になる。
-3. `only_if_waiting` なら、親 workflow が存在し未完了であることを確認して `NotWaiting` を返す。先取りは作らない。
-4. 通常送信なら、wait plan を登録し、parent と initial signal を付けて同じ run ID を Submit する。新規なら `early=true` の receipt を返す。既存なら同じ番号を読み直す。
+### 決定項 5（適用範囲をコードワークフローの wait に限定する）
 
-receipt と error の公開型・名前は ADR 0064 のままとする。既存の `Signal` は、kairod でも新しい実装を呼んで receipt を捨てる。これにより、kairod の `Signal` も wait より先に届いた payload を保持する。互換性上、先取りを望まない利用者は `OnlyIfWaiting` を使う。
+この receipt、先取り、論理 signal ID の契約は、SDK が所有するコードワークフローの wait child に適用する。既存の receipt を返さない送信 API は、この経路を使って receipt を捨てる。これにより、埋め込みと kairod で、wait より先に来た signal の意味を揃える。
 
-suspend mode では、signal が child wait を終端して親が ready になった後、ADR 0069 と同じ Tick 経路で進める。同期 signal の HTTP handler 自身が workflow code を実行しない。
+任意の graph run に対する既存の非同期 signal API は変更しない。新しい能力を持たない kairod へ receipt 付き送信を接続した場合は、保証を弱めて非同期送信へ切り替えず、未対応として失敗させる。
 
-### 5. 費用と保持
+論理 signal ID は冪等性のための識別子であり、認証情報にはしない。signal を送れる主体の認証・認可は、既存の API の信頼境界に従う。
 
-signal が来たときだけ、番号ごとの Get と、勝者を決める同期 event 適用を行う。競合で負けた番号について、無視された event をログへ書かない。先取り時に増える start と signal の記録は、後で同じ wait が作る状態と payload の耐久化である。
+### 決定項 6（signal が来た経路だけが追加費用を払う）
 
-通常の workflow 実行、graph run、signal のない run に state、goroutine、polling、対応表を足さない。先取り wait は parent の子であり、ADR 0067 の冪等期間と親子の終端規則に従う。kairod の終了 child は親より先に期限切れになりうる既存の制約を変えない（ADR 0067）。
+論理 signal ID と receipt の情報は、受理した wait outcome に置く。signal 専用の常設 queue、全 workflow が持つ対応表、実行ごとの goroutine、polling は追加しない。
+
+同期の耐久化待ち、競合した番号の確認、先取り child の作成は、signal を送った要求だけが払う。signal のない通常実行と任意の graph run の event hot pathには、receipt 用の状態や待ち合わせを追加しない。
+
+### この ADR で決定しないこと
+
+- HTTP の path、request / response の JSON、言語ごとの option 名、保存形式の具体的な符号化は、実装と公開 API の仕様で決める。
+- 実装順、個別の障害注入・競合テスト、完了条件は、この判断を追跡する Issue で管理する。
+- wait child の結果を既存の冪等期間より長く保持することと、期間を過ぎた receipt の永続的な検索は決定しない。
+- 任意の graph run の signal を同期 API へ移すことは決定しない。
 
 ## 結果
 
-- 3 SDK の signal receipt、only-if-waiting、先取り signal の契約が、埋め込みと kairod で同じになる。
-- 同時送信の一つだけが現在の wait を終わらせ、負けた通常送信は次の wait、only-if-waiting は `NotWaiting` になる。
-- wait より先に送った payload は、親子関係と event log に耐久化され、SDK process や kairod の再起動をまたいで後の `WaitFor` が受け取る。
-- 新しい log event、snapshot field、表、外部依存は増えない。HTTP API と Submit の入力契約、同期 ack の engine 経路は増える。
-
-少なくとも次を 3 SDK と engine でテストする。
-
-- 現在の wait への別 process からの同時 only-if-waiting は一つだけ成功し、次の wait に payload を残さない。
-- 通常 signal の同時送信は現在と次の wait に異なる receipt で入り、payload が一つずつ返る。
-- wait の作成と同期 signal を競合させ、shard の順序どおり applied または NotWaiting の一方になる。
-- initial signal の start と signal の間、耐久 ack の前後で kairod を停止しても、signal だけまたは空の wait だけを残さない。
-- signal の再送、HTTP 応答切断、kairod 再起動が payload を二つの番号へ複製しない。
-- 存在しない、終了済み、workflow でない親を区別し、終端と先取り child attach の競合で親より後の子を作らない。
-- context cancellation の同期 waiter が残らず、`scripts/check.sh --race` が通る。通常の非同期 signal と graph event の benchmark に不要な回帰がない。
+- 良い影響: 成功した送信は receipt と payload が耐久化済みであり、応答が失われても同じ論理 signal ID から同じ receipt を確定できる。
+- 良い影響: 複数 process の競合でも 1 つの論理 signal は高々 1 つの wait に届き、only-if-waiting は将来の signal を残さない。
+- 悪い影響: receipt 付き送信は非同期の signal より応答が遅く、競合数に応じて複数の wait outcome を読む。
+- 悪い影響: process をまたぐ再試行を必要とする利用者は、論理 signal ID を保持して再利用する必要がある。
+- 中立な影響: 任意の graph signal の非同期契約と、signal のない実行の状態・実行経路は変わらない。
+- 中立な影響: 保存形式は拡張しうるが、新しい実装は既存のログと snapshot を読み続ける。
+- 新しい制約: 成功応答より前に、受理した event、論理 signal ID、先取り区分を同じ wait outcome として耐久化しなければならない。
+- 新しい制約: 障害から空の先取り wait だけを復旧してはならず、同じ ID と異なる内容の送信を別の wait へ届けてはならない。
 
 ## 検討した代替案
 
-- **SDK が Get の後に既存の 202 signal を送る:** Get と適用の間に競合があり、どの wait が受け取ったか分からない。
-- **親 workflow に signal queue と通し番号を持つ:** 親の state / codec / log をすべての signal で更新し、wait child と別の真実を作る。既存の決定的な child ID と event log で表せる。
-- **kairod が SDK の call ID を再実装する:** 3 言語の canonical JSON と番号規則を engine に重複させる。SDK が ID を作り、engine は parent attach と冪等 Submit を検証すればよい。
-- **Submit 後に普通の signal を別要求で送る:** 両方の間で停止すると、payload のない先取り wait が残る。initial signal を start と同じ durable batch に入れる。
-- **すべての signal API を同期へ変える:** graph API の既存 202 契約と通常 event の費用を変える。receipt を要るコードワークフローだけが新 endpoint を使う。
-- **先取り signal 専用の表を作る:** wait run が後で同じ payload を持つため、二重の保存と原子性が要る。signal 済み wait 自体を先に作る方が既存の意味に合う。
+- payload を再読して自分の送信か判定する: 同じ payload を別の送信が持てるため、再送の識別にならない。
+- 応答を確認できなければ次の番号へ進む: 最初の送信が受理済みだった場合、同じ論理 signal を 2 つの wait へ届ける。
+- 親 workflow に signal queue と通し番号を持つ: signal がない workflow にも状態を足し、wait child と別の真実を同期する必要がある。
+- signal 専用の耐久 ledger を別に持つ: 不受理を含むすべての試行を保存できるが、wait outcome との原子性、保持、退役を新たに解く必要がある。受理した outcome が再送の真実になれば足りる。
+- 親と child の全 shard を 1 つのトランザクションにする: shard loop の所有権と独立性を失う。親の attach guard と、子の復旧単位を分ければ必要な性質を満たせる。
+- 既存の非同期 signal をすべて同期化する: receipt を必要としない graph API の互換性と費用を変える。
+- receipt を無期限に保持する: 既存の実行結果と RunID の冪等期間を越える別の索引と退役規則が必要になる。
+
+## 関連する ADR
+
+- ADR 0023 の決定項 2（冪等性）: 同じ RunID の開始を、結果を確認できない要求の再試行に使う既存の境界。
+- ADR 0041 の決定項 1（原則）: signal がない通常実行に常設の費用を足さない根拠。
+- ADR 0059 の決定項 2（待ちより先に来たシグナルを、待ちの実行として先に作っておく）: 先取り signal と決定的な wait child の意味。
+- ADR 0064 の決定項 1（埋め込みランタイムに、receipt を返す送信 API を足す）: 3 SDK が返す receipt の既存契約。
+- ADR 0064 の決定項 2（`only if waiting` は、現在の wait がなければ先取りしない）: kairod でも保つ only-if-waiting の意味。
+- ADR 0067 の決定項 2（直接の子の集合は、親を所有する shard が持つ）: 親の終端と先取り child の attach に順序を付ける仕組み。
+- ADR 0069 の決定項 4（`Run`、`Signal`、`Resolve`、`Tick` を同じ ready 経路へつなぐ）: signal 後に suspend workflow を再駆動する既存の経路。
+
+## 参照
+
+- [Issue 19: Support durable signals-ahead and atomic receipts over kairod](https://github.com/r-hashi01/kairo/issues/19)（2026-11-11確認）: 対象範囲、再送の重複防止、互換性、検証の受け入れ条件。
+- [engine の Submit と signal API](../../engine/engine.go)（2026-11-11確認）: RunID の冪等性、親 attach、既存の非同期 signal の事実。
+- [engine shard の event 適用と耐久化待ち](../../engine/shard.go)（2026-11-11確認）: 無視された event を記録しないことと、耐久化後に応答できる既存機構の事実。
+- [Go SDK の signal receipt と出現番号探索](../../sdk/go/kairo.go)（2026-11-11確認）: 埋め込みの receipt、only-if-waiting、先取りの既存契約。
+- [core の signal 適用](../../core/apply.go)（2026-11-11確認）: 最初の signal だけが wait を終わらせ、後続を無視する事実。

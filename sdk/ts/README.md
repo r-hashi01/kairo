@@ -98,7 +98,7 @@ With either backend, calls and child workflows belong to their parent's tree. A 
 | `k.submit(name, input, { id, meta?, parent? })` | Starts workflow `id` and returns its id once the start is durable, without waiting |
 | `k.result(id, { signal? })` | The result of workflow `id`, from any process, once it has finished |
 | `k.signal(id, name, payload)` | Delivers a signal to the first wait for it; a wait the workflow has not reached yet receives it when it does |
-| `k.sendSignal(id, name, payload, { onlyIfWaiting? })` | Atomically delivers a signal and returns its wait `runId`, zero-based `index` and whether it was `early`. By default it may make the next wait early; `onlyIfWaiting` throws `NotWaitingError` when no current wait exists. The embedded runtime only |
+| `k.sendSignal(id, name, payload, { onlyIfWaiting?, signalId? })` | Atomically delivers a signal and returns its wait `runId`, zero-based `index` and whether it was `early`, with either the embedded runtime or kairod. By default it may make the next wait early; `onlyIfWaiting` throws `NotWaitingError` when no current wait exists. Reuse `signalId` when retrying an ambiguous kairod response from another process. |
 | `k.cancel(id)` | Cancels the workflow and the calls it waits for, and waits for the durable outcome. Repeated cancellation succeeds; a workflow already completed or failed throws `RunSettledError` |
 | `k.resolve(callId, output)`, `k.resolveFailed(callId, message)` | Settles a call stopped for review (a real step whose outcome is unknown), over kairod or embedded: it took effect with `output`, or it failed. Settling one stuck because its effect was weakened is embedded only |
 | `k.children(id)` | The runs made directly by `id`, over kairod or embedded |

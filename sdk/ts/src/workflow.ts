@@ -337,6 +337,16 @@ function canonical(v: unknown): string {
 	return JSON.stringify(v ?? null);
 }
 
+function recordedSignal(output: unknown, payload: unknown, signalId: string, onlyIfWaiting: boolean): boolean | undefined {
+	if (!output || typeof output !== 'object') return undefined;
+	const row = output as { payload?: unknown; _kairo_signal?: { id?: unknown; early?: unknown; only_if_waiting?: unknown } };
+	const meta = row._kairo_signal;
+	if (!meta || meta.id !== signalId) return undefined;
+	if (canonical(row.payload) !== canonical(payload) || !!meta.only_if_waiting !== onlyIfWaiting)
+		throw new Error(`logical signal id ${JSON.stringify(signalId)} conflicts with its recorded outcome`);
+	return !!meta.early;
+}
+
 export class Kairo {
 	readonly backend: Backend;
 	private readonly opts: KairoOptions;
@@ -1159,50 +1169,27 @@ export class Kairo {
 
 	/**
 	 * Sends a signal to the first wait for it in workflow id that has not
-	 * received one. With the embedded runtime, a wait the workflow has not
-	 * reached yet receives it when it does (ADR 0059): signals of one name
-	 * go to its waits in order.
+	 * received one. A wait the workflow has not reached yet receives it when
+	 * it does (ADR 0059, 0071): signals of one name go to its waits in order.
 	 */
 	async signal(id: string, name: string, payload: unknown = null): Promise<void> {
-		if (this.rt) {
-			await this.sendSignal(id, name, payload);
-			return;
-		}
-		// The waits' plan, which this process may not have needed yet.
-		await this.plan(PLAN_WAIT + name, waitRoot(name));
-		let signaled = '';
-		for (let n = 0; ; n++) {
-			const runId = callId(id, PLAN_WAIT + name, null, n);
-			let r: RunInfo;
-			try {
-				r = await this.backend.get(runId);
-			} catch (e) {
-				if (!(e instanceof KairoError && e.status === 404)) throw e;
-				throw new Error(`workflow ${id} does not wait for ${name}`);
-			}
-			if (finished(r)) continue;
-			await this.backend.signal(runId, name, payload);
-			signaled = runId;
-			break;
-		}
-		if (this.suspend) {
-			await this.backend.wait(signaled);
-			await this.tick();
-		}
+		await this.sendSignal(id, name, payload);
 	}
 
 	/**
-	 * Atomically sends a signal and reports which wait accepted it. Embedded
-	 * runtime only; onlyIfWaiting refuses to keep an early signal (ADR 0064).
+	 * Atomically sends a signal and reports which wait accepted it.
+	 * onlyIfWaiting refuses to keep an early signal (ADR 0064, 0071).
 	 */
 	async sendSignal(
 		id: string,
 		name: string,
 		payload: unknown = null,
-		opts: { onlyIfWaiting?: boolean } = {},
+		opts: { onlyIfWaiting?: boolean; signalId?: string } = {},
 	): Promise<SignalReceipt> {
 		const rt = this.rt;
-		if (!rt) throw new Error('sendSignal needs the embedded runtime');
+		if (!rt && !this.backend.applySignal) throw new Error('kairod does not support durable signal receipts');
+		const signalId = opts.signalId ?? randomUUID();
+		if (!signalId || Buffer.byteLength(signalId) > 256) throw new Error('signalId must be non-empty and at most 256 bytes');
 		await this.plan(PLAN_WAIT + name, waitRoot(name));
 		let receipt: SignalReceipt | undefined;
 		for (let n = 0; ; n++) {
@@ -1216,8 +1203,11 @@ export class Kairo {
 			if (!r) {
 				// The no-op transaction is the linearization point for "not
 				// present now". A wait created first accepts the signal here.
-				if (await rt.signalApplied(runId, name, payload)) {
-					receipt = { runId, index: n, early: false };
+				const applied = rt
+					? { applied: await rt.signalApplied(runId, name, payload), early: false }
+					: await this.backend.applySignal!(runId, name, payload, signalId, !!opts.onlyIfWaiting);
+				if (applied.applied) {
+					receipt = { runId, index: n, early: !!applied.early };
 					break;
 				}
 				if (opts.onlyIfWaiting) {
@@ -1231,29 +1221,44 @@ export class Kairo {
 					if (wf.plan !== PLAN_WORKFLOW) throw new Error(`no workflow ${id}`);
 					throw new NotWaitingError(`workflow ${id} is not waiting for ${name}`);
 				}
-				if (!(await this.signalAhead(id, name, runId, payload))) {
+				if (!(await this.signalAhead(id, name, runId, payload, signalId))) {
 					n--; // a concurrent wait or signal made this number; inspect it
 					continue;
 				}
 				receipt = { runId, index: n, early: true };
 				break;
 			}
-			if (finished(r)) continue;
-			if (await rt.signalApplied(runId, name, payload)) {
-				receipt = { runId, index: n, early: false };
+			if (finished(r)) {
+				const recorded = recordedSignal(r.output, payload, signalId, !!opts.onlyIfWaiting);
+				if (recorded !== undefined) {
+					receipt = { runId, index: n, early: recorded };
+					break;
+				}
+				continue;
+			}
+			const applied = rt
+				? { applied: await rt.signalApplied(runId, name, payload), early: false }
+				: await this.backend.applySignal!(runId, name, payload, signalId, !!opts.onlyIfWaiting);
+			if (applied.applied) {
+				receipt = { runId, index: n, early: !!applied.early };
 				break;
 			}
 			// A concurrent signal, timeout or cancellation won; try the next.
 		}
 		if (this.suspend) {
-			await this.settle();
-			await this.wakeUp();
+			if (!this.rt) {
+				await this.backend.wait(receipt!.runId);
+				await this.tick();
+			} else {
+				await this.settle();
+				await this.wakeUp();
+			}
 		}
 		return receipt!;
 	}
 
 	/** Makes wait runId of workflow id, as the workflow will when it reaches it, with the signal applied in the same transaction. */
-	private async signalAhead(id: string, name: string, runId: string, payload: unknown): Promise<boolean> {
+	private async signalAhead(id: string, name: string, runId: string, payload: unknown, signalId: string): Promise<boolean> {
 		let wf: RunInfo;
 		try {
 			wf = await this.backend.get(id);
@@ -1263,7 +1268,13 @@ export class Kairo {
 		}
 		if (wf.plan !== PLAN_WORKFLOW) throw new Error(`no workflow ${id}`);
 		if (finished(wf)) throw new Error(`workflow ${id} has finished`);
-		const r = await this.backend.run(PLAN_WAIT + name, { in: null }, { runId, parent: id, then: [{ kind: 'signal', name, data: payload ?? null }] });
+		const r = await this.backend.run(PLAN_WAIT + name, { in: null }, {
+			runId,
+			parent: id,
+			...(this.rt
+				? { then: [{ kind: 'signal', name, data: payload ?? null }] }
+				: { initialSignal: { name, payload: payload ?? null, signal_id: signalId } }),
+		});
 		return !r.existing;
 	}
 

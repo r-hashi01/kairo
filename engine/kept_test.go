@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/r-hashi01/kairo/blob"
+	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/task"
 	"github.com/r-hashi01/kairo/wal"
 )
@@ -308,5 +309,21 @@ func TestStartMetaKeep(t *testing.T) {
 		if err != nil || !reflect.DeepEqual(*rec.meta, *m) || rec.snapLSN != 42 {
 			t.Fatalf("checkpoint keep=%v: %+v %v", keep, rec, err)
 		}
+	}
+}
+
+func TestInitialStartRecordIsOneRecoverableUnit(t *testing.T) {
+	m := &startMeta{RunID: "wait-1", Parent: "workflow-1", Plan: "kairo.wait/approve", PlanHash: "hash", Tenant: "default", Tier: TierFile, Keep: true}
+	start := &core.Event{Kind: core.EvStart, At: 10, Data: json.RawMessage(`{"in":null}`)}
+	signal := &core.Event{Kind: core.EvSignal, At: 10, Name: "approve", Data: json.RawMessage(`{"by":"alice"}`), Meta: json.RawMessage(`{"id":"signal-1","early":true,"only_if_waiting":false}`)}
+	rec, err := decodeRecord(encodeInitialStart(nil, m, start, signal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.kind != recInitialStart || rec.meta.RunID != m.RunID || len(rec.events) != 2 || rec.events[0].Kind != core.EvStart || rec.events[1].Kind != core.EvSignal {
+		t.Fatalf("decoded initial start: %+v", rec)
+	}
+	if string(rec.events[1].Meta) != string(signal.Meta) {
+		t.Fatalf("signal meta %s", rec.events[1].Meta)
 	}
 }

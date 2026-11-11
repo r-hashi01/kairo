@@ -191,6 +191,25 @@ type SubmitRequest struct {
 	// above; it costs one blob write when the run finishes and one delete
 	// when its marker expires.
 	KeepOutput bool `json:"keep_output,omitempty"`
+	// InitialSignal creates an SDK-owned wait with its first signal as one
+	// recoverable unit (ADR 0071). It is rejected for other plans.
+	InitialSignal *SignalRequest `json:"initial_signal,omitempty"`
+}
+
+// SignalRequest identifies one logical signal. ID is reused after an
+// ambiguous response; OnlyIfWaiting is bound to that identity (ADR 0071).
+type SignalRequest struct {
+	Name          string          `json:"name,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
+	ID            string          `json:"signal_id"`
+	OnlyIfWaiting bool            `json:"only_if_waiting,omitempty"`
+}
+
+// SignalResult reports whether this logical signal owns the wait outcome.
+type SignalResult struct {
+	Applied   bool `json:"applied"`
+	Duplicate bool `json:"duplicate,omitempty"`
+	Early     bool `json:"early,omitempty"`
 }
 
 // RunLimits bound one run (ADR 0030): the number of steps, waits and
@@ -651,6 +670,11 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 	if p == nil {
 		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
 	}
+	if req.InitialSignal != nil {
+		if err := validateInitialSignal(p, req.Parent, req.InitialSignal); err != nil {
+			return SubmitResult{}, err
+		}
+	}
 	if req.Workflow != "" && p.Name != "kairo.workflow" {
 		return SubmitResult{}, errors.New("engine: workflow metadata requires the kairo.workflow plan")
 	}
@@ -723,7 +747,7 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 			lim.MaxDuration = l.MaxDuration
 		}
 	}
-	sr := &startReq{runID: id, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive,
+	sr := &startReq{runID: id, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive, initialSignal: req.InitialSignal,
 		keep: req.KeepOutput && tier >= TierFile, reply: reply}
 	sh := e.shardFor(id)
 	active := make(chan struct{}, 1)

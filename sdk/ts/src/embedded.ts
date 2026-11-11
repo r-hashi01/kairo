@@ -764,6 +764,8 @@ export interface RunStart {
 	drive?: number;
 	/** Events applied in the start's transaction (a signal received before its wait, ADR 0059). */
 	then?: Array<Omit<CoreEvent, 'at'>>;
+	/** kairod: creates an early wait and its first signal as one recoverable unit (ADR 0071). */
+	initialSignal?: { name: string; payload: unknown; signal_id: string; only_if_waiting?: boolean };
 }
 
 /** A drive lease's token: a nonzero int32 (ADR 0059). */

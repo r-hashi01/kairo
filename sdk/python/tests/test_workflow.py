@@ -398,6 +398,38 @@ class WorkflowTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_signal_ahead_receipt_is_idempotent(self) -> None:
+        async def main() -> None:
+            entered = threading.Event()
+            release = threading.Event()
+            k = Kairo(self.url, worker=self.sock, concurrency=4)
+
+            @k.action("py-signal-gate", effect="unprotected")
+            def gate(input, ctx):
+                entered.set()
+                release.wait(10)
+                return None
+
+            @k.workflow("py-early-signal")
+            async def early(ctx, input):
+                await ctx.call("py-signal-gate")
+                return await ctx.wait_for("message")
+
+            await k.start()
+            run = asyncio.create_task(k.run("py-early-signal", None, id="py-remote-signal-1"))
+            self.assertTrue(await asyncio.to_thread(entered.wait, 10))
+            first = await k.send_signal("py-remote-signal-1", "message", "hello", signal_id="py-logical-signal-1")
+            self.assertEqual((first.index, first.early), (0, True))
+            retry = await k.send_signal("py-remote-signal-1", "message", "hello", signal_id="py-logical-signal-1")
+            self.assertEqual(retry, first)
+            with self.assertRaises((ValueError, KairoError)):
+                await k.send_signal("py-remote-signal-1", "message", "different", signal_id="py-logical-signal-1")
+            release.set()
+            self.assertEqual(await asyncio.wait_for(run, 10), "hello")
+            await k.close()
+
+        asyncio.run(main())
+
     def test_resolve_unknown_call(self) -> None:
         if type(self) is not WorkflowTest:
             self.skipTest("kairod only")
