@@ -74,8 +74,8 @@
 | [0067](0067-parent-trees-over-kairod.md) | kairod の親子を耐久化し、親 shard で子の開始と親の終端を直列化する | 承認 |
 | [0068](0068-list-code-workflows-over-kairod.md) | kairod のコードワークフローを shard 横断で一覧する | 承認 |
 | [0069](0069-suspend-code-workflows-over-kairod.md) | kairod のコードワークフローを、期限付きの駆動権と起床通知で suspend できるようにする | 承認 |
-| [0070](0070-kairod-owns-async-action-callbacks.md) | kairod が非同期 HTTP アクションのコールバックと期限切れを所有する | 提案 |
-| [0071](0071-atomic-early-signals-over-kairod.md) | kairod の Signal を耐久化まで同期し、先取りの wait と receipt を原子的に作る | 提案 |
+| [0070](0070-kairod-owns-async-action-callbacks.md) | kairod が非同期 HTTP アクションのコールバックと期限切れを所有する | 承認 |
+| [0071](0071-atomic-early-signals-over-kairod.md) | kairod の論理 Signal は耐久化した wait outcome を receipt とし、再送で二重配送しない | 提案 |
 | [0072](0072-retry-unconfirmed-kairod-starts-by-run-id.md) | kairod で開始を確認できない実行は、同じ RunID で確認し直し、ワークフローの失敗にしない | 承認 |
 | [0073](0073-drain-kairod-workers-before-planned-shutdown.md) | 計画停止では、kairod のworkerが新しい仕事を止め、実行中の結果を記録してから閉じる | 承認 |
 | [0074](0074-adapt-durable-start-admission-to-storage.md) | 耐久開始の受け付けを保存先の処理能力に合わせ、開始前に過負荷を返す | 承認 |
