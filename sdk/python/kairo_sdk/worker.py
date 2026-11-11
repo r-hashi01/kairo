@@ -12,7 +12,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import CAPABILITY_GRACEFUL_DRAIN, Cancel, Chunk, Credit, Hello, MsgType, Result, read_frame, write_frame
+from .protocol import (
+    CAPABILITY_ASYNC_ACTION_CALLBACK,
+    CAPABILITY_GRACEFUL_DRAIN,
+    Cancel,
+    Chunk,
+    Credit,
+    Hello,
+    MsgType,
+    Result,
+    read_frame,
+    write_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +45,7 @@ class Task:
     params: Any = None
     seq: int = 0
     depth: int = 0
+    callback: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -164,12 +176,14 @@ class Worker:
         *,
         token: str = "",
         resource: str = "io",
+        callback_actions: list[str] | None = None,
     ) -> None:
         self.name = name
         self.token = token
         if not concurrency:
             concurrency = default_concurrency(resource)
         self.actions = actions
+        self.callback_actions = callback_actions or []
         self.handler = handler
         self.concurrency = max(concurrency, 1)
         self._wlock = threading.Lock()
@@ -209,10 +223,20 @@ class Worker:
             self._failed = None
             self._negotiated = False
             self._drain_cap = False
+        capabilities = [CAPABILITY_GRACEFUL_DRAIN]
+        if self.callback_actions:
+            capabilities.append(CAPABILITY_ASYNC_ACTION_CALLBACK)
         self._send(
             w,
             MsgType.HELLO,
-            Hello(self.name, self.actions, self.concurrency, self.token, [CAPABILITY_GRACEFUL_DRAIN]).body(),
+            Hello(
+                self.name,
+                self.actions,
+                self.concurrency,
+                self.token,
+                capabilities,
+                self.callback_actions,
+            ).body(),
         )
         with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix=self.name) as pool:
             try:

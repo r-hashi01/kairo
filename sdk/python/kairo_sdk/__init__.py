@@ -27,7 +27,19 @@ from .observe import (
     Observer,
 )
 from .metrics import Metric, MetricSink
-from .protocol import CAPABILITY_GRACEFUL_DRAIN, Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
+from .protocol import (
+    CAPABILITY_ASYNC_ACTION_CALLBACK,
+    CAPABILITY_GRACEFUL_DRAIN,
+    Cancel,
+    Chunk,
+    Credit,
+    Hello,
+    MsgType,
+    ProtocolError,
+    Result,
+    read_frame,
+    write_frame,
+)
 from .worker import DrainUnsupportedError, Task, TaskContext, Worker
 from .store import ParentUnavailableError, PostgresStore, SQLiteStore, WorkflowRetryError
 from ._version import __version__
@@ -60,6 +72,7 @@ __all__ = [
     "Cancel",
     "CallError",
     "Cancelled",
+    "CAPABILITY_ASYNC_ACTION_CALLBACK",
     "CAPABILITY_GRACEFUL_DRAIN",
     "Client",
     "Context",

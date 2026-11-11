@@ -209,6 +209,8 @@ const k = new Kairo({ url: 'http://127.0.0.1:8420', worker: '/var/lib/kairo/work
 
 The workflow code is the same.
 
+For URL-backed actions, pass `secret` as usual, but omit `callbackUrl`: a configured kairod negotiates async callback support with the SDK worker and supplies a short-lived, attempt-scoped callback URL on each eligible task. `callbackUrl` remains required with the embedded backend.
+
 `mode: 'suspend'` and `k.tick()` also work with kairod. Drivers use fenced leases; before a suspended invocation returns, its current child call is terminal or quiescent. `wake` receives the earliest timer or lease deadline, so the host schedules one future tick instead of polling. Sending a signal before its wait exists remains an embedded-runtime feature.
 
 ## License

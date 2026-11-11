@@ -25,11 +25,14 @@ const capabilityNegotiationTimeout = time.Second
 // Worker is the Go client of the protocol (the reference for SDKs in other
 // languages).
 type Worker struct {
-	Name        string
-	Actions     []string
-	Concurrency int
-	Handler     Handler
-	Token       string // the server's Token, if it has one (ADR 0037)
+	Name    string
+	Actions []string
+	// CallbackActions are URL-backed actions that can use daemon-owned
+	// callbacks when the server selects the capability (ADR 0070).
+	CallbackActions []string
+	Concurrency     int
+	Handler         Handler
+	Token           string // the server's Token, if it has one (ADR 0037)
 
 	mu      sync.Mutex
 	session *workerSession
@@ -239,8 +242,12 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 		}
 		wk.mu.Unlock()
 	}()
+	capabilities := []string{CapabilityGracefulDrain}
+	if len(wk.CallbackActions) > 0 {
+		capabilities = append(capabilities, CapabilityAsyncActionCallback)
+	}
 	if err := s.send(MsgHello, Hello{Worker: wk.Name, Actions: wk.Actions, Credit: conc, Token: wk.Token,
-		Capabilities: []string{CapabilityGracefulDrain}}); err != nil {
+		Capabilities: capabilities, CallbackActions: wk.CallbackActions}); err != nil {
 		s.finish(err)
 		return err
 	}
@@ -270,7 +277,7 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 					delete(cancels, seq)
 				}
 				cmu.Unlock()
-				if err := s.sendResult(Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait}); err != nil {
+				if err := s.sendResult(Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait, Pending: res.Pending}); err != nil {
 					s.finish(err)
 				}
 			}

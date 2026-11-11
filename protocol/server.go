@@ -21,6 +21,9 @@ type Server struct {
 	E *engine.Engine
 	// Token, if set, must be in every worker's Hello (ADR 0037).
 	Token string
+	// Callback issues a daemon-owned callback for eligible worker tasks. Nil
+	// disables async callback capability negotiation (ADR 0070).
+	Callback func(*task.Task) *task.Callback
 
 	once sync.Once
 	// asking counts the connections that asked for RunEnd: with none, a
@@ -136,9 +139,12 @@ func (s *Server) handle(c net.Conn) {
 	}
 	c.SetReadDeadline(time.Time{})
 	if len(h.Capabilities) > 0 {
-		selected := make([]string, 0, 1)
+		selected := make([]string, 0, 2)
 		if hasCapability(h.Capabilities, CapabilityGracefulDrain) {
 			selected = append(selected, CapabilityGracefulDrain)
+		}
+		if s.Callback != nil && len(h.CallbackActions) > 0 && hasCapability(h.Capabilities, CapabilityAsyncActionCallback) {
+			selected = append(selected, CapabilityAsyncActionCallback)
 		}
 		if WriteFrame(w, MsgHello, Welcome{Capabilities: selected}) != nil || w.Flush() != nil {
 			return
@@ -146,6 +152,13 @@ func (s *Server) handle(c net.Conn) {
 	}
 	if h.Credit <= 0 {
 		h.Credit = 1
+	}
+	callbackActions := make(map[string]bool, len(h.CallbackActions))
+	callbackCap := s.Callback != nil && len(h.CallbackActions) > 0 && hasCapability(h.Capabilities, CapabilityAsyncActionCallback)
+	if callbackCap {
+		for _, action := range h.CallbackActions {
+			callbackActions[action] = true
+		}
 	}
 	d := s.E.Dispatcher()
 	var p *sched.Poller
@@ -252,6 +265,13 @@ func (s *Server) handle(c net.Conn) {
 			seq := t.Seq
 			tt := *t
 			tt.Input = in
+			if callbackActions[t.Action] {
+				issued := s.Callback(t)
+				tt.Callback = issued
+				// Keep the issued capability with the outstanding task. The
+				// pending result is interpreted after the sent copy is gone.
+				t.Callback = issued
+			}
 			// Registered before the frame is written (a large frame reaches
 			// the worker before WriteFrame returns, and so may its Result),
 			// under wmu, which the Cancel sender also needs: a Cancel never
@@ -295,7 +315,13 @@ func (s *Server) handle(c net.Conn) {
 			if t == nil {
 				continue
 			}
-			s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait})
+			pending := res.Pending
+			invalidPending := pending && (t.Callback == nil || len(res.Output) > 0 || res.Err != "" || res.Retryable || res.Unknown || res.Tokens != 0 || res.ErrType != "" || len(res.Meta) > 0 || res.RateLimited || res.Wait != nil)
+			if invalidPending {
+				s.E.Complete(t, task.Result{Err: "worker sent pending without a negotiated callback", Unknown: true, Retryable: true, ErrType: "protocol"})
+			} else {
+				s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait, Pending: pending})
+			}
 			if drained {
 				wmu.Lock()
 				err = WriteFrame(w, MsgCredit, Credit{N: 1})

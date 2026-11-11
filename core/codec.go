@@ -15,8 +15,9 @@ import (
 // adds run limits and counters (ADR 0030). Version 4 has the same layout:
 // an activation may be a step waiting for its deadline (ADR 0045), which
 // older code would not understand, so it refuses version 4 snapshots
-// instead of leaving such a run stuck.
-const codecVersion = 4
+// instead of leaving such a run stuck. Version 5 adds the pending flag for
+// async HTTP actions (ADR 0070); version 4 snapshots still decode.
+const codecVersion = 5
 
 var errCorrupt = errors.New("core: corrupt snapshot")
 

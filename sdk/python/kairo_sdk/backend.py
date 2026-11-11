@@ -95,6 +95,7 @@ class HttpBackend:
         self._tenant = tenant
         self._concurrency = concurrency
         self._worker: Worker | None = None
+        self.callback_actions: list[str] = []
         self.owner = f"kairo-python-{os.getpid()}-{id(self):x}"
         self.lease_ms = lease_ms
         self._claims: dict[str, dict[str, Any]] = {}
@@ -114,7 +115,14 @@ class HttpBackend:
         self._renew_task = asyncio.create_task(self._renew())
         if self._addr is None:
             return
-        self._worker = Worker(f"kairo-sdk-{os.getpid()}", [s["action"] for s in specs], serve, self._concurrency, token=self._token)
+        self._worker = Worker(
+            f"kairo-sdk-{os.getpid()}",
+            [s["action"] for s in specs],
+            serve,
+            self._concurrency,
+            token=self._token,
+            callback_actions=self.callback_actions,
+        )
         threading.Thread(target=self._serve_forever, args=(self._worker,), daemon=True).start()
 
     def _serve_forever(self, w: Worker) -> None:

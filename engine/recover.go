@@ -71,7 +71,7 @@ func (s *shard) recover() error {
 				if r.snapLSN >= x.cpLSN {
 					x.meta, x.cpLSN, x.cpRec = r.meta, r.snapLSN, lsn
 				}
-			case recEvent:
+			case recEvent, recEventV2:
 				if x := runs[r.runID]; x != nil {
 					x.events = append(x.events, lsnEvent{lsn: lsn, ev: r.ev})
 				}

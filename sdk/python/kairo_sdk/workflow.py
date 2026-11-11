@@ -593,12 +593,16 @@ class Kairo:
         for name in BUILTIN:
             specs.append({"action": name, "effect": "unprotected"})
         if any(a.url for a in self._actions.values()):
-            # Actions over HTTP(S) (ADR 0052) take their outcomes on the callback.
-            if not self._secret or not self._callback_url:
-                raise ValueError("actions with a url need secret and callback_url")
-            check_url(self._callback_url, self._allow_insecure)
-            if not hasattr(self.backend, "complete"):
-                raise ValueError("actions with a url need the embedded backend")
+            if not self._secret:
+                raise ValueError("actions with a url need secret")
+            if isinstance(self.backend, HttpBackend):
+                self.backend.callback_actions = [name for name, a in self._actions.items() if a.url]
+            else:
+                if not self._callback_url:
+                    raise ValueError("actions with a url need callback_url with the embedded backend")
+                check_url(self._callback_url, self._allow_insecure)
+                if not hasattr(self.backend, "complete"):
+                    raise ValueError("actions with a url need the embedded backend or kairod")
         for name, a in self._actions.items():
             if not a.limit and not a.rate:
                 continue
@@ -946,6 +950,9 @@ class Kairo:
     def _call_remote(self, task: Task, a: _Action, input: Any) -> Result:
         """Calls an action over HTTP(S) (ADR 0052); on the step's thread."""
         assert a.url and self._secret
+        callback = task.callback.get("url") if task.callback else None
+        if callback is None and self._rt is not None:
+            callback = self._callback_url
         body = json.dumps(
             {
                 "run_id": task.run_id,
@@ -955,7 +962,7 @@ class Kairo:
                 "action": task.action,
                 "input": input,
                 "idempotency_key": task.idempotency_key,
-                "callback": self._callback_url,
+                "callback": callback,
             },
             separators=(",", ":"),
             ensure_ascii=False,
@@ -973,6 +980,13 @@ class Kairo:
             # It may have run: unknown (invariant 5).
             return Result(error=f"calling {a.url}: {e}", unknown=True, retryable=True, error_type="http")
         if r.status == 202:
+            if not callback:
+                return Result(
+                    error="the async action did not receive a callback",
+                    unknown=True,
+                    retryable=True,
+                    error_type="unsupported",
+                )
             return Result(pending={"owner": f"remote:{a.url}", "lease_ms": lease_ms})
         if 200 <= r.status < 300:
             try:

@@ -15,6 +15,7 @@
 
 export const MAX_FRAME = 64 << 20;
 export const CAPABILITY_GRACEFUL_DRAIN = 'graceful-drain-v1';
+export const CAPABILITY_ASYNC_ACTION_CALLBACK = 'async-action-callback-v1';
 
 export const MsgType = {
 	Hello: 1,
@@ -41,6 +42,7 @@ export interface Task {
 	params?: unknown;
 	seq: number;
 	depth?: number;
+	callback?: { url: string; until: number };
 	[key: string]: unknown;
 }
 
@@ -64,9 +66,8 @@ export interface Result {
 	/** `until`: unix milliseconds (rounded down to an integer). */
 	wait?: { until: number; output?: unknown };
 	/**
-	 * Embedded runtime only (ADR 0052): the step runs elsewhere and its
-	 * outcome comes later (Embedded.complete). Its lease goes to owner for
-	 * leaseMs. Not sent over the worker protocol.
+	 * The step runs elsewhere and its outcome comes later. Embedded uses
+	 * the lease value; the worker protocol serializes this as pending=true.
 	 */
 	pending?: { owner: string; leaseMs: number };
 }
@@ -75,7 +76,8 @@ export class ProtocolError extends Error {}
 
 export function resultBody(seq: number, r: Result): Record<string, unknown> {
 	const b: Record<string, unknown> = { seq };
-	if (r.error !== undefined || r.unknown) b.error = r.error ?? '';
+	if (r.pending) b.pending = true;
+	else if (r.error !== undefined || r.unknown) b.error = r.error ?? '';
 	else if (r.wait) b.wait = { until: Math.floor(r.wait.until), output: r.wait.output ?? null };
 	else b.output = r.output ?? null;
 	if (r.retryable) b.retryable = true;
