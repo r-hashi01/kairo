@@ -7,6 +7,7 @@ import { Embedded, type ActionHandler, type EmbeddedOptions, type RunStart } fro
 import type { Result } from './protocol.ts';
 import { Worker, type Address } from './worker.ts';
 import { ChildrenUnsettledError, ParentUnavailableError } from './store.ts';
+import { MetricEmitter, MetricName, type MetricSink } from './metrics.ts';
 
 export interface Backend {
 	/** Registers the actions, and runs their steps with serve (here, or on a worker). */
@@ -54,6 +55,7 @@ export interface HttpBackendOptions {
 	token?: string;
 	concurrency?: number;
 	leaseMs?: number;
+	metrics?: MetricSink;
 }
 
 export interface DriveClaim {
@@ -77,11 +79,17 @@ export class HttpBackend implements Backend {
 	private readonly startAbort = new AbortController();
 	private activeStarts = 0;
 	private startIdleWaiters: Array<() => void> = [];
+	private metrics?: MetricEmitter;
 
 	constructor(opts: HttpBackendOptions = {}) {
 		this.opts = opts;
 		this.client = new Client(opts.url);
 		this.leaseMs = opts.leaseMs ?? 30_000;
+		if (opts.metrics) this.metrics = new MetricEmitter(opts.metrics);
+	}
+
+	setMetrics(metrics: MetricEmitter | undefined): void {
+		this.metrics = metrics;
 	}
 
 	async start(specs: NodeSpec[], serve: ActionHandler): Promise<void> {
@@ -118,13 +126,15 @@ export class HttpBackend implements Backend {
 		// restarts still finds its finished calls' results.
 		const signal = opts.signal ? AbortSignal.any([opts.signal, this.startAbort.signal]) : this.startAbort.signal;
 		this.activeStarts++;
+		const started = this.metrics ? performance.now() : 0;
+		let outcome = 'failed';
 		try {
 			let delay = 50;
 			let attempt = 0;
 			for (;;) {
 				if (signal.aborted) throw signal.reason ?? new Error(`run ${opts.runId}: stopped while confirming its start`);
 				try {
-					return await this.client.run(plan, input, {
+					const result = await this.client.run(plan, input, {
 					runId: opts.runId,
 					tier: 'file',
 					vars: opts.vars,
@@ -134,16 +144,33 @@ export class HttpBackend implements Backend {
 					drive: !!opts.drive,
 					signal,
 				});
+					outcome = 'confirmed';
+					return result;
 				} catch (e) {
 					if (signal.aborted) throw signal.reason ?? e;
 					if (e instanceof KairoError && e.status === 409) throw new ParentUnavailableError(e.message);
 					if (!(e instanceof KairoTransportError) && !(e instanceof KairoError && (e.status === 504 || e.status === 429))) throw e;
+					let cause = 'transport';
+					if (e instanceof KairoError) cause = e.status === 429 ? 'overloaded' : 'unconfirmed';
+					if (e instanceof KairoTransportError)
+						this.metrics?.emit({ name: MetricName.runStartUnconfirmed, kind: 'counter', unit: '{event}', value: 1, labels: { cause: 'transport_ambiguity' } });
+					else if (e.status === 504)
+						this.metrics?.emit({ name: MetricName.runStartUnconfirmed, kind: 'counter', unit: '{event}', value: 1, labels: { cause: 'durability_timeout' } });
+					this.metrics?.emit({ name: MetricName.runStartRetries, kind: 'counter', unit: '{event}', value: 1, labels: { cause } });
 					await abortableDelay(retryDelay(delay, e instanceof KairoError ? e.retryAfterMs : undefined, opts.runId, attempt), signal);
 				}
 				attempt++;
 				delay = Math.min(delay * 2, 1000);
 			}
 		} finally {
+			if (signal.aborted) outcome = 'cancelled';
+			this.metrics?.emit({
+				name: MetricName.runStartConfirmation,
+				kind: 'histogram',
+				unit: 's',
+				value: (performance.now() - started) / 1000,
+				labels: { outcome },
+			});
 			this.activeStarts--;
 			if (this.activeStarts === 0) {
 				for (const resolve of this.startIdleWaiters.splice(0)) resolve();

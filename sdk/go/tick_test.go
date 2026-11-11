@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,14 @@ func TestConcurrentTicksAreSerialized(t *testing.T) {
 }
 
 func TestRemoteRunRetriesUnconfirmedStartWithSameID(t *testing.T) {
+	var mu sync.Mutex
+	var measured []Metric
+	emitter := newMetricEmitter(MetricSinkFunc(func(batch []Metric) error {
+		mu.Lock()
+		measured = append(measured, batch...)
+		mu.Unlock()
+		return nil
+	}))
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if n := calls.Add(1); n == 1 {
@@ -73,10 +82,23 @@ func TestRemoteRunRetriesUnconfirmedStartWithSameID(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"run_id": "same", "existing": true})
 	}))
 	defer srv.Close()
-	m := &remote{url: srv.URL, client: srv.Client()}
+	m := &remote{url: srv.URL, client: srv.Client(), metrics: emitter}
 	existing, err := m.run(context.Background(), "plan", nil, "same", runSpec{})
+	emitter.close()
 	if err != nil || !existing || calls.Load() != 2 {
 		t.Fatalf("existing=%v calls=%d err=%v", existing, calls.Load(), err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	seen := map[string]int{}
+	for _, metric := range measured {
+		seen[metric.Name]++
+		if metric.Labels.Cause == "" && metric.Labels.Outcome == "" {
+			t.Fatalf("metric has no bounded cause/outcome: %+v", metric)
+		}
+	}
+	if seen["kairo_run_start_unconfirmed_total"] != 1 || seen["kairo_run_start_confirmation_retries_total"] != 1 || seen["kairo_run_start_confirmation_seconds"] != 1 {
+		t.Fatalf("measurements = %#v", measured)
 	}
 }
 

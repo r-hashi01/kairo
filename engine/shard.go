@@ -13,6 +13,7 @@ import (
 	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/ir"
 	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/mpsc"
 	"github.com/r-hashi01/kairo/obs"
 	"github.com/r-hashi01/kairo/sched"
@@ -830,6 +831,7 @@ func (s *shard) event(r *run, ev core.Event) {
 		return
 	}
 	ev.At = s.now
+	wasBlocked := r.status == core.StatusBlocked
 	var out []core.Command
 	var err error
 	if s.e.feed != nil {
@@ -856,6 +858,10 @@ func (s *shard) event(r *run, ev core.Event) {
 	}
 	if r.status = r.st.Status; r.status == core.StatusBlocked || r.reviews != nil {
 		r.reviews = reviews(r)
+	}
+	if !wasBlocked && r.status == core.StatusBlocked {
+		s.e.measure(metrics.Measurement{Name: metrics.RunBlocked, Kind: metrics.Counter, Unit: "{event}", Value: 1,
+			Labels: metrics.Labels{Reason: "real_outcome_unknown"}})
 	}
 	s.commands(r, out)
 	if !r.done {

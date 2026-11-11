@@ -27,6 +27,7 @@ import (
 	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/ir"
 	"github.com/r-hashi01/kairo/live"
+	"github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/mpsc"
 	"github.com/r-hashi01/kairo/obs"
 	"github.com/r-hashi01/kairo/sched"
@@ -144,6 +145,9 @@ type Config struct {
 	EstimateTokens func(t *task.Task) int
 
 	Observe obs.Sink
+	// Metrics receives bounded-cardinality operational measurements (ADR
+	// 0076). Nil disables them without starting a goroutine or reading time.
+	Metrics metrics.Sink
 
 	// Keys, if set, encrypts and authenticates everything stored: every
 	// log, snapshots and blobs (ADR 0021). Data written with keys can only
@@ -249,19 +253,20 @@ var (
 )
 
 type Engine struct {
-	cfg    Config
-	shards []*shard
-	disp   *sched.Dispatcher
-	adm    *sched.Admission
-	starts *sched.StartAdmission
-	live   *live.Hub
-	obs    *obs.Stream
-	blobs  blob.Store
-	snaps  blob.Store
-	tiers  [tierCount]bool
-	io     chan func()         // fixed pool of I/O workers
-	ioq    *mpsc.Queue[func()] // unbounded, never blocks the caller
-	ioStop chan struct{}
+	cfg     Config
+	shards  []*shard
+	disp    *sched.Dispatcher
+	adm     *sched.Admission
+	starts  *sched.StartAdmission
+	live    *live.Hub
+	obs     *obs.Stream
+	metrics *metrics.Stream
+	blobs   blob.Store
+	snaps   blob.Store
+	tiers   [tierCount]bool
+	io      chan func()         // fixed pool of I/O workers
+	ioq     *mpsc.Queue[func()] // unbounded, never blocks the caller
+	ioStop  chan struct{}
 
 	plansMu sync.RWMutex
 	plans   map[string]*ir.Plan // by name and by name@hash
@@ -334,6 +339,7 @@ func New(cfg Config) (*Engine, error) {
 		starts:       sched.NewStartAdmission(cfg.Admission.MaxStarting, cfg.Now),
 		live:         live.NewHub(),
 		obs:          obs.NewStream(cfg.Observe, 1<<16, 512),
+		metrics:      metrics.NewStream(cfg.Metrics, 4096, 256),
 		plans:        map[string]*ir.Plan{},
 		waiters:      map[string][]chan RunInfo{},
 		finished:     map[string]RunInfo{},
@@ -342,6 +348,9 @@ func New(cfg Config) (*Engine, error) {
 		ioStop:       make(chan struct{}),
 		stopped:      make(chan struct{}),
 		driveChanged: make(chan struct{}),
+	}
+	if e.metrics != nil {
+		e.starts.SetObserver(e.observeStart)
 	}
 	var err error
 	if e.blobs = cfg.Blobs; e.blobs == nil {
@@ -511,6 +520,7 @@ func (e *Engine) Close() {
 		s.close()
 	}
 	e.obs.Close()
+	e.metrics.Close()
 }
 
 func (e *Engine) ioWorker() {
@@ -1246,6 +1256,8 @@ type Stats struct {
 	DispatchQueued          int
 	InMemory, Evicted       int
 	ObsDropped              uint64
+	MetricDropped           uint64
+	MetricFailed            uint64
 	// FeedBacklog is the most unacknowledged feed entries any subscription
 	// holds (ADR 0034).
 	FeedBacklog int
@@ -1270,6 +1282,8 @@ func (e *Engine) Stats() Stats {
 		st.Evicted += int(s.evicted.Load())
 	}
 	st.ObsDropped = e.obs.Dropped()
+	st.MetricDropped = e.metrics.Dropped()
+	st.MetricFailed = e.metrics.Failed()
 	if e.feed != nil {
 		st.FeedBacklog = e.feed.backlog()
 	}
@@ -1277,6 +1291,55 @@ func (e *Engine) Stats() Stats {
 		st.FailedLogs += int(s.failedLogs.Load())
 	}
 	return st
+}
+
+func (e *Engine) measure(m metrics.Measurement) { e.metrics.Emit(m) }
+
+func (e *Engine) MetricsEnabled() bool { return e.metrics != nil }
+
+// ObserveWorkflowClaim records one of the finite claim paths and outcomes
+// defined by ADR 0076. API calls it at the HTTP ownership boundary.
+func (e *Engine) ObserveWorkflowClaim(path, outcome string, duration time.Duration) {
+	if path != "direct" && path != "scan" {
+		return
+	}
+	switch outcome {
+	case "claimed", "empty", "cancelled", "failed":
+	default:
+		return
+	}
+	labels := metrics.Labels{Path: path, Outcome: outcome}
+	e.measure(metrics.Measurement{Name: metrics.WorkflowClaim, Kind: metrics.Counter, Unit: "{event}", Value: 1, Labels: labels})
+	e.measure(metrics.Measurement{Name: metrics.WorkflowClaimDuration, Kind: metrics.Histogram, Unit: "s", Value: duration.Seconds(), Labels: labels})
+}
+
+// ObserveWorkerDisconnect records a worker disconnect without identifying
+// the worker or its tasks.
+func (e *Engine) ObserveWorkerDisconnect(tasks int) {
+	outstanding := "none"
+	if tasks > 0 {
+		outstanding = "present"
+	}
+	e.measure(metrics.Measurement{Name: metrics.WorkerDisconnect, Kind: metrics.Counter, Unit: "{event}", Value: 1,
+		Labels: metrics.Labels{Outstanding: outstanding}})
+	e.measure(metrics.Measurement{Name: metrics.WorkerDisconnectTasks, Kind: metrics.Histogram, Unit: "{task}", Value: float64(tasks)})
+}
+
+func (e *Engine) observeStart(o sched.StartObservation) {
+	labels := metrics.Labels{Shard: strconv.Itoa(o.Key.Shard), Tier: Tier(o.Key.Tier).String()}
+	switch o.Kind {
+	case sched.StartGauge:
+		e.measure(metrics.Measurement{Name: metrics.DurableStartInflight, Kind: metrics.Gauge, Unit: "{start}", Value: float64(o.Inflight), Labels: labels})
+		e.measure(metrics.Measurement{Name: metrics.DurableStartQueued, Kind: metrics.Gauge, Unit: "{start}", Value: float64(o.Queued), Labels: labels})
+	case sched.StartRejected:
+		e.measure(metrics.Measurement{Name: metrics.DurableStartRejected, Kind: metrics.Counter, Unit: "{event}", Value: 1, Labels: labels})
+	case sched.StartQueueWait:
+		e.measure(metrics.Measurement{Name: metrics.DurableStartQueue, Kind: metrics.Histogram, Unit: "s", Value: o.Duration.Seconds(), Labels: labels})
+	case sched.StartInboxWait:
+		e.measure(metrics.Measurement{Name: metrics.DurableStartInbox, Kind: metrics.Histogram, Unit: "s", Value: o.Duration.Seconds(), Labels: labels})
+	case sched.StartWALWait:
+		e.measure(metrics.Measurement{Name: metrics.DurableStartWALAck, Kind: metrics.Histogram, Unit: "s", Value: o.Duration.Seconds(), Labels: labels})
+	}
 }
 
 // checkShardCount pins the number of shards of a data directory: runs are

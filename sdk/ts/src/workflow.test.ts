@@ -13,6 +13,7 @@ import { after, before, describe, test } from 'node:test';
 import { EmbeddedBackend, HttpBackend, type Backend } from './backend.ts';
 import { KairoError } from './client.ts';
 import { ObservationKind, StepStatus } from './observe.ts';
+import { MetricName, type Metric } from './metrics.ts';
 import { PostgresStore, SQLiteStore } from './store.ts';
 import { ParentUnavailableError } from './store.ts';
 import { CallError, CancelledError, Kairo, RunSettledError, Suspended, UnknownOutcomeError } from './workflow.ts';
@@ -64,9 +65,15 @@ async function waitUntil(cond: () => boolean | Promise<boolean>): Promise<void> 
 
 test('remote drain uses the backend', async () => {
 	let drained = false;
+	const measured: Metric[] = [];
 	const backend = { async drain() { drained = true; } } as unknown as Backend;
-	await new Kairo({ backend }).drain();
+	await new Kairo({ backend, metrics: (metric) => measured.push(metric) }).drain();
+	await Promise.resolve();
 	assert.equal(drained, true);
+	assert.deepEqual(
+		new Set(measured.map((metric) => metric.name)),
+		new Set([MetricName.drain, MetricName.drainDuration, MetricName.drainStartingTasks, MetricName.drainStartingDrives]),
+	);
 });
 
 test('concurrent ticks take turns', async () => {
@@ -99,7 +106,8 @@ test('concurrent ticks take turns', async () => {
 });
 
 test('an unconfirmed start is retried with the same id', async () => {
-	const backend = new HttpBackend();
+	const measured: Metric[] = [];
+	const backend = new HttpBackend({ metrics: (metric) => measured.push(metric) });
 	const calls: string[] = [];
 	(backend.client as unknown as { run: (plan: string, input: unknown, opts: { runId?: string }) => Promise<unknown> }).run = async (_plan, _input, opts) => {
 		calls.push(opts.runId ?? '');
@@ -109,6 +117,12 @@ test('an unconfirmed start is retried with the same id', async () => {
 	const out = await backend.run('plan', null, { runId: 'same' });
 	assert.equal(out.existing, true);
 	assert.deepEqual(calls, ['same', 'same']);
+	await Promise.resolve();
+	assert.deepEqual(
+		new Set(measured.map((metric) => metric.name)),
+		new Set([MetricName.runStartUnconfirmed, MetricName.runStartRetries, MetricName.runStartConfirmation]),
+	);
+	assert.equal(measured.some((metric) => 'runId' in (metric.labels ?? {})), false);
 });
 
 test('an overloaded start honors retry metadata and retries with the same id', async () => {

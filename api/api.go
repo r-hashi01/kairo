@@ -364,26 +364,33 @@ func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
 		// If the direct claim races or is not ready, fall back so NextAt and
 		// long-poll behavior stay unchanged.
 		if req.RunID != "" {
+			directAt := a.metricStart()
 			ri, getErr := a.E.GetInput(ctx, req.RunID)
 			if getErr == nil && driveMatch(req, ri) {
 				claim, ok, claimErr := a.E.ClaimWorkflow(ctx, req.RunID, req.Owner, time.Duration(req.LeaseMS)*time.Millisecond)
 				if claimErr != nil {
 					if ctx.Err() != nil {
+						a.claimMetric("direct", "cancelled", directAt)
 						reply(w, http.StatusOK, driveClaimResponse{})
 						return
 					}
+					a.claimMetric("direct", "failed", directAt)
 					fail(w, http.StatusInternalServerError, claimErr)
 					return
 				}
 				if ok {
+					a.claimMetric("direct", "claimed", directAt)
 					claim.Run.Input = ri.Input
 					reply(w, http.StatusOK, driveClaimResponse{Claim: &claim})
 					return
 				}
 			}
+			a.claimMetric("direct", "empty", directAt)
 		}
+		scanAt := a.metricStart()
 		rows, err := a.E.DriveCandidates(ctx)
 		if err != nil {
+			a.claimMetric("scan", "cancelled", scanAt)
 			reply(w, http.StatusOK, driveClaimResponse{})
 			return
 		}
@@ -402,19 +409,23 @@ func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
 			claim, ok, err := a.E.ClaimWorkflow(ctx, row.Run.RunID, req.Owner, time.Duration(req.LeaseMS)*time.Millisecond)
 			if err != nil {
 				if ctx.Err() != nil {
+					a.claimMetric("scan", "cancelled", scanAt)
 					reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
 					return
 				}
+				a.claimMetric("scan", "failed", scanAt)
 				fail(w, http.StatusInternalServerError, err)
 				return
 			}
 			if ok {
+				a.claimMetric("scan", "claimed", scanAt)
 				claim.Run.Input = ri.Input
 				reply(w, http.StatusOK, driveClaimResponse{Claim: &claim})
 				return
 			}
 		}
 		if req.TimeoutMS == 0 {
+			a.claimMetric("scan", "empty", scanAt)
 			reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
 			return
 		}
@@ -435,6 +446,7 @@ func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
 			if stop != nil {
 				stop.Stop()
 			}
+			a.claimMetric("scan", "cancelled", scanAt)
 			reply(w, http.StatusOK, driveClaimResponse{NextAt: next})
 			return
 		}
@@ -442,6 +454,20 @@ func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
 			stop.Stop()
 		}
 	}
+}
+
+func (a *API) metricStart() time.Time {
+	if !a.E.MetricsEnabled() {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func (a *API) claimMetric(path, outcome string, started time.Time) {
+	if started.IsZero() {
+		return
+	}
+	a.E.ObserveWorkflowClaim(path, outcome, time.Since(started))
 }
 
 type driveLeaseRequest struct {

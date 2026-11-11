@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from .client import Client, KairoError, KairoTransportError, finished
 from .embedded import ActionHandler, Embedded
+from .metrics import Metric, MetricEmitter, MetricSink, RUN_START_CONFIRMATION, RUN_START_RETRIES, RUN_START_UNCONFIRMED
 from .protocol import Result
 from .store import Store
 from .store import ChildrenUnsettledError, ParentUnavailableError
@@ -84,6 +85,7 @@ class HttpBackend:
         concurrency: int | None = None,
         lease_ms: int = 30_000,
         request_timeout: float = 90.0,
+        metrics: MetricSink | MetricEmitter | None = None,
     ) -> None:
         # A cancelled asyncio.to_thread call cannot stop urllib's thread. Its
         # lifetime is nevertheless bounded by this HTTP timeout.
@@ -103,6 +105,9 @@ class HttpBackend:
         self._starts: set[asyncio.Task[Any]] = set()
         self._starts_idle = asyncio.Event()
         self._starts_idle.set()
+        self.metrics = (
+            metrics if isinstance(metrics, MetricEmitter) else MetricEmitter(metrics) if metrics is not None else None
+        )
 
     async def start(self, specs: list[dict[str, Any]], serve: ActionHandler) -> None:
         await asyncio.to_thread(self.client.register_nodes, specs)
@@ -143,6 +148,8 @@ class HttpBackend:
         if task is not None:
             self._starts.add(task)
             self._starts_idle.clear()
+        started = time.monotonic() if self.metrics is not None else 0.0
+        outcome = "failed"
         try:
             delay = 0.05
             attempt = 0
@@ -151,7 +158,7 @@ class HttpBackend:
                     raise asyncio.CancelledError
                 minimum = None
                 try:
-                    return await asyncio.to_thread(
+                    result = await asyncio.to_thread(
                         lambda: self.client.run(
                             plan,
                             input,
@@ -166,22 +173,43 @@ class HttpBackend:
                             drive=drive != 0,
                         )
                     )
+                    outcome = "confirmed"
+                    return result
                 except KairoError as e:
                     if e.status == 409:
                         raise ParentUnavailableError(str(e)) from None
                     if e.status not in (429, 504):
                         raise
                     minimum = e.retry_after
+                    cause = "overloaded" if e.status == 429 else "unconfirmed"
+                    if e.status == 504 and self.metrics is not None:
+                        self.metrics.emit(
+                            Metric(RUN_START_UNCONFIRMED, "counter", "{event}", 1, {"cause": "durability_timeout"})
+                        )
                 except KairoTransportError:
-                    pass
+                    cause = "transport"
+                    if self.metrics is not None:
+                        self.metrics.emit(
+                            Metric(RUN_START_UNCONFIRMED, "counter", "{event}", 1, {"cause": "transport_ambiguity"})
+                        )
+                if self.metrics is not None:
+                    self.metrics.emit(Metric(RUN_START_RETRIES, "counter", "{event}", 1, {"cause": cause}))
                 await asyncio.sleep(_retry_delay(delay, minimum, run_id, attempt))
                 attempt += 1
                 delay = min(delay * 2, 1.0)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         finally:
+            if self.metrics is not None:
+                self.metrics.emit(
+                    Metric(RUN_START_CONFIRMATION, "histogram", "s", time.monotonic() - started, {"outcome": outcome})
+                )
             if task is not None:
                 self._starts.discard(task)
                 if not self._starts:
                     self._starts_idle.set()
+
     async def get(self, run_id: str, *, input: bool = False) -> dict[str, Any]:
         return await asyncio.to_thread(self.client.get, run_id, input=input)
 

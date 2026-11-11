@@ -41,6 +41,15 @@ from .backend import Backend, HttpBackend
 from .client import KairoError, finished
 from .embedded import EffectWeakenedError, Embedded, new_token
 from .http import SignatureError, check_url, post, sign, verify
+from .metrics import (
+    DRAIN,
+    DRAIN_DURATION,
+    DRAIN_STARTING_DRIVES,
+    DRAIN_STARTING_TASKS,
+    Metric,
+    MetricEmitter,
+    MetricSink,
+)
 from .observe import LOGGER, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
 from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, WorkflowRetryError, is_workflow_retry
@@ -383,6 +392,7 @@ class Kairo:
         wake: Callable[[int], Awaitable[None]] | None = None,
         logger: logging.Logger | None = None,
         observe: Observer | None = None,
+        metrics: MetricSink | None = None,
     ) -> None:
         """concurrency: steps at once in this process, on kairod's worker or
         in the embedded runtime (ADR 0059; kairo.now, kairo.random and
@@ -409,6 +419,7 @@ class Kairo:
         time and trace them). It is called in the runtime, as it works (on
         the event loop; with kairod, on the worker's threads, and only for
         the steps it runs here): it must not block."""
+        self._metrics = MetricEmitter(metrics) if metrics is not None else None
         self.backend: Any = backend or HttpBackend(
             url,
             worker=worker,
@@ -416,7 +427,10 @@ class Kairo:
             tenant=tenant,
             concurrency=concurrency,
             request_timeout=request_timeout,
+            metrics=self._metrics,
         )
+        if isinstance(self.backend, HttpBackend) and self._metrics is not None:
+            self.backend.metrics = self._metrics
         self._ttl = idempotency_ttl
         self._concurrency = concurrency
         self._actions: dict[str, _Action] = {}
@@ -478,6 +492,13 @@ class Kairo:
         self._slots: _Slots | None = None
         self._limits: dict[str, _Limiter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def metric_stats(self) -> tuple[int, int]:
+        """Measurements dropped before delivery, and sink failures."""
+        if self._metrics is None:
+            return 0, 0
+        return self._metrics.dropped, self._metrics.failed
 
     def action(
         self,
@@ -639,6 +660,30 @@ class Kairo:
         return self._life
 
     async def drain(self) -> None:
+        started = time.monotonic() if self._metrics is not None else 0.0
+        if self._metrics is not None:
+            self._metrics.emit(
+                Metric(DRAIN_STARTING_TASKS, "histogram", "{task}", float(getattr(self.backend, "inflight", 0)))
+            )
+            self._metrics.emit(Metric(DRAIN_STARTING_DRIVES, "histogram", "{drive}", float(len(self._stops))))
+        outcome = "failed"
+        try:
+            await self._drain()
+            outcome = "completed"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as error:
+            if type(error).__name__ == "DrainUnsupportedError":
+                outcome = "unsupported"
+            raise
+        finally:
+            if self._metrics is not None:
+                labels = {"outcome": outcome}
+                self._metrics.emit(Metric(DRAIN, "counter", "{event}", 1, labels))
+                self._metrics.emit(Metric(DRAIN_DURATION, "histogram", "s", time.monotonic() - started, labels))
+
+    async def _drain(self) -> None:
         """Stops this process at the edges of its steps, before close: no new
         step starts here (a workflow driven here stops at its next call, to go
         on where it is driven next; timers and sweeps are left to a tick here
@@ -685,6 +730,8 @@ class Kairo:
         waits = [*self._drives, *self._redrives] + ([self._sweeper] if self._sweeper is not None else [])
         await asyncio.gather(*waits, return_exceptions=True)
         await self.backend.close()
+        if self._metrics is not None:
+            self._metrics.close()
 
     async def tick(self) -> int | None:
         """Suspend mode: takes up due timers and steps whose process stopped,

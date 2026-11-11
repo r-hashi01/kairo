@@ -17,6 +17,7 @@ import (
 
 	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/ir"
+	opmetrics "github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/task"
 	"github.com/r-hashi01/kairo/wal"
@@ -253,7 +254,13 @@ func TestRecoveryRealStepNeedsReview(t *testing.T) {
 	e1.Close()
 
 	var reads atomic.Int32
-	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true})
+	measured := make(chan opmetrics.Measurement, 8)
+	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, Metrics: opmetrics.SinkFunc(func(batch []opmetrics.Measurement) error {
+		for _, metric := range batch {
+			measured <- metric
+		}
+		return nil
+	})})
 	defer e2.Close()
 	mustPlan(t, e2, plan)
 	e2.RegisterExecutor([]string{"llm"}, 2, ExecutorFunc(func(context.Context, *task.Task, func([]byte)) task.Result {
@@ -272,6 +279,14 @@ func TestRecoveryRealStepNeedsReview(t *testing.T) {
 	})
 	if sendCalls.Load() != 1 || len(ri.Reviews) != 1 {
 		t.Fatalf("send executed %d times, reviews %+v", sendCalls.Load(), ri.Reviews)
+	}
+	select {
+	case metric := <-measured:
+		if metric.Name != opmetrics.RunBlocked || metric.Labels.Reason != "real_outcome_unknown" {
+			t.Fatalf("blocked measurement = %+v", metric)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked measurement was not emitted")
 	}
 	// The operator confirms the message was sent.
 	e2.Resolve(id, ri.Reviews[0].Act, json.RawMessage(`"confirmed"`), "")

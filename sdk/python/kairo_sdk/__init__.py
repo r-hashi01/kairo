@@ -26,6 +26,7 @@ from .observe import (
     Observation,
     Observer,
 )
+from .metrics import Metric, MetricSink
 from .protocol import CAPABILITY_GRACEFUL_DRAIN, Cancel, Chunk, Credit, Hello, MsgType, ProtocolError, Result, read_frame, write_frame
 from .worker import DrainUnsupportedError, Task, TaskContext, Worker
 from .store import ParentUnavailableError, PostgresStore, SQLiteStore, WorkflowRetryError
@@ -65,6 +66,8 @@ __all__ = [
     "Kairo",
     "KairoError",
     "Observation",
+    "Metric",
+    "MetricSink",
     "Observer",
     "RUN_SETTLED",
     "RUN_STARTED",

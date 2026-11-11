@@ -19,6 +19,7 @@ from kairo_sdk.backend import EmbeddedBackend, HttpBackend
 from kairo_sdk.observe import STEP_FINISHED, STEP_UNKNOWN
 from kairo_sdk.store import ParentUnavailableError, SQLiteStore
 from kairo_sdk.client import KairoError
+from kairo_sdk.metrics import Metric, MetricEmitter
 from kairo_sdk.workflow import CallError, Cancelled, Kairo, RunSettledError, StoppedError, Suspended, UnknownOutcomeError
 
 try:
@@ -69,11 +70,28 @@ class TickSerializationTest(unittest.TestCase):
             async def drain(self) -> None:
                 self.drained = True
 
+            async def close(self) -> None:
+                pass
+
         async def main() -> None:
             backend = Backend()
-            k = Kairo(backend=backend)
+            measured: list[Metric] = []
+            ready = threading.Event()
+
+            def metric(value: Metric) -> None:
+                measured.append(value)
+                if len(measured) == 4:
+                    ready.set()
+
+            k = Kairo(backend=backend, metrics=metric)
             await k.drain()
             self.assertTrue(backend.drained)
+            self.assertTrue(await asyncio.to_thread(ready.wait, 1))
+            self.assertEqual(
+                {m.name for m in measured},
+                {"kairo_drain_total", "kairo_drain_seconds", "kairo_drain_starting_tasks", "kairo_drain_starting_drives"},
+            )
+            await k.close()
 
         asyncio.run(main())
 
@@ -112,7 +130,15 @@ class TickSerializationTest(unittest.TestCase):
 
     def test_unconfirmed_start_is_retried_with_same_id(self) -> None:
         async def main() -> None:
-            backend = HttpBackend()
+            measured: list[Metric] = []
+            ready = threading.Event()
+
+            def metric(value: Metric) -> None:
+                measured.append(value)
+                if len(measured) == 3:
+                    ready.set()
+
+            backend = HttpBackend(metrics=MetricEmitter(metric))
             calls: list[str] = []
 
             def run(_plan, _input, **opts):
@@ -125,6 +151,16 @@ class TickSerializationTest(unittest.TestCase):
             out = await backend.run("plan", None, run_id="same")
             self.assertTrue(out["existing"])
             self.assertEqual(calls, ["same", "same"])
+            self.assertTrue(await asyncio.to_thread(ready.wait, 1))
+            self.assertEqual(
+                {m.name for m in measured},
+                {
+                    "kairo_run_start_unconfirmed_total",
+                    "kairo_run_start_confirmation_retries_total",
+                    "kairo_run_start_confirmation_seconds",
+                },
+            )
+            self.assertTrue(all("run_id" not in m.labels for m in measured))
 
         asyncio.run(main())
 

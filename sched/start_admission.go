@@ -26,14 +26,35 @@ type StartStat struct {
 	WALWaitMS   float64 `json:"wal_wait_ms,omitempty"`
 }
 
+type StartObservationKind uint8
+
+const (
+	StartGauge StartObservationKind = iota + 1
+	StartRejected
+	StartQueueWait
+	StartInboxWait
+	StartWALWait
+)
+
+// StartObservation is one bounded operational measurement from durable-start
+// admission. Observe is called while the admission lock is held and must not
+// block (ADR 0076).
+type StartObservation struct {
+	Kind             StartObservationKind
+	Key              StartKey
+	Inflight, Queued int
+	Duration         time.Duration
+}
+
 // StartAdmission admits durable starts according to the storage round trips
 // observed for each shard and tier. Its queues are round-robin by tenant.
 // It performs no I/O and calls start only without its lock held (ADR 0074).
 type StartAdmission struct {
-	mu    sync.Mutex
-	now   func() time.Time
-	max   int
-	lanes map[StartKey]*startLane
+	mu       sync.Mutex
+	now      func() time.Time
+	max      int
+	lanes    map[StartKey]*startLane
+	observer func(StartObservation)
 }
 
 type startLane struct {
@@ -75,6 +96,20 @@ func NewStartAdmission(max int, now func() time.Time) *StartAdmission {
 	return &StartAdmission{now: now, max: max, lanes: map[StartKey]*startLane{}}
 }
 
+// SetObserver installs the process-level operational observer before Admit is
+// used. A nil observer leaves the hot path with one nil check.
+func (a *StartAdmission) SetObserver(observe func(StartObservation)) { a.observer = observe }
+
+func (a *StartAdmission) observed(o StartObservation) {
+	if a.observer != nil {
+		a.observer(o)
+	}
+}
+
+func (a *StartAdmission) gauge(key StartKey, l *startLane) {
+	a.observed(StartObservation{Kind: StartGauge, Key: key, Inflight: l.inflight, Queued: l.queued})
+}
+
 func (a *StartAdmission) lane(key StartKey) *startLane {
 	l := a.lanes[key]
 	if l == nil {
@@ -96,12 +131,14 @@ func (a *StartAdmission) Admit(key StartKey, tenant string, start func(*StartTic
 	if l.queued == 0 && l.inflight < l.window {
 		l.inflight++
 		e.state, e.admittedAt = 1, now
+		a.gauge(key, l)
 		a.mu.Unlock()
 		start(ticket)
 		return ticket, nil
 	}
 	if l.queued >= 4*l.window {
 		l.rejected++
+		a.observed(StartObservation{Kind: StartRejected, Key: key})
 		a.mu.Unlock()
 		return nil, ErrOverloaded
 	}
@@ -110,6 +147,7 @@ func (a *StartAdmission) Admit(key StartKey, tenant string, start func(*StartTic
 	}
 	l.queues[tenant] = append(l.queues[tenant], e)
 	l.queued++
+	a.gauge(key, l)
 	a.mu.Unlock()
 	return ticket, nil
 }
@@ -125,6 +163,7 @@ func (t *StartTicket) Cancel() bool {
 	l := a.lane(t.key)
 	a.removeQueued(l, t.e)
 	t.e.state = 2
+	a.gauge(t.key, l)
 	return true
 }
 
@@ -139,6 +178,7 @@ func (a *StartAdmission) Drop(t *StartTicket) {
 	if t.e.state == 0 {
 		a.removeQueued(l, t.e)
 		t.e.state = 2
+		a.gauge(t.key, l)
 		a.mu.Unlock()
 		return
 	}
@@ -148,7 +188,8 @@ func (a *StartAdmission) Drop(t *StartTicket) {
 	}
 	t.e.state = 2
 	l.inflight--
-	starts := a.startQueued(l)
+	starts := a.startQueued(t.key, l)
+	a.gauge(t.key, l)
 	a.mu.Unlock()
 	for _, start := range starts {
 		start()
@@ -163,8 +204,10 @@ func (a *StartAdmission) ObserveInbox(t *StartTicket, now time.Time) {
 	a.mu.Lock()
 	if t.e.state == 1 {
 		l := a.lane(t.key)
-		l.inboxWait = moving(l.inboxWait, nonnegative(now.Sub(t.e.admittedAt)), 8)
+		wait := nonnegative(now.Sub(t.e.admittedAt))
+		l.inboxWait = moving(l.inboxWait, wait, 8)
 		t.e.inboxAt = now
+		a.observed(StartObservation{Kind: StartInboxWait, Key: t.key, Duration: wait})
 	}
 	a.mu.Unlock()
 }
@@ -190,6 +233,7 @@ func (a *StartAdmission) ConfirmRound(key StartKey, round uint64, tickets []*Sta
 			from = t.e.admittedAt
 		}
 		walWait = max(walWait, nonnegative(now.Sub(from)))
+		a.observed(StartObservation{Kind: StartWALWait, Key: key, Duration: nonnegative(now.Sub(from))})
 		t.e.state = 2
 		l.inflight--
 	}
@@ -198,7 +242,8 @@ func (a *StartAdmission) ConfirmRound(key StartKey, round uint64, tickets []*Sta
 		l.walWait = moving(l.walWait, walWait, 8)
 		a.observe(l, rtt, false, saturated)
 	}
-	starts := a.startQueued(l)
+	starts := a.startQueued(key, l)
+	a.gauge(key, l)
 	a.mu.Unlock()
 	for _, start := range starts {
 		start()
@@ -239,7 +284,7 @@ func (a *StartAdmission) observe(l *startLane, rtt time.Duration, failed, satura
 	}
 }
 
-func (a *StartAdmission) startQueued(l *startLane) []func() {
+func (a *StartAdmission) startQueued(key StartKey, l *startLane) []func() {
 	var starts []func()
 	for l.inflight < l.window && len(l.ring) > 0 {
 		idx := l.rr % len(l.ring)
@@ -248,7 +293,9 @@ func (a *StartAdmission) startQueued(l *startLane) []func() {
 		e := q[0]
 		now := a.now()
 		e.state, e.admittedAt = 1, now
-		l.queueWait = moving(l.queueWait, nonnegative(now.Sub(e.queuedAt)), 8)
+		wait := nonnegative(now.Sub(e.queuedAt))
+		l.queueWait = moving(l.queueWait, wait, 8)
+		a.observed(StartObservation{Kind: StartQueueWait, Key: key, Duration: wait})
 		l.queued--
 		l.inflight++
 		starts = append(starts, func() { e.start(e.ticket) })
