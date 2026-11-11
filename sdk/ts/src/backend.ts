@@ -24,6 +24,7 @@ export interface Backend {
 	wait(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	waitQuiescent?(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	signal(runId: string, name: string, payload: unknown): Promise<void>;
+	applySignal?(runId: string, name: string, payload: unknown, signalId: string, onlyIfWaiting: boolean): Promise<{ applied: boolean; duplicate?: boolean; early?: boolean }>;
 	children(runId: string): Promise<RunInfo[]>;
 	list(opts?: { workflow?: string; status?: string; since?: number; until?: number; after?: string; limit?: number }): Promise<RunInfo[]>;
 	finish?(runId: string, payload: unknown): Promise<void>;
@@ -144,6 +145,7 @@ export class HttpBackend implements Backend {
 					parent: opts.parent,
 					...(opts.parent ? {} : { workflow: opts.workflow, meta: opts.meta }),
 					drive: !!opts.drive,
+						initialSignal: opts.initialSignal,
 					signal,
 				});
 					outcome = 'confirmed';
@@ -265,6 +267,10 @@ export class HttpBackend implements Backend {
 
 	signal(runId: string, name: string, payload: unknown) {
 		return this.client.signal(runId, name, payload);
+	}
+
+	applySignal(runId: string, name: string, payload: unknown, signalId: string, onlyIfWaiting: boolean) {
+		return this.client.applySignal(runId, name, payload, signalId, onlyIfWaiting);
 	}
 
 	async children(runId: string) {

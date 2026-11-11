@@ -118,6 +118,19 @@ type remoteError struct {
 	retryAfter time.Duration
 }
 
+type remoteSignalRequest struct {
+	Name          string          `json:"name,omitempty"`
+	Payload       json.RawMessage `json:"payload"`
+	ID            string          `json:"signal_id"`
+	OnlyIfWaiting bool            `json:"only_if_waiting,omitempty"`
+}
+
+type remoteSignalResult struct {
+	Applied   bool `json:"applied"`
+	Duplicate bool `json:"duplicate,omitempty"`
+	Early     bool `json:"early,omitempty"`
+}
+
 func (e *remoteError) Error() string { return fmt.Sprintf("kairod: %d %s", e.status, e.msg) }
 
 type remoteTransportError struct{ err error }
@@ -289,6 +302,9 @@ func (m *remote) run(ctx context.Context, plan string, input any, runID string, 
 	}
 	if spec.drive != 0 {
 		body["drive"] = true
+	}
+	if spec.initialSignal != nil {
+		body["initial_signal"] = spec.initialSignal
 	}
 	var out struct {
 		RunID    string `json:"run_id"`
@@ -584,6 +600,17 @@ func (m *remote) releaseAll() {
 func (m *remote) signal(ctx context.Context, runID, name string, payload any) error {
 	_, err := m.call(ctx, http.MethodPost, runPath(runID)+"/signals/"+url.PathEscape(name), payload, nil)
 	return err
+}
+
+func (m *remote) applySignal(ctx context.Context, runID, name string, payload any, signalID string, onlyIfWaiting bool) (remoteSignalResult, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return remoteSignalResult{}, err
+	}
+	body := remoteSignalRequest{Payload: data, ID: signalID, OnlyIfWaiting: onlyIfWaiting}
+	var out remoteSignalResult
+	_, err = m.call(ctx, http.MethodPost, runPath(runID)+"/signals/"+url.PathEscape(name)+"/apply", body, &out)
+	return out, err
 }
 
 func (m *remote) cancel(ctx context.Context, runID string) error {

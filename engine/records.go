@@ -19,6 +19,9 @@ const (
 	// recEventV2 makes binaries predating ADR 0070 reject records with its
 	// event kinds instead of decoding and silently ignoring them.
 	recEventV2 byte = 4
+	// recInitialStart keeps an SDK wait's start and initial signal in one WAL
+	// frame, so recovery cannot expose an empty early wait (ADR 0071).
+	recInitialStart byte = 5
 )
 
 var errBadRecord = errors.New("engine: bad log record")
@@ -88,6 +91,19 @@ func encodeStart(b []byte, m *startMeta) []byte {
 	b = appendStr(b, m.Tenant)
 	b = append(b, tierByte(m))
 	return appendMeta(b, m)
+}
+
+func encodeInitialStart(b []byte, m *startMeta, start, signal *core.Event) []byte {
+	b = append(b, recInitialStart)
+	for _, rec := range [][]byte{
+		encodeStart(nil, m),
+		encodeEvent(nil, m.RunID, start),
+		encodeEvent(nil, m.RunID, signal),
+	} {
+		b = binary.AppendUvarint(b, uint64(len(rec)))
+		b = append(b, rec...)
+	}
+	return b
 }
 
 // encodeCheckpoint records that the snapshot of m.RunID covering the log up
@@ -217,7 +233,8 @@ type record struct {
 	runID   string
 	meta    *startMeta  // start, checkpoint
 	ev      *core.Event // event
-	snapLSN uint64      // checkpoint
+	events  []*core.Event
+	snapLSN uint64 // checkpoint
 }
 
 func decodeMeta(r *rdr) *startMeta {
@@ -248,6 +265,22 @@ func decodeRecord(rec []byte) (record, error) {
 	case recStart:
 		out.meta = decodeMeta(r)
 		out.runID = out.meta.RunID
+	case recInitialStart:
+		parts := make([]record, 3)
+		for i := range parts {
+			part, err := decodeRecord(r.bytes())
+			if err != nil {
+				return out, err
+			}
+			parts[i] = part
+		}
+		if parts[0].kind != recStart || parts[1].ev == nil || parts[1].ev.Kind != core.EvStart ||
+			parts[2].ev == nil || parts[2].ev.Kind != core.EvSignal ||
+			parts[1].runID != parts[0].runID || parts[2].runID != parts[0].runID {
+			return out, errBadRecord
+		}
+		out.meta, out.runID = parts[0].meta, parts[0].runID
+		out.events = []*core.Event{parts[1].ev, parts[2].ev}
 	case recCheckpoint:
 		out.meta = decodeMeta(r)
 		out.runID = out.meta.RunID

@@ -61,11 +61,14 @@ func (s *shard) recover() error {
 				return err
 			}
 			switch r.kind {
-			case recStart:
+			case recStart, recInitialStart:
 				// A start record begins a new run even if an earlier run
 				// used the same id: forget that run's records.
 				x := get(Tier(t), r.meta)
 				*x = recovered{meta: r.meta, tier: Tier(t), startLSN: lsn}
+				for _, ev := range r.events {
+					x.events = append(x.events, lsnEvent{lsn: lsn, ev: ev})
+				}
 			case recCheckpoint:
 				x := get(Tier(t), r.meta)
 				if r.snapLSN >= x.cpLSN {

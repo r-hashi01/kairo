@@ -79,7 +79,8 @@ type Event struct {
 	// EvStart: initial values of the run variables (an object, ADR 0033).
 	Vars json.RawMessage
 	// EvStepOK / EvStepErr: the executor's process data and metadata,
-	// passed through to the step's trace (ADR 0034).
+	// passed through to the step's trace (ADR 0034). EvSignal may carry
+	// durable receipt metadata for an SDK-owned wait (ADR 0071).
 	Meta json.RawMessage
 }
 

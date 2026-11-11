@@ -186,7 +186,7 @@ func (m *machine) apply(ev *Event) error {
 			}
 			a.Flags &^= fSignalWait
 			m.cancelTimer(a)
-			m.complete(ev.Act, a, signalOutput(ev.Data))
+			m.complete(ev.Act, a, signalOutput(ev.Data, ev.Meta))
 			return nil
 		}
 		for _, id := range sortedActs(s) {
@@ -194,7 +194,7 @@ func (m *machine) apply(ev *Event) error {
 			if a.Flags&fSignalWait != 0 && m.p.Nodes[a.Node].Signal == ev.Name {
 				a.Flags &^= fSignalWait
 				m.cancelTimer(a)
-				m.complete(id, a, signalOutput(ev.Data))
+				m.complete(id, a, signalOutput(ev.Data, ev.Meta))
 				return nil
 			}
 		}
@@ -256,13 +256,17 @@ func (m *machine) apply(ev *Event) error {
 	return ErrIgnored
 }
 
-func signalOutput(payload json.RawMessage) json.RawMessage {
+func signalOutput(payload, meta json.RawMessage) json.RawMessage {
 	if len(payload) == 0 {
 		payload = null
 	}
-	b := make([]byte, 0, len(payload)+32)
+	b := make([]byte, 0, len(payload)+len(meta)+64)
 	b = append(b, `{"timed_out":false,"payload":`...)
 	b = append(b, payload...)
+	if len(meta) > 0 {
+		b = append(b, `,"_kairo_signal":`...)
+		b = append(b, meta...)
+	}
 	b = append(b, '}')
 	return b
 }
@@ -364,7 +368,7 @@ func (m *machine) start(node int32, parent, scope uint32, idx int32) {
 				} else {
 					s.Mailbox[n.Signal] = q[1:]
 				}
-				m.complete(id, a, signalOutput(p))
+				m.complete(id, a, signalOutput(p, nil))
 				return
 			}
 			a.Flags |= fSignalWait

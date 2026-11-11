@@ -157,8 +157,9 @@ type driveState struct {
 }
 
 type pendingEvent struct {
-	ev    core.Event
-	reply chan error // non-nil for a callback waiting for durability
+	ev      core.Event
+	reply   chan error          // non-nil for a callback waiting for durability
+	applied chan signalDecision // non-nil for a synchronous signal decision
 }
 
 type timerRef struct {
@@ -184,6 +185,7 @@ type startReq struct {
 	drive         bool            // explicit code-workflow reach (ADR 0069)
 	reply         chan startReply // answered once the start is durable
 	startTicket   *sched.StartTicket
+	initialSignal *SignalRequest
 	inboxObserved bool
 }
 
@@ -228,6 +230,7 @@ const (
 	mDriveRenew
 	mDriveRelease
 	mCallback
+	mApplySignal
 )
 
 type listItem struct {
@@ -251,6 +254,7 @@ type msg struct {
 	attachReply   chan attachReply
 	childrenReply chan []string
 	errReply      chan error
+	appliedReply  chan signalDecision
 	listFilter    ListFilter
 	listReply     chan []listItem
 	quietID       uint64
@@ -551,7 +555,30 @@ func (s *shard) handle(m *msg) {
 			}
 			return
 		}
-		s.eventReply(r, m.ev, m.errReply)
+		s.eventReply(r, m.ev, m.errReply, nil, true)
+	case mApplySignal:
+		r := s.runs[m.runID]
+		if r == nil {
+			m.appliedReply <- signalDecision{}
+			m.errReply <- nil
+			return
+		}
+		if r.done {
+			match, conflict, early := matchSignalEvent(r.st.Output, m.ev)
+			switch {
+			case conflict:
+				m.appliedReply <- signalDecision{}
+				m.errReply <- ErrSignalConflict
+			case match:
+				m.appliedReply <- signalDecision{applied: true, duplicate: true, early: early}
+				s.ackEvent(r, m.errReply)
+			default:
+				m.appliedReply <- signalDecision{}
+				m.errReply <- nil
+			}
+			return
+		}
+		s.eventReply(r, m.ev, m.errReply, m.appliedReply, true)
 	case mAck:
 		s.ack(m.tier, m.lsn, m.err)
 	case mDoneAck:
@@ -805,19 +832,33 @@ func (s *shard) startRun(sr *startReq) {
 		s.e.notifyDrive()
 	}
 	s.inMemory.Add(1)
+	ev := core.Event{Kind: core.EvStart, At: s.now, Data: sr.input, Name: sr.entry,
+		MaxSteps: int32(sr.limits.MaxSteps), Depth: int32(sr.depth), Vars: sr.vars}
+	if d := sr.limits.MaxDuration; d > 0 {
+		ev.Deadline = s.now + d.Milliseconds()
+	}
+	var initial core.Event
+	if sr.initialSignal != nil {
+		initial = core.Event{Kind: core.EvSignal, At: s.now, Name: sr.initialSignal.Name, Data: sr.initialSignal.Payload,
+			Meta: encodeSignalMeta(sr.initialSignal, true)}
+	}
 	if l := s.logFor(r); l != nil {
-		l.buf = wal.Frame(l.buf, encodeStart(nil, s.meta(r)))
+		rec := encodeStart(nil, s.meta(r))
+		if sr.initialSignal != nil {
+			rec = encodeInitialStart(nil, s.meta(r), &ev, &initial)
+		}
+		l.buf = wal.Frame(l.buf, rec)
 		l.lsn++
 		r.lastLSN, r.startLSN = l.lsn, l.lsn
 	}
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "run.start", RunID: r.id, Tenant: r.tenant, Data: sr.input})
 	r.startWait = append(r.startWait, sr.reply)
-	ev := core.Event{Kind: core.EvStart, Data: sr.input, Name: sr.entry,
-		MaxSteps: int32(sr.limits.MaxSteps), Depth: int32(sr.depth), Vars: sr.vars}
-	if d := sr.limits.MaxDuration; d > 0 {
-		ev.Deadline = s.now + d.Milliseconds()
+	if sr.initialSignal != nil {
+		s.eventReply(r, ev, nil, nil, false)
+		s.eventReply(r, initial, nil, nil, false)
+	} else {
+		s.event(r, ev)
 	}
-	s.event(r, ev)
 	if l := s.logFor(r); l != nil {
 		// Durable once the start record and the EvStart event are. Held at
 		// lastLSN (at or after both) to keep the held list in LSN order.
@@ -841,16 +882,19 @@ func (s *shard) logFor(r *run) *shardLog {
 
 // event applies ev to r: the only place where run state changes.
 func (s *shard) event(r *run, ev core.Event) {
-	s.eventReply(r, ev, nil)
+	s.eventReply(r, ev, nil, nil, true)
 }
 
-func (s *shard) eventReply(r *run, ev core.Event, reply chan error) {
+func (s *shard) eventReply(r *run, ev core.Event, reply chan error, applied chan signalDecision, record bool) {
 	if r.done {
+		if applied != nil {
+			applied <- signalDecision{}
+		}
 		s.ackEvent(r, reply)
 		return
 	}
 	if r.st == nil {
-		r.pending = append(r.pending, pendingEvent{ev: ev, reply: reply})
+		r.pending = append(r.pending, pendingEvent{ev: ev, reply: reply, applied: applied})
 		s.load(r)
 		return
 	}
@@ -865,14 +909,22 @@ func (s *shard) eventReply(r *run, ev core.Event, reply chan error) {
 	}
 	s.cmds = out[:0]
 	if err != nil {
+		if applied != nil {
+			applied <- signalDecision{}
+		}
 		s.ackEvent(r, reply)
 		return // ignored (stale) events are not logged
+	}
+	if applied != nil {
+		applied <- signalDecision{applied: true}
 	}
 	if ev.Kind == core.EvStart && r.created == 0 {
 		r.created = ev.At
 	}
 	r.updated = ev.At
-	s.record(r, &ev)
+	if record {
+		s.record(r, &ev)
+	}
 	s.ackEvent(r, reply)
 	if s.e.feed != nil && len(s.traces) > 0 {
 		// Before the commands: a task's chunks must not overtake the trace
@@ -1379,6 +1431,9 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 			}
 		}
 		for _, p := range r.pending {
+			if p.applied != nil {
+				p.applied <- signalDecision{}
+			}
 			if p.reply != nil {
 				p.reply <- err
 			}
@@ -1400,7 +1455,7 @@ func (s *shard) loaded(r *run, data []byte, err error) {
 			s.load(r)
 			continue
 		}
-		s.eventReply(r, p.ev, p.reply)
+		s.eventReply(r, p.ev, p.reply, p.applied, true)
 	}
 	if s.quietWaits != nil {
 		s.answerQuiet(r)

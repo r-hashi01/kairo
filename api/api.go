@@ -43,6 +43,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/runs/{id}/children", a.children)
 	mux.HandleFunc("GET /v1/runs/{id}/stream", a.streamRun)
 	mux.HandleFunc("POST /v1/runs/{id}/signals/{name}", a.signal)
+	mux.HandleFunc("POST /v1/runs/{id}/signals/{name}/apply", a.applySignal)
 	mux.HandleFunc("POST /v1/runs/{id}/steps/{act}/signals/{name}", a.signal)
 	mux.HandleFunc("POST /v1/runs/{id}/resolve", a.resolve)
 	mux.HandleFunc("POST /v1/runs/{id}/finish", a.finish)
@@ -605,6 +606,24 @@ func (a *API) signal(w http.ResponseWriter, r *http.Request) {
 		a.E.Signal(r.PathValue("id"), r.PathValue("name"), b)
 	}
 	reply(w, 202, map[string]bool{"accepted": true})
+}
+
+func (a *API) applySignal(w http.ResponseWriter, r *http.Request) {
+	var req engine.SignalRequest
+	if err := readJSON(r, &req); err != nil {
+		fail(w, 400, err)
+		return
+	}
+	req.Name = r.PathValue("name")
+	res, err := a.E.ApplySignal(r.Context(), r.PathValue("id"), req)
+	switch {
+	case errors.Is(err, engine.ErrSignalConflict):
+		fail(w, 409, err)
+	case err != nil:
+		fail(w, 400, err)
+	default:
+		reply(w, 200, res)
+	}
 }
 
 func (a *API) resolve(w http.ResponseWriter, r *http.Request) {

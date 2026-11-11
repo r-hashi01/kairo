@@ -95,6 +95,7 @@ class Client:
         workflow: str | None = None,
         meta: dict[str, Any] | None = None,
         drive: bool = False,
+        initial_signal: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Starts a run of plan once its start is durable. With a run id already
         running or recently finished, nothing new starts ("existing").
@@ -117,6 +118,8 @@ class Client:
             body["meta"] = meta
         if drive:
             body["drive"] = True
+        if initial_signal is not None:
+            body["initial_signal"] = initial_signal
         status, out = self._call("POST", "/v1/runs", body)
         if status == 504:
             raise KairoError(504, f"run {out.get('run_id')}: start not confirmed")
@@ -162,6 +165,15 @@ class Client:
 
     def signal(self, run_id: str, name: str, payload: Any = None) -> None:
         self._call("POST", f"/v1/runs/{self._id(run_id)}/signals/{urllib.parse.quote(name, safe='')}", payload)
+
+    def apply_signal(
+        self, run_id: str, name: str, payload: Any, *, signal_id: str, only_if_waiting: bool
+    ) -> dict[str, Any]:
+        return self._call(
+            "POST",
+            f"/v1/runs/{self._id(run_id)}/signals/{urllib.parse.quote(name, safe='')}/apply",
+            {"payload": payload, "signal_id": signal_id, "only_if_waiting": only_if_waiting},
+        )[1]
 
     def cancel(self, run_id: str) -> None:
         self._call("POST", f"/v1/runs/{self._id(run_id)}/cancel")

@@ -321,6 +321,8 @@ type runSpec struct {
 	// then: events applied in the start's transaction (a signal received
 	// before the wait was reached, ADR 0059).
 	then []wasmcore.Event
+	// initialSignal is the kairod form of then for an early wait (ADR 0071).
+	initialSignal *remoteSignalRequest
 }
 
 // run starts a run of plan, or finds it: a run id is an idempotency key.
