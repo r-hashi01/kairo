@@ -74,14 +74,37 @@ func decode[T any](raw json.RawMessage) (T, error) {
 	return v, err
 }
 
+// CallOption configures one action call.
+type CallOption func(*callOpts)
+
+type callOpts struct{ destination string }
+
+// CallDestination selects this call's runtime rate-limit destination
+// (ADR 0077). It is part of the call's deterministic identity.
+func CallDestination(destination string) CallOption {
+	return func(o *callOpts) { o.destination = destination }
+}
+
+func callKind(action, destination string) string {
+	kind := planCall + action
+	if destination != "" {
+		kind += "\x00destination:" + destination
+	}
+	return kind
+}
+
 // Call runs action with in, once, however often the workflow runs again.
-func Call[O any](ctx *Context, action string, in any) (O, error) {
+func Call[O any](ctx *Context, action string, in any, opts ...CallOption) (O, error) {
+	var o callOpts
+	for _, option := range opts {
+		option(&o)
+	}
 	canon, err := canonical(in)
 	if err != nil {
 		var zero O
 		return zero, err
 	}
-	out, err := ctx.k.callRun(ctx, planCall+action, nil, in, ctx.next(planCall+action, canon))
+	out, err := ctx.k.callRunTo(ctx, planCall+action, nil, in, ctx.next(callKind(action, o.destination), canon), o.destination)
 	if err != nil {
 		var zero O
 		return zero, err

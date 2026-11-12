@@ -183,6 +183,9 @@ type Options struct {
 	// Concurrency: at most this many steps of actions run here at once
 	// (default: no limit). Steps over it wait, leased, for a slot.
 	Concurrency int
+	// DestinationLimits resolves the current per-process limits of a
+	// destination when a step is admitted (ADR 0077).
+	DestinationLimits func(string) (DestinationLimits, error)
 	// Logger takes what goes wrong in the runtime's background work (lease
 	// renewals, sweeps, callbacks; default slog.Default()).
 	Logger *slog.Logger
@@ -249,6 +252,15 @@ type Kairo struct {
 	concurrency int
 	slots       chan struct{}       // Concurrency (nil: no limit)
 	limits      map[string]*limiter // by destination
+	limitFor    func(string) (DestinationLimits, error)
+}
+
+// DestinationLimits are per-process limits for one runtime destination.
+// Zero values are unlimited.
+type DestinationLimits struct {
+	Concurrency    int
+	RequestsPerMin int
+	WeightPerMin   int
 }
 
 type drive struct {
@@ -355,6 +367,7 @@ type actionDef struct {
 	async   bool
 	limit   int // steps at once (0: no limit)
 	rate    int // steps started a minute (0: no limit)
+	weight  int // reported weight a minute (0: no limit)
 }
 
 // Open opens the runtime on opts.Store. Declare actions and workflows, then
@@ -395,7 +408,8 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	rt.metrics = newMetricEmitter(opts.Metrics)
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
-		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
+		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, limitFor: opts.DestinationLimits,
+		tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
 	k.tickSlot <- struct{}{}
 	k.runs = rt
 	k.bgCtx, k.bgCancel = context.WithCancel(context.Background())
@@ -481,6 +495,12 @@ func Rate(perMinute int) ActionOption {
 	return func(s map[string]any) { s["$rate"] = perMinute }
 }
 
+// WeightRate limits the non-negative weight reported by completed steps
+// of the destination per minute (ADR 0077).
+func WeightRate(perMinute int) ActionOption {
+	return func(s map[string]any) { s["$weight_rate"] = perMinute }
+}
+
 // IdempotentRetry declares that a real action may run again with the same
 // idempotency key when its outcome is unknown (instead of stopping for
 // review).
@@ -495,17 +515,28 @@ type TaskContext struct {
 	RunID, StepID, IdempotencyKey string
 	Attempt                       int32
 	emit                          func([]byte)
+	weight                        atomic.Int64
 }
 
 // Emit sends a chunk of live output to subscribers (Kairo.Subscribe); it
 // is not recorded.
 func (t *TaskContext) Emit(chunk []byte) { t.emit(chunk) }
 
+// SetWeight reports the non-negative admission weight consumed by this
+// attempt (for example, provider tokens). The last call wins.
+func (t *TaskContext) SetWeight(n int) {
+	if n < 0 {
+		panic("kairo: step weight must not be negative")
+	}
+	t.weight.Store(int64(n))
+}
+
 // stepError carries how a failure is to be taken.
 type stepError struct {
-	err       error
-	retryable bool
-	unknown   bool
+	err        error
+	retryable  bool
+	unknown    bool
+	retryAfter time.Duration
 }
 
 func (e *stepError) Error() string { return e.err.Error() }
@@ -514,6 +545,19 @@ func (e *stepError) Unwrap() error { return e.err }
 // Retryable marks an action's failure as one that may be retried (it did
 // not take effect).
 func Retryable(err error) error { return &stepError{err: err, retryable: true} }
+
+// RetryAfter marks a definite failure retryable and asks this attempt and
+// the destination's other work to wait at least d (ADR 0077).
+func RetryAfter(err error, d time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	var se *stepError
+	if errors.As(err, &se) {
+		return &stepError{err: err, retryable: true, unknown: se.unknown, retryAfter: max(d, 0)}
+	}
+	return &stepError{err: err, retryable: true, retryAfter: max(d, 0)}
+}
 
 // Unknown marks an action's failure as an unknown outcome (it may have
 // taken effect): never taken as success (invariant 5).
@@ -532,12 +576,14 @@ func Action[I, O any](k *Kairo, name string, effect Effect, fn func(t *TaskConte
 	async, _ := spec["$async"].(bool)
 	limit, _ := spec["$limit"].(int)
 	rate, _ := spec["$rate"].(int)
-	for _, key := range []string{"$url", "$async", "$limit", "$rate"} {
+	weight, _ := spec["$weight_rate"].(int)
+	for _, key := range []string{"$url", "$async", "$limit", "$rate", "$weight_rate"} {
 		delete(spec, key)
 	}
+	spec["destination_from"] = "$kairo_destination"
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.actions[name] = &actionDef{spec: spec, url: u, async: async, limit: limit, rate: rate, handler: func(t *TaskContext, raw json.RawMessage) (any, error) {
+	k.actions[name] = &actionDef{spec: spec, url: u, async: async, limit: limit, rate: rate, weight: weight, handler: func(t *TaskContext, raw json.RawMessage) (any, error) {
 		var in I
 		if len(raw) > 0 && string(raw) != "null" {
 			if err := json.Unmarshal(raw, &in); err != nil {
@@ -593,7 +639,7 @@ func (k *Kairo) Start(ctx context.Context) error {
 		k.slots = make(chan struct{}, k.concurrency)
 	}
 	for name, a := range k.actions {
-		if a.limit > 0 || a.rate > 0 {
+		if a.limit > 0 || a.rate > 0 || a.weight > 0 {
 			// Actions of one destination share its limits: the strictest.
 			key := destination(name, a)
 			l := k.limits[key]
@@ -601,7 +647,7 @@ func (k *Kairo) Start(ctx context.Context) error {
 				l = &limiter{}
 				k.limits[key] = l
 			}
-			l.tighten(a.limit, a.rate)
+			l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight})
 		}
 		specs = append(specs, a.spec)
 		if a.url != "" {
@@ -647,7 +693,8 @@ func (k *Kairo) Start(ctx context.Context) error {
 	}
 	for _, s := range specs {
 		a := s["action"].(string)
-		root := map[string]any{"kind": "step", "id": "call", "action": a, "input": map[string]any{"in": "$input.in"}}
+		root := map[string]any{"kind": "step", "id": "call", "action": a,
+			"input": map[string]any{"in": "$input.in", "$kairo_destination": "$input.destination"}}
 		if err := k.plan(planCall+a, root, nil); err != nil {
 			return err
 		}
@@ -777,17 +824,21 @@ func (k *Kairo) serve(ctx context.Context, t task, emit func([]byte)) result {
 	if a == nil {
 		return result{Err: "no action " + t.Action + " here"}
 	}
-	// Over a limit, the step waits here for a slot, leased (ADR 0059).
-	release, err := k.admit(ctx, t.Action, a)
+	// Over a limit, the step waits here for a slot, leased (ADR 0059, 0077).
+	finish, err := k.admit(ctx, t.Destination, a)
 	if err != nil {
 		return result{Err: err.Error(), Retryable: true, ErrType: "cancelled"}
 	}
-	defer release()
+	var res result
 	if a.url != "" {
-		return k.callRemote(ctx, t, a, in.In)
+		res = k.callRemote(ctx, t, a, in.In)
+	} else {
+		tc := &TaskContext{Context: ctx, RunID: t.RunID, StepID: t.StepID, IdempotencyKey: t.IdemKey, Attempt: t.Attempt, emit: emit}
+		res = k.runHandler(a, tc, t.Action, in.In)
+		res.Weight = int(tc.weight.Load())
 	}
-	tc := &TaskContext{Context: ctx, RunID: t.RunID, StepID: t.StepID, IdempotencyKey: t.IdemKey, Attempt: t.Attempt, emit: emit}
-	return k.runHandler(a, tc, t.Action, in.In)
+	finish(res)
+	return res
 }
 
 // runHandler runs an action's handler and takes its outcome.
@@ -796,7 +847,12 @@ func (k *Kairo) runHandler(a *actionDef, tc *TaskContext, action string, in json
 	if err != nil {
 		var se *stepError
 		if errors.As(err, &se) {
-			return result{Err: err.Error(), Retryable: se.retryable, Unknown: se.unknown, ErrType: "error"}
+			retryAfter := int64(0)
+			if !se.unknown {
+				retryAfter = max(se.retryAfter.Milliseconds(), 0)
+			}
+			return result{Err: err.Error(), Retryable: se.retryable, Unknown: se.unknown, ErrType: "error",
+				RetryAfter: retryAfter, RateLimited: retryAfter > 0}
 		}
 		return result{Err: err.Error(), ErrType: "error"}
 	}
@@ -1454,6 +1510,10 @@ func done(id string, ri RunInfo) (json.RawMessage, error) {
 
 // callRun runs one call: a run of its own, found again by its id.
 func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, runID string) (json.RawMessage, error) {
+	return k.callRunTo(c, plan, root, in, runID, "")
+}
+
+func (k *Kairo) callRunTo(c *Context, plan string, root map[string]any, in any, runID, destination string) (json.RawMessage, error) {
 	if k.remote == nil {
 		k.rt.reach(runID, true)
 		defer k.rt.reach(runID, false)
@@ -1471,7 +1531,11 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 		}
 	}
 	// Kept and removed with the workflow that makes it (ADR 0054).
-	if _, err := k.runs.run(c, plan, map[string]any{"in": in}, runID, runSpec{parent: c.id}); err != nil {
+	runInput := map[string]any{"in": in}
+	if destination != "" {
+		runInput["destination"] = destination
+	}
+	if _, err := k.runs.run(c, plan, runInput, runID, runSpec{parent: c.id}); err != nil {
 		return nil, err
 	}
 	if k.remote == nil {
@@ -2160,31 +2224,190 @@ func destination(name string, a *actionDef) string {
 	return name
 }
 
-// limiter limits the steps of one destination (ADR 0059): at once
-// (slots) and a minute (every: the spacing of their starts).
+// limiter limits one runtime destination in this process (ADR 0059, 0077).
 type limiter struct {
-	slots chan struct{}
-	every time.Duration
-	mu    sync.Mutex
-	next  time.Time
+	mu          sync.Mutex
+	changed     chan struct{}
+	active      int
+	concurrency int
+	every       time.Duration
+	next        time.Time
+	wpm         float64
+	weightCap   float64
+	weight      float64
+	weightAt    time.Time
+	pauseUntil  time.Time
+	declared    DestinationLimits
 }
 
-func (l *limiter) tighten(limit, perMinute int) {
-	if limit > 0 && (l.slots == nil || limit < cap(l.slots)) {
-		l.slots = make(chan struct{}, limit)
+func (l *limiter) declare(v DestinationLimits) {
+	l.mu.Lock()
+	l.declared.Concurrency = stricter(l.declared.Concurrency, v.Concurrency)
+	l.declared.RequestsPerMin = stricter(l.declared.RequestsPerMin, v.RequestsPerMin)
+	l.declared.WeightPerMin = stricter(l.declared.WeightPerMin, v.WeightPerMin)
+	l.mu.Unlock()
+}
+
+func (l *limiter) configure(v DestinationLimits, now time.Time) {
+	l.concurrency = max(v.Concurrency, 0)
+	if v.RequestsPerMin > 0 {
+		l.every = time.Minute / time.Duration(v.RequestsPerMin)
+	} else {
+		l.every = 0
+		l.next = time.Time{}
 	}
-	if perMinute > 0 {
-		if every := time.Minute / time.Duration(perMinute); every > l.every {
-			l.every = every
+	if v.WeightPerMin <= 0 {
+		l.wpm, l.weightCap, l.weight = 0, 0, 0
+		l.weightAt = now
+		return
+	}
+	l.refill(now)
+	wpm := float64(v.WeightPerMin) / float64(time.Minute/time.Millisecond)
+	cap := max(1, float64(v.WeightPerMin)/6) // ten seconds of burst
+	if l.wpm == 0 {
+		l.weight = cap
+	} else if l.weight > cap {
+		l.weight = cap
+	}
+	l.wpm, l.weightCap, l.weightAt = wpm, cap, now
+}
+
+func (l *limiter) refill(now time.Time) {
+	if l.wpm <= 0 {
+		return
+	}
+	if l.weightAt.IsZero() {
+		l.weightAt = now
+		return
+	}
+	ms := float64(now.Sub(l.weightAt)) / float64(time.Millisecond)
+	l.weight = min(l.weightCap, l.weight+ms*l.wpm)
+	l.weightAt = now
+}
+
+func (l *limiter) wake() {
+	if l.changed != nil {
+		close(l.changed)
+	}
+	l.changed = make(chan struct{})
+}
+
+func (l *limiter) admit(ctx context.Context, limits DestinationLimits) error {
+	for {
+		now := time.Now()
+		l.mu.Lock()
+		limits.Concurrency = stricter(l.declared.Concurrency, limits.Concurrency)
+		limits.RequestsPerMin = stricter(l.declared.RequestsPerMin, limits.RequestsPerMin)
+		limits.WeightPerMin = stricter(l.declared.WeightPerMin, limits.WeightPerMin)
+		l.configure(limits, now)
+		if l.changed == nil {
+			l.changed = make(chan struct{})
+		}
+		at := now
+		if l.pauseUntil.After(at) {
+			at = l.pauseUntil
+		}
+		if l.next.After(at) {
+			at = l.next
+		}
+		if l.wpm > 0 && l.weight < 0 {
+			weightAt := now.Add(durationFromMillis((-l.weight) / l.wpm))
+			if weightAt.After(at) {
+				at = weightAt
+			}
+		}
+		full := l.concurrency > 0 && l.active >= l.concurrency
+		if !full && !at.After(now) {
+			l.active++
+			if l.every > 0 {
+				l.next = now.Add(l.every)
+			}
+			l.mu.Unlock()
+			return nil
+		}
+		changed := l.changed
+		l.mu.Unlock()
+
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !full {
+			timer = time.NewTimer(time.Until(at))
+			timerC = timer.C
+		}
+		select {
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return ctx.Err()
+		case <-changed:
+			if timer != nil {
+				timer.Stop()
+			}
+		case <-timerC:
 		}
 	}
 }
 
-// admit waits for a step of action a to be let run: its destination's
-// slot and turn, then the process's slot. release gives the slots back.
-func (k *Kairo) admit(ctx context.Context, action string, a *actionDef) (release func(), err error) {
+func (l *limiter) finish(weight int, retryAfter time.Duration) {
+	now := time.Now()
+	l.mu.Lock()
+	l.refill(now)
+	if weight > 0 && l.wpm > 0 {
+		l.weight -= float64(weight)
+	}
+	if retryAfter > 0 {
+		until := now.Add(retryAfter)
+		if until.After(l.pauseUntil) {
+			l.pauseUntil = until
+		}
+	}
+	if l.active > 0 {
+		l.active--
+	}
+	l.wake()
+	l.mu.Unlock()
+}
+
+func (l *limiter) idleAfter(now time.Time) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refill(now)
+	if l.active > 0 {
+		return false, 0
+	}
+	after := max(l.pauseUntil.Sub(now), l.next.Sub(now))
+	if l.wpm > 0 && l.weight < l.weightCap {
+		after = max(after, durationFromMillis((l.weightCap-l.weight)/l.wpm))
+	}
+	return after <= 0, after
+}
+
+func durationFromMillis(ms float64) time.Duration {
+	if ms <= 0 {
+		return 0
+	}
+	maxMs := float64(math.MaxInt64) / float64(time.Millisecond)
+	if ms >= maxMs {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ms * float64(time.Millisecond))
+}
+
+func stricter(a, b int) int {
+	if a <= 0 {
+		return max(b, 0)
+	}
+	if b <= 0 {
+		return a
+	}
+	return min(a, b)
+}
+
+// admit waits for a step's runtime destination and the process slot.
+func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish func(result), err error) {
 	var held []chan struct{}
-	release = func() {
+	releaseSlots := func() {
 		for _, s := range held {
 			<-s
 		}
@@ -2195,43 +2418,56 @@ func (k *Kairo) admit(ctx context.Context, action string, a *actionDef) (release
 			held = append(held, s)
 			return nil
 		case <-ctx.Done():
-			release()
+			releaseSlots()
 			return ctx.Err()
 		}
 	}
+	limits := DestinationLimits{}
+	if k.limitFor != nil {
+		dynamic, e := k.limitFor(dest)
+		if e != nil {
+			return nil, e
+		}
+		limits = dynamic
+	}
 	k.mu.Lock()
-	l := k.limits[destination(action, a)]
+	l := k.limits[dest]
+	if l == nil {
+		l = &limiter{}
+		k.limits[dest] = l
+	}
 	k.mu.Unlock()
-	if l != nil {
-		if l.slots != nil {
-			if err := take(l.slots); err != nil {
-				return nil, err
-			}
-		}
-		if l.every > 0 {
-			l.mu.Lock()
-			at := l.next
-			if now := time.Now(); at.Before(now) {
-				at = now
-			}
-			l.next = at.Add(l.every)
-			l.mu.Unlock()
-			if d := time.Until(at); d > 0 {
-				t := time.NewTimer(d)
-				select {
-				case <-t.C:
-				case <-ctx.Done():
-					t.Stop()
-					release()
-					return nil, ctx.Err()
-				}
-			}
-		}
+	l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight})
+	if err := l.admit(ctx, limits); err != nil {
+		return nil, err
 	}
 	if k.slots != nil {
 		if err := take(k.slots); err != nil {
+			l.finish(0, 0)
 			return nil, err
 		}
 	}
-	return release, nil
+	return func(res result) {
+		releaseSlots()
+		l.finish(res.Weight, time.Duration(res.RetryAfter)*time.Millisecond)
+		k.retireLimiter(dest, l)
+	}, nil
+}
+
+func (k *Kairo) retireLimiter(dest string, l *limiter) {
+	idle, after := l.idleAfter(time.Now())
+	if !idle && after > 0 {
+		time.AfterFunc(after+time.Millisecond, func() { k.retireLimiter(dest, l) })
+		return
+	}
+	if !idle {
+		return
+	}
+	k.mu.Lock()
+	if k.limits[dest] == l {
+		if stillIdle, _ := l.idleAfter(time.Now()); stillIdle {
+			delete(k.limits, dest)
+		}
+	}
+	k.mu.Unlock()
 }

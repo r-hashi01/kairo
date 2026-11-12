@@ -106,6 +106,21 @@ class RetryableError(Exception):
     not take effect)."""
 
 
+class RetryAfterError(RetryableError):
+    """A definite retryable refusal that asks the destination to wait."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = max(0.0, retry_after)
+
+
+@dataclass(frozen=True)
+class DestinationLimits:
+    concurrency: int | None = None
+    requests_per_minute: float | None = None
+    weight_per_minute: float | None = None
+
+
 class UnknownOutcomeError(Exception):
     """Raised by an action's handler: its outcome is unknown (it may have
     taken effect). Never taken for success (invariant 5): a real step stops
@@ -159,22 +174,28 @@ def _failure(e: BaseException) -> Result:
     error = f"{type(e).__name__}: {e}"
     if isinstance(e, UnknownOutcomeError):
         return Result(error=error, unknown=True, retryable=True, error_type=type(e).__name__)
-    return Result(error=error, retryable=isinstance(e, RetryableError), error_type=type(e).__name__)
+    retry_after = round(e.retry_after * 1000) if isinstance(e, RetryAfterError) else 0
+    return Result(error=error, retryable=isinstance(e, RetryableError), retry_after_ms=retry_after,
+                  rate_limited=retry_after > 0, error_type=type(e).__name__)
 
 
 def _to_wire(r: Result) -> tuple[dict[str, Any], bool]:
     """A result as an action over HTTP(S) answers it (ADR 0052), and whether
     it is unknown: an unknown outcome has no 200 body."""
+    usage = {"weight": r.weight} if r.weight else {}
     if r.unknown:
-        return {"error": r.error, **({"error_type": r.error_type} if r.error_type else {})}, True
+        return {"error": r.error, **usage, **({"error_type": r.error_type} if r.error_type else {})}, True
     if r.error:
         w: dict[str, Any] = {"error": r.error}
         if r.retryable:
             w["retryable"] = True
+        if r.retryable and r.retry_after_ms > 0:
+            w["retry_after_ms"] = r.retry_after_ms
+        w.update(usage)
         if r.error_type:
             w["error_type"] = r.error_type
         return w, False
-    return {"output": r.output}, False
+    return {"output": r.output, **usage}, False
 
 
 class _NotHere(KairoError):
@@ -236,6 +257,7 @@ class _Action:
     async_: bool = False
     limit: int | None = None
     rate: float | None = None
+    weight_rate: float | None = None
     max_attempts: int | None = None
     backoff: str | None = None
 
@@ -391,6 +413,7 @@ class Kairo:
         tenant: str = "default",
         idempotency_ttl: float = 24 * 3600,
         concurrency: int | None = None,
+        destination_limits: Callable[[str], DestinationLimits] | None = None,
         request_timeout: float = 90.0,
         backend: Backend | None = None,
         mode: str = "wait",
@@ -444,6 +467,7 @@ class Kairo:
             self.backend.metrics = self._metrics
         self._ttl = idempotency_ttl
         self._concurrency = concurrency
+        self._destination_limits = destination_limits
         self._actions: dict[str, _Action] = {}
         self._workflows: dict[str, _WorkflowDef] = {}
         self._planned: set[str] = set()
@@ -523,6 +547,7 @@ class Kairo:
         allow_insecure: bool | None = None,
         limit: int | None = None,
         rate: float | None = None,
+        weight_rate: float | None = None,
         max_attempts: int | None = None,
         backoff: str | None = None,
     ):
@@ -550,7 +575,7 @@ class Kairo:
             check_url(url, self._allow_insecure if allow_insecure is None else allow_insecure)
 
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate, max_attempts, backoff)
+            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate, weight_rate, max_attempts, backoff)
             return fn
 
         return register
@@ -591,7 +616,7 @@ class Kairo:
         self._life_future()
         specs: list[dict[str, Any]] = []
         for name, a in self._actions.items():
-            s: dict[str, Any] = {"action": name, "effect": a.effect}
+            s: dict[str, Any] = {"action": name, "effect": a.effect, "destination_from": "$kairo_destination"}
             if a.timeout:
                 s["timeout"] = a.timeout
             if a.destination:
@@ -615,21 +640,22 @@ class Kairo:
                 if not hasattr(self.backend, "complete"):
                     raise ValueError("actions with a url need the embedded backend or kairod")
         for name, a in self._actions.items():
-            if not a.limit and not a.rate:
+            if not a.limit and not a.rate and not a.weight_rate:
                 continue
             # Actions of one destination share its limits: the strictest.
             key = a.destination or name
-            self._limits.setdefault(key, _Limiter()).tighten(a.limit or 0, a.rate or 0)
+            self._limits.setdefault(key, _Limiter()).declare(DestinationLimits(a.limit, a.rate, a.weight_rate))
         rt = self._rt
         # kairod's worker limits its own tasks.
         if rt is not None and self._concurrency:
             self._slots = _Slots(self._concurrency)
-        if rt is not None and (self._slots or self._limits):
+        if rt is not None and (self._slots or self._limits or self._destination_limits):
             # Steps wait for their slots on the event loop, before their thread.
             rt.admit = self._admit_step
         await self.backend.start(specs, self._serve_observed if self._observer is not None else self._serve)
         for s in specs:
-            await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"], "input": {"in": "$input.in"}})
+            await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"],
+                                                         "input": {"in": "$input.in", "$kairo_destination": "$input.destination"}})
         await self._plan_workflow()
         if rt is not None:
             rt.lost_drive = self._lost_drive
@@ -859,22 +885,33 @@ class Kairo:
     async def _plan_workflow(self) -> None:
         await self._plan(PLAN_WORKFLOW, {"kind": "wait", "id": "done", "signal": "done"}, {"started_at": {"type": "integer", "value": 0}})
 
-    async def _admit(self, action: str, ctx: TaskContext) -> Callable[[], None]:
+    async def _admit(self, action: str, destination: str, ctx: TaskContext) -> Callable[[Result], None]:
         """Waits, on the event loop, for a step of action to be let run (ADR
         0059): its destination's slot and turn, then the process's slot.
         Returns what gives the slots back (on the event loop). Raises
         _StepStopped if the step is cancelled first."""
         a = self._actions.get(action)
-        lim = self._limits.get(a.destination or action) if a is not None and action not in BUILTIN else None
+        lim: _Limiter | None = None
         slots = self._slots if a is not None and action not in BUILTIN else None
         held: list[_Slots] = []
 
-        def release() -> None:
+        def release_slots() -> None:
             while held:
                 held.pop().give()
 
+        if a is not None and action not in BUILTIN:
+            limits = DestinationLimits(a.limit, a.rate, a.weight_rate)
+            if self._destination_limits is not None:
+                dynamic = self._destination_limits(destination)
+                limits = DestinationLimits(
+                    _stricter(limits.concurrency, dynamic.concurrency),
+                    _stricter(limits.requests_per_minute, dynamic.requests_per_minute),
+                    _stricter(limits.weight_per_minute, dynamic.weight_per_minute),
+                )
+            lim = self._limits.setdefault(destination, _Limiter())
+            lim.declare(DestinationLimits(a.limit, a.rate, a.weight_rate))
         if lim is None and slots is None:
-            return release
+            return lambda _result: release_slots()
         stop: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         loop = asyncio.get_running_loop()
 
@@ -885,32 +922,43 @@ class Kairo:
                 pass  # the loop is closed: nothing waits on it any more
 
         off = ctx.cancelled.on_set(stopped) if hasattr(ctx.cancelled, "on_set") else (lambda: None)
+        admitted = False
         try:
-            if lim is not None and lim.slots is not None:
-                await lim.slots.take(stop)
-                held.append(lim.slots)
-            if lim is not None and lim.every > 0:
-                now = time.time()
-                at = max(lim.next, now)
-                lim.next = at + lim.every
-                if at > now:
-                    done, _ = await asyncio.wait({stop}, timeout=at - now)
-                    if done:
-                        raise _StepStopped
+            if lim is not None:
+                await lim.admit(limits, stop)
+                admitted = True
             if slots is not None:
                 await slots.take(stop)
                 held.append(slots)
-            return release
+            def finish(result: Result) -> None:
+                release_slots()
+                if lim is not None:
+                    retry_after = result.retry_after_ms if result.retryable and not result.unknown else 0
+                    lim.finish(result.weight or result.tokens, retry_after)
+                    self._retire_limiter(destination, lim)
+            return finish
         except BaseException:
-            release()
+            release_slots()
+            if admitted and lim is not None:
+                lim.finish(0, 0)
             raise
         finally:
             off()
 
+    def _retire_limiter(self, destination: str, limiter: _Limiter) -> None:
+        after = limiter.idle_after()
+        if after is None:
+            return
+        if after <= 0:
+            if self._limits.get(destination) is limiter and limiter.idle_after() == 0:
+                self._limits.pop(destination, None)
+            return
+        asyncio.get_running_loop().call_later(after + 0.001, self._retire_limiter, destination, limiter)
+
     async def _admit_step(self, task: Task, ctx: TaskContext) -> Callable[[], None] | Result:
         """The embedded runtime's admission of a dispatched step (ADR 0059)."""
         try:
-            return await self._admit(task.action, ctx)
+            return await self._admit(task.action, task.destination or task.action, ctx)
         except _StepStopped:
             return _stopped_waiting(task.action)
 
@@ -939,24 +987,30 @@ class Kairo:
         # On kairod's worker (a thread of its own), over a limit, the step
         # waits here for a slot (ADR 0059); the embedded runtime admits it
         # before its thread.
-        release: Callable[[], None] | None = None
-        if self._rt is None and self._limits and self._loop is not None:
+        finish: Callable[[Result], None] | None = None
+        if self._rt is None and (self._limits or self._destination_limits) and self._loop is not None:
             try:
-                release = asyncio.run_coroutine_threadsafe(self._admit(task.action, ctx), self._loop).result()
+                finish = asyncio.run_coroutine_threadsafe(
+                    self._admit(task.action, task.destination or a.destination or task.action, ctx), self._loop
+                ).result()
             except _StepStopped:
                 return _stopped_waiting(task.action)
+        result: Result
         try:
             if a.url:
-                return self._call_remote(task, a, input)
-            out = a.handler(input, ctx)
-            if inspect.isawaitable(out):
-                out = asyncio.run(_await(out))
-            return Result(output=out)
+                result = self._call_remote(task, a, input)
+            else:
+                out = a.handler(input, ctx)
+                if inspect.isawaitable(out):
+                    out = asyncio.run(_await(out))
+                result = Result(output=out)
         except Exception as e:  # the handler's failure, of the kind it says
-            return _failure(e)
-        finally:
-            if release is not None:
-                self._loop.call_soon_threadsafe(release)  # type: ignore[union-attr]
+            result = _failure(e)
+        if not result.weight and ctx._weight:
+            result.weight = ctx._weight
+        if finish is not None:
+            self._loop.call_soon_threadsafe(finish, result)  # type: ignore[union-attr]
+        return result
 
     def _call_remote(self, task: Task, a: _Action, input: Any) -> Result:
         """Calls an action over HTTP(S) (ADR 0052); on the step's thread."""
@@ -973,6 +1027,7 @@ class Kairo:
                 "action": task.action,
                 "input": input,
                 "idempotency_key": task.idempotency_key,
+                "destination": task.destination,
                 "callback": callback,
             },
             separators=(",", ":"),
@@ -1082,13 +1137,16 @@ class Kairo:
             return 404, {"error": f"no action {m.get('action')} here"}
 
         async def run() -> tuple[dict[str, Any], bool]:
+            ctx = TaskContext(lambda _d: None)
             try:
-                out = await asyncio.to_thread(a.handler, m.get("input"), TaskContext(lambda _d: None))
+                out = await asyncio.to_thread(a.handler, m.get("input"), ctx)
                 if inspect.isawaitable(out):
                     out = await out
-                return _to_wire(Result(output=out))
+                return _to_wire(Result(output=out, weight=ctx._weight))
             except Exception as e:
-                return _to_wire(_failure(e))
+                result = _failure(e)
+                result.weight = ctx._weight
+                return _to_wire(result)
 
         if not a.async_:
             # An unknown outcome: 502, which the caller takes as unknown.
@@ -1803,16 +1861,18 @@ class Kairo:
             if not unfinished:
                 return
 
-    async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
+    async def _call_run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str,
+                        parent: str | None = None, destination: str = "") -> Any:
         if self._rt is not None:
             self._rt.reach(run_id, True)
         try:
-            return await self._call_run_reached(plan, root, input, run_id, parent)
+            return await self._call_run_reached(plan, root, input, run_id, parent, destination)
         finally:
             if self._rt is not None:
                 self._rt.reach(run_id, False)
 
-    async def _call_run_reached(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, parent: str | None = None) -> Any:
+    async def _call_run_reached(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str,
+                                parent: str | None = None, destination: str = "") -> Any:
         if self._closing:
             raise StoppedError(f"call {run_id}: stopped before it started")
         if self._draining:
@@ -1827,7 +1887,8 @@ class Kairo:
         if root is not None:
             await self._plan(plan, root)
         # Kept and removed with the workflow that makes it (ADR 0054).
-        await self.backend.run(plan, {"in": input}, run_id=run_id, parent=parent)
+        run_input = {"in": input, **({"destination": destination} if destination else {})}
+        await self.backend.run(plan, run_input, run_id=run_id, parent=parent)
         if self._rt is not None:
             await self._rt.resume_reached(run_id)
         if self.suspend:
@@ -1873,11 +1934,19 @@ def _from_wire(w: Any) -> Result:
     """A result as actions over HTTP(S) send it (ADR 0052)."""
     if not isinstance(w, dict):
         raise TypeError("not a result")
+    weight = w.get("weight", 0)
+    if not isinstance(weight, int) or isinstance(weight, bool) or weight < 0:
+        weight = 0
+    retryable = bool(w.get("retryable"))
+    retry_after = w.get("retry_after_ms", 0)
+    if not retryable or not isinstance(retry_after, int) or isinstance(retry_after, bool) or retry_after < 0:
+        retry_after = 0
     if w.get("error") is not None:
-        return Result(error=str(w["error"]), retryable=bool(w.get("retryable")), error_type=w.get("error_type") or "")
+        return Result(error=str(w["error"]), retryable=retryable, weight=weight, retry_after_ms=retry_after,
+                      rate_limited=retry_after > 0, error_type=w.get("error_type") or "")
     if w.get("wait"):
-        return Result(wait={"until": int(w["wait"]["until"]), "output": w["wait"].get("output")})
-    return Result(output=w.get("output"))
+        return Result(wait={"until": int(w["wait"]["until"]), "output": w["wait"].get("output")}, weight=weight)
+    return Result(output=w.get("output"), weight=weight)
 
 
 def _duration_ms(d: str | None) -> int | None:
@@ -1969,20 +2038,114 @@ class _Slots:
         self._free += 1
 
 
+def _stricter(a: float | int | None, b: float | int | None) -> Any:
+    if not a or a <= 0:
+        return b if b and b > 0 else None
+    if not b or b <= 0:
+        return a
+    return min(a, b)
+
+
 class _Limiter:
-    """The limits of one destination (ADR 0059): steps at once, and the
-    spacing of their starts (seconds, by the wall clock)."""
+    """Process-local limits of one runtime destination (ADR 0059, 0077)."""
 
     def __init__(self) -> None:
-        self.slots: _Slots | None = None
+        self.declared = DestinationLimits()
+        self.active = 0
+        self.concurrency = 0
         self.every = 0.0
-        self.next = 0.0  # when the next step may start (unix seconds)
+        self.next = 0.0
+        self.weight_rate = 0.0
+        self.weight_capacity = 0.0
+        self.weight = 0.0
+        self.weight_at = 0.0
+        self.pause_until = 0.0
+        self.changed: asyncio.Future[None] | None = None
 
-    def tighten(self, limit: int, per_minute: float) -> None:
-        if limit > 0 and (self.slots is None or limit < self.slots.size):
-            self.slots = _Slots(limit)
-        if per_minute > 0:
-            self.every = max(self.every, 60 / per_minute)
+    def declare(self, v: DestinationLimits) -> None:
+        self.declared = DestinationLimits(
+            _stricter(self.declared.concurrency, v.concurrency),
+            _stricter(self.declared.requests_per_minute, v.requests_per_minute),
+            _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+        )
+
+    def configure(self, v: DestinationLimits) -> None:
+        v = DestinationLimits(
+            _stricter(self.declared.concurrency, v.concurrency),
+            _stricter(self.declared.requests_per_minute, v.requests_per_minute),
+            _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+        )
+        now = time.time()
+        self._refill(now)
+        self.concurrency = max(0, int(v.concurrency or 0))
+        self.every = 60 / v.requests_per_minute if v.requests_per_minute and v.requests_per_minute > 0 else 0.0
+        if not self.every:
+            self.next = 0.0
+        if not v.weight_per_minute or v.weight_per_minute <= 0:
+            self.weight_rate = self.weight_capacity = self.weight = 0.0
+            self.weight_at = now
+            return
+        capacity = max(1.0, v.weight_per_minute / 6)
+        self.weight = capacity if not self.weight_rate else min(self.weight, capacity)
+        self.weight_rate = v.weight_per_minute / 60
+        self.weight_capacity = capacity
+        self.weight_at = now
+
+    def _refill(self, now: float) -> None:
+        if self.weight_rate <= 0:
+            return
+        if not self.weight_at:
+            self.weight_at = now
+        self.weight = min(self.weight_capacity, self.weight + max(0.0, now - self.weight_at) * self.weight_rate)
+        self.weight_at = now
+
+    def _wake(self) -> None:
+        if self.changed is not None and not self.changed.done():
+            self.changed.set_result(None)
+        self.changed = None
+
+    async def admit(self, limits: DestinationLimits, stop: asyncio.Future[None]) -> None:
+        while True:
+            self.configure(limits)
+            now = time.time()
+            self._refill(now)
+            at = max(now, self.pause_until, self.next)
+            if self.weight_rate > 0 and self.weight < 0:
+                at = max(at, now + (-self.weight / self.weight_rate))
+            full = self.concurrency > 0 and self.active >= self.concurrency
+            if not full and at <= now:
+                self.active += 1
+                if self.every > 0:
+                    self.next = now + self.every
+                return
+            if self.changed is None:
+                self.changed = asyncio.get_running_loop().create_future()
+            done, _ = await asyncio.wait(
+                {self.changed, stop}, timeout=None if full else max(0.0, at - now), return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop in done:
+                raise _StepStopped
+
+    def finish(self, weight: int, retry_after_ms: int) -> None:
+        now = time.time()
+        self._refill(now)
+        if isinstance(weight, int) and weight > 0 and self.weight_rate > 0:
+            self.weight -= weight
+        if retry_after_ms > 0:
+            self.pause_until = max(self.pause_until, now + retry_after_ms / 1000)
+        if self.active > 0:
+            self.active -= 1
+        self._wake()
+
+    def idle_after(self) -> float | None:
+        now = time.time()
+        self._refill(now)
+        if self.active > 0:
+            return None
+        after = max(0.0, self.pause_until - now, self.next - now)
+        if self.weight_rate > 0 and self.weight < self.weight_capacity:
+            after = max(after, (self.weight_capacity - self.weight) / self.weight_rate)
+        return after
 
 
 class Context:
@@ -2005,11 +2168,11 @@ class Context:
         self._seen[key] = n + 1
         return _call_id(self.id, kind, input, n)
 
-    async def _run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str) -> Any:
+    async def _run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, destination: str = "") -> Any:
         if self._stop.done():
             raise StoppedError(f"call {run_id}: stopped before it started")
         try:
-            return await self._k._call_run(plan, root, input, run_id, self.id)
+            return await self._k._call_run(plan, root, input, run_id, self.id, destination)
         except asyncio.CancelledError:
             # The workflow was cancelled in kairo: so is the call. If not, the
             # workflow is only no longer driven here: the call goes on in
@@ -2021,9 +2184,10 @@ class Context:
                     pass
             raise
 
-    async def call(self, action: str, input: Any = None) -> Any:
+    async def call(self, action: str, input: Any = None, *, destination: str = "") -> Any:
         """Runs action with input (once, however often the workflow runs again)."""
-        return await self._run(PLAN_CALL + action, None, input, self._next(PLAN_CALL + action, input))
+        kind = PLAN_CALL + action + (("\0destination:" + destination) if destination else "")
+        return await self._run(PLAN_CALL + action, None, input, self._next(kind, input), destination)
 
     async def wait_for(self, name: str, timeout: float | None = None) -> Any:
         """Waits for signal name (see Kairo.signal); returns its payload. With

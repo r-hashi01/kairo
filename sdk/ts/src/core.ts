@@ -21,6 +21,7 @@ export interface CoreEvent {
 	error_type?: string;
 	retryable?: boolean;
 	unknown?: boolean;
+	retry_after_ms?: number;
 	deadline?: number;
 	vars?: unknown;
 	meta?: unknown;
@@ -39,6 +40,7 @@ export interface CoreCommand {
 	step_id?: string;
 	idempotency_key?: string;
 	input?: unknown;
+	destination?: string;
 }
 
 /** What applying an event answers besides the new state (wasmcore.Result). */

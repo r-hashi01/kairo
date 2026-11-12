@@ -64,6 +64,92 @@ func TestKeepFinishedSetting(t *testing.T) {
 	}
 }
 
+func TestRuntimeDestinationsShareActualWeightAndRetryAfter(t *testing.T) {
+	var mu sync.Mutex
+	var resolved []string
+	k, err := Open(context.Background(), Options{Store: NewMemStore(), DestinationLimits: func(destination string) (DestinationLimits, error) {
+		mu.Lock()
+		resolved = append(resolved, destination)
+		mu.Unlock()
+		return DestinationLimits{WeightPerMin: 60_000}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	runs := 0
+	var firstFinished, secondStarted time.Time
+	Action(k, "metered", Unprotected, func(ctx *TaskContext, value string) (int, error) {
+		runs++
+		switch value {
+		case "first":
+			ctx.SetWeight(10_100)
+			firstFinished = time.Now()
+		case "second":
+			secondStarted = time.Now()
+		}
+		return runs, nil
+	})
+	retryAttempts := 0
+	var retryBegan time.Time
+	Action(k, "retry-after", Unprotected, func(*TaskContext, any) (time.Duration, error) {
+		retryAttempts++
+		if retryAttempts == 1 {
+			retryBegan = time.Now()
+			return 0, RetryAfter(errors.New("busy"), 80*time.Millisecond)
+		}
+		return time.Since(retryBegan), nil
+	}, MaxAttempts(2), Backoff(time.Millisecond))
+	type output struct {
+		A, B       int
+		RetryDelay time.Duration
+	}
+	Workflow(k, "w", func(ctx *Context, _ any) (output, error) {
+		a, err := Call[int](ctx, "metered", "same", CallDestination("provider-a"))
+		if err != nil {
+			return output{}, err
+		}
+		b, err := Call[int](ctx, "metered", "same", CallDestination("provider-b"))
+		if err != nil {
+			return output{}, err
+		}
+		if _, err := Call[int](ctx, "metered", "first", CallDestination("provider-a")); err != nil {
+			return output{}, err
+		}
+		if _, err := Call[int](ctx, "metered", "second", CallDestination("provider-a")); err != nil {
+			return output{}, err
+		}
+		delay, err := Call[time.Duration](ctx, "retry-after", nil, CallDestination("provider-a"))
+		return output{A: a, B: b, RetryDelay: delay}, err
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Run[output](context.Background(), k, "w", nil, WithID("runtime-destinations-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.A == out.B {
+		t.Fatal("different destinations reused one call identity")
+	}
+	mu.Lock()
+	seenA, seenB := false, false
+	for _, destination := range resolved {
+		seenA = seenA || destination == "provider-a"
+		seenB = seenB || destination == "provider-b"
+	}
+	mu.Unlock()
+	if !seenA || !seenB {
+		t.Fatalf("resolved destinations = %v", resolved)
+	}
+	if waited := secondStarted.Sub(firstFinished); waited < 75*time.Millisecond {
+		t.Fatalf("weight debt waited %v", waited)
+	}
+	if out.RetryDelay < 60*time.Millisecond {
+		t.Fatalf("retry-after waited %v", out.RetryDelay)
+	}
+}
+
 // cancelBeforeDone serializes a cancellation immediately before the workflow
 // driver sends done. It makes the ADR 0061 race deterministic.
 type cancelBeforeDone struct {

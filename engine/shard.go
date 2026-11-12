@@ -1011,10 +1011,11 @@ func (s *shard) dispatch(r *run, c *core.Command) {
 	n := &r.plan.Nodes[c.Node]
 	t := &task.Task{
 		RunID: r.id, StepID: c.StepID, Act: c.Act, Attempt: c.Attempt, IdemKey: c.IdemKey,
-		Action: n.Spec.Action, Destination: n.Spec.Destination, Tenant: r.tenant,
+		Action: n.Spec.Action, Destination: c.Destination, Tenant: r.tenant,
 		Effect: n.Spec.Effect, Input: c.Input, Params: n.Params, Deadline: c.At,
 	}
 	t.EstTokens = s.e.cfg.EstimateTokens(t)
+	t.EstWeight = t.EstTokens
 	t.Depth = int(r.st.Depth)
 	s.e.obs.Emit(obs.Record{At: s.now, Type: "step.dispatch", RunID: r.id, Tenant: r.tenant, StepID: c.StepID,
 		Action: t.Action, Effect: t.Effect.String(), Attempt: c.Attempt, Data: c.Input})

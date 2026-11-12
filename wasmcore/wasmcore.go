@@ -121,22 +121,23 @@ func Inspect(state []byte) (Inspection, error) {
 
 // Event is an input to a run (core.Event).
 type Event struct {
-	Kind      string          `json:"kind"` // see eventKinds
-	At        int64           `json:"at"`   // unix ms
-	Act       uint32          `json:"act,omitempty"`
-	Attempt   int32           `json:"attempt,omitempty"`
-	Timer     uint32          `json:"timer,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Err       string          `json:"error,omitempty"`
-	ErrType   string          `json:"error_type,omitempty"`
-	Retryable bool            `json:"retryable,omitempty"`
-	Unknown   bool            `json:"unknown,omitempty"`
-	MaxSteps  int32           `json:"max_steps,omitempty"`
-	Deadline  int64           `json:"deadline,omitempty"`
-	Depth     int32           `json:"depth,omitempty"`
-	Vars      json.RawMessage `json:"vars,omitempty"`
-	Meta      json.RawMessage `json:"meta,omitempty"`
+	Kind       string          `json:"kind"` // see eventKinds
+	At         int64           `json:"at"`   // unix ms
+	Act        uint32          `json:"act,omitempty"`
+	Attempt    int32           `json:"attempt,omitempty"`
+	Timer      uint32          `json:"timer,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	Data       json.RawMessage `json:"data,omitempty"`
+	Err        string          `json:"error,omitempty"`
+	ErrType    string          `json:"error_type,omitempty"`
+	Retryable  bool            `json:"retryable,omitempty"`
+	Unknown    bool            `json:"unknown,omitempty"`
+	RetryAfter int64           `json:"retry_after_ms,omitempty"`
+	MaxSteps   int32           `json:"max_steps,omitempty"`
+	Deadline   int64           `json:"deadline,omitempty"`
+	Depth      int32           `json:"depth,omitempty"`
+	Vars       json.RawMessage `json:"vars,omitempty"`
+	Meta       json.RawMessage `json:"meta,omitempty"`
 }
 
 var eventKinds = map[string]core.EventKind{
@@ -164,17 +165,18 @@ var commandKinds = map[core.CmdKind]string{
 // Command is an output of a run (core.Command), with the effect of its
 // step so that the host knows whether to hold it for a durable intent.
 type Command struct {
-	Kind    string          `json:"kind"` // see commandKinds
-	Act     uint32          `json:"act,omitempty"`
-	Node    string          `json:"node,omitempty"` // the plan node's id
-	Action  string          `json:"action,omitempty"`
-	Effect  string          `json:"effect,omitempty"`
-	Attempt int32           `json:"attempt,omitempty"`
-	Timer   uint32          `json:"timer,omitempty"`
-	At      int64           `json:"at,omitempty"`
-	StepID  string          `json:"step_id,omitempty"`
-	IdemKey string          `json:"idempotency_key,omitempty"`
-	Input   json.RawMessage `json:"input,omitempty"`
+	Kind        string          `json:"kind"` // see commandKinds
+	Act         uint32          `json:"act,omitempty"`
+	Node        string          `json:"node,omitempty"` // the plan node's id
+	Action      string          `json:"action,omitempty"`
+	Effect      string          `json:"effect,omitempty"`
+	Attempt     int32           `json:"attempt,omitempty"`
+	Timer       uint32          `json:"timer,omitempty"`
+	At          int64           `json:"at,omitempty"`
+	StepID      string          `json:"step_id,omitempty"`
+	IdemKey     string          `json:"idempotency_key,omitempty"`
+	Input       json.RawMessage `json:"input,omitempty"`
+	Destination string          `json:"destination,omitempty"`
 }
 
 var traceKinds = map[core.TraceKind]string{
@@ -254,7 +256,7 @@ func (c *Core) Apply(plan int, runID string, state, eventJSON []byte, traced boo
 	}
 	ev := core.Event{Kind: kind, At: e.At, Act: e.Act, Attempt: e.Attempt, Timer: e.Timer, Name: e.Name, Data: e.Data,
 		Err: e.Err, ErrType: e.ErrType, Retryable: e.Retryable, Unknown: e.Unknown, MaxSteps: e.MaxSteps,
-		Deadline: e.Deadline, Depth: e.Depth, Vars: e.Vars, Meta: e.Meta}
+		Deadline: e.Deadline, Depth: e.Depth, Vars: e.Vars, Meta: e.Meta, RetryAfter: e.RetryAfter}
 	var cmds []core.Command
 	var traces []core.Trace
 	var err error
@@ -273,7 +275,7 @@ func (c *Core) Apply(plan int, runID string, state, eventJSON []byte, traced boo
 		Error: s.Error, Quiescent: s.Quiescent()}
 	for _, cm := range cmds {
 		out := Command{Kind: commandKinds[cm.Kind], Act: cm.Act, Attempt: cm.Attempt, Timer: cm.Timer, At: cm.At,
-			StepID: cm.StepID, IdemKey: cm.IdemKey, Input: cm.Input}
+			StepID: cm.StepID, IdemKey: cm.IdemKey, Input: cm.Input, Destination: cm.Destination}
 		if cm.Node >= 0 && int(cm.Node) < len(p.Nodes) {
 			n := &p.Nodes[cm.Node]
 			out.Node = n.ID

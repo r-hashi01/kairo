@@ -86,7 +86,7 @@ func (m *machine) apply(ev *Event) error {
 			m.complete(ev.Act, a, out)
 			return nil
 		}
-		m.stepFailed(ev.Act, a, ev.Err, ev.ErrType, ev.Retryable, ev.Unknown)
+		m.stepFailed(ev.Act, a, ev.Err, ev.ErrType, ev.Retryable, ev.Unknown, ev.RetryAfter)
 		return nil
 
 	case EvStepWait, EvCallbackWait:
@@ -123,7 +123,7 @@ func (m *machine) apply(ev *Event) error {
 		a.Flags |= fPending
 		if ev.Deadline <= m.at {
 			a.Flags &^= fPending
-			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true)
+			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true, 0)
 			return nil
 		}
 		m.armTimer(ev.Act, a, ev.Deadline)
@@ -162,7 +162,7 @@ func (m *machine) apply(ev *Event) error {
 			m.complete(ev.Act, a, out)
 		case a.Flags&fPending != 0:
 			a.Flags &^= fPending
-			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true)
+			m.stepFailed(ev.Act, a, "async action callback expired", "outcome_unknown", true, true, 0)
 		case a.Flags&fRetryWait != 0:
 			a.Flags &^= fRetryWait
 			m.dispatch(ev.Act, a)
@@ -170,7 +170,7 @@ func (m *machine) apply(ev *Event) error {
 			// Step timeout: the outcome is unknown.
 			m.out = append(m.out, Command{Kind: CmdAbort, Act: ev.Act, Node: a.Node, Attempt: a.Attempt})
 			m.undispatch(a)
-			m.stepFailed(ev.Act, a, "timeout", "timeout", true, true)
+			m.stepFailed(ev.Act, a, "timeout", "timeout", true, true, 0)
 		default:
 			return ErrIgnored
 		}
@@ -400,6 +400,13 @@ func (m *machine) nodeIndex(n *ir.Node) int32 {
 
 func (m *machine) dispatch(id uint32, a *Act) {
 	n := &m.p.Nodes[a.Node]
+	in := m.buildInput(n, a.Scope)
+	destination, err := stepDestination(*n.Spec, in)
+	if err != nil {
+		m.traceStart(id, a, n, in)
+		m.giveUp(id, a, n, err.Error(), "invalid_destination")
+		return
+	}
 	var deadline int64
 	if n.Spec.Timeout > 0 {
 		deadline = m.at + time.Duration(n.Spec.Timeout).Milliseconds()
@@ -409,16 +416,16 @@ func (m *machine) dispatch(id uint32, a *Act) {
 	a.Flags &^= fIntent
 	m.s.Inflight++
 	stepID := m.stepID(id, a)
-	in := m.buildInput(n, a.Scope)
 	m.out = append(m.out, Command{
-		Kind:    CmdDispatch,
-		Act:     id,
-		Node:    a.Node,
-		Attempt: a.Attempt,
-		StepID:  stepID,
-		IdemKey: m.s.RunID + "/" + stepID,
-		Input:   in,
-		At:      deadline,
+		Kind:        CmdDispatch,
+		Act:         id,
+		Node:        a.Node,
+		Attempt:     a.Attempt,
+		StepID:      stepID,
+		IdemKey:     m.s.RunID + "/" + stepID,
+		Input:       in,
+		Destination: destination,
+		At:          deadline,
 	})
 	if a.Attempt == 1 {
 		m.traceStart(id, a, n, in) // retries are TrNodeRetry
@@ -426,6 +433,41 @@ func (m *machine) dispatch(id uint32, a *Act) {
 	if deadline > 0 {
 		m.armTimer(id, a, deadline)
 	}
+}
+
+const maxDestinationBytes = 512
+
+func stepDestination(spec ir.NodeSpec, input json.RawMessage) (string, error) {
+	destination := spec.Destination
+	if destination == "" {
+		destination = spec.Action
+	}
+	if spec.DestinationFrom == "" {
+		return validDestination(destination, "destination")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input, &fields); err != nil {
+		return "", errors.New("destination field " + strconv.Quote(spec.DestinationFrom) + ": step input is not an object")
+	}
+	raw, ok := fields[spec.DestinationFrom]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return validDestination(destination, "destination")
+	}
+	var selected string
+	if err := json.Unmarshal(raw, &selected); err != nil || selected == "" {
+		return "", errors.New("destination field " + strconv.Quote(spec.DestinationFrom) + " must be a non-empty string")
+	}
+	return validDestination(selected, "destination field "+strconv.Quote(spec.DestinationFrom))
+}
+
+func validDestination(destination, label string) (string, error) {
+	if destination == "" {
+		return "", errors.New(label + " must be non-empty")
+	}
+	if len(destination) > maxDestinationBytes {
+		return "", errors.New(label + " exceeds " + strconv.Itoa(maxDestinationBytes) + " bytes")
+	}
+	return destination, nil
 }
 
 func (m *machine) undispatch(a *Act) {
@@ -509,7 +551,7 @@ func (m *machine) cancelTimer(a *Act) {
 	}
 }
 
-func (m *machine) stepFailed(id uint32, a *Act, msg, errType string, retryable, unknown bool) {
+func (m *machine) stepFailed(id uint32, a *Act, msg, errType string, retryable, unknown bool, retryAfter int64) {
 	n := &m.p.Nodes[a.Node]
 	spec := n.Spec
 	if unknown {
@@ -536,6 +578,9 @@ func (m *machine) stepFailed(id uint32, a *Act, msg, errType string, retryable, 
 			if backoff > time.Minute {
 				backoff = time.Minute
 			}
+		}
+		if requested := time.Duration(max(retryAfter, 0)) * time.Millisecond; requested > backoff {
+			backoff = requested
 		}
 		a.Flags |= fRetryWait
 		m.trace(Trace{Kind: TrNodeRetry, Act: id, Node: a.Node, StepID: m.stepID(id, a), Attempt: a.Attempt, Err: msg, ErrType: errType})
@@ -714,7 +759,7 @@ func (m *machine) recover() {
 			if n.Spec.Effect == ir.EffectReal && a.Flags&fIntent != 0 {
 				// It may have been executed: the outcome is unknown.
 				m.undispatch(a)
-				m.stepFailed(id, a, "outcome unknown after restart", "outcome_unknown", true, true)
+				m.stepFailed(id, a, "outcome unknown after restart", "outcome_unknown", true, true, 0)
 				continue
 			}
 			// Unprotected, or real but provably never released.

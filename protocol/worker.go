@@ -277,7 +277,9 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 					delete(cancels, seq)
 				}
 				cmu.Unlock()
-				if err := s.sendResult(Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait, Pending: res.Pending}); err != nil {
+				if err := s.sendResult(Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown,
+					Tokens: res.Tokens, Weight: res.Weight, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited,
+					RetryAfter: res.RetryAfter, Wait: res.Wait, Pending: res.Pending}); err != nil {
 					s.finish(err)
 				}
 			}

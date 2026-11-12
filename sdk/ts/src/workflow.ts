@@ -37,6 +37,8 @@ export interface ActionDef<I = any, O = any> {
 	limit?: number;
 	/** At most this many steps of the action (of its destination) start in this process a minute, spaced evenly (ADR 0059). */
 	rate?: number;
+	/** At most this much reported weight of the destination is admitted per minute (ADR 0077). */
+	weightRate?: number;
 	/**
 	 * Where the action runs (ADR 0052): its steps are called over HTTP(S)
 	 * at this URL, and the handler runs there (fetchHandler). https, or
@@ -113,6 +115,8 @@ export interface KairoOptions {
 	 * counted). Steps over it wait, leased, for a slot. Default: no limit.
 	 */
 	concurrency?: number;
+	/** Resolves current per-process limits when a destination is admitted. */
+	destinationLimits?: (destination: string) => DestinationLimits;
 	/**
 	 * "wait" (the default): run() drives a workflow to its end, waiting in
 	 * this process for timers and signals. "suspend" (serverless, embedded
@@ -162,6 +166,12 @@ export interface KairoOptions {
 	metrics?: MetricSink;
 }
 
+export interface DestinationLimits {
+	concurrency?: number;
+	requestsPerMinute?: number;
+	weightPerMinute?: number;
+}
+
 /** The workflow ran into a call whose result kairo no longer keeps. */
 export class ResultLostError extends Error {}
 /** The workflow was cancelled. */
@@ -194,6 +204,16 @@ class DrivenElsewhere extends Error {}
 /** Thrown by an action's handler: a failure that may be retried (it did not take effect). */
 export class RetryableError extends Error {
 	override name = 'RetryableError';
+}
+
+/** A definite retryable refusal that asks the destination to wait (ADR 0077). */
+export class RetryAfterError extends RetryableError {
+	override name = 'RetryAfterError';
+	readonly retryAfter: number;
+	constructor(message: string, retryAfter: number) {
+		super(message);
+		this.retryAfter = Math.max(0, retryAfter);
+	}
 }
 
 /**
@@ -251,14 +271,18 @@ function failure(e: unknown): Result {
 	const error = String((e as Error)?.message ?? e);
 	const errorType = (e as Error)?.name;
 	if (e instanceof UnknownOutcomeError) return { error, unknown: true, retryable: true, errorType };
-	return { error, ...(e instanceof RetryableError ? { retryable: true } : {}), ...(errorType ? { errorType } : {}) };
+	return { error, ...(e instanceof RetryableError ? { retryable: true } : {}),
+		...(e instanceof RetryAfterError && e.retryAfter > 0 ? { retryAfter: e.retryAfter, rateLimited: true } : {}),
+		...(errorType ? { errorType } : {}) };
 }
 
 /** A result as an action over HTTP(S) answers it (ADR 0052): an unknown outcome has no 200 body. */
 function toWire(r: Result): { wire: Wire; unknown: boolean } {
-	if (r.unknown) return { wire: { error: r.error ?? '', ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: true };
-	if (r.error !== undefined) return { wire: { error: r.error, ...(r.retryable ? { retryable: true } : {}), ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: false };
-	return { wire: { output: r.output ?? null }, unknown: false };
+	const usage = { ...(r.weight !== undefined ? { weight: r.weight } : {}) };
+	if (r.unknown) return { wire: { error: r.error ?? '', ...usage, ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: true };
+	if (r.error !== undefined) return { wire: { error: r.error, ...usage, ...(r.retryable ? { retryable: true } : {}),
+		...(r.retryable && r.retryAfter ? { retry_after_ms: Math.floor(r.retryAfter) } : {}), ...(r.errorType ? { error_type: r.errorType } : {}) }, unknown: false };
+	return { wire: { output: r.output ?? null, ...usage }, unknown: false };
 }
 
 /** The action a call's plan calls ("" for a wait). */
@@ -309,15 +333,20 @@ interface Wire {
 	output?: unknown;
 	error?: string;
 	retryable?: boolean;
+	weight?: number;
+	retry_after_ms?: number;
 	error_type?: string;
 	wait?: { until: number; output?: unknown };
 }
 
 function fromWire(w: Wire): Result {
 	if (typeof w !== 'object' || w === null) throw new Error('not a result');
-	if (w.error !== undefined) return { error: String(w.error), retryable: !!w.retryable, ...(w.error_type ? { errorType: w.error_type } : {}) };
-	if (w.wait) return { wait: { until: Number(w.wait.until), output: w.wait.output ?? null } };
-	return { output: w.output ?? null };
+	const weight = Number.isSafeInteger(w.weight) && (w.weight ?? -1) >= 0 ? w.weight : undefined;
+	const retryAfter = w.retryable && Number.isSafeInteger(w.retry_after_ms) && (w.retry_after_ms ?? 0) > 0 ? w.retry_after_ms : undefined;
+	if (w.error !== undefined) return { error: String(w.error), retryable: !!w.retryable, ...(weight !== undefined ? { weight } : {}),
+		...(retryAfter !== undefined ? { retryAfter, rateLimited: true } : {}), ...(w.error_type ? { errorType: w.error_type } : {}) };
+	if (w.wait) return { wait: { until: Number(w.wait.until), output: w.wait.output ?? null }, ...(weight !== undefined ? { weight } : {}) };
+	return { output: w.output ?? null, ...(weight !== undefined ? { weight } : {}) };
 }
 
 /** Milliseconds of a duration such as "300ms", "5s", "5m", "1h". */
@@ -451,6 +480,7 @@ export class Kairo {
 		const specs: NodeSpec[] = [...this.actions].map(([action, def]) => ({
 			action,
 			effect: def.effect ?? 'real',
+			destination_from: '$kairo_destination',
 			...(def.timeout ? { timeout: def.timeout } : {}),
 			...(def.destination ? { destination: def.destination } : {}),
 			...(def.maxAttempts ? { max_attempts: def.maxAttempts } : {}),
@@ -468,19 +498,20 @@ export class Kairo {
 			}
 		}
 		for (const [name, def] of this.actions) {
-			if (!def.limit && !def.rate) continue;
+			if (!def.limit && !def.rate && !def.weightRate) continue;
 			// Actions of one destination share its limits: the strictest.
 			const key = def.destination || name;
 			let l = this.limits.get(key);
 			if (!l) this.limits.set(key, (l = new Limiter()));
-			l.tighten(def.limit ?? 0, def.rate ?? 0);
+			l.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate });
 		}
 		// kairod's worker limits its own tasks.
 		if (this.rt && this.opts.concurrency) this.slots = new Slots(this.opts.concurrency);
 		// The embedded runtime observes the steps it runs; with kairod, the worker's are observed here.
 		const observer = this.rt ? undefined : this.opts.observe;
 		await this.backend.start(specs, observer ? (task, ctx) => this.serveObserved(observer, task, ctx) : (task, ctx) => this.serve(task, ctx));
-		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action, input: { in: '$input.in' } });
+		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action,
+			input: { in: '$input.in', $kairo_destination: '$input.destination' } });
 		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
 		const rt = this.rt;
 		if (rt) {
@@ -757,20 +788,27 @@ export class Kairo {
 		const def = this.actions.get(task.action);
 		if (!def) return { error: `no action ${task.action} here` };
 		// Over a limit, the step waits here for a slot, leased (ADR 0059).
-		let release: () => void;
+		let finish: (result: Result) => void;
 		try {
-			release = await this.admit(task.action, def, ctx.signal);
+			finish = await this.admit(task.destination || def.destination || task.action, def, ctx.signal);
 		} catch {
 			return { error: `step of ${task.action} stopped waiting for a slot`, retryable: true, errorType: 'cancelled' };
 		}
+		let weight = 0;
+		const taskContext: TaskContext = { ...ctx, setWeight: (n) => {
+			if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
+			weight = n;
+		} };
+		let result: Result;
 		try {
-			if (def.url) return await this.callRemote(task, def, input);
-			return { output: (await def.handler(input, ctx)) ?? null };
+			if (def.url) result = await this.callRemote(task, def, input);
+			else result = { output: (await def.handler(input, taskContext)) ?? null };
 		} catch (e) {
-			return failure(e);
-		} finally {
-			release();
+			result = failure(e);
 		}
+		if (result.weight === undefined && weight > 0) result = { ...result, weight };
+		finish(result);
+		return result;
 	}
 
 	/**
@@ -778,32 +816,53 @@ export class Kairo {
 	 * destination's slot and turn, then the process's slot. Returns what
 	 * gives the slots back.
 	 */
-	private async admit(action: string, def: ActionDef, signal: AbortSignal): Promise<() => void> {
+	private async admit(destination: string, def: ActionDef, signal: AbortSignal): Promise<(result: Result) => void> {
 		const held: Slots[] = [];
-		const release = () => {
+		const releaseSlots = () => {
 			for (const s of held.splice(0)) s.give();
 		};
+		let limits: DestinationLimits = { concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate };
+		if (this.opts.destinationLimits) {
+			const dynamic = this.opts.destinationLimits(destination);
+			limits = {
+				concurrency: stricter(limits.concurrency, dynamic.concurrency),
+				requestsPerMinute: stricter(limits.requestsPerMinute, dynamic.requestsPerMinute),
+				weightPerMinute: stricter(limits.weightPerMinute, dynamic.weightPerMinute),
+			};
+		}
+		let limiter = this.limits.get(destination);
+		if (!limiter) this.limits.set(destination, (limiter = new Limiter()));
+		limiter.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate });
+		let admitted = false;
 		try {
-			const l = this.limits.get(def.destination || action);
-			if (l?.slots) {
-				await l.slots.take(signal);
-				held.push(l.slots);
-			}
-			if (l && l.every > 0) {
-				const now = Date.now();
-				const at = Math.max(l.next, now);
-				l.next = at + l.every;
-				if (at > now) await delay(at - now, signal);
-			}
+			await limiter.admit(limits, signal);
+			admitted = true;
 			if (this.slots) {
 				await this.slots.take(signal);
 				held.push(this.slots);
 			}
-			return release;
+			return (result) => {
+				releaseSlots();
+				limiter!.finish(result.weight ?? result.tokens ?? 0,
+					result.retryable && !result.unknown ? result.retryAfter ?? 0 : 0);
+				this.retireLimiter(destination, limiter!);
+			};
 		} catch (e) {
-			release();
+			releaseSlots();
+			if (admitted) limiter.finish(0, 0);
 			throw e;
 		}
+	}
+
+	private retireLimiter(destination: string, limiter: Limiter): void {
+		const after = limiter.idleAfter();
+		if (after === null) return;
+		if (after <= 0) {
+			if (this.limits.get(destination) === limiter && limiter.idleAfter() === 0) this.limits.delete(destination);
+			return;
+		}
+		const timer = setTimeout(() => this.retireLimiter(destination, limiter), after + 1);
+		timer.unref?.();
 	}
 
 	/** Calls an action over HTTP(S) (ADR 0052). */
@@ -817,6 +876,7 @@ export class Kairo {
 			action: task.action,
 			input: input ?? null,
 			idempotency_key: task.idempotency_key,
+			destination: task.destination ?? '',
 			callback,
 		});
 		const leaseMs = durationMs(def.timeout) ?? 15 * 60 * 1000;
@@ -887,10 +947,15 @@ export class Kairo {
 			const def = this.actions.get(m.action);
 			if (!def) return json(404, { error: `no action ${m.action} here` });
 			const run = async (): Promise<{ wire: Wire; unknown: boolean }> => {
+				let weight = 0;
 				try {
-					return toWire({ output: (await def.handler(m.input, { signal: new AbortController().signal, emit: () => {} })) ?? null });
+					return toWire({ output: (await def.handler(m.input, { signal: new AbortController().signal, emit: () => {}, setWeight: (n) => {
+						if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
+						weight = n;
+					} })) ?? null, ...(weight > 0 ? { weight } : {}) });
 				} catch (e) {
-					return toWire(failure(e));
+					const result = failure(e);
+					return toWire(weight > 0 ? { ...result, weight } : result);
 				}
 			};
 			if (!def.async) {
@@ -1537,16 +1602,16 @@ export class Kairo {
 	}
 
 	/** One call of workflow ctx: a run of its own, found again by its id. */
-	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
+	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context, destination = ''): Promise<unknown> {
 		this.rt?.reach(runId, true);
 		try {
-			return await this.callRunReached(plan, root, input, runId, ctx);
+			return await this.callRunReached(plan, root, input, runId, ctx, destination);
 		} finally {
 			this.rt?.reach(runId, false);
 		}
 	}
 
-	private async callRunReached(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context): Promise<unknown> {
+	private async callRunReached(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context, destination: string): Promise<unknown> {
 		if (ctx.signal.aborted) throw new StoppedError(`call ${runId}: stopped before it started`);
 		if (this.draining) {
 			// Draining: no new call starts here (its step would be
@@ -1560,7 +1625,7 @@ export class Kairo {
 		}
 		if (root) await this.plan(plan, root);
 		// Kept and removed with the workflow that makes it (ADR 0054).
-		await this.backend.run(plan, { in: input }, { runId, parent: ctx.id, signal: ctx.signal });
+		await this.backend.run(plan, { in: input, ...(destination ? { destination } : {}) }, { runId, parent: ctx.id, signal: ctx.signal });
 		await this.rt?.resumeReached(runId);
 		let r: RunInfo;
 		if (this.suspend) {
@@ -1692,16 +1757,123 @@ class Slots {
 	}
 }
 
-/** The limits of one destination (ADR 0059): steps at once, and the spacing of their starts (ms). */
-class Limiter {
-	slots?: Slots;
-	every = 0;
-	/** When the next step may start (unix ms). */
-	next = 0;
+function stricter(a: number | undefined, b: number | undefined): number | undefined {
+	if (!a || a <= 0) return b && b > 0 ? b : undefined;
+	if (!b || b <= 0) return a;
+	return Math.min(a, b);
+}
 
-	tighten(limit: number, perMinute: number): void {
-		if (limit > 0 && (!this.slots || limit < this.slots.size)) this.slots = new Slots(limit);
-		if (perMinute > 0) this.every = Math.max(this.every, 60_000 / perMinute);
+/** Process-local limits of one runtime destination (ADR 0059, 0077). */
+class Limiter {
+	private declared: DestinationLimits = {};
+	private active = 0;
+	private concurrency = 0;
+	private every = 0;
+	private next = 0;
+	private weightRate = 0;
+	private weightCapacity = 0;
+	private weight = 0;
+	private weightAt = 0;
+	private pauseUntil = 0;
+	private changed = new Set<() => void>();
+
+	declare(v: DestinationLimits): void {
+		this.declared = {
+			concurrency: stricter(this.declared.concurrency, v.concurrency),
+			requestsPerMinute: stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
+			weightPerMinute: stricter(this.declared.weightPerMinute, v.weightPerMinute),
+		};
+	}
+
+	configure(v: DestinationLimits): void {
+		v = {
+			concurrency: stricter(this.declared.concurrency, v.concurrency),
+			requestsPerMinute: stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
+			weightPerMinute: stricter(this.declared.weightPerMinute, v.weightPerMinute),
+		};
+		const now = Date.now();
+		this.refill(now);
+		this.concurrency = Math.max(0, Math.floor(v.concurrency ?? 0));
+		this.every = v.requestsPerMinute && v.requestsPerMinute > 0 ? 60_000 / v.requestsPerMinute : 0;
+		if (this.every === 0) this.next = 0;
+		if (!v.weightPerMinute || v.weightPerMinute <= 0) {
+			this.weightRate = this.weightCapacity = this.weight = 0;
+			this.weightAt = now;
+			return;
+		}
+		const capacity = Math.max(1, v.weightPerMinute / 6);
+		if (this.weightRate === 0) this.weight = capacity;
+		else this.weight = Math.min(this.weight, capacity);
+		this.weightRate = v.weightPerMinute / 60_000;
+		this.weightCapacity = capacity;
+		this.weightAt = now;
+	}
+
+	private refill(now: number): void {
+		if (this.weightRate <= 0) return;
+		if (this.weightAt === 0) this.weightAt = now;
+		this.weight = Math.min(this.weightCapacity, this.weight + Math.max(0, now - this.weightAt) * this.weightRate);
+		this.weightAt = now;
+	}
+
+	private wake(): void {
+		const waiters = [...this.changed];
+		this.changed.clear();
+		for (const wake of waiters) wake();
+	}
+
+	private wait(ms: number | undefined, signal: AbortSignal): Promise<void> {
+		return new Promise((resolve, reject) => {
+			if (signal.aborted) return reject(signal.reason);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const finish = (err?: unknown) => {
+				if (timer) clearTimeout(timer);
+				this.changed.delete(changed);
+				signal.removeEventListener('abort', stopped);
+				err === undefined ? resolve() : reject(err);
+			};
+			const changed = () => finish();
+			const stopped = () => finish(signal.reason);
+			this.changed.add(changed);
+			signal.addEventListener('abort', stopped, { once: true });
+			if (ms !== undefined) timer = setTimeout(changed, Math.max(0, ms));
+		});
+	}
+
+	async admit(v: DestinationLimits, signal: AbortSignal): Promise<void> {
+		for (;;) {
+			this.configure(v);
+			const now = Date.now();
+			this.refill(now);
+			let at = Math.max(now, this.pauseUntil, this.next);
+			if (this.weightRate > 0 && this.weight < 0) at = Math.max(at, now + (-this.weight / this.weightRate));
+			const full = this.concurrency > 0 && this.active >= this.concurrency;
+			if (!full && at <= now) {
+				this.active++;
+				if (this.every > 0) this.next = now + this.every;
+				return;
+			}
+			await this.wait(full ? undefined : at - now, signal);
+		}
+	}
+
+	finish(weight: number, retryAfter: number): void {
+		const now = Date.now();
+		this.refill(now);
+		if (Number.isSafeInteger(weight) && weight > 0 && this.weightRate > 0) this.weight -= weight;
+		if (retryAfter > 0) this.pauseUntil = Math.max(this.pauseUntil, now + retryAfter);
+		if (this.active > 0) this.active--;
+		this.wake();
+	}
+
+	idleAfter(): number | null {
+		const now = Date.now();
+		this.refill(now);
+		if (this.active > 0) return null;
+		let after = Math.max(0, this.pauseUntil - now, this.next - now);
+		if (this.weightRate > 0 && this.weight < this.weightCapacity)
+			after = Math.max(after, (this.weightCapacity - this.weight) / this.weightRate);
+		return after;
 	}
 }
 
@@ -1750,9 +1922,11 @@ export class Context {
 	}
 
 	/** Runs action with input (once, however often the workflow runs again). */
-	async call<O = any>(action: string, input: unknown = null): Promise<O> {
-		const id = this.next(PLAN_CALL + action, input);
-		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this)) as O;
+	async call<O = any>(action: string, input: unknown = null, opts: { destination?: string } = {}): Promise<O> {
+		const destination = opts.destination ?? '';
+		const kind = PLAN_CALL + action + (destination ? `\0destination:${destination}` : '');
+		const id = this.next(kind, input);
+		return (await this.k.callRun(PLAN_CALL + action, null, input, id, this, destination)) as O;
 	}
 
 	/** Runs the calls at once; their results in order. */

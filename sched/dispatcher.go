@@ -17,6 +17,9 @@ import (
 type DestLimits struct {
 	RPM int // requests per minute, 0 = unlimited
 	TPM int // tokens per minute, 0 = unlimited
+	// WPM is generic weight per minute (ADR 0077). When zero, TPM remains
+	// the weight limit for compatibility.
+	WPM int
 	// BurstSeconds sizes the buckets: how many seconds of quota may be used
 	// at once. Default 10.
 	BurstSeconds float64
@@ -35,8 +38,10 @@ type DestLimits struct {
 // time. Both lower the destination's concurrency.
 type Outcome struct {
 	Tokens      int
+	Weight      int
 	RateLimited bool
 	TimedOut    bool
+	RetryAfter  time.Duration
 }
 
 // The adaptive concurrency of a destination (ADR 0039): unlimited (up to a
@@ -106,17 +111,18 @@ const (
 )
 
 type dmsg struct {
-	kind    dmsgKind
-	task    *task.Task
-	poller  *Poller
-	credit  int
-	dest    string
-	tenant  string
-	est     int
-	actual  int
-	limited bool
-	key     task.Key
-	run     string
+	kind       dmsgKind
+	task       *task.Task
+	poller     *Poller
+	credit     int
+	dest       string
+	tenant     string
+	est        int
+	actual     int
+	limited    bool
+	retryAfter int64
+	key        task.Key
+	run        string
 }
 
 type handed struct {
@@ -165,6 +171,7 @@ type dest struct {
 	srtt, baseRTT time.Duration // recent and long-run round trip
 	lastDecrease  time.Time
 	refused       uint64
+	pauseUntil    time.Time
 }
 
 func (ds *dest) maxLimit() float64 {
@@ -258,7 +265,24 @@ func (b *bucket) wait(n float64) time.Duration {
 	if b.tokens >= n {
 		return 0
 	}
-	return time.Duration((n-b.tokens)/b.perMs*1e6) + time.Millisecond
+	return bucketWait((n - b.tokens) / b.perMs)
+}
+
+// recovery returns when an idle bucket no longer affects later work.
+func (b *bucket) recovery(now time.Time) time.Duration {
+	b.refill(now)
+	if b.unlimited() || b.tokens >= b.cap {
+		return 0
+	}
+	return bucketWait((b.cap - b.tokens) / b.perMs)
+}
+
+func bucketWait(ms float64) time.Duration {
+	maxMs := float64(math.MaxInt64-time.Millisecond) / float64(time.Millisecond)
+	if ms >= maxMs {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ms*float64(time.Millisecond)) + time.Millisecond
 }
 
 func NewDispatcher(limits func(dest string) DestLimits) *Dispatcher {
@@ -345,8 +369,16 @@ func (d *Dispatcher) Done(t *task.Task, tokens int) { d.Finish(t, Outcome{Tokens
 // Finish is Done with how the task went, which adjusts its destination's
 // concurrency (ADR 0039).
 func (d *Dispatcher) Finish(t *task.Task, o Outcome) {
-	d.q.Push(dmsg{kind: mDone, task: t, key: t.Key(), dest: t.Destination, tenant: t.Tenant, est: t.EstTokens,
-		actual: o.Tokens, limited: o.RateLimited || o.TimedOut})
+	est := t.EstWeight
+	if est == 0 {
+		est = t.EstTokens
+	}
+	actual := o.Weight
+	if actual == 0 {
+		actual = o.Tokens
+	}
+	d.q.Push(dmsg{kind: mDone, task: t, key: t.Key(), dest: t.Destination, tenant: t.Tenant, est: est,
+		actual: actual, limited: o.RateLimited || o.TimedOut, retryAfter: o.RetryAfter.Milliseconds()})
 }
 
 // Abort drops a queued task, or cancels the context of a delivered one
@@ -499,6 +531,12 @@ func (d *Dispatcher) loop() {
 					// Settle the estimate against actual usage.
 					ds.tpm.tokens += float64(m.est - m.actual)
 				}
+				if m.retryAfter > 0 {
+					until := d.now().Add(time.Duration(m.retryAfter) * time.Millisecond)
+					if until.After(ds.pauseUntil) {
+						ds.pauseUntil = until
+					}
+				}
 				touched[ds] = struct{}{}
 			case mAbort:
 				if _, ok := d.pending[m.key]; ok {
@@ -529,6 +567,14 @@ func (d *Dispatcher) loop() {
 		for ds := range touched {
 			if w := d.match(ds); w > 0 && (nextWake == 0 || w < nextWake) {
 				nextWake = w
+			}
+		}
+		for ds := range touched {
+			forget, wait := ds.forgetAfter(d.now())
+			if forget {
+				d.forget(ds)
+			} else if wait > 0 && (nextWake == 0 || wait < nextWake) {
+				nextWake = wait
 			}
 		}
 		if nextWake > 0 {
@@ -579,16 +625,48 @@ func (d *Dispatcher) dest(name, action string) *dest {
 		if lim.BurstSeconds <= 0 {
 			lim.BurstSeconds = 10
 		}
+		wpm := lim.WPM
+		if wpm == 0 {
+			wpm = lim.TPM
+		}
 		ds = &dest{
 			name: name, action: action, lim: lim,
 			rpm:     newBucket(lim.RPM, lim.BurstSeconds, now),
-			tpm:     newBucket(lim.TPM, lim.BurstSeconds, now),
+			tpm:     newBucket(wpm, lim.BurstSeconds, now),
 			tenants: map[string]*tenantQ{},
 		}
 		ds.limit = ds.maxLimit()
 		d.dests[name] = ds
 	}
 	return ds
+}
+
+// forgetAfter reports when an idle destination ceases to affect admission.
+func (ds *dest) forgetAfter(now time.Time) (bool, time.Duration) {
+	if ds.queued > 0 || ds.inflight > 0 {
+		return false, 0
+	}
+	w := max(ds.rpm.recovery(now), ds.tpm.recovery(now))
+	if ds.pauseUntil.After(now) {
+		w = max(w, ds.pauseUntil.Sub(now))
+	}
+	return w <= 0, w
+}
+
+func (d *Dispatcher) forget(ds *dest) {
+	delete(d.dests, ds.name)
+	list := d.byAction[ds.action]
+	for i, item := range list {
+		if item == ds {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(d.byAction, ds.action)
+	} else {
+		d.byAction[ds.action] = list
+	}
 }
 
 // requeue returns a task that was delivered but never taken to the head of
@@ -651,6 +729,9 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 	now := d.now()
 	ds.rpm.refill(now)
 	ds.tpm.refill(now)
+	if ds.pauseUntil.After(now) {
+		return ds.pauseUntil.Sub(now)
+	}
 	for ds.queued > 0 {
 		ps := d.pollers[ds.action]
 		if len(ps) == 0 {
@@ -695,7 +776,11 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		if t == nil {
 			return 0
 		}
-		est := float64(max(t.EstTokens, 0))
+		estWeight := t.EstWeight
+		if estWeight == 0 {
+			estWeight = t.EstTokens
+		}
+		est := float64(max(estWeight, 0))
 		w := max(ds.rpm.wait(1), ds.tpm.wait(est))
 		if w > 0 {
 			return w

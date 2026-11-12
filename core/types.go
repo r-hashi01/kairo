@@ -70,6 +70,9 @@ type Event struct {
 	Retryable bool
 	Unknown   bool   // outcome unknown (timeout, disconnect)
 	ErrType   string // EvStepErr: the executor's error class (ADR 0030)
+	// RetryAfter is the minimum wait in milliseconds requested by a
+	// definite retryable failure (ADR 0077).
+	RetryAfter int64
 
 	// EvStart: limits of the run (ADR 0030). Deadline is absolute (unix
 	// ms), so replaying the log reproduces it; 0 means none.
@@ -107,6 +110,8 @@ type Command struct {
 	StepID  string // node id + iteration path, e.g. "send[2]"
 	IdemKey string // stable across attempts
 	Input   json.RawMessage
+	// Destination is resolved from the step input before dispatch (ADR 0077).
+	Destination string
 }
 
 const (

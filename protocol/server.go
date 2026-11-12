@@ -320,7 +320,9 @@ func (s *Server) handle(c net.Conn) {
 			if invalidPending {
 				s.E.Complete(t, task.Result{Err: "worker sent pending without a negotiated callback", Unknown: true, Retryable: true, ErrType: "protocol"})
 			} else {
-				s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown, Tokens: res.Tokens, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited, Wait: res.Wait, Pending: pending})
+				s.E.Complete(t, task.Result{Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown,
+					Tokens: res.Tokens, Weight: res.Weight, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited,
+					RetryAfter: res.RetryAfter, Wait: res.Wait, Pending: pending})
 			}
 			if drained {
 				wmu.Lock()

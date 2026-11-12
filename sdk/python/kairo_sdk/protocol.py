@@ -74,6 +74,8 @@ class Result:
     retryable: bool = False
     unknown: bool = False
     tokens: int = 0
+    weight: int = 0
+    retry_after_ms: int = 0
     error_type: str = ""
     meta: Any = None
     rate_limited: bool = False
@@ -94,7 +96,7 @@ class Result:
             b["wait"] = {"until": int(self.wait["until"]), "output": self.wait.get("output")}
         else:
             b["output"] = self.output
-        for k in ("retryable", "unknown", "tokens", "error_type", "meta", "rate_limited"):
+        for k in ("retryable", "unknown", "tokens", "weight", "retry_after_ms", "error_type", "meta", "rate_limited"):
             v = getattr(self, k)
             if v:
                 b[k] = v

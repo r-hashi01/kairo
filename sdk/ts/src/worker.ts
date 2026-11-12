@@ -20,6 +20,8 @@ export interface TaskContext {
 	signal: AbortSignal;
 	/** Streams output of the step to watchers. */
 	emit(data: string | Buffer): void;
+	/** Reports this attempt's non-negative admission weight (ADR 0077). */
+	setWeight(weight: number): void;
 }
 
 export type Handler = (task: Task, ctx: TaskContext) => Promise<Result>;
@@ -261,6 +263,7 @@ export class Worker {
 
 	private serve(task: Task, send: (type: number, body: unknown) => void): void {
 		const controller = new AbortController();
+		let weight = 0;
 		this.cancels.set(task.seq, controller);
 		const ctx: TaskContext = {
 			signal: controller.signal,
@@ -269,6 +272,10 @@ export class Worker {
 					seq: task.seq,
 					data: (typeof data === 'string' ? Buffer.from(data) : data).toString('base64'),
 				}),
+			setWeight: (n) => {
+				if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
+				weight = n;
+			},
 		};
 		void (async () => {
 			let result: Result;
@@ -278,6 +285,7 @@ export class Worker {
 				// A handler that throws: the step failed, definitely.
 				result = { error: e instanceof Error ? e.message : String(e) };
 			}
+			if (result.weight === undefined && weight > 0) result = { ...result, weight };
 			this.cancels.delete(task.seq);
 			if (this.draining) this.pendingAcks++;
 			send(MsgType.Result, resultBody(task.seq, result));

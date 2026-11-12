@@ -23,6 +23,7 @@ func TestJSONAndClassification(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"text":"hi","usage":{"total_tokens":42}}`)
 		case "/limited":
+			w.Header().Set("Retry-After", "2")
 			w.WriteHeader(429)
 		default:
 			w.WriteHeader(400)
@@ -37,7 +38,7 @@ func TestJSONAndClassification(t *testing.T) {
 		t.Fatalf("%+v key=%q body=%v", res, gotKey, gotBody)
 	}
 	tk.Params = json.RawMessage(`{"url":"` + srv.URL + `/limited"}`)
-	if res := x.Execute(context.Background(), tk, nil); !res.Retryable {
+	if res := x.Execute(context.Background(), tk, nil); !res.Retryable || res.RetryAfter != 2000 {
 		t.Fatalf("429 not retryable: %+v", res)
 	}
 	tk.Params = json.RawMessage(`{"url":"` + srv.URL + `/bad"}`)

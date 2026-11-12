@@ -14,6 +14,7 @@ export interface NodeSpec {
 	max_attempts?: number;
 	timeout?: string;
 	destination?: string;
+	destination_from?: string;
 	[key: string]: unknown;
 }
 

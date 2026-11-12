@@ -91,6 +91,7 @@ func TestEventRecordExtension(t *testing.T) {
 		{Kind: core.EvStepErr, Act: 3, Err: "x", ErrType: "Timeout", Unknown: true},
 		{Kind: core.EvStart, Data: json.RawMessage(`{}`), Name: "web", MaxSteps: 500, Deadline: 1234567, Depth: 2},
 		{Kind: core.EvStepOK, Act: 4, Data: json.RawMessage(`1`), Meta: json.RawMessage(`{"tokens":3}`)},
+		{Kind: core.EvStepErr, Act: 4, Err: "busy", Retryable: true, RetryAfter: 2500},
 	} {
 		r, err := decodeRecord(encodeEvent(nil, "r", &ev))
 		if err != nil {

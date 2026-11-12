@@ -71,21 +71,24 @@ func info(row *RunRow) RunInfo {
 
 // task is a dispatched step, as an action handler gets it.
 type task struct {
-	RunID, StepID, Action, IdemKey string
-	Act                            uint32
-	Attempt                        int32
-	Input                          json.RawMessage
-	Callback                       string
+	RunID, StepID, Action, IdemKey, Destination string
+	Act                                         uint32
+	Attempt                                     int32
+	Input                                       json.RawMessage
+	Callback                                    string
 }
 
 // result is a step's outcome.
 type result struct {
-	Output    json.RawMessage
-	Err       string
-	ErrType   string
-	Retryable bool
-	Unknown   bool
-	Wait      *waitResult
+	Output      json.RawMessage
+	Err         string
+	ErrType     string
+	Retryable   bool
+	Unknown     bool
+	Weight      int
+	RetryAfter  int64
+	RateLimited bool
+	Wait        *waitResult
 	// Pending: the step runs elsewhere and its outcome comes later
 	// (complete); its lease goes to Owner (ADR 0052).
 	Pending *pending
@@ -1072,7 +1075,8 @@ func (r *runtime) dispatch(runID string, c wasmcore.Command) {
 	r.running[key] = cancel
 	r.mu.Unlock()
 	r.renew()
-	t := task{RunID: runID, StepID: c.StepID, Act: c.Act, Attempt: c.Attempt, IdemKey: c.IdemKey, Action: c.Action, Input: c.Input}
+	t := task{RunID: runID, StepID: c.StepID, Act: c.Act, Attempt: c.Attempt, IdemKey: c.IdemKey,
+		Action: c.Action, Destination: c.Destination, Input: c.Input}
 	r.observe(Observation{Kind: ObsStepStarted, RunID: runID, Action: c.Action, StepID: c.StepID, Attempt: c.Attempt})
 	began := time.Now()
 	res := r.call(ctx, h, t)
@@ -1123,8 +1127,12 @@ func outcome(res result, act uint32, attempt int32, at int64) wasmcore.Event {
 		if msg == "" {
 			msg = "outcome unknown"
 		}
+		retryAfter := int64(0)
+		if res.Retryable && !res.Unknown {
+			retryAfter = max(res.RetryAfter, 0)
+		}
 		return wasmcore.Event{Kind: "step_err", At: at, Act: act, Attempt: attempt, Err: msg, Retryable: res.Retryable,
-			Unknown: res.Unknown, ErrType: res.ErrType}
+			Unknown: res.Unknown, ErrType: res.ErrType, RetryAfter: retryAfter}
 	}
 	if res.Wait != nil {
 		return wasmcore.Event{Kind: "step_wait", At: at, Act: act, Attempt: attempt, Deadline: res.Wait.Until, Data: orNull(res.Wait.Output)}

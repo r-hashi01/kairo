@@ -103,9 +103,16 @@ class TaskContext:
     def __init__(self, emit: Callable[[bytes], None]) -> None:
         self.cancelled = Flag()
         self._emit = emit
+        self._weight = 0
 
     def emit(self, data: bytes | str) -> None:
         self._emit(data.encode() if isinstance(data, str) else data)
+
+    def set_weight(self, weight: int) -> None:
+        """Reports this attempt's non-negative admission weight (ADR 0077)."""
+        if not isinstance(weight, int) or isinstance(weight, bool) or weight < 0:
+            raise ValueError("step weight must be a non-negative integer")
+        self._weight = weight
 
 
 Handler = Callable[[Task, TaskContext], Result]
@@ -296,6 +303,8 @@ class Worker:
         except Exception as e:  # a handler bug must not lose the task's slot
             logger.exception("task %s failed", task.step_id)
             res = Result(error=f"{type(e).__name__}: {e}", error_type=type(e).__name__, retryable=False)
+        if not res.weight and ctx._weight:
+            res.weight = ctx._weight
         res.seq = task.seq
         with self._clock:
             self._cancels.pop(task.seq, None)

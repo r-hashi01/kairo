@@ -13,9 +13,9 @@ import (
 
 func TestDecodeCallbackResultIsStrict(t *testing.T) {
 	valid := []string{
-		`{"output":{"ok":true}}`,
-		`{"error":"busy","retryable":true,"error_type":"upstream"}`,
-		`{"wait":{"until":123,"output":null}}`,
+		`{"output":{"ok":true},"weight":12}`,
+		`{"error":"busy","retryable":true,"error_type":"upstream","weight":3,"retry_after_ms":2500}`,
+		`{"wait":{"until":123,"output":null},"weight":1}`,
 	}
 	for _, body := range valid {
 		if _, err := decodeCallbackResult([]byte(body)); err != nil {
@@ -28,12 +28,19 @@ func TestDecodeCallbackResultIsStrict(t *testing.T) {
 		`{"output":1,"retryable":true}`,
 		`{"error":""}`,
 		`{"wait":{"until":0}}`,
+		`{"error":"busy","retry_after_ms":10}`,
+		`{"error":"busy","retryable":true,"retry_after_ms":-1}`,
+		`{"output":1,"weight":-1}`,
 		`{"output":1,"capability":"leak"}`,
 	}
 	for _, body := range invalid {
 		if _, err := decodeCallbackResult([]byte(body)); err == nil {
 			t.Fatalf("invalid body accepted: %s", body)
 		}
+	}
+	got, err := decodeCallbackResult([]byte(`{"error":"busy","retryable":true,"weight":3,"retry_after_ms":2500}`))
+	if err != nil || got.Weight != 3 || got.RetryAfter != 2500 || !got.RateLimited {
+		t.Fatalf("decoded result = %+v, %v", got, err)
 	}
 }
 

@@ -69,7 +69,8 @@ func decodeCallbackResult(body []byte) (task.Result, error) {
 	if len(body) == 0 || json.Unmarshal(body, &fields) != nil {
 		return task.Result{}, errors.New("callback result must be a JSON object")
 	}
-	allowed := map[string]bool{"output": true, "error": true, "retryable": true, "error_type": true, "wait": true}
+	allowed := map[string]bool{"output": true, "error": true, "retryable": true, "error_type": true, "wait": true,
+		"weight": true, "retry_after_ms": true}
 	for key := range fields {
 		if !allowed[key] {
 			return task.Result{}, errors.New("callback result has an unknown field")
@@ -81,11 +82,15 @@ func decodeCallbackResult(body []byte) (task.Result, error) {
 	if btoi(output)+btoi(failure)+btoi(waiting) != 1 {
 		return task.Result{}, errors.New("callback result needs exactly one of output, error, or wait")
 	}
+	weight := 0
+	if raw := fields["weight"]; raw != nil && (json.Unmarshal(raw, &weight) != nil || weight < 0) {
+		return task.Result{}, errors.New("callback weight must be a non-negative integer")
+	}
 	if output {
-		if fields["retryable"] != nil || fields["error_type"] != nil || !json.Valid(fields["output"]) {
+		if fields["retryable"] != nil || fields["error_type"] != nil || fields["retry_after_ms"] != nil || !json.Valid(fields["output"]) {
 			return task.Result{}, errors.New("invalid callback output")
 		}
-		return task.Result{Output: bytes.Clone(fields["output"])}, nil
+		return task.Result{Output: bytes.Clone(fields["output"]), Weight: weight}, nil
 	}
 	if failure {
 		var out task.Result
@@ -98,16 +103,26 @@ func decodeCallbackResult(body []byte) (task.Result, error) {
 		if raw := fields["error_type"]; raw != nil && json.Unmarshal(raw, &out.ErrType) != nil {
 			return task.Result{}, errors.New("callback error_type must be a string")
 		}
+		if raw := fields["retry_after_ms"]; raw != nil {
+			if json.Unmarshal(raw, &out.RetryAfter) != nil || out.RetryAfter < 0 {
+				return task.Result{}, errors.New("callback retry_after_ms must be a non-negative integer")
+			}
+			if !out.Retryable {
+				return task.Result{}, errors.New("callback retry_after_ms needs retryable")
+			}
+			out.RateLimited = out.RetryAfter > 0
+		}
+		out.Weight = weight
 		return out, nil
 	}
-	if fields["retryable"] != nil || fields["error_type"] != nil {
+	if fields["retryable"] != nil || fields["error_type"] != nil || fields["retry_after_ms"] != nil {
 		return task.Result{}, errors.New("callback wait cannot carry error fields")
 	}
 	var wait task.Wait
 	if json.Unmarshal(fields["wait"], &wait) != nil || wait.Until <= 0 {
 		return task.Result{}, errors.New("callback wait needs a positive until")
 	}
-	return task.Result{Wait: &wait}, nil
+	return task.Result{Wait: &wait, Weight: weight}, nil
 }
 
 func btoi(v bool) int {

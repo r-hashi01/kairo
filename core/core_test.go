@@ -407,6 +407,79 @@ func TestRetryUnprotected(t *testing.T) {
 	x.checkReplay()
 }
 
+func TestRetryAfterOverridesBackoff(t *testing.T) {
+	x := newSim(t, compile(t, `{"name":"r","root":{"kind":"step","id":"a","action":"llm","retry":{"max_attempts":2,"interval":"10ms"}}}`))
+	n := 0
+	x.handler = func(Command, *ir.Node) Event {
+		n++
+		if n == 1 {
+			return Event{Kind: EvStepErr, Err: "busy", Retryable: true, RetryAfter: 250}
+		}
+		return ok(`1`)
+	}
+	x.run(`{}`)
+	if x.now != 1250 || n != 2 {
+		t.Fatalf("retry at %d with %d attempts, want 1250 and 2", x.now, n)
+	}
+	x.checkReplay()
+}
+
+func TestDestinationFromResolvedInput(t *testing.T) {
+	r := registry()
+	r.Register(ir.NodeSpec{Action: "route", Effect: ir.EffectUnprotected, Destination: "fixed", DestinationFrom: "provider"})
+	d, err := ir.ParseDefinition([]byte(`{"name":"r","root":{"kind":"step","id":"a","action":"route","input":{"provider":"$input.provider"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := ir.Compile(d, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		input string
+		want  string
+	}{
+		{`{"provider":"openai/project-a"}`, "openai/project-a"},
+		{`{"provider":null}`, "fixed"},
+	} {
+		x := newSim(t, p)
+		x.handler = func(c Command, _ *ir.Node) Event {
+			if c.Destination != tc.want {
+				t.Fatalf("destination %q, want %q", c.Destination, tc.want)
+			}
+			return ok(`1`)
+		}
+		x.run(tc.input)
+		if x.s.Status != StatusCompleted {
+			t.Fatalf("status %v: %s", x.s.Status, x.s.Error)
+		}
+		x.checkReplay()
+	}
+}
+
+func TestInvalidDestinationFailsBeforeDispatch(t *testing.T) {
+	r := registry()
+	r.Register(ir.NodeSpec{Action: "route", Effect: ir.EffectUnprotected, DestinationFrom: "provider"})
+	d, err := ir.ParseDefinition([]byte(`{"name":"r","root":{"kind":"step","id":"a","action":"route","input":{"provider":"$input.provider"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := ir.Compile(d, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := newSim(t, p)
+	x.handler = func(Command, *ir.Node) Event {
+		t.Fatal("invalid destination was dispatched")
+		return Event{}
+	}
+	x.run(`{"provider":""}`)
+	if x.s.Status != StatusFailed || !strings.Contains(x.s.Error, "non-empty string") {
+		t.Fatalf("status %v error %q", x.s.Status, x.s.Error)
+	}
+	x.checkReplay()
+}
+
 func TestRealUnknownOutcomeNeedsReview(t *testing.T) {
 	x := newSim(t, compile(t, `{"name":"r","root":{"kind":"seq","nodes":[
 	  {"kind":"step","id":"send","action":"send"},{"kind":"step","id":"after","action":"llm"}]}}`))

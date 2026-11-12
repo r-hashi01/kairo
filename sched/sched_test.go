@@ -1,6 +1,7 @@
 package sched
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +81,72 @@ func TestDispatcherRateLimit(t *testing.T) {
 	// 5 immediately (burst), 5 more at 10/s => ~0.5s.
 	if el := time.Since(start); el < 400*time.Millisecond || el > 900*time.Millisecond {
 		t.Fatalf("10 requests at 10/s with burst 5 took %v", el)
+	}
+}
+
+func TestRetryAfterPausesDestination(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, 2)
+	first := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "provider"}
+	d.Submit(first)
+	<-p.C
+	d.Finish(first, Outcome{RateLimited: true, RetryAfter: 80 * time.Millisecond})
+	second := &task.Task{RunID: "r", Act: 2, Tenant: "t", Action: "x", Destination: "provider"}
+	started := time.Now()
+	d.Submit(second)
+	select {
+	case <-p.C:
+		if elapsed := time.Since(started); elapsed < 60*time.Millisecond {
+			t.Fatalf("destination resumed after %v, before Retry-After", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("destination did not resume after Retry-After")
+	}
+}
+
+func TestActualWeightDebtPausesLaterTask(t *testing.T) {
+	d := NewDispatcher(func(string) DestLimits { return DestLimits{WPM: 60_000} })
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, 2)
+	first := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "provider"}
+	d.Submit(first)
+	<-p.C
+	// The ten-second burst is 10,000. With no estimate, the response may
+	// cross it; the next task repays the 100 units of debt at 1,000/s.
+	d.Finish(first, Outcome{Weight: 10_100})
+	second := &task.Task{RunID: "r", Act: 2, Tenant: "t", Action: "x", Destination: "provider"}
+	started := time.Now()
+	d.Submit(second)
+	select {
+	case <-p.C:
+		if elapsed := time.Since(started); elapsed < 75*time.Millisecond {
+			t.Fatalf("destination repaid weight debt in %v", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("destination did not resume after weight debt")
+	}
+}
+
+func TestIdleDestinationStateIsRetired(t *testing.T) {
+	var resolved atomic.Int64
+	d := NewDispatcher(func(string) DestLimits {
+		resolved.Add(1)
+		return DestLimits{}
+	})
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, 1)
+	tk := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "ephemeral"}
+	d.Submit(tk)
+	<-p.C
+	d.Done(tk, 0)
+	waitTracked(t, d, 0)
+	d.Poll(p, 1)
+	next := &task.Task{RunID: "r", Act: 2, Tenant: "t", Action: "x", Destination: "ephemeral"}
+	d.Submit(next)
+	<-p.C
+	if got := resolved.Load(); got != 2 {
+		t.Fatalf("destination limits resolved %d times, want 2 after retirement", got)
 	}
 }
 

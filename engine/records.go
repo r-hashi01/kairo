@@ -144,7 +144,7 @@ func encodeEvent(b []byte, runID string, ev *core.Event) []byte {
 	if ev.Unknown {
 		flags |= 2
 	}
-	ext := ev.ErrType != "" || ev.MaxSteps != 0 || ev.Deadline != 0 || ev.Depth != 0 || len(ev.Vars) > 0 || len(ev.Meta) > 0
+	ext := ev.ErrType != "" || ev.MaxSteps != 0 || ev.Deadline != 0 || ev.Depth != 0 || len(ev.Vars) > 0 || len(ev.Meta) > 0 || ev.RetryAfter != 0
 	if !ext {
 		return append(b, flags)
 	}
@@ -162,12 +162,14 @@ func encodeEvent(b []byte, runID string, ev *core.Event) []byte {
 	b = append(b, ev.Vars...)
 	// Version 3 (ADR 0034).
 	b = binary.AppendUvarint(b, uint64(len(ev.Meta)))
-	return append(b, ev.Meta...)
+	b = append(b, ev.Meta...)
+	// Version 4 (ADR 0077).
+	return binary.AppendVarint(b, ev.RetryAfter)
 }
 
 const (
 	flagExt    byte = 4
-	extVersion      = 3
+	extVersion      = 4
 )
 
 type rdr struct {
@@ -312,6 +314,9 @@ func decodeRecord(rec []byte) (record, error) {
 			}
 			if v >= 3 {
 				e.Meta = r.bytes()
+			}
+			if v >= 4 {
+				e.RetryAfter = r.i()
 			}
 		}
 		out.ev = e
