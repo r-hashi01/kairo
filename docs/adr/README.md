@@ -82,5 +82,6 @@
 | [0075](0075-negotiate-graceful-worker-drain-capability.md) | worker と kairod は graceful Drain の能力を接続ごとに合意してから使う | 承認 |
 | [0076](0076-operational-measurements-are-nondurable-and-bounded.md) | 運用指標は実行記録から分離し、有界 cardinality の非耐久な計数・分布として公開する | 承認 |
 | [0077](0077-runtime-destinations-weight-limits-and-retry-after.md) | 実行時に選んだ宛先へ、完了後の重みと再試行待ちを共有して適用する | 承認 |
+| [0078](0078-share-destination-rate-state-through-the-store.md) | 埋め込みランタイムは宛先の要求数・重み・再試行待ちを保存先でプロセス間共有できる | 提案 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
