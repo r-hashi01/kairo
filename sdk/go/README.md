@@ -198,7 +198,7 @@ kairo.NewSQLStore(db, kairo.Postgres)             // any PostgreSQL driver (gith
 kairo.NewMemStore()                               // runs that need not outlive the process; tests
 ```
 
-The `*sql.DB` is yours: kairo does not close it. For PostgreSQL, `pgnotify.Wrap(store, dsn)` (`github.com/r-hashi01/kairo/sdk/go/pgnotify`, a module of its own) also wakes a wait in one process when a run settles in another (`LISTEN`/`NOTIFY`). Finished runs are removed, together with everything they started, once they have been kept long enough: `Options.KeepFinished`, or `KAIRO_KEEP_FINISHED` (`24h` by default, `7d`, `forever`). A workflow that is still waiting keeps its history for as long as it waits.
+The `*sql.DB` is yours: kairo does not close it. For PostgreSQL, `pgnotify.Wrap(store, dsn)` (`github.com/r-hashi01/kairo/sdk/go/pgnotify`, a module of its own) wakes a wait in one process when a run settles in another (`LISTEN`/`NOTIFY`). For a file-backed SQLite store on the same host, `sqlitenotify.Wrap(store, "kairo.db")` (`github.com/r-hashi01/kairo/sdk/go/sqlitenotify`) provides the same wake-up through local sockets. Every process writing that database should use the wrapper for immediate wake-ups; the lease-period recheck remains the fallback. Finished runs are removed, together with everything they started, once they have been kept long enough: `Options.KeepFinished`, or `KAIRO_KEEP_FINISHED` (`24h` by default, `7d`, `forever`). A workflow that is still waiting keeps its history for as long as it waits.
 
 ## Serverless
 

@@ -4,6 +4,11 @@
 // the events, replace the state and arm or disarm timers.
 
 import type { CoreEvent } from './core.ts';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdir, readdir, realpath, rm, rmdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { createConnection, createServer, type Server } from 'node:net';
+import { tmpdir } from 'node:os';
 
 /**
  * Stops the current workflow drive without recording an outcome, so the
@@ -366,12 +371,19 @@ export class SQLiteStore implements Store {
 	private readonly path: string;
 	private readonly p: string;
 	private readonly sync: string;
+	private readonly notifier?: SQLiteNotifier;
 	private q: Record<string, any> = {};
+	readonly listen?: (settled: (runId: string) => void) => Promise<() => Promise<void>>;
 
-	constructor(path: string, opts: { prefix?: string; synchronous?: 'FULL' | 'NORMAL' } = {}) {
+	constructor(path: string, opts: { prefix?: string; synchronous?: 'FULL' | 'NORMAL'; notify?: boolean } = {}) {
 		this.path = path;
 		this.p = checkPrefix(opts.prefix ?? 'kairo_');
 		this.sync = opts.synchronous ?? 'FULL';
+		if (opts.notify) {
+			if (path === ':memory:') throw new Error('SQLite notifications require a file');
+			this.notifier = new SQLiteNotifier(path, this.p);
+			this.listen = (settled) => this.notifier!.listen(settled);
+		}
 	}
 
 	async init(): Promise<void> {
@@ -471,6 +483,7 @@ export class SQLiteStore implements Store {
 				for (const rate of [...c.sharedRates].sort((a, b) => a.destination.localeCompare(b.destination))) this.settleRate(rate, now);
 			}
 			this.db.exec('COMMIT');
+			if (c.notify) await this.notifier?.publish(id);
 			return c.result;
 		} catch (e) {
 			this.db.exec('ROLLBACK');
@@ -589,6 +602,74 @@ export class SQLiteStore implements Store {
 
 	async close(): Promise<void> {
 		this.db?.close();
+	}
+}
+
+const NOTIFY_MAX = 64 << 10;
+
+class SQLiteNotifier {
+	private readonly path: string;
+	private readonly namespace: string;
+	private dir = '';
+	private socket = '';
+	private server?: Server;
+
+	constructor(path: string, namespace: string) {
+		this.path = path;
+		this.namespace = namespace;
+	}
+
+	async listen(settled: (runId: string) => void): Promise<() => Promise<void>> {
+		const path = await realpath(this.path);
+		const key = createHash('sha256').update(path).update('\0').update(this.namespace).digest('hex').slice(0, 16);
+		this.dir = join(await realpath(tmpdir()), `.kairo-n-${key}`);
+		await mkdir(this.dir, { recursive: true, mode: 0o700 });
+		this.socket = join(this.dir, `${randomBytes(4).toString('hex')}.sock`);
+		this.server = createServer((conn) => {
+			const chunks: Buffer[] = [];
+			let size = 0;
+			conn.on('data', (chunk: Buffer) => {
+				size += chunk.length;
+				if (size > NOTIFY_MAX) conn.destroy();
+				else chunks.push(chunk);
+			});
+			conn.on('end', () => {
+				try {
+					const m = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+					if (m.v === 1 && m.namespace === this.namespace && typeof m.run_id === 'string' && m.run_id) settled(m.run_id);
+				} catch { /* a notification is only a hint */ }
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			this.server!.once('error', reject);
+			this.server!.listen(this.socket, () => {
+				this.server!.off('error', reject);
+				resolve();
+			});
+		});
+		return async () => {
+			if (this.server) await new Promise<void>((resolve) => this.server!.close(() => resolve()));
+			await rm(this.socket, { force: true }).catch(() => {});
+			await rmdir(this.dir).catch(() => {});
+		};
+	}
+
+	async publish(runId: string): Promise<void> {
+		if (!this.dir) return;
+		const data = Buffer.from(JSON.stringify({ v: 1, namespace: this.namespace, run_id: runId }));
+		if (data.length > NOTIFY_MAX) return;
+		const entries = await readdir(this.dir, { withFileTypes: true }).catch(() => []);
+		await Promise.all(entries.filter((e) => !e.isDirectory() && e.name.endsWith('.sock')).map(async (e) => {
+			const path = join(this.dir, e.name);
+			if (path === this.socket) return;
+			await new Promise<void>((resolve) => {
+				const conn = createConnection(path);
+				const timer = setTimeout(() => conn.destroy(), 100);
+				conn.once('connect', () => conn.end(data));
+				conn.once('error', () => { rm(path, { force: true }).catch(() => {}); });
+				conn.once('close', () => { clearTimeout(timer); resolve(); });
+			});
+		}));
 	}
 }
 

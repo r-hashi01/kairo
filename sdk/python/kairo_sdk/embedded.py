@@ -353,10 +353,7 @@ class Embedded:
         return [info(r) for r in await self.store.list(**f)]
 
     async def recheck(self) -> None:
-        """Without listen, reads the runs waited for here: one may have settled
-        in another process (ADR 0059)."""
-        if getattr(self.store, "listen", None) is not None:
-            return
+        """Fallback for absent or lost process notifications (ADR 0059, 0079)."""
         for id in list(self._waiters):
             try:
                 r = await self.get(id)

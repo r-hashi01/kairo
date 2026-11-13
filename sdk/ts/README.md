@@ -159,8 +159,11 @@ await env.close();
 
 ```ts
 new SQLiteStore('kairo.db')                               // node:sqlite; one file
+new SQLiteStore('kairo.db', { notify: true })             // also wake waits across same-host processes
 new PostgresStore(new pg.Pool({ connectionString }))      // your node-postgres pool
 ```
+
+SQLite notifications use one local socket per process and are best-effort wake hints; SQLite remains authoritative and the lease-period recheck is the fallback. Enable `notify` in every process writing the same database namespace for immediate wake-ups.
 
 PostgreSQL also wakes a wait in one process when a run settles in another (`LISTEN`/`NOTIFY`). Finished runs are removed, together with everything they started, once they have been kept long enough: `keepFinished` on `EmbeddedBackend.open`, or `KAIRO_KEEP_FINISHED` (`24h` by default, `7d`, `forever`). A workflow that is still waiting keeps its history for as long as it waits.
 
