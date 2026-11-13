@@ -8,10 +8,14 @@ TypeScript SDK (sdk/ts/src/store.ts)."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
+import os
 import re
+import secrets
 import sqlite3
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
@@ -408,11 +412,16 @@ class SQLiteStore:
     without awaiting, so nothing else runs on the connection meanwhile.
     """
 
-    def __init__(self, path: str, *, prefix: str = "kairo_", synchronous: str = "FULL") -> None:
+    def __init__(self, path: str, *, prefix: str = "kairo_", synchronous: str = "FULL", notify: bool = False) -> None:
         self.path = path
         self.p = _prefix(prefix)
         self.sync = synchronous
         self.db: sqlite3.Connection | None = None
+        self._notifier = _SQLiteNotifier(path, self.p) if notify else None
+        if notify:
+            if path == ":memory:":
+                raise ValueError("SQLite notifications require a file")
+            self.listen = self._notifier.listen  # type: ignore[method-assign]
 
     async def init(self) -> None:
         self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
@@ -488,6 +497,8 @@ class SQLiteStore:
                 for rate in sorted(c.shared_rates, key=lambda x: x.destination):
                     self._settle_rate(rate, now)
             db.execute("COMMIT")
+            if c.notify and self._notifier is not None:
+                await self._notifier.publish(id)
             return c.result
         except BaseException:
             db.execute("ROLLBACK")
@@ -633,6 +644,83 @@ class SQLiteStore:
     async def close(self) -> None:
         if self.db is not None:
             self.db.close()
+
+
+_NOTIFY_MAX = 64 << 10
+
+
+class _SQLiteNotifier:
+    def __init__(self, path: str, namespace: str) -> None:
+        self.path = path
+        self.namespace = namespace
+        self.directory = ""
+        self.socket = ""
+        self.server: asyncio.Server | None = None
+
+    async def listen(self, settled: Callable[[str], None]) -> Callable[[], Any]:
+        path = os.path.realpath(self.path)
+        key = hashlib.sha256((path + "\0" + self.namespace).encode()).hexdigest()[:16]
+        self.directory = os.path.join(os.path.realpath(tempfile.gettempdir()), f".kairo-n-{key}")
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        self.socket = os.path.join(self.directory, secrets.token_hex(4) + ".sock")
+
+        async def receive(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                data = await reader.read(_NOTIFY_MAX + 1)
+                if 0 < len(data) <= _NOTIFY_MAX:
+                    msg = json.loads(data)
+                    if msg.get("v") == 1 and msg.get("namespace") == self.namespace and isinstance(msg.get("run_id"), str) and msg["run_id"]:
+                        settled(msg["run_id"])
+            except Exception:
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        self.server = await asyncio.start_unix_server(receive, path=self.socket, limit=_NOTIFY_MAX + 1)
+
+        async def stop() -> None:
+            if self.server is not None:
+                self.server.close()
+                await self.server.wait_closed()
+            try:
+                os.unlink(self.socket)
+            except FileNotFoundError:
+                pass
+            try:
+                os.rmdir(self.directory)
+            except OSError:
+                pass
+
+        return stop
+
+    async def publish(self, run_id: str) -> None:
+        if not self.directory:
+            return
+        data = json.dumps({"v": 1, "namespace": self.namespace, "run_id": run_id}, separators=(",", ":")).encode()
+        if len(data) > _NOTIFY_MAX:
+            return
+        try:
+            names = os.listdir(self.directory)
+        except OSError:
+            return
+
+        async def send(path: str) -> None:
+            if path == self.socket:
+                return
+            try:
+                _, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), 0.1)
+                writer.write(data)
+                await asyncio.wait_for(writer.drain(), 0.1)
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        await asyncio.gather(*(send(os.path.join(self.directory, name)) for name in names if name.endswith(".sock")))
 
 
 class PostgresStore:

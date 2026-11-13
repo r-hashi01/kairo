@@ -5,12 +5,59 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	kairo "github.com/r-hashi01/kairo/sdk/go"
 	"github.com/r-hashi01/kairo/sdk/go/pgnotify"
+	"github.com/r-hashi01/kairo/sdk/go/sqlitenotify"
 )
+
+func TestSQLiteNotifyPublishesAfterCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kairo.db")
+	open := func() *sqlitenotify.Store {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		store, err := kairo.NewSQLStore(db, kairo.SQLite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := sqlitenotify.Wrap(store, path)
+		if err := n.Init(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	a, b := open(), open()
+	heard := make(chan string, 1)
+	stopA, err := a.Listen(context.Background(), func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopA()
+	stopB, err := b.Listen(context.Background(), func(id string) { heard <- id })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopB()
+	if err := a.WithRun(context.Background(), "n-1", func(*kairo.RunRow) (*kairo.Changes, error) {
+		return &kairo.Changes{Notify: true}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-heard:
+		if id != "n-1" {
+			t.Fatalf("notification = %q", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SQLite notification was not delivered")
+	}
+}
 
 // A run settled in another process wakes the wait here at once, through
 // LISTEN/NOTIFY: no tick, no polling.

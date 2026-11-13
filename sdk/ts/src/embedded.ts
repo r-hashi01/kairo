@@ -331,9 +331,8 @@ export class Embedded {
 		}
 	}
 
-	/** Without listen, reads the runs waited for here: one may have settled in another process (ADR 0059). */
+	/** Fallback for absent or lost process notifications (ADR 0059, 0079). */
 	async recheck(): Promise<void> {
-		if (this.store.listen) return;
 		for (const id of [...this.waiters.keys()]) {
 			const r = await this.get(id).catch(() => undefined);
 			if (r && SETTLED.has(r.status)) for (const w of this.waiters.get(id) ?? []) w(r);

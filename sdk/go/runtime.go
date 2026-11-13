@@ -593,12 +593,9 @@ func (r *runtime) tick(ctx context.Context) error {
 	return nil
 }
 
-// recheck, without a Notifier, reads the runs waited for here: one may have
-// settled in another process (ADR 0059).
+// recheck reads the runs waited for here. It is the fallback when a notifier
+// is absent or loses a best-effort notification (ADR 0059, 0079).
 func (r *runtime) recheck(ctx context.Context) {
-	if _, ok := r.store.(Notifier); ok {
-		return
-	}
 	r.mu.Lock()
 	ids := make([]string, 0, len(r.waiters))
 	for id := range r.waiters {
