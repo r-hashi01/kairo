@@ -72,6 +72,9 @@ export interface Result {
 	 * the lease value; the worker protocol serializes this as pending=true.
 	 */
 	pending?: { owner: string; leaseMs: number };
+	/** Embedded-runtime metadata; never serialized on the worker protocol. */
+	sharedRate?: import('./store.ts').SharedRateSettlement;
+	dispatchError?: unknown;
 }
 
 export class ProtocolError extends Error {}

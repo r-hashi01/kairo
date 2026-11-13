@@ -110,7 +110,9 @@ To stop a resident process without leaving a real step to review, `await k.drain
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires; while the lease lives, a `run` elsewhere waits instead of running the workflow twice.
 
-Limits, per process: `concurrency` on `Kairo` (steps at once), and `limit`, `rate` and `weightRate` on an action. `destinationLimits(destination)` may resolve current limits at admission; positive action and resolved limits use the stricter value. An action calls `ctx.setWeight(n)` to report actual non-negative weight; debt delays later work.
+Limits are process-local by default: `concurrency` on `Kairo` (steps at once), and `limit`, `rate` and `weightRate` on an action. `destinationLimits(destination)` may resolve current limits at admission; positive action and resolved limits use the stricter value. An action calls `ctx.setWeight(n)` to report actual non-negative weight; debt delays later work.
+
+With an embedded SQLite or PostgreSQL store, set `sharedLimits: true` on an action, or return `{shared: true}` from `destinationLimits`, to share request rate, actual-weight debt and `RetryAfterError` pauses across processes using that store. `limit` and `concurrency` stay process-local. A shared limit fails closed if the Store lacks this capability; it is not supported by kairod or asynchronous URL actions.
 
 ### Logging and observing
 

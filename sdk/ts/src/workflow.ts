@@ -39,6 +39,8 @@ export interface ActionDef<I = any, O = any> {
 	rate?: number;
 	/** At most this much reported weight of the destination is admitted per minute (ADR 0077). */
 	weightRate?: number;
+	/** Share rate, actual-weight and Retry-After state through the embedded Store (ADR 0078). */
+	sharedLimits?: boolean;
 	/**
 	 * Where the action runs (ADR 0052): its steps are called over HTTP(S)
 	 * at this URL, and the handler runs there (fetchHandler). https, or
@@ -115,7 +117,7 @@ export interface KairoOptions {
 	 * counted). Steps over it wait, leased, for a slot. Default: no limit.
 	 */
 	concurrency?: number;
-	/** Resolves current per-process limits when a destination is admitted. */
+	/** Resolves current limits when a destination is admitted (shared is opt-in). */
 	destinationLimits?: (destination: string) => DestinationLimits;
 	/**
 	 * "wait" (the default): run() drives a workflow to its end, waiting in
@@ -170,6 +172,7 @@ export interface DestinationLimits {
 	concurrency?: number;
 	requestsPerMinute?: number;
 	weightPerMinute?: number;
+	shared?: boolean;
 }
 
 /** The workflow ran into a call whose result kairo no longer keeps. */
@@ -477,6 +480,13 @@ export class Kairo {
 		for (const [name, d] of this.workflows) {
 			if (d.currents !== 1) throw new Error(`workflow ${name}: ${d.currents} current versions (one, the others draining)`);
 		}
+		for (const [name, def] of this.actions) {
+			if (def.sharedLimits && def.async) throw new Error(`action ${name}: sharedLimits does not support asynchronous URL actions`);
+			if (def.sharedLimits && (!this.rt || !this.rt.supportsSharedRates))
+				throw new Error(`action ${name}: sharedLimits needs an embedded runtime with a shared-rate Store`);
+			if (def.sharedLimits) for (const [label, value] of [['rate', def.rate], ['weightRate', def.weightRate]] as const)
+				if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`action ${name}: shared ${label} must be a non-negative safe integer`);
+		}
 		const specs: NodeSpec[] = [...this.actions].map(([action, def]) => ({
 			action,
 			effect: def.effect ?? 'real',
@@ -498,12 +508,12 @@ export class Kairo {
 			}
 		}
 		for (const [name, def] of this.actions) {
-			if (!def.limit && !def.rate && !def.weightRate) continue;
+			if (!def.limit && !def.rate && !def.weightRate && !def.sharedLimits) continue;
 			// Actions of one destination share its limits: the strictest.
 			const key = def.destination || name;
 			let l = this.limits.get(key);
 			if (!l) this.limits.set(key, (l = new Limiter()));
-			l.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate });
+			l.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate, shared: def.sharedLimits });
 		}
 		// kairod's worker limits its own tasks.
 		if (this.rt && this.opts.concurrency) this.slots = new Slots(this.opts.concurrency);
@@ -791,7 +801,8 @@ export class Kairo {
 		let finish: (result: Result) => void;
 		try {
 			finish = await this.admit(task.destination || def.destination || task.action, def, ctx.signal);
-		} catch {
+		} catch (e) {
+			if (isWorkflowRetry(e)) return { dispatchError: e };
 			return { error: `step of ${task.action} stopped waiting for a slot`, retryable: true, errorType: 'cancelled' };
 		}
 		let weight = 0;
@@ -821,18 +832,42 @@ export class Kairo {
 		const releaseSlots = () => {
 			for (const s of held.splice(0)) s.give();
 		};
-		let limits: DestinationLimits = { concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate };
+		let limits: DestinationLimits = { concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate, shared: def.sharedLimits };
 		if (this.opts.destinationLimits) {
 			const dynamic = this.opts.destinationLimits(destination);
 			limits = {
 				concurrency: stricter(limits.concurrency, dynamic.concurrency),
 				requestsPerMinute: stricter(limits.requestsPerMinute, dynamic.requestsPerMinute),
 				weightPerMinute: stricter(limits.weightPerMinute, dynamic.weightPerMinute),
+				shared: !!limits.shared || !!dynamic.shared,
 			};
 		}
 		let limiter = this.limits.get(destination);
 		if (!limiter) this.limits.set(destination, (limiter = new Limiter()));
-		limiter.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate });
+		limiter.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate, shared: def.sharedLimits });
+		limits = limiter.resolve(limits);
+		const shared = { ...limits };
+		if (limits.shared) {
+			if (!this.rt?.supportsSharedRates) throw new Error('shared destination limits need an embedded runtime with a shared-rate Store');
+			for (const [label, value] of [['requestsPerMinute', limits.requestsPerMinute], ['weightPerMinute', limits.weightPerMinute]] as const)
+				if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`shared ${label} must be a non-negative safe integer`);
+			for (;;) {
+				const wait = await this.rt.admitDestination({ destination, requestsPerMinute: limits.requestsPerMinute, weightPerMinute: limits.weightPerMinute });
+				if (wait <= 0) break;
+				await new Promise<void>((resolve, reject) => {
+					const timer = setTimeout(done, wait);
+					const stopped = () => done(signal.reason ?? new Error('stopped'));
+					function done(error?: unknown) {
+						signal.removeEventListener('abort', stopped);
+						clearTimeout(timer);
+						if (error) reject(error); else resolve();
+					}
+					signal.addEventListener('abort', stopped, { once: true });
+					if (signal.aborted) stopped();
+				});
+			}
+			limits = { concurrency: limits.concurrency, shared: true };
+		}
 		let admitted = false;
 		try {
 			await limiter.admit(limits, signal);
@@ -843,7 +878,13 @@ export class Kairo {
 			}
 			return (result) => {
 				releaseSlots();
-				limiter!.finish(result.weight ?? result.tokens ?? 0,
+				if (limits.shared) {
+					limiter!.finish(0, 0);
+					const actualWeight = result.weight ?? result.tokens ?? 0;
+					result.sharedRate = { destination, requestsPerMinute: shared.requestsPerMinute, weightPerMinute: shared.weightPerMinute,
+						weight: Number.isSafeInteger(actualWeight) && actualWeight >= 0 ? actualWeight : 0,
+						retryAfter: result.retryable && !result.unknown ? Math.max(0, Math.ceil(result.retryAfter ?? 0)) : 0 };
+				} else limiter!.finish(result.weight ?? result.tokens ?? 0,
 					result.retryable && !result.unknown ? result.retryAfter ?? 0 : 0);
 				this.retireLimiter(destination, limiter!);
 			};
@@ -1782,14 +1823,25 @@ class Limiter {
 			concurrency: stricter(this.declared.concurrency, v.concurrency),
 			requestsPerMinute: stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
 			weightPerMinute: stricter(this.declared.weightPerMinute, v.weightPerMinute),
+			shared: !!this.declared.shared || !!v.shared,
+		};
+	}
+
+	resolve(v: DestinationLimits): DestinationLimits {
+		return {
+			concurrency: stricter(this.declared.concurrency, v.concurrency),
+			requestsPerMinute: stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
+			weightPerMinute: stricter(this.declared.weightPerMinute, v.weightPerMinute),
+			shared: !!this.declared.shared || !!v.shared,
 		};
 	}
 
 	configure(v: DestinationLimits): void {
 		v = {
 			concurrency: stricter(this.declared.concurrency, v.concurrency),
-			requestsPerMinute: stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
-			weightPerMinute: stricter(this.declared.weightPerMinute, v.weightPerMinute),
+			requestsPerMinute: v.shared ? v.requestsPerMinute : stricter(this.declared.requestsPerMinute, v.requestsPerMinute),
+			weightPerMinute: v.shared ? v.weightPerMinute : stricter(this.declared.weightPerMinute, v.weightPerMinute),
+			shared: v.shared,
 		};
 		const now = Date.now();
 		this.refill(now);

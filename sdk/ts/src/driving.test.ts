@@ -552,6 +552,24 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k.close();
 	});
 
+	test('shared limits pace actions across embedded runtimes', async () => {
+		const path = join(dir, 'shared-limits.db');
+		const starts: number[] = [];
+		const make = async () => {
+			const k = await open(path);
+			k.defineAction('shared-scope', { effect: 'unprotected', destination: 'provider', sharedLimits: true, handler: async () => null });
+			k.defineAction('limited', { effect: 'unprotected', destination: 'provider', rate: 600, handler: async () => (starts.push(performance.now()), null) });
+			k.workflow('shared', async (ctx) => ctx.call('limited'));
+			await k.start();
+			return k;
+		};
+		const [a, b] = await Promise.all([make(), make()]);
+		await Promise.all([a.run('shared', null, { id: 'shared-a' }), b.run('shared', null, { id: 'shared-b' })]);
+		starts.sort((x, y) => x - y);
+		assert.ok(starts[1]! - starts[0]! >= 90, `shared starts were only ${starts[1]! - starts[0]!}ms apart`);
+		await Promise.all([a.close(), b.close()]);
+	});
+
 	test('submit, result and list', async () => {
 		const k = await open(join(dir, 'list.db'));
 		k.workflow('double', async (_ctx, n: number) => 2 * n);
@@ -916,7 +934,7 @@ describe('driving workflows on PostgreSQL (ADR 0059)', { skip: !hasGo || !dsn ||
 		pool = new pg.Pool({ connectionString: dsn, max: 8 });
 	});
 	after(async () => {
-		for (const t of ['run', 'event', 'timer', 'lease']) await pool.query(`DROP TABLE IF EXISTS ${prefix}${t}`);
+		for (const t of ['run', 'event', 'timer', 'lease', 'rate']) await pool.query(`DROP TABLE IF EXISTS ${prefix}${t}`);
 		await pool.end();
 	});
 	const pgStore = () => new PostgresStore(pool, { prefix });

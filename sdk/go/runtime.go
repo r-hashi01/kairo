@@ -89,6 +89,9 @@ type result struct {
 	RetryAfter  int64
 	RateLimited bool
 	Wait        *waitResult
+	// Internal embedded-runtime metadata, never sent over the worker protocol.
+	sharedRate  *SharedRateSettlement
+	dispatchErr error
 	// Pending: the step runs elsewhere and its outcome comes later
 	// (complete); its lease goes to Owner (ADR 0052).
 	Pending *pending
@@ -118,6 +121,7 @@ type runtime struct {
 	core    *wasmcore.Core
 	coreMu  sync.RWMutex // Compile appends plans; Apply reads them
 	store   Store
+	rates   SharedRateStore
 	now     func() int64
 	owner   string
 	leaseMs int64
@@ -135,6 +139,7 @@ type runtime struct {
 	subs      map[int]*subscription
 	nextSub   int
 	closed    bool
+	closedCh  chan struct{}
 	renewStop chan struct{}
 
 	busyMu    sync.Mutex
@@ -172,8 +177,11 @@ const removePerTick = 100
 func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int64) *runtime {
 	r := &runtime{core: wasmcore.New(), store: wrapStore(store), now: now, owner: owner, leaseMs: leaseMs, keepMs: keepMs,
 		plans: map[string]wasmcore.Compiled{}, waiters: map[string]map[chan RunInfo]struct{}{}, hooks: map[int]func(RunInfo){},
-		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, reached: map[string]int{}, subs: map[int]*subscription{}}
+		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, reached: map[string]int{}, subs: map[int]*subscription{}, closedCh: make(chan struct{})}
 	r.busyCond = sync.NewCond(&r.busyMu)
+	if rates, ok := store.(SharedRateStore); ok {
+		r.rates = rates
+	}
 	r.logger = slog.Default()
 	return r
 }
@@ -577,6 +585,11 @@ func (r *runtime) tick(ctx context.Context) error {
 			return err
 		}
 	}
+	if r.rates != nil {
+		if _, err := r.rates.PruneDestinationRates(ctx, removePerTick); err != nil {
+			return storeRetry(ctx, err)
+		}
+	}
 	return nil
 }
 
@@ -773,7 +786,10 @@ func (r *runtime) mayAdvance(ctx context.Context, runID string) (bool, error) {
 // dropped (they stay in the store), steps running here are cancelled.
 func (r *runtime) close() error {
 	r.mu.Lock()
-	r.closed = true
+	if !r.closed {
+		r.closed = true
+		close(r.closedCh)
+	}
 	for k, t := range r.timers {
 		t.Stop()
 		delete(r.timers, k)
@@ -850,6 +866,15 @@ func (r *runtime) process(ctx context.Context, runID string, events []wasmcore.E
 }
 
 func (r *runtime) processReported(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo) (processReport, error) {
+	return r.processReportedWithRates(ctx, runID, events, start, nil)
+}
+
+func (r *runtime) processWithRates(ctx context.Context, runID string, events []wasmcore.Event, rates []SharedRateSettlement) (bool, error) {
+	report, err := r.processReportedWithRates(ctx, runID, events, nil, rates)
+	return report.existing, err
+}
+
+func (r *runtime) processReportedWithRates(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo, rates []SharedRateSettlement) (processReport, error) {
 	var (
 		existing, settled, applied bool
 		commands                   []wasmcore.Command
@@ -949,6 +974,9 @@ func (r *runtime) processReported(ctx context.Context, runID string, events []wa
 			}
 		}
 		ch := &Changes{Events: recorded, Row: next, EndLeases: endLeases, Clear: doneStatus[status]}
+		// Only a newly recorded outcome is settled. If COMMIT succeeded but its
+		// answer was lost, the retry sees an ignored event and must not settle twice.
+		ch.SharedRates = append(ch.SharedRates, rates...)
 		if row == nil && start.guardParent {
 			ch.GuardParent = start.parent
 		}
@@ -1079,17 +1107,28 @@ func (r *runtime) dispatch(runID string, c wasmcore.Command) {
 		Action: c.Action, Destination: c.Destination, Input: c.Input}
 	r.observe(Observation{Kind: ObsStepStarted, RunID: runID, Action: c.Action, StepID: c.StepID, Attempt: c.Attempt})
 	began := time.Now()
-	res := r.call(ctx, h, t)
+	var res result
+	for {
+		res = r.call(ctx, h, t)
+		if res.dispatchErr == nil {
+			break
+		}
+		r.logger.Warn("kairo: admitting a step", "run", runID, "err", res.dispatchErr)
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			res = result{Err: ctx.Err().Error(), Retryable: true, ErrType: "cancelled"}
+		case <-timer.C:
+			if r.isClosed() {
+				return
+			}
+			continue
+		}
+		break
+	}
 	r.observe(Observation{Kind: ObsStepFinished, RunID: runID, Action: c.Action, StepID: c.StepID, Attempt: c.Attempt,
 		Status: stepStatus(res), Error: res.Err, Duration: time.Since(began)})
-	r.mu.Lock()
-	delete(r.running, key)
-	r.mu.Unlock()
-	cancel()
-	r.renew()
-	if r.isClosed() {
-		return
-	}
 	if res.Pending != nil {
 		// It runs elsewhere (ADR 0052): its lease goes there until its
 		// outcome comes (complete) or the lease expires.
@@ -1097,11 +1136,39 @@ func (r *runtime) dispatch(runID string, c wasmcore.Command) {
 			Owner: res.Pending.Owner, Until: r.now() + res.Pending.LeaseMs}); err != nil {
 			r.logger.Warn("kairo: handing over a lease", "run", runID, "err", err)
 		}
+		r.mu.Lock()
+		delete(r.running, key)
+		r.mu.Unlock()
+		cancel()
+		r.renew()
 		return
 	}
-	if _, err := r.process(context.Background(), runID, []wasmcore.Event{outcome(res, c.Act, c.Attempt, r.now())}, nil); err != nil {
-		r.logger.Warn("kairo: applying a step's outcome", "run", runID, "err", err)
+	var rates []SharedRateSettlement
+	if res.sharedRate != nil {
+		rates = append(rates, *res.sharedRate)
 	}
+	ev := outcome(res, c.Act, c.Attempt, r.now())
+	for delay := 100 * time.Millisecond; !r.isClosed(); delay = min(delay*2, 5*time.Second) {
+		if _, err := r.processWithRates(context.Background(), runID, []wasmcore.Event{ev}, rates); err == nil {
+			break
+		} else if !retryWorkflow(err) {
+			r.logger.Warn("kairo: applying a step's outcome", "run", runID, "err", err)
+			break
+		} else {
+			r.logger.Warn("kairo: retrying a step's outcome", "run", runID, "err", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-r.closedCh:
+			timer.Stop()
+		}
+	}
+	r.mu.Lock()
+	delete(r.running, key)
+	r.mu.Unlock()
+	cancel()
+	r.renew()
 }
 
 // call runs a handler; a panic is the step's definite failure.

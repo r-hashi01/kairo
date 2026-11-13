@@ -152,7 +152,9 @@ To stop a resident process without leaving a real step to review, `k.Drain(ctx)`
 
 A process that drives a workflow holds a lease on it. If the process stops, another process that has the workflow takes it up once the lease expires (`Options.Lease`, 30s by default); while the lease lives, a `Run` elsewhere waits instead of running the workflow twice. `Close` hands its leases over at once.
 
-Limits, per process: `Options.Concurrency` (steps at once), and `Limit`, `Rate` and `WeightRate` on an action. `Options.DestinationLimits` may resolve current limits when each runtime destination is admitted; positive action and resolved limits use the stricter value. Actual weight can put the bucket into debt and delay later work.
+Limits are process-local by default: `Options.Concurrency` (steps at once), and `Limit`, `Rate` and `WeightRate` on an action. `Options.DestinationLimits` may resolve current limits when each runtime destination is admitted; positive action and resolved limits use the stricter value. Actual weight can put the bucket into debt and delay later work.
+
+With an embedded SQLite or PostgreSQL store, add `SharedLimits()` to an action, or return `DestinationLimits{Shared: true}`, to share request rate, actual-weight debt and `RetryAfter` pauses across processes using that store. `Limit` and `Options.Concurrency` stay process-local. A shared limit fails closed if the Store lacks this capability; it is not supported by `Connect` or asynchronous URL actions.
 
 ### Logging and observing
 

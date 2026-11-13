@@ -656,6 +656,37 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_shared_limits_pace_actions_across_embedded_runtimes(self) -> None:
+        async def main() -> None:
+            path = self.path("shared-limits.db")
+            starts: list[float] = []
+
+            async def make() -> Kairo:
+                k = await self.open(path)
+
+                @k.action("shared-scope", effect="unprotected", destination="provider", shared_limits=True)
+                def shared_scope(_input, _ctx):
+                    return None
+
+                @k.action("limited", effect="unprotected", destination="provider", rate=600)
+                def limited(_input, _ctx):
+                    starts.append(time.monotonic())
+
+                @k.workflow("shared")
+                async def shared(ctx, _input):
+                    return await ctx.call("limited")
+
+                await k.start()
+                return k
+
+            a, b = await asyncio.gather(make(), make())
+            await asyncio.gather(a.run("shared", None, id="shared-a"), b.run("shared", None, id="shared-b"))
+            starts.sort()
+            self.assertGreaterEqual(starts[1] - starts[0], 0.09)
+            await asyncio.gather(a.close(), b.close())
+
+        asyncio.run(main())
+
     def test_submit_result_and_list(self) -> None:
         async def main() -> None:
             k = await self.open(self.path("list.db"))
