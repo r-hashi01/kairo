@@ -191,7 +191,7 @@ test('a run settled in another process wakes the wait here', { skip: !hasGo || !
 		await a.close();
 		await b.close();
 	} finally {
-		for (const t of ['run', 'event', 'timer', 'lease']) await pool.query(`DROP TABLE IF EXISTS ${prefix}${t}`);
+		for (const t of ['run', 'event', 'timer', 'lease', 'rate']) await pool.query(`DROP TABLE IF EXISTS ${prefix}${t}`);
 		await pool.end();
 	}
 });

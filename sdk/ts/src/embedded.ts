@@ -21,7 +21,7 @@ import type { Result, Task } from './protocol.ts';
 import { randomInt, randomUUID } from 'node:crypto';
 
 import { consoleLogger, observe, stepStatus, type Logger, type Observation, type Observer } from './observe.ts';
-import { retryingStore, type LeaseRow, type ListFilter, type RunRow, type Store, type TimerRow } from './store.ts';
+import { isWorkflowRetry, retryingStore, type LeaseRow, type ListFilter, type RunRow, type SharedRateRequest, type SharedRateSettlement, type Store, type TimerRow } from './store.ts';
 import type { TaskContext } from './worker.ts';
 
 /** Runs the actions of dispatched steps in this process. */
@@ -213,6 +213,15 @@ export class Embedded {
 	registerActions(specs: NodeSpec[], handler: ActionHandler): void {
 		this.core.register(specs);
 		this.handler = handler;
+	}
+
+	get supportsSharedRates(): boolean {
+		return typeof this.store.admitDestination === 'function';
+	}
+
+	async admitDestination(request: SharedRateRequest): Promise<number> {
+		if (!this.store.admitDestination) throw new Error('store does not support shared destination limits');
+		return this.store.admitDestination(request);
 	}
 
 	/** Compiles a plan; runs of it name it. */
@@ -436,6 +445,7 @@ export class Embedded {
 		}
 		// Finished trees past the time they are kept (ADR 0054).
 		if (Number.isFinite(this.keepMs)) await this.store.removeFinished(this.now() - this.keepMs, REMOVE_PER_TICK);
+		await this.store.pruneDestinationRates?.(REMOVE_PER_TICK);
 	}
 
 	/**
@@ -526,14 +536,15 @@ export class Embedded {
 	 * commands. With start, a new run of that plan (or the existing one: the
 	 * answer says which).
 	 */
-	private async process(runId: string, events: CoreEvent[], start?: RunStart & { plan: Compiled; at: number }): Promise<boolean> {
-		return (await this.processReported(runId, events, start)).existing;
+	private async process(runId: string, events: CoreEvent[], start?: RunStart & { plan: Compiled; at: number }, sharedRates: SharedRateSettlement[] = []): Promise<boolean> {
+		return (await this.processReported(runId, events, start, sharedRates)).existing;
 	}
 
 	private async processReported(
 		runId: string,
 		events: CoreEvent[],
 		start?: RunStart & { plan: Compiled; at: number },
+		sharedRates: SharedRateSettlement[] = [],
 	): Promise<{ existing: boolean; applied: boolean }> {
 		const out = await this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
@@ -608,6 +619,9 @@ export class Embedded {
 				clearTimers: done,
 				endLeases,
 				setLeases,
+				// A retry after an ambiguously successful COMMIT sees the outcome
+				// ignored above, so its shared settlement is not applied twice.
+				sharedRates,
 				result: { existing: false, applied: true, started: !row, settled, commands, row: next },
 			};
 		});
@@ -697,33 +711,70 @@ export class Embedded {
 			input: c.input ?? null,
 		} as Task;
 		const step = { runId, action: task.action, stepId: task.step_id, attempt: task.attempt };
+		const finishRunning = () => {
+			this.running.delete(key);
+			this.renew();
+		};
 		this.observe({ kind: 'step.started', ...step });
 		const began = performance.now();
 		let res: Result;
 		let weight = 0;
-		try {
-			res = await this.handler(task, { signal: abort.signal, emit: () => {}, setWeight: (n) => {
-				if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
-				weight = n;
-			} });
-			if (res.weight === undefined && weight > 0) res = { ...res, weight };
-		} catch (e) {
-			res = { error: String((e as Error)?.message ?? e), errorType: (e as Error)?.name };
-		} finally {
-			this.running.delete(key);
-			this.renew();
+		for (;;) {
+			try {
+				res = await this.handler(task, { signal: abort.signal, emit: () => {}, setWeight: (n) => {
+					if (!Number.isSafeInteger(n) || n < 0) throw new Error('step weight must be a non-negative integer');
+					weight = n;
+				} });
+				if (res.dispatchError && isWorkflowRetry(res.dispatchError)) {
+					this.logger.warn('kairo: admitting a step', { run: runId, err: res.dispatchError });
+					await new Promise<void>((resolve, reject) => {
+						const stopped = () => done(abort.signal.reason);
+						const timer = setTimeout(done, 100);
+						function done(error?: unknown) {
+							abort.signal.removeEventListener('abort', stopped);
+							clearTimeout(timer);
+							if (error) reject(error); else resolve();
+						}
+						abort.signal.addEventListener('abort', stopped, { once: true });
+						if (abort.signal.aborted) stopped();
+					});
+					if (!this.closed) continue;
+				}
+				if (res.weight === undefined && weight > 0) res = { ...res, weight };
+			} catch (e) {
+				res = { error: String((e as Error)?.message ?? e), errorType: (e as Error)?.name };
+			}
+			break;
 		}
 		this.observe({ kind: 'step.finished', ...step, status: stepStatus(res), ...(res.error ? { error: res.error } : {}), duration: performance.now() - began });
-		if (this.closed) return;
+		if (this.closed) {
+			finishRunning();
+			return;
+		}
 		if (res.pending) {
 			// It runs elsewhere (ADR 0052): its lease goes there, until its
 			// outcome comes (complete) or the lease expires. An outcome that
 			// came first ended the lease; then nothing is handed over.
 			const lease = { run: runId, act: c.act!, attempt: c.attempt ?? 0, owner: res.pending.owner, until: this.now() + res.pending.leaseMs };
 			await this.store.handOver(lease).catch((e) => this.logger.warn('kairo: handing over a lease', { run: runId, err: e }));
+			finishRunning();
 			return;
 		}
-		await this.process(runId, [outcome(res, c.act!, c.attempt ?? 0, this.now())]);
+		const ev = outcome(res, c.act!, c.attempt ?? 0, this.now());
+		for (let delay = 100; !this.closed; delay = Math.min(delay * 2, 5000)) {
+			try {
+				await this.process(runId, [ev], undefined, res.sharedRate ? [res.sharedRate] : []);
+				break;
+			} catch (e) {
+				if (!isWorkflowRetry(e)) {
+					finishRunning();
+					throw e;
+				}
+				this.logger.warn('kairo: retrying a step outcome', { run: runId, err: e });
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+		finishRunning();
 	}
 
 	/** When something is next to do: the earliest timer or lease expiry (ADR 0053). */

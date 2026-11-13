@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import sqlite3
 from collections.abc import Callable
@@ -98,6 +99,20 @@ class Changes(Generic[T]):
     set_leases: list[LeaseRow] = field(default_factory=list)
     end_leases: list[int] = field(default_factory=list)
     notify: bool = False  # the run settled: tell the listeners at commit
+    shared_rates: list[SharedRateSettlement] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SharedRateRequest:
+    destination: str
+    requests_per_minute: int = 0
+    weight_per_minute: int = 0
+
+
+@dataclass(frozen=True)
+class SharedRateSettlement(SharedRateRequest):
+    weight: int = 0
+    retry_after_ms: int = 0
 
 
 class Store(Protocol):
@@ -212,7 +227,64 @@ def _ddl(p: str, blob: str, big: str) -> list[str]:
           until {big} NOT NULL, PRIMARY KEY (run, act))""",
         f"CREATE INDEX IF NOT EXISTS {p}lease_until ON {p}lease (until)",
         f"CREATE INDEX IF NOT EXISTS {p}lease_owner ON {p}lease (owner)",
+        f"""CREATE TABLE IF NOT EXISTS {p}rate (destination TEXT PRIMARY KEY, rpm {big} NOT NULL, wpm {big} NOT NULL,
+          next_at {big} NOT NULL, weight REAL NOT NULL, weight_at {big} NOT NULL, pause_until {big} NOT NULL, expires_at {big} NOT NULL)""",
+        f"CREATE INDEX IF NOT EXISTS {p}rate_expires ON {p}rate (expires_at)",
     ]
+
+
+@dataclass
+class _RateRow:
+    destination: str
+    rpm: int = 0
+    wpm: int = 0
+    next_at: int = 0
+    weight: float = 0
+    weight_at: int = 0
+    pause_until: int = 0
+    expires_at: int = 0
+
+
+def _rate_cap(wpm: int) -> float:
+    return max(1.0, wpm / 6) if wpm > 0 else 0.0
+
+
+def _validate_shared_rate(v: SharedRateRequest) -> None:
+    if not v.destination:
+        raise ValueError("shared rate destination is empty")
+    values = [v.requests_per_minute, v.weight_per_minute]
+    if isinstance(v, SharedRateSettlement):
+        values += [v.weight, v.retry_after_ms]
+    if any(not isinstance(n, int) or isinstance(n, bool) or n < 0 for n in values):
+        raise ValueError("shared rates must be non-negative integers")
+
+
+def _strict_rate(a: int, b: int) -> int:
+    return max(b, 0) if a <= 0 else a if b <= 0 else min(a, b)
+
+
+def _configure_rate(row: _RateRow, now: int, request: SharedRateRequest) -> _RateRow:
+    r = _RateRow(row.destination) if row.expires_at <= now else _RateRow(**vars(row))
+    if r.wpm > 0 and r.weight_at > 0 and now > r.weight_at:
+        r.weight = min(_rate_cap(r.wpm), r.weight + (now - r.weight_at) * r.wpm / 60_000)
+    old_wpm = r.wpm
+    r.rpm = _strict_rate(r.rpm, request.requests_per_minute)
+    r.wpm = _strict_rate(r.wpm, request.weight_per_minute)
+    if r.wpm <= 0:
+        r.weight = 0
+    elif old_wpm <= 0:
+        r.weight = _rate_cap(r.wpm)
+    else:
+        r.weight = min(r.weight, _rate_cap(r.wpm))
+    r.weight_at = now
+    return r
+
+
+def _rate_expiry(r: _RateRow, now: int) -> int:
+    expires = max(r.next_at, r.pause_until)
+    if r.wpm > 0 and r.weight < _rate_cap(r.wpm):
+        expires = max(expires, now + math.ceil((_rate_cap(r.wpm) - r.weight) * 60_000 / r.wpm))
+    return expires
 
 
 _DONE_SQL = "('completed', 'failed', 'cancelled')"
@@ -411,11 +483,81 @@ class SQLiteStore:
                     attempt = excluded.attempt, owner = excluded.owner, until = excluded.until""",
                     (lease.run, lease.act, lease.attempt, lease.owner, lease.until),
                 )
+            if c.shared_rates:
+                now = self._store_now()
+                for rate in sorted(c.shared_rates, key=lambda x: x.destination):
+                    self._settle_rate(rate, now)
             db.execute("COMMIT")
             return c.result
         except BaseException:
             db.execute("ROLLBACK")
             raise
+
+    def _store_now(self) -> int:
+        assert self.db is not None
+        return int(self.db.execute("SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)").fetchone()[0])
+
+    def _read_rate(self, destination: str) -> _RateRow:
+        assert self.db is not None
+        v = self.db.execute(
+            f"SELECT destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at FROM {self.p}rate WHERE destination = ?",
+            (destination,),
+        ).fetchone()
+        return _RateRow(destination) if v is None else _RateRow(v[0], int(v[1]), int(v[2]), int(v[3]), float(v[4]), int(v[5]), int(v[6]), int(v[7]))
+
+    def _write_rate(self, r: _RateRow, now: int) -> None:
+        assert self.db is not None
+        r.expires_at = _rate_expiry(r, now)
+        if r.expires_at <= now:
+            self.db.execute(f"DELETE FROM {self.p}rate WHERE destination = ?", (r.destination,))
+            return
+        self.db.execute(
+            f"""INSERT INTO {self.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (destination) DO UPDATE SET rpm=excluded.rpm, wpm=excluded.wpm,
+            next_at=excluded.next_at, weight=excluded.weight, weight_at=excluded.weight_at, pause_until=excluded.pause_until, expires_at=excluded.expires_at""",
+            (r.destination, r.rpm, r.wpm, r.next_at, r.weight, r.weight_at, r.pause_until, r.expires_at),
+        )
+
+    def _settle_rate(self, v: SharedRateSettlement, now: int) -> None:
+        _validate_shared_rate(v)
+        r = _configure_rate(self._read_rate(v.destination), now, v)
+        if v.weight > 0 and r.wpm > 0:
+            r.weight -= v.weight
+        if v.retry_after_ms > 0:
+            r.pause_until = max(r.pause_until, now + v.retry_after_ms)
+        self._write_rate(r, now)
+
+    async def admit_destination(self, request: SharedRateRequest) -> int:
+        _validate_shared_rate(request)
+        assert self.db is not None
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            now = self._store_now()
+            r = _configure_rate(self._read_rate(request.destination), now, request)
+            at = max(r.next_at, r.pause_until)
+            if r.wpm > 0 and r.weight < 0:
+                at = max(at, now + math.ceil(-r.weight * 60_000 / r.wpm))
+            wait = max(0, at - now)
+            if wait == 0 and r.rpm > 0:
+                r.next_at = now + math.ceil(60_000 / r.rpm)
+            self._write_rate(r, now)
+            self.db.execute("COMMIT")
+            return wait
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+
+    async def prune_destination_rates(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        assert self.db is not None
+        before = self.db.total_changes
+        self.db.execute(
+            f"""DELETE FROM {self.p}rate WHERE destination IN (SELECT destination FROM {self.p}rate
+            WHERE expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) ORDER BY expires_at LIMIT ?)""",
+            (limit,),
+        )
+        return self.db.total_changes - before
 
     async def get(self, id: str) -> RunRow | None:
         assert self.db is not None
@@ -574,9 +716,75 @@ class PostgresStore:
                         attempt = excluded.attempt, owner = excluded.owner, until = excluded.until""",
                         (lease.run, lease.act, lease.attempt, lease.owner, lease.until),
                     )
+                if c.shared_rates:
+                    now = await self._store_now(conn)
+                    for rate in sorted(c.shared_rates, key=lambda x: x.destination):
+                        await self._settle_rate(conn, rate, now)
                 if c.notify:
                     await conn.execute("SELECT pg_notify(%s, %s)", (f"{p}settled", id))
         return c.result
+
+    async def _store_now(self, conn: Any) -> int:
+        cur = await conn.execute("SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)")
+        return int((await cur.fetchone())[0])
+
+    async def _read_rate(self, conn: Any, destination: str) -> _RateRow:
+        await conn.execute(
+            f"INSERT INTO {self.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at) "
+            "VALUES (%s,0,0,0,0,0,0,0) ON CONFLICT (destination) DO NOTHING", (destination,)
+        )
+        cur = await conn.execute(
+            f"SELECT destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at FROM {self.p}rate WHERE destination = %s FOR UPDATE",
+            (destination,),
+        )
+        v = await cur.fetchone()
+        return _RateRow(v[0], int(v[1]), int(v[2]), int(v[3]), float(v[4]), int(v[5]), int(v[6]), int(v[7]))
+
+    async def _write_rate(self, conn: Any, r: _RateRow, now: int) -> None:
+        r.expires_at = _rate_expiry(r, now)
+        if r.expires_at <= now:
+            await conn.execute(f"DELETE FROM {self.p}rate WHERE destination = %s", (r.destination,))
+            return
+        await conn.execute(
+            f"""INSERT INTO {self.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (destination) DO UPDATE SET rpm=excluded.rpm, wpm=excluded.wpm,
+            next_at=excluded.next_at, weight=excluded.weight, weight_at=excluded.weight_at, pause_until=excluded.pause_until, expires_at=excluded.expires_at""",
+            (r.destination, r.rpm, r.wpm, r.next_at, r.weight, r.weight_at, r.pause_until, r.expires_at),
+        )
+
+    async def _settle_rate(self, conn: Any, v: SharedRateSettlement, now: int) -> None:
+        _validate_shared_rate(v)
+        r = _configure_rate(await self._read_rate(conn, v.destination), now, v)
+        if v.weight > 0 and r.wpm > 0:
+            r.weight -= v.weight
+        if v.retry_after_ms > 0:
+            r.pause_until = max(r.pause_until, now + v.retry_after_ms)
+        await self._write_rate(conn, r, now)
+
+    async def admit_destination(self, request: SharedRateRequest) -> int:
+        _validate_shared_rate(request)
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                now = await self._store_now(conn)
+                r = _configure_rate(await self._read_rate(conn, request.destination), now, request)
+                at = max(r.next_at, r.pause_until)
+                if r.wpm > 0 and r.weight < 0:
+                    at = max(at, now + math.ceil(-r.weight * 60_000 / r.wpm))
+                wait = max(0, at - now)
+                if wait == 0 and r.rpm > 0:
+                    r.next_at = now + math.ceil(60_000 / r.rpm)
+                await self._write_rate(conn, r, now)
+                return wait
+
+    async def prune_destination_rates(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        rows = await self._exec(
+            f"""DELETE FROM {self.p}rate WHERE destination IN (SELECT destination FROM {self.p}rate
+            WHERE expires_at <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) ORDER BY expires_at LIMIT %s) RETURNING destination""",
+            (limit,),
+        )
+        return len(rows)
 
     async def get(self, id: str) -> RunRow | None:
         rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE id = %s", (id,))

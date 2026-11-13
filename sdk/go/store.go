@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Where the embedded runtime keeps runs (ADR 0051): per run its state (the
@@ -83,7 +84,34 @@ type Changes struct {
 	// EndLeases: steps (acts) whose leases end; their outcome is in.
 	EndLeases []uint32
 	// Notify: the run settled; tell the listeners at commit.
-	Notify bool
+	Notify      bool
+	SharedRates []SharedRateSettlement
+}
+
+// SharedRateRequest asks a store to admit one start against the shared
+// request and actual-weight budgets of a destination (ADR 0078).
+type SharedRateRequest struct {
+	Destination    string
+	RequestsPerMin int
+	WeightPerMin   int
+}
+
+// SharedRateSettlement records what a completed action actually consumed.
+// SQL stores apply it in the same transaction as the action's outcome.
+type SharedRateSettlement struct {
+	Destination    string
+	RequestsPerMin int
+	WeightPerMin   int
+	Weight         int
+	RetryAfter     time.Duration
+}
+
+// SharedRateStore is the optional Store capability used by shared
+// destination limits. Implementations must apply Changes.SharedRates in the
+// same transaction as the other Changes (ADR 0078).
+type SharedRateStore interface {
+	AdmitDestination(ctx context.Context, req SharedRateRequest) (wait time.Duration, err error)
+	PruneDestinationRates(ctx context.Context, limit int) (int, error)
 }
 
 // ErrParentUnavailable means a run cannot safely be added to the requested

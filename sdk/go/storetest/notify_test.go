@@ -43,7 +43,7 @@ func TestPostgresNotifyWakesWaits(t *testing.T) {
 	t.Cleanup(func() {
 		db, _ := sql.Open("pgx", dsn)
 		defer db.Close()
-		for _, tbl := range []string{"run", "event", "timer", "lease"} {
+		for _, tbl := range []string{"run", "event", "timer", "lease", "rate"} {
 			db.Exec("DROP TABLE IF EXISTS " + prefix + tbl)
 		}
 	})

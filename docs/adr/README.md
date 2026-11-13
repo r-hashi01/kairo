@@ -63,7 +63,7 @@
 | [0056](0056-time-budgets-are-measured-not-tested.md) | 時間の予算は、テストでも CI でも判定しない: 決まったマシンで測り、変更の前後で比べる | 承認 |
 | [0057](0057-distribution-and-releases.md) | 配布の形: SDK は kairo-sdk として npm と PyPI に、kairo.wasm を同梱し、タグからの 1 本のリリースで出す | 承認 |
 | [0058](0058-go-sdk.md) | Go の SDK を用意する: コアを WASM なしで埋め込み、TypeScript・Python と同じ表と同じ取り決めで動かす | 承認 |
-| [0059](0059-embedded-runtime-gaps.md) | 埋め込みのランタイムの不足を埋める: 動かす側の借用で再開し、先に来たシグナルを受け、上限・待ちの期限・一覧・投げっぱなしの開始を足す | 承認 |
+| [0059](0059-embedded-runtime-gaps.md) | 埋め込みのランタイムの不足を埋める: 動かす側の借用で再開し、先に来たシグナルを受け、上限・待ちの期限・一覧・投げっぱなしの開始を足す | 承認（一部を 0078 で置き換え） |
 | [0060](0060-code-changes-under-running-workflows.md) | 実行中のワークフローの下でコードと設定が変わるとき: ワークフローは版で固定し、呼び出しは今の設定で続ける（作用は弱めない） | 承認 |
 | [0061](0061-first-recorded-workflow-settlement-wins.md) | コードで書くワークフローの完了と取り消しは、先に記録された結果だけを返す | 承認 |
 | [0062](0062-children-run-only-when-replay-reaches-them.md) | 子の実行は親のリプレイが到達したときだけ再開し、親が終わる前に未完了の子孫を取り消す | 承認 |
@@ -81,6 +81,7 @@
 | [0074](0074-adapt-durable-start-admission-to-storage.md) | 耐久開始の受け付けを保存先の処理能力に合わせ、開始前に過負荷を返す | 承認 |
 | [0075](0075-negotiate-graceful-worker-drain-capability.md) | worker と kairod は graceful Drain の能力を接続ごとに合意してから使う | 承認 |
 | [0076](0076-operational-measurements-are-nondurable-and-bounded.md) | 運用指標は実行記録から分離し、有界 cardinality の非耐久な計数・分布として公開する | 承認 |
-| [0077](0077-runtime-destinations-weight-limits-and-retry-after.md) | 実行時に選んだ宛先へ、完了後の重みと再試行待ちを共有して適用する | 承認 |
+| [0077](0077-runtime-destinations-weight-limits-and-retry-after.md) | 実行時に選んだ宛先へ、完了後の重みと再試行待ちを共有して適用する | 承認（一部を 0078 で置き換え） |
+| [0078](0078-share-destination-rate-state-through-the-store.md) | 埋め込みランタイムは宛先の要求数・重み・再試行待ちを保存先でプロセス間共有できる | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

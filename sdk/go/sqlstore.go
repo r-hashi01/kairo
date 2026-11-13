@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Dialect is the SQL product behind a SQLStore.
@@ -91,6 +95,9 @@ func (s *SQLStore) Init(ctx context.Context) error {
 		  until ` + big + ` NOT NULL, PRIMARY KEY (run, act))`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `lease_until ON ` + p + `lease (until)`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `lease_owner ON ` + p + `lease (owner)`,
+		`CREATE TABLE IF NOT EXISTS ` + p + `rate (destination TEXT PRIMARY KEY, rpm ` + big + ` NOT NULL, wpm ` + big + ` NOT NULL,
+		  next_at ` + big + ` NOT NULL, weight REAL NOT NULL, weight_at ` + big + ` NOT NULL, pause_until ` + big + ` NOT NULL, expires_at ` + big + ` NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS ` + p + `rate_expires ON ` + p + `rate (expires_at)`,
 	}
 	if s.dialect == SQLite {
 		ddl = append([]string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`}, ddl...)
@@ -367,6 +374,19 @@ func (s *SQLStore) WithRun(ctx context.Context, id string, fn func(*RunRow) (*Ch
 				return err
 			}
 		}
+		if len(ch.SharedRates) > 0 {
+			settlements := append([]SharedRateSettlement(nil), ch.SharedRates...)
+			sort.Slice(settlements, func(i, j int) bool { return settlements[i].Destination < settlements[j].Destination })
+			now, err := s.storeNow(ctx, ex)
+			if err != nil {
+				return err
+			}
+			for _, settlement := range settlements {
+				if err := s.settleDestination(ctx, ex, now, settlement); err != nil {
+					return err
+				}
+			}
+		}
 		if ch.Notify && s.dialect == Postgres {
 			if _, err := ex.ExecContext(ctx, `SELECT pg_notify($1, $2)`, p+"settled", id); err != nil {
 				return err
@@ -374,6 +394,168 @@ func (s *SQLStore) WithRun(ctx context.Context, id string, fn func(*RunRow) (*Ch
 		}
 		return nil
 	})
+}
+
+type sharedRateRow struct {
+	destination                         string
+	rpm, wpm, nextAt, weightAt, pauseAt int64
+	weight                              float64
+	expiresAt                           int64
+}
+
+func (s *SQLStore) storeNow(ctx context.Context, ex execer) (int64, error) {
+	q := `SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
+	if s.dialect == Postgres {
+		q = `SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)`
+	}
+	var now int64
+	err := ex.QueryRowContext(ctx, q).Scan(&now)
+	return now, err
+}
+
+func (s *SQLStore) readRate(ctx context.Context, ex execer, destination string) (sharedRateRow, bool, error) {
+	if s.dialect == Postgres {
+		if _, err := ex.ExecContext(ctx, s.q(`INSERT INTO `+s.p+`rate
+			(destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+			VALUES (?, 0, 0, 0, 0, 0, 0, 0) ON CONFLICT (destination) DO NOTHING`), destination); err != nil {
+			return sharedRateRow{}, false, err
+		}
+	}
+	lock := ""
+	if s.dialect == Postgres {
+		lock = " FOR UPDATE"
+	}
+	var r sharedRateRow
+	err := ex.QueryRowContext(ctx, s.q(`SELECT destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at
+		FROM `+s.p+`rate WHERE destination = ?`+lock), destination).Scan(
+		&r.destination, &r.rpm, &r.wpm, &r.nextAt, &r.weight, &r.weightAt, &r.pauseAt, &r.expiresAt)
+	if err == sql.ErrNoRows {
+		return sharedRateRow{destination: destination}, false, nil
+	}
+	return r, err == nil, err
+}
+
+func rateCap(wpm int64) float64 {
+	if wpm <= 0 {
+		return 0
+	}
+	return max(1, float64(wpm)/6)
+}
+
+func configureRate(r *sharedRateRow, now int64, rpm, wpm int) {
+	if r.expiresAt <= now {
+		*r = sharedRateRow{destination: r.destination}
+	}
+	if r.wpm > 0 && r.weightAt > 0 && now > r.weightAt {
+		r.weight = min(rateCap(r.wpm), r.weight+float64(now-r.weightAt)*float64(r.wpm)/60_000)
+	}
+	oldWPM := r.wpm
+	r.rpm = int64(stricter(int(r.rpm), rpm))
+	r.wpm = int64(stricter(int(r.wpm), wpm))
+	if r.wpm <= 0 {
+		r.weight = 0
+	} else if oldWPM <= 0 {
+		r.weight = rateCap(r.wpm)
+	} else {
+		r.weight = min(r.weight, rateCap(r.wpm))
+	}
+	r.weightAt = now
+}
+
+func rateExpiry(r sharedRateRow, now int64) int64 {
+	expires := max(r.nextAt, r.pauseAt)
+	if r.wpm > 0 && r.weight < rateCap(r.wpm) {
+		full := now + int64(math.Ceil((rateCap(r.wpm)-r.weight)*60_000/float64(r.wpm)))
+		expires = max(expires, full)
+	}
+	return expires
+}
+
+func (s *SQLStore) writeRate(ctx context.Context, ex execer, r sharedRateRow, now int64) error {
+	r.expiresAt = rateExpiry(r, now)
+	if r.expiresAt <= now {
+		_, err := ex.ExecContext(ctx, s.q(`DELETE FROM `+s.p+`rate WHERE destination = ?`), r.destination)
+		return err
+	}
+	_, err := ex.ExecContext(ctx, s.q(`INSERT INTO `+s.p+`rate
+		(destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (destination) DO UPDATE SET rpm = excluded.rpm, wpm = excluded.wpm, next_at = excluded.next_at,
+		weight = excluded.weight, weight_at = excluded.weight_at, pause_until = excluded.pause_until, expires_at = excluded.expires_at`),
+		r.destination, r.rpm, r.wpm, r.nextAt, r.weight, r.weightAt, r.pauseAt, r.expiresAt)
+	return err
+}
+
+// AdmitDestination atomically reserves a shared request start. A positive
+// wait means no reservation was made; the caller waits and asks again.
+func (s *SQLStore) AdmitDestination(ctx context.Context, req SharedRateRequest) (time.Duration, error) {
+	if req.Destination == "" {
+		return 0, errors.New("kairo: shared rate destination is empty")
+	}
+	if req.RequestsPerMin < 0 || req.WeightPerMin < 0 {
+		return 0, errors.New("kairo: shared destination rates must be non-negative")
+	}
+	var wait time.Duration
+	err := s.tx(ctx, func(ex execer) error {
+		now, err := s.storeNow(ctx, ex)
+		if err != nil {
+			return err
+		}
+		r, _, err := s.readRate(ctx, ex, req.Destination)
+		if err != nil {
+			return err
+		}
+		configureRate(&r, now, req.RequestsPerMin, req.WeightPerMin)
+		at := max(r.nextAt, r.pauseAt)
+		if r.wpm > 0 && r.weight < 0 {
+			at = max(at, now+int64(math.Ceil(-r.weight*60_000/float64(r.wpm))))
+		}
+		if at > now {
+			wait = time.Duration(at-now) * time.Millisecond
+		} else if r.rpm > 0 {
+			r.nextAt = now + int64(math.Ceil(60_000/float64(r.rpm)))
+		}
+		return s.writeRate(ctx, ex, r, now)
+	})
+	return wait, err
+}
+
+func (s *SQLStore) settleDestination(ctx context.Context, ex execer, now int64, v SharedRateSettlement) error {
+	if v.Destination == "" {
+		return errors.New("kairo: shared rate destination is empty")
+	}
+	if v.RequestsPerMin < 0 || v.WeightPerMin < 0 || v.Weight < 0 || v.RetryAfter < 0 {
+		return errors.New("kairo: shared rate settlement must be non-negative")
+	}
+	r, _, err := s.readRate(ctx, ex, v.Destination)
+	if err != nil {
+		return err
+	}
+	configureRate(&r, now, v.RequestsPerMin, v.WeightPerMin)
+	if v.Weight > 0 && r.wpm > 0 {
+		r.weight -= float64(v.Weight)
+	}
+	if v.RetryAfter > 0 {
+		r.pauseAt = max(r.pauseAt, now+v.RetryAfter.Milliseconds())
+	}
+	return s.writeRate(ctx, ex, r, now)
+}
+
+// PruneDestinationRates removes neutral shared-limit rows in bounded batches.
+func (s *SQLStore) PruneDestinationRates(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	now := `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
+	if s.dialect == Postgres {
+		now = `CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)`
+	}
+	res, err := s.db.ExecContext(ctx, s.q(`DELETE FROM `+s.p+`rate WHERE destination IN
+		(SELECT destination FROM `+s.p+`rate WHERE expires_at <= `+now+` ORDER BY expires_at LIMIT ?)`), limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 func (s *SQLStore) Get(ctx context.Context, id string) (*RunRow, error) {

@@ -64,6 +64,18 @@ func TestKeepFinishedSetting(t *testing.T) {
 	}
 }
 
+func TestSharedLimitsRequireCapableEmbeddedStore(t *testing.T) {
+	k, err := Open(context.Background(), Options{Store: NewMemStore()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	Action(k, "shared", Unprotected, func(*TaskContext, any) (any, error) { return nil, nil }, Rate(60), SharedLimits())
+	if err := k.Start(context.Background()); err == nil {
+		t.Fatal("SharedLimits with MemStore was accepted")
+	}
+}
+
 func TestRuntimeDestinationsShareActualWeightAndRetryAfter(t *testing.T) {
 	var mu sync.Mutex
 	var resolved []string

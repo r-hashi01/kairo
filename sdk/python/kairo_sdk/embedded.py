@@ -33,7 +33,7 @@ from .client import KairoError
 from .core import Core
 from .observe import LOGGER, RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
-from .store import Changes, LeaseRow, RunRow, Store, TimerRow, retrying_store
+from .store import Changes, LeaseRow, RunRow, SharedRateRequest, SharedRateSettlement, Store, TimerRow, is_workflow_retry, retrying_store
 from .worker import Task, TaskContext
 
 #: Runs the action of a dispatched step here (it may block: it runs on a thread).
@@ -217,6 +217,16 @@ class Embedded:
     def register_actions(self, specs: list[dict[str, Any]], handler: ActionHandler) -> None:
         self.core.register(specs)
         self.handler = handler
+
+    @property
+    def supports_shared_rates(self) -> bool:
+        return hasattr(self.store, "admit_destination")
+
+    async def admit_destination(self, request: SharedRateRequest) -> int:
+        method = getattr(self.store, "admit_destination", None)
+        if method is None:
+            raise ValueError("store does not support shared destination limits")
+        return int(await method(request))
 
     def register_plan(self, definition: dict[str, Any]) -> dict[str, Any]:
         c = self.core.compile(definition)
@@ -508,6 +518,9 @@ class Embedded:
         # Finished trees past the time they are kept (ADR 0054).
         if self.keep_ms is not None:
             await self.store.remove_finished(self.now() - self.keep_ms, REMOVE_PER_TICK)
+        prune = getattr(self.store, "prune_destination_rates", None)
+        if prune is not None:
+            await prune(REMOVE_PER_TICK)
 
     async def close(self) -> None:
         """Stops, as a process that stops: no new step starts, timers are
@@ -668,12 +681,14 @@ class Embedded:
             raise _ParentNotReached("the parent replay has not reached this child")
         return await apply()
 
-    async def _process(self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None) -> bool:
-        out = await self._process_report(run_id, events, begin)
+    async def _process(self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None,
+                       shared_rates: list[SharedRateSettlement] | None = None) -> bool:
+        out = await self._process_report(run_id, events, begin, shared_rates)
         return bool(out["existing"])
 
     async def _process_report(
-        self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None
+        self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None,
+        shared_rates: list[SharedRateSettlement] | None = None,
     ) -> dict[str, bool]:
         """Applies events to run_id in one transaction, then carries out the
         commands. With begin, a new run of its plan (or the existing one: the
@@ -747,6 +762,9 @@ class Embedded:
                 clear=res["status"] in DONE,
                 end_leases=end_leases,
                 notify=settled,
+                # A retry after an ambiguously successful COMMIT sees the outcome
+                # ignored above, so its shared settlement is not applied twice.
+                shared_rates=shared_rates or [],
             )
             for c in commands:
                 if c["kind"] == "timer":
@@ -850,7 +868,18 @@ class Embedded:
         began = 0.0
         try:
             # Over a limit, the step waits here for a slot, leased (ADR 0059).
-            got = await self.admit(task, ctx) if self.admit is not None else None
+            while True:
+                try:
+                    got = await self.admit(task, ctx) if self.admit is not None else None
+                    break
+                except Exception as e:
+                    if not is_workflow_retry(e):
+                        raise
+                    self.logger.warning("kairo: run %s: admitting a step: %s", run_id, e)
+                    await asyncio.sleep(0.1)
+                    if self._closed:
+                        got = Result(error="runtime closed", retryable=True, error_type="cancelled")
+                        break
             if isinstance(got, Result):
                 res = got
             else:
@@ -863,12 +892,12 @@ class Embedded:
         finally:
             if release is not None:
                 release(res)
-            self._running.pop(key, None)
-            self._renew()
         if began:
             # It ran (not stopped waiting for a slot).
             self._observe(Observation(STEP_FINISHED, **step, status=step_status(res), error=res.error, duration=time.monotonic() - began))
         if self._closed:
+            self._running.pop(key, None)
+            self._renew()
             return
         if res.pending is not None:
             # It runs elsewhere (ADR 0052): its lease goes there, until its
@@ -879,8 +908,25 @@ class Embedded:
                 await self.store.hand_over(LeaseRow(run_id, c["act"], c.get("attempt", 0), res.pending["owner"], until))
             except Exception as e:
                 self.logger.warning("kairo: run %s: handing over a lease: %s", run_id, e)
+            self._running.pop(key, None)
+            self._renew()
             return
-        await self._process(run_id, [_outcome(res, c["act"], c.get("attempt", 0), self.now())])
+        event = _outcome(res, c["act"], c.get("attempt", 0), self.now())
+        delay = 0.1
+        while not self._closed:
+            try:
+                await self._process(run_id, [event], shared_rates=[res.shared_rate] if res.shared_rate is not None else [])
+                break
+            except Exception as e:
+                if not is_workflow_retry(e):
+                    self._running.pop(key, None)
+                    self._renew()
+                    raise
+                self.logger.warning("kairo: run %s: retrying a step outcome: %s", run_id, e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5.0)
+        self._running.pop(key, None)
+        self._renew()
 
     async def next_wake(self) -> int | None:
         """When something is next to do: the earliest timer or lease expiry (ADR 0053)."""

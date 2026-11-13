@@ -183,8 +183,8 @@ type Options struct {
 	// Concurrency: at most this many steps of actions run here at once
 	// (default: no limit). Steps over it wait, leased, for a slot.
 	Concurrency int
-	// DestinationLimits resolves the current per-process limits of a
-	// destination when a step is admitted (ADR 0077).
+	// DestinationLimits resolves the current limits of a destination when a
+	// step is admitted (ADR 0077, 0078).
 	DestinationLimits func(string) (DestinationLimits, error)
 	// Logger takes what goes wrong in the runtime's background work (lease
 	// renewals, sweeps, callbacks; default slog.Default()).
@@ -253,14 +253,18 @@ type Kairo struct {
 	slots       chan struct{}       // Concurrency (nil: no limit)
 	limits      map[string]*limiter // by destination
 	limitFor    func(string) (DestinationLimits, error)
+	rates       SharedRateStore
 }
 
-// DestinationLimits are per-process limits for one runtime destination.
+// DestinationLimits are limits for one runtime destination. Concurrency is
+// always process-local. Shared makes request, weight, and Retry-After state
+// common to embedded runtimes using the same capable Store (ADR 0078).
 // Zero values are unlimited.
 type DestinationLimits struct {
 	Concurrency    int
 	RequestsPerMin int
 	WeightPerMin   int
+	Shared         bool
 }
 
 type drive struct {
@@ -368,6 +372,7 @@ type actionDef struct {
 	limit   int // steps at once (0: no limit)
 	rate    int // steps started a minute (0: no limit)
 	weight  int // reported weight a minute (0: no limit)
+	shared  bool
 }
 
 // Open opens the runtime on opts.Store. Declare actions and workflows, then
@@ -410,6 +415,9 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, limitFor: opts.DestinationLimits,
 		tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
+	if rates, ok := opts.Store.(SharedRateStore); ok {
+		k.rates = rates
+	}
 	k.tickSlot <- struct{}{}
 	k.runs = rt
 	k.bgCtx, k.bgCancel = context.WithCancel(context.Background())
@@ -501,6 +509,12 @@ func WeightRate(perMinute int) ActionOption {
 	return func(s map[string]any) { s["$weight_rate"] = perMinute }
 }
 
+// SharedLimits makes Rate, WeightRate, and Retry-After common to embedded
+// runtimes using the same SQL store. Limit remains process-local (ADR 0078).
+func SharedLimits() ActionOption {
+	return func(s map[string]any) { s["$shared_limits"] = true }
+}
+
 // IdempotentRetry declares that a real action may run again with the same
 // idempotency key when its outcome is unknown (instead of stopping for
 // review).
@@ -577,13 +591,14 @@ func Action[I, O any](k *Kairo, name string, effect Effect, fn func(t *TaskConte
 	limit, _ := spec["$limit"].(int)
 	rate, _ := spec["$rate"].(int)
 	weight, _ := spec["$weight_rate"].(int)
-	for _, key := range []string{"$url", "$async", "$limit", "$rate", "$weight_rate"} {
+	shared, _ := spec["$shared_limits"].(bool)
+	for _, key := range []string{"$url", "$async", "$limit", "$rate", "$weight_rate", "$shared_limits"} {
 		delete(spec, key)
 	}
 	spec["destination_from"] = "$kairo_destination"
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.actions[name] = &actionDef{spec: spec, url: u, async: async, limit: limit, rate: rate, weight: weight, handler: func(t *TaskContext, raw json.RawMessage) (any, error) {
+	k.actions[name] = &actionDef{spec: spec, url: u, async: async, limit: limit, rate: rate, weight: weight, shared: shared, handler: func(t *TaskContext, raw json.RawMessage) (any, error) {
 		var in I
 		if len(raw) > 0 && string(raw) != "null" {
 			if err := json.Unmarshal(raw, &in); err != nil {
@@ -639,7 +654,19 @@ func (k *Kairo) Start(ctx context.Context) error {
 		k.slots = make(chan struct{}, k.concurrency)
 	}
 	for name, a := range k.actions {
-		if a.limit > 0 || a.rate > 0 || a.weight > 0 {
+		if a.shared && a.async {
+			k.mu.Unlock()
+			return fmt.Errorf("kairo: action %s: SharedLimits does not support asynchronous URL actions", name)
+		}
+		if a.shared && (k.remote != nil || k.rates == nil) {
+			k.mu.Unlock()
+			return fmt.Errorf("kairo: action %s: SharedLimits needs an embedded runtime with a shared-rate Store", name)
+		}
+		if a.shared && (a.rate < 0 || a.weight < 0) {
+			k.mu.Unlock()
+			return fmt.Errorf("kairo: action %s: shared rates must be non-negative", name)
+		}
+		if a.limit > 0 || a.rate > 0 || a.weight > 0 || a.shared {
 			// Actions of one destination share its limits: the strictest.
 			key := destination(name, a)
 			l := k.limits[key]
@@ -647,7 +674,7 @@ func (k *Kairo) Start(ctx context.Context) error {
 				l = &limiter{}
 				k.limits[key] = l
 			}
-			l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight})
+			l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight, Shared: a.shared})
 		}
 		specs = append(specs, a.spec)
 		if a.url != "" {
@@ -827,6 +854,9 @@ func (k *Kairo) serve(ctx context.Context, t task, emit func([]byte)) result {
 	// Over a limit, the step waits here for a slot, leased (ADR 0059, 0077).
 	finish, err := k.admit(ctx, t.Destination, a)
 	if err != nil {
+		if retryWorkflow(err) {
+			return result{dispatchErr: err}
+		}
 		return result{Err: err.Error(), Retryable: true, ErrType: "cancelled"}
 	}
 	var res result
@@ -837,7 +867,7 @@ func (k *Kairo) serve(ctx context.Context, t task, emit func([]byte)) result {
 		res = k.runHandler(a, tc, t.Action, in.In)
 		res.Weight = int(tc.weight.Load())
 	}
-	finish(res)
+	finish(&res)
 	return res
 }
 
@@ -2245,7 +2275,18 @@ func (l *limiter) declare(v DestinationLimits) {
 	l.declared.Concurrency = stricter(l.declared.Concurrency, v.Concurrency)
 	l.declared.RequestsPerMin = stricter(l.declared.RequestsPerMin, v.RequestsPerMin)
 	l.declared.WeightPerMin = stricter(l.declared.WeightPerMin, v.WeightPerMin)
+	l.declared.Shared = l.declared.Shared || v.Shared
 	l.mu.Unlock()
+}
+
+func (l *limiter) resolve(v DestinationLimits) DestinationLimits {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v.Concurrency = stricter(l.declared.Concurrency, v.Concurrency)
+	v.RequestsPerMin = stricter(l.declared.RequestsPerMin, v.RequestsPerMin)
+	v.WeightPerMin = stricter(l.declared.WeightPerMin, v.WeightPerMin)
+	v.Shared = v.Shared || l.declared.Shared
+	return v
 }
 
 func (l *limiter) configure(v DestinationLimits, now time.Time) {
@@ -2297,8 +2338,10 @@ func (l *limiter) admit(ctx context.Context, limits DestinationLimits) error {
 		now := time.Now()
 		l.mu.Lock()
 		limits.Concurrency = stricter(l.declared.Concurrency, limits.Concurrency)
-		limits.RequestsPerMin = stricter(l.declared.RequestsPerMin, limits.RequestsPerMin)
-		limits.WeightPerMin = stricter(l.declared.WeightPerMin, limits.WeightPerMin)
+		if !limits.Shared {
+			limits.RequestsPerMin = stricter(l.declared.RequestsPerMin, limits.RequestsPerMin)
+			limits.WeightPerMin = stricter(l.declared.WeightPerMin, limits.WeightPerMin)
+		}
 		l.configure(limits, now)
 		if l.changed == nil {
 			l.changed = make(chan struct{})
@@ -2405,7 +2448,7 @@ func stricter(a, b int) int {
 }
 
 // admit waits for a step's runtime destination and the process slot.
-func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish func(result), err error) {
+func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish func(*result), err error) {
 	var held []chan struct{}
 	releaseSlots := func() {
 		for _, s := range held {
@@ -2430,6 +2473,9 @@ func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish fu
 		}
 		limits = dynamic
 	}
+	limits.Shared = limits.Shared || a.shared
+	limits.RequestsPerMin = stricter(limits.RequestsPerMin, a.rate)
+	limits.WeightPerMin = stricter(limits.WeightPerMin, a.weight)
 	k.mu.Lock()
 	l := k.limits[dest]
 	if l == nil {
@@ -2437,7 +2483,36 @@ func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish fu
 		k.limits[dest] = l
 	}
 	k.mu.Unlock()
-	l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight})
+	l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight, Shared: a.shared})
+	limits = l.resolve(limits)
+	sharedLimits := limits
+	if limits.Shared {
+		if k.remote != nil || k.rates == nil {
+			return nil, errors.New("kairo: shared destination limits need an embedded runtime with a shared-rate Store")
+		}
+		if limits.RequestsPerMin < 0 || limits.WeightPerMin < 0 {
+			return nil, errors.New("kairo: shared destination rates must be non-negative")
+		}
+		for {
+			wait, e := k.rates.AdmitDestination(ctx, SharedRateRequest{Destination: dest,
+				RequestsPerMin: limits.RequestsPerMin, WeightPerMin: limits.WeightPerMin})
+			if e != nil {
+				return nil, storeRetry(ctx, e)
+			}
+			if wait <= 0 {
+				break
+			}
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			}
+		}
+		// The shared store owns request/weight state; only concurrency is local.
+		limits.RequestsPerMin, limits.WeightPerMin = 0, 0
+	}
 	if err := l.admit(ctx, limits); err != nil {
 		return nil, err
 	}
@@ -2447,9 +2522,15 @@ func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish fu
 			return nil, err
 		}
 	}
-	return func(res result) {
+	return func(res *result) {
 		releaseSlots()
-		l.finish(res.Weight, time.Duration(res.RetryAfter)*time.Millisecond)
+		if limits.Shared {
+			l.finish(0, 0)
+			res.sharedRate = &SharedRateSettlement{Destination: dest, RequestsPerMin: sharedLimits.RequestsPerMin,
+				WeightPerMin: sharedLimits.WeightPerMin, Weight: max(res.Weight, 0), RetryAfter: time.Duration(max(res.RetryAfter, 0)) * time.Millisecond}
+		} else {
+			l.finish(res.Weight, time.Duration(res.RetryAfter)*time.Millisecond)
+		}
 		k.retireLimiter(dest, l)
 	}, nil
 }

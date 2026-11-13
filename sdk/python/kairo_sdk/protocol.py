@@ -85,6 +85,8 @@ class Result:
     # The step runs elsewhere and its outcome comes later. Embedded uses
     # the lease value; the worker protocol serializes this as pending=true.
     pending: dict[str, Any] | None = None
+    # Embedded-runtime metadata; never serialized on the worker protocol.
+    shared_rate: Any = None
 
     def body(self) -> dict[str, Any]:
         b: dict[str, Any] = {"seq": self.seq}

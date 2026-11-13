@@ -52,7 +52,7 @@ from .metrics import (
 )
 from .observe import LOGGER, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
-from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, WorkflowRetryError, is_workflow_retry
+from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, SharedRateRequest, SharedRateSettlement, WorkflowRetryError, is_workflow_retry
 from .worker import Task, TaskContext
 
 PLAN_CALL = "kairo.call/"
@@ -119,6 +119,7 @@ class DestinationLimits:
     concurrency: int | None = None
     requests_per_minute: float | None = None
     weight_per_minute: float | None = None
+    shared: bool = False
 
 
 class UnknownOutcomeError(Exception):
@@ -258,6 +259,7 @@ class _Action:
     limit: int | None = None
     rate: float | None = None
     weight_rate: float | None = None
+    shared_limits: bool = False
     max_attempts: int | None = None
     backoff: str | None = None
 
@@ -548,6 +550,7 @@ class Kairo:
         limit: int | None = None,
         rate: float | None = None,
         weight_rate: float | None = None,
+        shared_limits: bool = False,
         max_attempts: int | None = None,
         backoff: str | None = None,
     ):
@@ -559,6 +562,8 @@ class Kairo:
         this many of its steps run in this process at once; rate: at most
         this many start in this process a minute, spaced evenly (ADR 0059).
         Actions of one destination share limit and rate: the strictest.
+        shared_limits shares rate, actual-weight debt and Retry-After through
+        an embedded SQLite or PostgreSQL Store; concurrency stays local.
 
         max_attempts: a step of the action is tried at most this many times
         when it fails retryably (RetryableError; default 3, or 1 for a real
@@ -575,7 +580,7 @@ class Kairo:
             check_url(url, self._allow_insecure if allow_insecure is None else allow_insecure)
 
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate, weight_rate, max_attempts, backoff)
+            self._actions[name] = _Action(fn, effect, timeout, destination, url, async_, limit, rate, weight_rate, shared_limits, max_attempts, backoff)
             return fn
 
         return register
@@ -612,6 +617,15 @@ class Kairo:
         for name, d in self._workflows.items():
             if d.currents != 1:
                 raise ValueError(f"workflow {name}: {d.currents} current versions (one, the others draining)")
+        for name, a in self._actions.items():
+            if a.shared_limits and a.async_:
+                raise ValueError(f"action {name}: shared_limits does not support asynchronous URL actions")
+            if a.shared_limits and (self._rt is None or not self._rt.supports_shared_rates):
+                raise ValueError(f"action {name}: shared_limits needs an embedded runtime with a shared-rate Store")
+            if a.shared_limits:
+                for label, value in (("rate", a.rate), ("weight_rate", a.weight_rate)):
+                    if value is not None and (not float(value).is_integer() or value < 0):
+                        raise ValueError(f"action {name}: shared {label} must be a non-negative integer")
         self._loop = asyncio.get_running_loop()
         self._life_future()
         specs: list[dict[str, Any]] = []
@@ -640,16 +654,16 @@ class Kairo:
                 if not hasattr(self.backend, "complete"):
                     raise ValueError("actions with a url need the embedded backend or kairod")
         for name, a in self._actions.items():
-            if not a.limit and not a.rate and not a.weight_rate:
+            if not a.limit and not a.rate and not a.weight_rate and not a.shared_limits:
                 continue
             # Actions of one destination share its limits: the strictest.
             key = a.destination or name
-            self._limits.setdefault(key, _Limiter()).declare(DestinationLimits(a.limit, a.rate, a.weight_rate))
+            self._limits.setdefault(key, _Limiter()).declare(DestinationLimits(a.limit, a.rate, a.weight_rate, a.shared_limits))
         rt = self._rt
         # kairod's worker limits its own tasks.
         if rt is not None and self._concurrency:
             self._slots = _Slots(self._concurrency)
-        if rt is not None and (self._slots or self._limits or self._destination_limits):
+        if rt is not None and (self._slots or self._limits or self._destination_limits or any(a.shared_limits for a in self._actions.values())):
             # Steps wait for their slots on the event loop, before their thread.
             rt.admit = self._admit_step
         await self.backend.start(specs, self._serve_observed if self._observer is not None else self._serve)
@@ -900,16 +914,48 @@ class Kairo:
                 held.pop().give()
 
         if a is not None and action not in BUILTIN:
-            limits = DestinationLimits(a.limit, a.rate, a.weight_rate)
+            limits = DestinationLimits(a.limit, a.rate, a.weight_rate, a.shared_limits)
             if self._destination_limits is not None:
                 dynamic = self._destination_limits(destination)
                 limits = DestinationLimits(
                     _stricter(limits.concurrency, dynamic.concurrency),
                     _stricter(limits.requests_per_minute, dynamic.requests_per_minute),
                     _stricter(limits.weight_per_minute, dynamic.weight_per_minute),
+                    a.shared_limits or dynamic.shared,
                 )
             lim = self._limits.setdefault(destination, _Limiter())
-            lim.declare(DestinationLimits(a.limit, a.rate, a.weight_rate))
+            lim.declare(DestinationLimits(a.limit, a.rate, a.weight_rate, a.shared_limits))
+            limits = lim.resolve(limits)
+            shared = limits
+            if limits.shared:
+                if self._rt is None or not self._rt.supports_shared_rates:
+                    raise ValueError("shared destination limits need an embedded runtime with a shared-rate Store")
+                for value, label in ((limits.requests_per_minute, "requests_per_minute"), (limits.weight_per_minute, "weight_per_minute")):
+                    if value is not None and (not float(value).is_integer() or value < 0):
+                        raise ValueError(f"shared {label} must be a non-negative integer")
+                shared_stop: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+                shared_loop = asyncio.get_running_loop()
+
+                def shared_stopped() -> None:
+                    try:
+                        shared_loop.call_soon_threadsafe(_set, shared_stop)
+                    except RuntimeError:
+                        pass
+
+                shared_off = ctx.cancelled.on_set(shared_stopped) if hasattr(ctx.cancelled, "on_set") else (lambda: None)
+                try:
+                    while True:
+                        wait = await self._rt.admit_destination(SharedRateRequest(destination, int(limits.requests_per_minute or 0), int(limits.weight_per_minute or 0)))
+                        if wait <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(asyncio.shield(shared_stop), wait / 1000)
+                            raise _StepStopped()
+                        except TimeoutError:
+                            pass
+                finally:
+                    shared_off()
+                limits = DestinationLimits(concurrency=limits.concurrency, shared=True)
         if lim is None and slots is None:
             return lambda _result: release_slots()
         stop: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -933,8 +979,17 @@ class Kairo:
             def finish(result: Result) -> None:
                 release_slots()
                 if lim is not None:
-                    retry_after = result.retry_after_ms if result.retryable and not result.unknown else 0
-                    lim.finish(result.weight or result.tokens, retry_after)
+                    if limits.shared:
+                        lim.finish(0, 0)
+                        actual_weight = result.weight or result.tokens
+                        result.shared_rate = SharedRateSettlement(
+                            destination, int(shared.requests_per_minute or 0), int(shared.weight_per_minute or 0),
+                            actual_weight if isinstance(actual_weight, int) and not isinstance(actual_weight, bool) and actual_weight >= 0 else 0,
+                            max(0, int(result.retry_after_ms)) if result.retryable and not result.unknown else 0,
+                        )
+                    else:
+                        retry_after = result.retry_after_ms if result.retryable and not result.unknown else 0
+                        lim.finish(result.weight or result.tokens, retry_after)
                     self._retire_limiter(destination, lim)
             return finish
         except BaseException:
@@ -2067,13 +2122,23 @@ class _Limiter:
             _stricter(self.declared.concurrency, v.concurrency),
             _stricter(self.declared.requests_per_minute, v.requests_per_minute),
             _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+            self.declared.shared or v.shared,
+        )
+
+    def resolve(self, v: DestinationLimits) -> DestinationLimits:
+        return DestinationLimits(
+            _stricter(self.declared.concurrency, v.concurrency),
+            _stricter(self.declared.requests_per_minute, v.requests_per_minute),
+            _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+            self.declared.shared or v.shared,
         )
 
     def configure(self, v: DestinationLimits) -> None:
         v = DestinationLimits(
             _stricter(self.declared.concurrency, v.concurrency),
-            _stricter(self.declared.requests_per_minute, v.requests_per_minute),
-            _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+            v.requests_per_minute if v.shared else _stricter(self.declared.requests_per_minute, v.requests_per_minute),
+            v.weight_per_minute if v.shared else _stricter(self.declared.weight_per_minute, v.weight_per_minute),
+            v.shared,
         )
         now = time.time()
         self._refill(now)

@@ -103,7 +103,19 @@ export interface Changes<T> {
 	endLeases?: number[];
 	/** The run settled (finished, or stopped for review): tell the listeners at commit. */
 	notify?: boolean;
+	sharedRates?: SharedRateSettlement[];
 	result: T;
+}
+
+export interface SharedRateRequest {
+	destination: string;
+	requestsPerMinute?: number;
+	weightPerMinute?: number;
+}
+
+export interface SharedRateSettlement extends SharedRateRequest {
+	weight?: number;
+	retryAfter?: number;
 }
 
 export interface Store {
@@ -154,6 +166,9 @@ export interface Store {
 	endDrive(run: string, owner: string, token: number, now: number, resume: boolean): Promise<void>;
 	/** Root runs (no parent) in creation order (ADR 0059). */
 	list(f: ListFilter): Promise<RunRow[]>;
+	/** Optional capability for ADR 0078 shared destination limits. */
+	admitDestination?(request: SharedRateRequest): Promise<number>;
+	pruneDestinationRates?(limit: number): Promise<number>;
 	close(): Promise<void>;
 }
 
@@ -202,7 +217,51 @@ const DDL = (p: string, blob: string, big: string) => [
 	  until ${big} NOT NULL, PRIMARY KEY (run, act))`,
 	`CREATE INDEX IF NOT EXISTS ${p}lease_until ON ${p}lease (until)`,
 	`CREATE INDEX IF NOT EXISTS ${p}lease_owner ON ${p}lease (owner)`,
+	`CREATE TABLE IF NOT EXISTS ${p}rate (destination TEXT PRIMARY KEY, rpm ${big} NOT NULL, wpm ${big} NOT NULL,
+	  next_at ${big} NOT NULL, weight REAL NOT NULL, weight_at ${big} NOT NULL, pause_until ${big} NOT NULL, expires_at ${big} NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS ${p}rate_expires ON ${p}rate (expires_at)`,
 ];
+
+interface SharedRateRow {
+	destination: string;
+	rpm: number;
+	wpm: number;
+	nextAt: number;
+	weight: number;
+	weightAt: number;
+	pauseUntil: number;
+	expiresAt: number;
+}
+
+const rateCap = (wpm: number) => (wpm > 0 ? Math.max(1, wpm / 6) : 0);
+const strictRate = (a: number, b: number) => (a <= 0 ? Math.max(b, 0) : b <= 0 ? a : Math.min(a, b));
+
+function validateSharedRate(v: SharedRateRequest | SharedRateSettlement): void {
+	if (!v.destination) throw new Error('shared rate destination is empty');
+	for (const [name, n] of [['requestsPerMinute', v.requestsPerMinute], ['weightPerMinute', v.weightPerMinute],
+		['weight', 'weight' in v ? v.weight : undefined], ['retryAfter', 'retryAfter' in v ? v.retryAfter : undefined]] as const) {
+		if (n !== undefined && (!Number.isSafeInteger(n) || n < 0)) throw new Error(`shared ${name} must be a non-negative safe integer`);
+	}
+}
+
+function configureRate(row: SharedRateRow, now: number, request: SharedRateRequest): SharedRateRow {
+	let r = row.expiresAt <= now ? { destination: row.destination, rpm: 0, wpm: 0, nextAt: 0, weight: 0, weightAt: 0, pauseUntil: 0, expiresAt: 0 } : { ...row };
+	if (r.wpm > 0 && r.weightAt > 0 && now > r.weightAt) r.weight = Math.min(rateCap(r.wpm), r.weight + (now - r.weightAt) * r.wpm / 60_000);
+	const oldWpm = r.wpm;
+	r.rpm = strictRate(r.rpm, request.requestsPerMinute ?? 0);
+	r.wpm = strictRate(r.wpm, request.weightPerMinute ?? 0);
+	if (r.wpm <= 0) r.weight = 0;
+	else if (oldWpm <= 0) r.weight = rateCap(r.wpm);
+	else r.weight = Math.min(r.weight, rateCap(r.wpm));
+	r.weightAt = now;
+	return r;
+}
+
+function rateExpiry(r: SharedRateRow, now: number): number {
+	let expires = Math.max(r.nextAt, r.pauseUntil);
+	if (r.wpm > 0 && r.weight < rateCap(r.wpm)) expires = Math.max(expires, now + Math.ceil((rateCap(r.wpm) - r.weight) * 60_000 / r.wpm));
+	return expires;
+}
 
 /** Columns added to tables made before them: parent (ADR 0054), workflow and meta (ADR 0059). */
 const ADDED = ['parent', 'workflow', 'meta'];
@@ -407,12 +466,72 @@ export class SQLiteStore implements Store {
 			for (const t of c.setTimers ?? []) this.q.setTimer.run(t.run, t.timer, t.act, t.at);
 			for (const a of c.endLeases ?? []) this.q.endLease.run(id, a);
 			for (const l of c.setLeases ?? []) this.q.setLease.run(l.run, l.act, l.attempt, l.owner, l.until);
+			if (c.sharedRates?.length) {
+				const now = this.storeNow();
+				for (const rate of [...c.sharedRates].sort((a, b) => a.destination.localeCompare(b.destination))) this.settleRate(rate, now);
+			}
 			this.db.exec('COMMIT');
 			return c.result;
 		} catch (e) {
 			this.db.exec('ROLLBACK');
 			throw e;
 		}
+	}
+
+	private storeNow(): number {
+		return Number(this.db.prepare(`SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS now`).get().now);
+	}
+
+	private readRate(destination: string): SharedRateRow {
+		const v = this.db.prepare(`SELECT destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at FROM ${this.p}rate WHERE destination = ?`).get(destination);
+		return v ? { destination: v.destination, rpm: Number(v.rpm), wpm: Number(v.wpm), nextAt: Number(v.next_at), weight: Number(v.weight), weightAt: Number(v.weight_at), pauseUntil: Number(v.pause_until), expiresAt: Number(v.expires_at) }
+			: { destination, rpm: 0, wpm: 0, nextAt: 0, weight: 0, weightAt: 0, pauseUntil: 0, expiresAt: 0 };
+	}
+
+	private writeRate(r: SharedRateRow, now: number): void {
+		r.expiresAt = rateExpiry(r, now);
+		if (r.expiresAt <= now) {
+			this.db.prepare(`DELETE FROM ${this.p}rate WHERE destination = ?`).run(r.destination);
+			return;
+		}
+		this.db.prepare(`INSERT INTO ${this.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (destination) DO UPDATE SET rpm=excluded.rpm, wpm=excluded.wpm,
+			next_at=excluded.next_at, weight=excluded.weight, weight_at=excluded.weight_at, pause_until=excluded.pause_until, expires_at=excluded.expires_at`)
+			.run(r.destination, r.rpm, r.wpm, r.nextAt, r.weight, r.weightAt, r.pauseUntil, r.expiresAt);
+	}
+
+	private settleRate(v: SharedRateSettlement, now: number): void {
+		validateSharedRate(v);
+		const r = configureRate(this.readRate(v.destination), now, v);
+		if ((v.weight ?? 0) > 0 && r.wpm > 0) r.weight -= v.weight!;
+		if ((v.retryAfter ?? 0) > 0) r.pauseUntil = Math.max(r.pauseUntil, now + v.retryAfter!);
+		this.writeRate(r, now);
+	}
+
+	async admitDestination(request: SharedRateRequest): Promise<number> {
+		validateSharedRate(request);
+		this.db.exec('BEGIN IMMEDIATE');
+		try {
+			const now = this.storeNow();
+			const r = configureRate(this.readRate(request.destination), now, request);
+			let at = Math.max(r.nextAt, r.pauseUntil);
+			if (r.wpm > 0 && r.weight < 0) at = Math.max(at, now + Math.ceil(-r.weight * 60_000 / r.wpm));
+			const wait = Math.max(0, at - now);
+			if (wait === 0 && r.rpm > 0) r.nextAt = now + Math.ceil(60_000 / r.rpm);
+			this.writeRate(r, now);
+			this.db.exec('COMMIT');
+			return wait;
+		} catch (e) {
+			this.db.exec('ROLLBACK');
+			throw e;
+		}
+	}
+
+	async pruneDestinationRates(limit: number): Promise<number> {
+		if (limit <= 0) return 0;
+		const r = this.db.prepare(`DELETE FROM ${this.p}rate WHERE destination IN (SELECT destination FROM ${this.p}rate
+			WHERE expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) ORDER BY expires_at LIMIT ?)` ).run(limit);
+		return Number(r.changes);
 	}
 
 	async get(id: string): Promise<RunRow | undefined> {
@@ -584,6 +703,10 @@ export class PostgresStore implements Store {
 			for (const t of ch.setTimers ?? [])
 				await c.query(`INSERT INTO ${p}timer (run, timer, act, at) VALUES ($1, $2, $3, $4) ON CONFLICT (run, timer) DO UPDATE SET at = excluded.at`,
 					[t.run, t.timer, t.act, t.at]);
+			if (ch.sharedRates?.length) {
+				const now = await this.storeNow(c);
+				for (const rate of [...ch.sharedRates].sort((a, b) => a.destination.localeCompare(b.destination))) await this.settleRate(c, rate, now);
+			}
 			if (ch.notify) await c.query('SELECT pg_notify($1, $2)', [`${p}settled`, id]);
 			await c.query('COMMIT');
 			return ch.result;
@@ -593,6 +716,65 @@ export class PostgresStore implements Store {
 		} finally {
 			c.release();
 		}
+	}
+
+	private async storeNow(c: PgClient): Promise<number> {
+		return Number((await c.query(`SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) AS now`)).rows[0].now);
+	}
+
+	private async readRate(c: PgClient, destination: string): Promise<SharedRateRow> {
+		await c.query(`INSERT INTO ${this.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+			VALUES ($1, 0, 0, 0, 0, 0, 0, 0) ON CONFLICT (destination) DO NOTHING`, [destination]);
+		const v = (await c.query(`SELECT destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at
+			FROM ${this.p}rate WHERE destination = $1 FOR UPDATE`, [destination])).rows[0];
+		return { destination: v.destination, rpm: Number(v.rpm), wpm: Number(v.wpm), nextAt: Number(v.next_at), weight: Number(v.weight), weightAt: Number(v.weight_at), pauseUntil: Number(v.pause_until), expiresAt: Number(v.expires_at) };
+	}
+
+	private async writeRate(c: PgClient, r: SharedRateRow, now: number): Promise<void> {
+		r.expiresAt = rateExpiry(r, now);
+		if (r.expiresAt <= now) {
+			await c.query(`DELETE FROM ${this.p}rate WHERE destination = $1`, [r.destination]);
+			return;
+		}
+		await c.query(`INSERT INTO ${this.p}rate (destination, rpm, wpm, next_at, weight, weight_at, pause_until, expires_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (destination) DO UPDATE SET rpm=excluded.rpm, wpm=excluded.wpm,
+			next_at=excluded.next_at, weight=excluded.weight, weight_at=excluded.weight_at, pause_until=excluded.pause_until, expires_at=excluded.expires_at`,
+			[r.destination, r.rpm, r.wpm, r.nextAt, r.weight, r.weightAt, r.pauseUntil, r.expiresAt]);
+	}
+
+	private async settleRate(c: PgClient, v: SharedRateSettlement, now: number): Promise<void> {
+		validateSharedRate(v);
+		const r = configureRate(await this.readRate(c, v.destination), now, v);
+		if ((v.weight ?? 0) > 0 && r.wpm > 0) r.weight -= v.weight!;
+		if ((v.retryAfter ?? 0) > 0) r.pauseUntil = Math.max(r.pauseUntil, now + v.retryAfter!);
+		await this.writeRate(c, r, now);
+	}
+
+	async admitDestination(request: SharedRateRequest): Promise<number> {
+		validateSharedRate(request);
+		const c = await this.pool.connect();
+		try {
+			await c.query('BEGIN');
+			const now = await this.storeNow(c);
+			const r = configureRate(await this.readRate(c, request.destination), now, request);
+			let at = Math.max(r.nextAt, r.pauseUntil);
+			if (r.wpm > 0 && r.weight < 0) at = Math.max(at, now + Math.ceil(-r.weight * 60_000 / r.wpm));
+			const wait = Math.max(0, at - now);
+			if (wait === 0 && r.rpm > 0) r.nextAt = now + Math.ceil(60_000 / r.rpm);
+			await this.writeRate(c, r, now);
+			await c.query('COMMIT');
+			return wait;
+		} catch (e) {
+			await c.query('ROLLBACK').catch(() => {});
+			throw e;
+		} finally { c.release(); }
+	}
+
+	async pruneDestinationRates(limit: number): Promise<number> {
+		if (limit <= 0) return 0;
+		const r = await this.pool.query(`DELETE FROM ${this.p}rate WHERE destination IN (SELECT destination FROM ${this.p}rate
+			WHERE expires_at <= CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT) ORDER BY expires_at LIMIT $1) RETURNING destination`, [limit]);
+		return r.rows.length;
 	}
 
 	async get(id: string): Promise<RunRow | undefined> {
