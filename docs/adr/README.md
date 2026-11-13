@@ -55,7 +55,7 @@
 | [0048](0048-distribution-as-bundled-binary.md) | kairo は、kairod のバイナリを同梱した言語ごとのパッケージとして配る | 0051 により置き換え |
 | [0049](0049-sdk-graph-and-code-apis.md) | SDK は、グラフの API と、コードで書くワークフローの API の 2 段で用意する | 承認 |
 | [0050](0050-keep-outputs-of-finished-runs.md) | kairod では、指定した実行は、終わった後も出力を冪等の期間のあいだ残す | 承認 |
-| [0051](0051-no-resident-runtime.md) | kairo は常駐するサーバーを前提にしない: コアを利用者のプロセスに埋め込み、DB だけを使う | 承認 |
+| [0051](0051-no-resident-runtime.md) | kairo は常駐するサーバーを前提にしない: コアを利用者のプロセスに埋め込み、DB だけを使う | 承認（一部を 0079 で置き換え） |
 | [0052](0052-http-actions.md) | アクションを HTTP(S) で呼べるようにする（結果はその場か、後からコールバックで受ける） | 承認 |
 | [0053](0053-scheduler-entry-points.md) | サーバーレスのランタイムを、スケジューラーの定期実行か、次の時刻を知らせる一度きりの予約で起こす | 承認 |
 | [0054](0054-remove-finished-runs-embedded.md) | 埋め込みのランタイムは、終わった実行を、それを含む実行ごとまとめて、冪等の期間の後に消す | 承認 |
@@ -83,6 +83,6 @@
 | [0076](0076-operational-measurements-are-nondurable-and-bounded.md) | 運用指標は実行記録から分離し、有界 cardinality の非耐久な計数・分布として公開する | 承認 |
 | [0077](0077-runtime-destinations-weight-limits-and-retry-after.md) | 実行時に選んだ宛先へ、完了後の重みと再試行待ちを共有して適用する | 承認（一部を 0078 で置き換え） |
 | [0078](0078-share-destination-rate-state-through-the-store.md) | 埋め込みランタイムは宛先の要求数・重み・再試行待ちを保存先でプロセス間共有できる | 承認 |
-| [0079](0079-wake-sqlite-processes-with-local-notifications.md) | SQLite の別 process の決着はローカル通知で起こし、保存先を再読取して確定する | 提案 |
+| [0079](0079-wake-sqlite-processes-with-local-notifications.md) | SQLite の別 process の決着はローカル通知で起こし、保存先を再読取して確定する | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
