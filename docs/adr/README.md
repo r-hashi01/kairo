@@ -83,5 +83,6 @@
 | [0076](0076-operational-measurements-are-nondurable-and-bounded.md) | 運用指標は実行記録から分離し、有界 cardinality の非耐久な計数・分布として公開する | 承認 |
 | [0077](0077-runtime-destinations-weight-limits-and-retry-after.md) | 実行時に選んだ宛先へ、完了後の重みと再試行待ちを共有して適用する | 承認（一部を 0078 で置き換え） |
 | [0078](0078-share-destination-rate-state-through-the-store.md) | 埋め込みランタイムは宛先の要求数・重み・再試行待ちを保存先でプロセス間共有できる | 承認 |
+| [0079](0079-wake-sqlite-processes-with-local-notifications.md) | SQLite の別 process の決着はローカル通知で起こし、保存先を再読取して確定する | 提案 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
