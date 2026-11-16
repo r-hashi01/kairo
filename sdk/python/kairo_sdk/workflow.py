@@ -93,6 +93,39 @@ class TimedOutError(Exception):
 
 
 @dataclass(frozen=True)
+class ReplayCall:
+    """One call reached while evaluating a workflow from saved records."""
+
+    run_id: str
+    kind: str  # "call", "wait", or "workflow"
+    name: str
+    status: str
+    input: Any
+    output: Any = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """A read-only diagnostic evaluation; run is the authoritative durable root."""
+
+    run: dict[str, Any]
+    calls: list[ReplayCall]
+    outcome: str  # "completed", "failed", or "boundary"
+    output: Any = None
+    error: BaseException | None = None
+    boundary: ReplayCall | None = None
+
+
+class ReplayBoundaryError(RuntimeError):
+    """The replay reached a call that has no saved terminal result."""
+
+    def __init__(self, call: ReplayCall) -> None:
+        super().__init__(f"record-only replay stopped at {call.run_id} ({call.kind}: {call.status})")
+        self.call = call
+
+
+@dataclass(frozen=True)
 class SignalReceipt:
     """The wait that atomically accepted a signal (ADR 0064)."""
 
@@ -246,6 +279,57 @@ class _DrivenElsewhere(Exception):
 
 class _StepStopped(Exception):
     """A step stopped waiting for a slot (ADR 0059)."""
+
+
+class _ReplayDrive:
+    def __init__(self, backend: Backend, root: str) -> None:
+        self.backend = backend
+        self.root = root
+        self.calls: list[ReplayCall] = []
+        self.boundary: ReplayCall | None = None
+        self.fatal: BaseException | None = None
+
+    async def read(self, run_id: str, kind: str, name: str, input: Any) -> Any:
+        if self.boundary is not None:
+            raise ReplayBoundaryError(self.boundary)
+        try:
+            info = await self.backend.get(run_id)
+        except KairoError as e:
+            if e.status == 404:
+                return self._stop(ReplayCall(run_id, kind, name, "missing", input))
+            self.fatal = e
+            raise
+        except BaseException as e:
+            self.fatal = e
+            raise
+        call = ReplayCall(
+            run_id,
+            kind,
+            name,
+            str(info.get("status", "")),
+            input,
+            info.get("output"),
+            str(info.get("error") or ""),
+        )
+        if info.get("parent") != self.root:
+            return self._stop(ReplayCall(run_id, kind, name, "missing", input))
+        if info.get("trimmed"):
+            return self._stop(ReplayCall(run_id, kind, name, "trimmed", input))
+        if not finished(info):
+            return self._stop(call)
+        self.calls.append(call)
+        if kind == "workflow":
+            return _done(run_id, info)
+        if info.get("status") != "completed":
+            plan = PLAN_CALL + name if kind == "call" else PLAN_WAIT + name
+            raise _call_error(run_id, plan, str(info.get("status")), str(info.get("error") or ""))
+        return info.get("output")
+
+    def _stop(self, call: ReplayCall) -> Any:
+        self.calls.append(call)
+        if self.boundary is None:
+            self.boundary = call
+        raise ReplayBoundaryError(call)
 
 
 @dataclass
@@ -1338,6 +1422,45 @@ class Kairo:
         """Runs made directly by id: calls, waits and child workflows."""
         return await self.backend.children(id)
 
+    async def replay(self, id: str) -> ReplayResult:
+        """Evaluates an existing embedded code workflow using saved terminal
+        call records only. It does not run actions or child workflows,
+        advance waits, acquire a drive, or change any run."""
+        if self._rt is None:
+            raise RuntimeError("record-only replay needs the embedded runtime")
+        run = await self.backend.get(id, input=True)
+        if run.get("plan") != PLAN_WORKFLOW:
+            raise ValueError(f"run {id} is not a code workflow")
+        saved = _workflow_of(run.get("input"))
+        if saved is None:
+            raise ValueError(f"workflow {id} has no saved workflow input")
+        fn = self._fn_for(saved[0], saved[1])
+        if fn is None:
+            raise _NotHere(saved[0], saved[1])
+        drive = _ReplayDrive(self.backend, id)
+        ctx = Context(self, id, replay=drive)
+        output: Any = None
+        error: BaseException | None = None
+        try:
+            output = await _call(fn, ctx, saved[2])
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            error = e
+        if drive.fatal is not None:
+            raise drive.fatal
+        if drive.boundary is not None:
+            return ReplayResult(
+                run,
+                list(drive.calls),
+                "boundary",
+                error=ReplayBoundaryError(drive.boundary),
+                boundary=drive.boundary,
+            )
+        if error is not None:
+            return ReplayResult(run, list(drive.calls), "failed", error=error)
+        return ReplayResult(run, list(drive.calls), "completed", output=output)
+
     async def _begin(
         self, name: str, input: Any, id: str, meta: dict[str, Any] | None, requested_parent: str | None = None
     ) -> tuple[int, str | None]:
@@ -2217,7 +2340,12 @@ class Context:
     """What a workflow function calls."""
 
     def __init__(
-        self, k: Kairo, id: str, stop: asyncio.Future[None] | None = None, cancelled: Callable[[], bool] | None = None
+        self,
+        k: Kairo,
+        id: str,
+        stop: asyncio.Future[None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        replay: _ReplayDrive | None = None,
     ) -> None:
         self.id = id
         self._k = k
@@ -2226,6 +2354,7 @@ class Context:
         self._stop = stop if stop is not None else asyncio.get_running_loop().create_future()
         # Whether the workflow (or one above it) was cancelled in kairo: only then are its calls cancelled.
         self.cancelled: Callable[[], bool] = cancelled or (lambda: False)
+        self._replay = replay
 
     def _next(self, kind: str, input: Any) -> str:
         key = kind + "\0" + _canonical(input)
@@ -2234,6 +2363,10 @@ class Context:
         return _call_id(self.id, kind, input, n)
 
     async def _run(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, destination: str = "") -> Any:
+        if self._replay is not None:
+            if plan.startswith(PLAN_WAIT):
+                return await self._replay.read(run_id, "wait", plan[len(PLAN_WAIT) :].split("@", 1)[0], input)
+            return await self._replay.read(run_id, "call", plan[len(PLAN_CALL) :], input)
         if self._stop.done():
             raise StoppedError(f"call {run_id}: stopped before it started")
         try:
@@ -2282,4 +2415,7 @@ class Context:
 
     async def workflow(self, name: str, input: Any = None) -> Any:
         """Runs workflow name as a child of this one."""
-        return await self._k._run_child_as(name, input, self._next("kairo.workflow/" + name, input), self.id, self)
+        run_id = self._next("kairo.workflow/" + name, input)
+        if self._replay is not None:
+            return await self._replay.read(run_id, "workflow", name, input)
+        return await self._k._run_child_as(name, input, run_id, self.id, self)

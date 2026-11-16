@@ -20,8 +20,9 @@ import (
 // calls at once only through Parallel (not with goroutines of its own).
 type Context struct {
 	context.Context
-	k  *Kairo
-	id string
+	k      *Kairo
+	id     string
+	replay *replayDrive
 	// lane names a branch of Parallel: its calls' ids carry it, so that
 	// branches running at once number their calls without racing.
 	lane string
@@ -178,7 +179,13 @@ func Child[O any](ctx *Context, name string, in any) (O, error) {
 	if err != nil {
 		return zero, err
 	}
-	out, err := ctx.k.runChildAs(ctx, name, raw, ctx.next("kairo.workflow/"+name, canon), ctx.id, ctx.cancelled)
+	id := ctx.next("kairo.workflow/"+name, canon)
+	var out json.RawMessage
+	if ctx.replay != nil {
+		out, err = ctx.replay.call(ctx, id, "workflow", name, raw)
+	} else {
+		out, err = ctx.k.runChildAs(ctx, name, raw, id, ctx.id, ctx.cancelled)
+	}
 	if err != nil {
 		return zero, err
 	}
@@ -209,7 +216,7 @@ func Parallel(ctx *Context, fns ...func(ctx *Context) error) error {
 		if ctx.lane != "" {
 			lane = ctx.lane + "." + lane
 		}
-		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled, root: root}
+		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, replay: ctx.replay, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled, root: root}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

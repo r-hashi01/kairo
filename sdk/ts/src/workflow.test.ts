@@ -462,6 +462,46 @@ function suite(name: string, backend: () => Promise<Backend>) {
 				await k2.close();
 			}
 		});
+
+		test('record-only replay reads saved calls and stops at a missing call', { skip: name !== 'embedded (SQLite)' }, async () => {
+			const k = await kairo();
+			try {
+				k.workflow('replay-records', async (ctx, q: string) => `${(await ctx.call<{ answer: string }>('llm', { q })).answer}!`);
+				const beforeCalls = runs.llm;
+				assert.equal(await k.run('replay-records', 'hello', { id: 'ts-replay-records-1' }), 'HELLO!');
+				const root = await k.backend.get('ts-replay-records-1');
+				const replay = await k.replay('ts-replay-records-1');
+				assert.equal(replay.outcome, 'completed');
+				assert.equal(replay.output, 'HELLO!');
+				assert.deepEqual(replay.calls.map(({ kind, name, status }) => ({ kind, name, status })), [
+					{ kind: 'call', name: 'llm', status: 'completed' },
+				]);
+				assert.equal(runs.llm, beforeCalls + 1, 'the action did not run during replay');
+
+				k.workflow(
+					'replay-records',
+					async (ctx, q: string) => {
+						await ctx.call('llm', { q });
+						try {
+							await ctx.call('new-call', q);
+						} catch {}
+						return 'caught';
+					},
+					{ draining: true },
+				);
+				const boundary = await k.replay('ts-replay-records-1');
+				assert.equal(boundary.outcome, 'boundary');
+				assert.equal(boundary.boundary?.name, 'new-call');
+				assert.equal(boundary.boundary?.status, 'missing');
+				assert.equal(runs.llm, beforeCalls + 1, 'the action did not run during boundary replay');
+				const after = await k.backend.get('ts-replay-records-1');
+				assert.equal(after.status, root.status);
+				assert.equal(after.updatedAt, root.updatedAt);
+				assert.deepEqual(after.output, root.output);
+			} finally {
+				await k.close();
+			}
+		});
 	});
 }
 

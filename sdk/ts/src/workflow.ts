@@ -193,6 +193,40 @@ export class NotWaitingError extends Error {}
 /** A wait's timeout came before its signal (waitFor's timeout, ADR 0059). */
 export class TimedOutError extends Error {}
 
+export type ReplayOutcome = 'completed' | 'failed' | 'boundary';
+
+/** One call reached while evaluating a workflow from saved records. */
+export interface ReplayCall {
+	runId: string;
+	kind: 'call' | 'wait' | 'workflow';
+	name: string;
+	status: string;
+	input: unknown;
+	output?: unknown;
+	error?: string;
+}
+
+/** A read-only diagnostic evaluation; run is the authoritative durable root. */
+export interface ReplayResult {
+	run: RunInfo;
+	calls: ReplayCall[];
+	outcome: ReplayOutcome;
+	output?: unknown;
+	error?: unknown;
+	boundary?: ReplayCall;
+}
+
+/** The replay reached a call that has no saved terminal result. */
+export class ReplayBoundaryError extends Error {
+	override name = 'ReplayBoundaryError';
+	readonly call: ReplayCall;
+
+	constructor(call: ReplayCall) {
+		super(`record-only replay stopped at ${call.runId} (${call.kind}: ${call.status})`);
+		this.call = call;
+	}
+}
+
 /** The wait that atomically accepted a signal (ADR 0064). */
 export interface SignalReceipt {
 	runId: string;
@@ -308,6 +342,55 @@ const PLAN_WAIT = 'kairo.wait/';
 const PLAN_WORKFLOW = 'kairo.workflow';
 const BUILTIN = { now: 'kairo.now', random: 'kairo.random', sleep: 'kairo.sleep' };
 
+class ReplayDrive {
+	readonly calls: ReplayCall[] = [];
+	boundary?: ReplayCall;
+	fatal?: unknown;
+	hasFatal = false;
+	private readonly backend: Backend;
+	private readonly root: string;
+
+	constructor(backend: Backend, root: string) {
+		this.backend = backend;
+		this.root = root;
+	}
+
+	async read(runId: string, kind: ReplayCall['kind'], name: string, input: unknown): Promise<unknown> {
+		if (this.boundary) throw new ReplayBoundaryError(this.boundary);
+		let info: RunInfo;
+		try {
+			info = await this.backend.get(runId);
+		} catch (e) {
+			if (e instanceof KairoError && e.status === 404) return this.stop({ runId, kind, name, status: 'missing', input });
+			this.fatal = e;
+			this.hasFatal = true;
+			throw e;
+		}
+		const call: ReplayCall = {
+			runId,
+			kind,
+			name,
+			status: info.status,
+			input,
+			...('output' in info ? { output: info.output } : {}),
+			...(info.error ? { error: info.error } : {}),
+		};
+		if (info.parent !== this.root) return this.stop({ runId, kind, name, status: 'missing', input });
+		if (info.trimmed) return this.stop({ ...call, status: 'trimmed', output: undefined });
+		if (!finished(info)) return this.stop(call);
+		this.calls.push(call);
+		if (kind === 'workflow') return done(runId, info);
+		if (info.status !== 'completed') throw new CallError(runId, kind === 'call' ? name : '', info.status, info.error ?? '');
+		return info.output;
+	}
+
+	private stop(call: ReplayCall): never {
+		this.calls.push(call);
+		this.boundary ??= call;
+		throw new ReplayBoundaryError(call);
+	}
+}
+
 /** Whether header is "Bearer <token>", compared in constant time. */
 function bearer(header: string | null, token: string): boolean {
 	const digest = (s: string) => createHash('sha256').update(s).digest();
@@ -384,6 +467,7 @@ export class Kairo {
 	private readonly opts: KairoOptions;
 	private readonly actions = new Map<string, ActionDef>();
 	private readonly workflows = new Map<string, WorkflowDef>();
+	private readonly replayDrives = new WeakMap<Context, ReplayDrive>();
 	private readonly planned = new Set<string>();
 	private readonly driving = new Set<AbortController>();
 	private readonly driveIdleWaiters = new Set<() => void>();
@@ -1110,6 +1194,50 @@ export class Kairo {
 	}
 
 	/**
+	 * Evaluates an existing embedded code workflow using saved terminal call
+	 * records only. It does not run actions or child workflows, advance waits,
+	 * acquire a drive, or change any run.
+	 */
+	async replay(id: string, opts: { signal?: AbortSignal } = {}): Promise<ReplayResult> {
+		if (!this.rt) throw new Error('record-only replay needs the embedded runtime');
+		if (opts.signal?.aborted) throw new StoppedError(`replay ${id}: stopped`);
+		const run = await this.backend.get(id, { input: true });
+		if (run.plan !== PLAN_WORKFLOW) throw new Error(`run ${id} is not a code workflow`);
+		const saved = workflowOf(run.input);
+		if (!saved) throw new Error(`workflow ${id} has no saved workflow input`);
+		const fn = this.fnFor(saved.name, saved.version);
+		if (!fn) throw notHere(saved.name, saved.version);
+		const drive = new ReplayDrive(this.backend, id);
+		const signal = opts.signal ?? new AbortController().signal;
+		const ctx = new Context(this, id, signal);
+		this.replayDrives.set(ctx, drive);
+		let output: unknown;
+		let error: unknown;
+		let failed = false;
+		try {
+			output = await fn(ctx, saved.input);
+		} catch (e) {
+			error = e;
+			failed = true;
+		} finally {
+			this.replayDrives.delete(ctx);
+		}
+		if (opts.signal?.aborted) throw new StoppedError(`replay ${id}: stopped`);
+		if (drive.hasFatal) throw drive.fatal;
+		if (drive.boundary) {
+			return {
+				run,
+				calls: [...drive.calls],
+				outcome: 'boundary',
+				boundary: drive.boundary,
+				error: new ReplayBoundaryError(drive.boundary),
+			};
+		}
+		if (failed) return { run, calls: [...drive.calls], outcome: 'failed', error };
+		return { run, calls: [...drive.calls], outcome: 'completed', output };
+	}
+
+	/**
 	 * Makes workflow name's run as id (or finds it). A new one is leased to
 	 * this process to drive, in the same transaction: its token (0: it
 	 * existed, or no leases here).
@@ -1644,6 +1772,11 @@ export class Kairo {
 
 	/** One call of workflow ctx: a run of its own, found again by its id. */
 	async callRun(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context, destination = ''): Promise<unknown> {
+		const replay = this.replayDrives.get(ctx);
+		if (replay) {
+			if (plan.startsWith(PLAN_WAIT)) return replay.read(runId, 'wait', plan.slice(PLAN_WAIT.length).split('@', 1)[0], input);
+			return replay.read(runId, 'call', calledAction(plan), input);
+		}
 		this.rt?.reach(runId, true);
 		try {
 			return await this.callRunReached(plan, root, input, runId, ctx, destination);
@@ -1701,6 +1834,8 @@ export class Kairo {
 	}
 
 	async childWorkflow(name: string, input: unknown, id: string, ctx: Context): Promise<unknown> {
+		const replay = this.replayDrives.get(ctx);
+		if (replay) return replay.read(id, 'workflow', name, input);
 		if (this.backend instanceof HttpBackend) {
 			const version = this.currentVersion(name);
 			if (version === undefined) throw new Error(`no workflow ${name}`);
