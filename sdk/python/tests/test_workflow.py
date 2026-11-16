@@ -603,6 +603,50 @@ class WorkflowTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_record_only_replay_reads_saved_calls_and_stops_at_boundary(self) -> None:
+        if type(self) is WorkflowTest:
+            self.skipTest("embedded only")
+
+        async def main() -> None:
+            k = await self.kairo()
+
+            @k.workflow("replay-records")
+            async def replay_records(ctx, q):
+                return (await ctx.call("llm", {"q": q}))["answer"] + "!"
+
+            before_calls = self.runs["llm"]
+            self.assertEqual(await k.run("replay-records", "hello", id="py-replay-records-1"), "HELLO!")
+            root = await k.backend.get("py-replay-records-1")
+            replay = await k.replay("py-replay-records-1")
+            self.assertEqual((replay.outcome, replay.output), ("completed", "HELLO!"))
+            self.assertEqual(
+                [(call.kind, call.name, call.status) for call in replay.calls],
+                [("call", "llm", "completed")],
+            )
+            self.assertEqual(self.runs["llm"], before_calls + 1, "the action did not run during replay")
+
+            @k.workflow("replay-records", draining=True)
+            async def changed(ctx, q):
+                await ctx.call("llm", {"q": q})
+                try:
+                    await ctx.call("new-call", q)
+                except Exception:
+                    pass
+                return "caught"
+
+            boundary = await k.replay("py-replay-records-1")
+            self.assertEqual(boundary.outcome, "boundary")
+            self.assertIsNotNone(boundary.boundary)
+            self.assertEqual((boundary.boundary.name, boundary.boundary.status), ("new-call", "missing"))
+            self.assertEqual(self.runs["llm"], before_calls + 1, "the action did not run during boundary replay")
+            after = await k.backend.get("py-replay-records-1")
+            self.assertEqual(after.get("status"), root.get("status"))
+            self.assertEqual(after.get("updated_at"), root.get("updated_at"))
+            self.assertEqual(after.get("output"), root.get("output"))
+            await k.close()
+
+        asyncio.run(main())
+
     def test_suspend_over_kairod(self) -> None:
         async def main() -> None:
             if await self.backend() is not None:

@@ -1544,6 +1544,10 @@ func (k *Kairo) callRun(c *Context, plan string, root map[string]any, in any, ru
 }
 
 func (k *Kairo) callRunTo(c *Context, plan string, root map[string]any, in any, runID, destination string) (json.RawMessage, error) {
+	if c.replay != nil {
+		kind, name := replayCallKind(plan)
+		return c.replay.call(c, runID, kind, name, in)
+	}
 	if k.remote == nil {
 		k.rt.reach(runID, true)
 		defer k.rt.reach(runID, false)
