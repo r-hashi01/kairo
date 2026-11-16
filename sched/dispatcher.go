@@ -115,6 +115,7 @@ type dmsg struct {
 	task       *task.Task
 	poller     *Poller
 	credit     int
+	accepted   chan bool
 	dest       string
 	tenant     string
 	est        int
@@ -127,6 +128,7 @@ type dmsg struct {
 
 type handed struct {
 	task   *task.Task
+	poller *Poller
 	ctx    context.Context
 	cancel context.CancelFunc
 	at     time.Time // when it was delivered
@@ -142,15 +144,21 @@ type Delivery struct {
 // Poller is a worker's standing request for tasks. Tasks are delivered on
 // C; the worker grants more credit with Dispatcher.Poll.
 type Poller struct {
-	Actions []string
-	C       chan Delivery
-	credit  int
-	gone    bool
+	Actions  []string
+	C        chan Delivery
+	credit   int // dispatcher-owned: delivery slots not yet used
+	inflight int // dispatcher-owned: delivered and not Done or requeued
+	gone     bool
 	// affine: a worker that keeps state per run gets a run's tasks while
 	// it has credit (ADR 0046). runs: the runs it is the poller of.
 	affine bool
 	runs   map[string]struct{}
 }
+
+// MaxPollerCredit bounds a poller's delivery window. It covers the largest
+// default used by the supported workers while keeping a peer from choosing an
+// unbounded channel allocation.
+const MaxPollerCredit = 32 << 10
 
 type dest struct {
 	name          string
@@ -314,9 +322,7 @@ func (d *Dispatcher) Submit(t *task.Task) { d.q.Push(dmsg{kind: mSubmit, task: t
 
 // NewPoller registers a worker for actions with an initial credit.
 func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
-	if credit < 1 {
-		credit = 1
-	}
+	credit = pollerCredit(credit)
 	p := &Poller{Actions: actions, C: make(chan Delivery, credit)}
 	d.q.Push(dmsg{kind: mPoll, poller: p, credit: credit})
 	return p
@@ -326,9 +332,7 @@ func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
 // tasks of a run go to the poller that took the run's earlier tasks while
 // it has credit (ADR 0046).
 func (d *Dispatcher) NewAffinePoller(actions []string, credit int) *Poller {
-	if credit < 1 {
-		credit = 1
-	}
+	credit = pollerCredit(credit)
 	p := &Poller{Actions: actions, C: make(chan Delivery, credit), affine: true, runs: map[string]struct{}{}}
 	d.affinePollers.Add(1)
 	d.q.Push(dmsg{kind: mPoll, poller: p, credit: credit})
@@ -345,10 +349,24 @@ func (d *Dispatcher) RunEnded(runID string) {
 	}
 }
 
-// Poll grants n more credits to p. The worker must have room for them:
-// the number of tasks received but not yet completed plus the outstanding
-// credit must not exceed cap(p.C).
+func pollerCredit(credit int) int { return min(max(credit, 1), MaxPollerCredit) }
+
+// Poll grants n more credits to p. Invalid grants are ignored. Use Grant for
+// untrusted input that must learn whether the grant was accepted.
 func (d *Dispatcher) Poll(p *Poller, n int) { d.q.Push(dmsg{kind: mPoll, poller: p, credit: n}) }
+
+// Grant adds n credits if they fit in p's original delivery window. The
+// dispatcher owns this check so no caller can make delivery block its loop.
+func (d *Dispatcher) Grant(p *Poller, n int) bool {
+	accepted := make(chan bool, 1)
+	d.q.Push(dmsg{kind: mPoll, poller: p, credit: n, accepted: accepted})
+	select {
+	case ok := <-accepted:
+		return ok
+	case <-d.done:
+		return false
+	}
+}
 
 // Unpoll removes p. Tasks already delivered to p.C but not taken are
 // returned to their queues; the worker must report Done for the ones it
@@ -463,7 +481,10 @@ func (d *Dispatcher) loop() {
 				touched[ds] = struct{}{}
 			case mPoll:
 				p := m.poller
-				if p.gone {
+				if p.gone || m.credit <= 0 || m.credit > cap(p.C)-p.credit-p.inflight {
+					if m.accepted != nil {
+						m.accepted <- false
+					}
 					continue
 				}
 				if p.credit == 0 {
@@ -472,6 +493,9 @@ func (d *Dispatcher) loop() {
 					}
 				}
 				p.credit += m.credit
+				if m.accepted != nil {
+					m.accepted <- true
+				}
 				for _, a := range p.Actions {
 					for _, ds := range d.byAction[a] {
 						touched[ds] = struct{}{}
@@ -504,6 +528,7 @@ func (d *Dispatcher) loop() {
 				if ok && h.task == m.task {
 					h.cancel() // releases the context
 					delete(d.delivered, m.key)
+					h.poller.inflight--
 					rtt = d.now().Sub(h.at)
 				}
 				ds := d.dests[m.dest]
@@ -702,6 +727,7 @@ func (d *Dispatcher) requeue(t *task.Task) bool {
 		aborted = h.ctx.Err() != nil
 		h.cancel()
 		delete(d.delivered, k)
+		h.poller.inflight--
 	}
 	tq := ds.tenants[t.Tenant]
 	if tq == nil {
@@ -835,7 +861,6 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		k := t.Key()
 		delete(d.pending, k)
 		ctx, cancel := context.WithCancel(context.Background())
-		d.delivered[k] = handed{t, ctx, cancel, now}
 		ds.inflight++
 		p, rotate := ps[0], true
 		if a := d.affine[t.RunID]; a != nil && !a.gone && a.credit > 0 && slices.Contains(a.Actions, t.Action) {
@@ -853,6 +878,8 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 			p.runs[t.RunID] = struct{}{}
 		}
 		p.credit--
+		p.inflight++
+		d.delivered[k] = handed{t, p, ctx, cancel, now}
 		p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C
 		if p.credit == 0 {
 			d.removePoller(p)

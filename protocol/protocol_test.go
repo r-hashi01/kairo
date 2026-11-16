@@ -136,6 +136,106 @@ func TestRemoteWorker(t *testing.T) {
 	}
 }
 
+func TestServerRejectsHugeInitialCredit(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "huge", Actions: []string{"code.run"}, Credit: MaxCredit + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
+		t.Fatalf("huge-credit connection read = %v, want EOF", err)
+	}
+	c.Close()
+
+	// Rejecting one session leaves the listener and dispatcher usable.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wk := &Worker{Name: "normal", Actions: []string{"code.run"}, Concurrency: 1,
+		Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+			return task.Result{Output: json.RawMessage(`{"ok":true}`)}
+		}}
+	go wk.Run(ctx, "unix", sock)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if ri, err := e.Wait(wctx, id); err != nil || ri.Status != "completed" {
+		t.Fatalf("normal worker after rejection = %+v, %v", ri, err)
+	}
+}
+
+func TestExcessCreditClosesBlockedWriterWithoutBlockingDispatcher(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"s","action":"code.run"}}`)
+	serverConn, workerConn := net.Pipe()
+	handled := make(chan struct{})
+	go func() {
+		(&Server{E: e}).handle(serverConn)
+		close(handled)
+	}()
+	t.Cleanup(func() { workerConn.Close() })
+	w := bufio.NewWriter(workerConn)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "stuck", Actions: []string{"code.run"}, Credit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading one byte proves the server writer entered Flush. net.Pipe has
+	// no socket buffer, so it stays blocked while the rest is unread.
+	if err := workerConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := io.ReadFull(workerConn, one[:]); err != nil {
+		t.Fatalf("server did not start writing the task: %v", err)
+	}
+	if err := WriteFrame(w, MsgCredit, Credit{N: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("invalid credit did not close the blocked session")
+	}
+
+	// The unprotected task is retried by a healthy worker. This also proves
+	// the rejected session did not wedge the dispatcher goroutine.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wk := &Worker{Name: "healthy", Actions: []string{"code.run"}, Concurrency: 1,
+		Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+			return task.Result{Output: json.RawMessage(`{"ok":true}`)}
+		}}
+	go wk.Run(ctx, "unix", sock)
+	wctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if ri, err := e.Wait(wctx, id); err != nil || ri.Status != "completed" {
+		t.Fatalf("retry after rejected session = %+v, %v", ri, err)
+	}
+}
+
 func TestWorkerDrainStopsDeliveryAndWaitsForAcceptedResult(t *testing.T) {
 	e, sock := setup(t)
 	plan(t, e, `{"name":"p","root":{"kind":"par","nodes":[

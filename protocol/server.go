@@ -137,6 +137,13 @@ func (s *Server) handle(c net.Conn) {
 		log.Printf("kairo: worker %q rejected: bad token", h.Worker)
 		return
 	}
+	if h.Credit <= 0 {
+		h.Credit = 1
+	}
+	if h.Credit > MaxCredit {
+		log.Printf("kairo: worker %q rejected: credit %d exceeds %d", h.Worker, h.Credit, MaxCredit)
+		return
+	}
 	c.SetReadDeadline(time.Time{})
 	if len(h.Capabilities) > 0 {
 		selected := make([]string, 0, 2)
@@ -149,9 +156,6 @@ func (s *Server) handle(c net.Conn) {
 		if WriteFrame(w, MsgHello, Welcome{Capabilities: selected}) != nil || w.Flush() != nil {
 			return
 		}
-	}
-	if h.Credit <= 0 {
-		h.Credit = 1
 	}
 	callbackActions := make(map[string]bool, len(h.CallbackActions))
 	callbackCap := s.Callback != nil && len(h.CallbackActions) > 0 && hasCapability(h.Capabilities, CapabilityAsyncActionCallback)
@@ -300,6 +304,8 @@ func (s *Server) handle(c net.Conn) {
 
 	drained := false
 	unpolled := false
+
+reading:
 	for {
 		typ, body, err := ReadFrame(r)
 		if err != nil {
@@ -343,7 +349,10 @@ func (s *Server) handle(c net.Conn) {
 				continue
 			}
 			if cr.N > 0 && !drained {
-				d.Poll(p, cr.N)
+				if !d.Grant(p, cr.N) {
+					log.Printf("kairo: worker %q rejected: invalid credit %d", h.Worker, cr.N)
+					break reading
+				}
 			} else if cr.N < 0 && !drained {
 				close(drain)
 				<-writerDone

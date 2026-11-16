@@ -218,13 +218,16 @@ func (wk *Worker) Inflight() int {
 // Run connects to the runtime and serves tasks until ctx is cancelled or
 // the connection breaks.
 func (wk *Worker) Run(ctx context.Context, network, addr string) error {
+	conc := max(wk.Concurrency, 1)
+	if conc > MaxCredit {
+		return fmt.Errorf("protocol: concurrency %d exceeds maximum credit %d", conc, MaxCredit)
+	}
 	var d net.Dialer
 	c, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	conc := max(wk.Concurrency, 1)
 	r := bufio.NewReaderSize(c, 64<<10)
 	w := bufio.NewWriterSize(c, 64<<10)
 	s := newWorkerSession(w)
