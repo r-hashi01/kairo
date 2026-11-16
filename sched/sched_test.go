@@ -309,6 +309,61 @@ func TestDispatcherUnpollRequeues(t *testing.T) {
 	}
 }
 
+func TestPollerCreditIsBoundedAndExcessGrantsAreRejected(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, MaxPollerCredit+1)
+	if got := cap(p.C); got != MaxPollerCredit {
+		t.Fatalf("poller capacity = %d, want %d", got, MaxPollerCredit)
+	}
+	for i := 0; i < 100; i++ {
+		if d.Grant(p, 1) {
+			t.Fatalf("excess grant %d was accepted", i+1)
+		}
+	}
+
+	// A faulty poller cannot stop unrelated work in the single dispatcher.
+	other := d.NewPoller([]string{"y"}, 1)
+	tk := &task.Task{RunID: "other", Act: 1, Tenant: "t", Action: "y", Destination: "y"}
+	d.Submit(tk)
+	select {
+	case dl := <-other.C:
+		if dl.Task != tk {
+			t.Fatalf("unrelated poller got %+v", dl.Task)
+		}
+		d.Done(tk, 0)
+	case <-time.After(time.Second):
+		t.Fatal("excess grants blocked unrelated delivery")
+	}
+}
+
+func TestPollerCreditReplenishesOnlyAfterDone(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	p := d.NewPoller([]string{"x"}, 1)
+	first := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "x"}
+	d.Submit(first)
+	<-p.C
+	if d.Grant(p, 1) {
+		t.Fatal("credit was replenished while the delivery was outstanding")
+	}
+	d.Done(first, 0)
+	if !d.Grant(p, 1) {
+		t.Fatal("credit was not replenished after Done")
+	}
+	second := &task.Task{RunID: "r", Act: 2, Tenant: "t", Action: "x", Destination: "x"}
+	d.Submit(second)
+	select {
+	case dl := <-p.C:
+		if dl.Task != second {
+			t.Fatalf("replenished poller got %+v", dl.Task)
+		}
+		d.Done(second, 0)
+	case <-time.After(time.Second):
+		t.Fatal("replenished credit did not deliver the next task")
+	}
+}
+
 func TestAdmissionCancel(t *testing.T) {
 	a := NewAdmission(AdmissionConfig{MaxActive: 1})
 	var started []string

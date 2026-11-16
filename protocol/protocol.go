@@ -13,7 +13,7 @@
 //	worker -> runtime   Result {"seq":17,"output":{...}}          (also grants 1 credit)
 //	                           {"seq":17,"wait":{"until":<ms>,"output":{...}}} (ADR 0045)
 //	                           {"seq":17,"pending":true}          (ADR 0070, negotiated only)
-//	worker -> runtime   Credit {"n":4}                            (optional extra credit)
+//	worker -> runtime   Credit {"n":4}                            (unused slots in the announced window)
 //	runtime -> worker   Cancel {"seq":17}                         (the step was abandoned)
 //	runtime -> worker   RunEnd {"run_id":"r1"}                    (the run finished)
 //
@@ -47,6 +47,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/task"
 )
 
@@ -63,6 +64,9 @@ const (
 )
 
 const maxFrame = 64 << 20
+
+// MaxCredit is the largest delivery window accepted from a worker.
+const MaxCredit = sched.MaxPollerCredit
 
 // CapabilityGracefulDrain selects the negative/zero/positive Credit drain
 // handshake of ADR 0073. Capabilities are negotiated per connection.

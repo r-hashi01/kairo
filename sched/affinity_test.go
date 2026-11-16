@@ -43,16 +43,19 @@ func TestAffinePollersKeepARunTogether(t *testing.T) {
 	// Runs a and b start on different pollers (rotation), then each
 	// keeps its poller.
 	submit("a")
-	ia, _ := recv(t, p1, p2)
+	ia, firstA := recv(t, p1, p2)
 	submit("b")
 	ib, _ := recv(t, p1, p2)
 	if ia == ib {
 		t.Fatal("two runs started on the same poller")
 	}
+	aTasks := []*task.Task{firstA}
 	for range 2 {
 		submit("a")
-		if i, _ := recv(t, p1, p2); i != ia {
+		if i, tk := recv(t, p1, p2); i != ia {
 			t.Fatal("a task of run a went to another poller")
+		} else {
+			aTasks = append(aTasks, tk)
 		}
 	}
 	// a's poller has no credit left: a's next task goes to the other one,
@@ -62,7 +65,10 @@ func TestAffinePollersKeepARunTogether(t *testing.T) {
 	if i, _ := recv(t, p1, p2); i != ib {
 		t.Fatal("with no credit, run a's task did not go to the other poller")
 	}
-	d.Poll(ps[ia], 3)
+	for _, tk := range aTasks {
+		d.Done(tk, 0)
+	}
+	d.Poll(ps[ia], len(aTasks))
 	submit("a")
 	if i, _ := recv(t, p1, p2); i != ib {
 		t.Fatal("run a did not stay on its new poller")
