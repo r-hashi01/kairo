@@ -67,6 +67,122 @@ func TestDispatcherRoundRobinBetweenTenants(t *testing.T) {
 	}
 }
 
+func TestSharedDestinationRoutesEachTaskByAction(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	pa := d.NewPoller([]string{"a"}, 2)
+	pb := d.NewPoller([]string{"b"}, 1)
+	a := &task.Task{RunID: "a", Act: 1, Tenant: "A", Action: "a", Destination: "provider"}
+	b := &task.Task{RunID: "b", Act: 1, Tenant: "B", Action: "b", Destination: "provider"}
+	d.Submit(a)
+	d.Submit(b)
+
+	select {
+	case dl := <-pa.C:
+		if dl.Task != a {
+			t.Fatalf("action a worker got %+v", dl.Task)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("action a task was not delivered")
+	}
+	select {
+	case dl := <-pb.C:
+		if dl.Task != b {
+			t.Fatalf("action b worker got %+v", dl.Task)
+		}
+	case dl := <-pa.C:
+		t.Fatalf("action a worker got action b task %+v", dl.Task)
+	case <-time.After(time.Second):
+		t.Fatal("action b task was not delivered")
+	}
+	waitTracked(t, d, 2)
+	d.Done(a, 0)
+	d.Done(b, 0)
+	waitTracked(t, d, 0)
+}
+
+func TestSharedDestinationDoesNotStarveAnotherAction(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	pb := d.NewPoller([]string{"b"}, 1)
+	d.Submit(&task.Task{RunID: "a", Act: 1, Tenant: "A", Action: "a", Destination: "provider"})
+	b := &task.Task{RunID: "b", Act: 1, Tenant: "B", Action: "b", Destination: "provider"}
+	d.Submit(b)
+
+	select {
+	case dl := <-pb.C:
+		if dl.Task != b {
+			t.Fatalf("action b worker got %+v", dl.Task)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("action b starved behind another action in the shared destination")
+	}
+	d.Done(b, 0)
+}
+
+func TestSharedDestinationKeepsOneConcurrencyLimit(t *testing.T) {
+	d := NewDispatcher(func(string) DestLimits { return DestLimits{Concurrency: 1} })
+	defer d.Close()
+	pa := d.NewPoller([]string{"a"}, 1)
+	pb := d.NewPoller([]string{"b"}, 1)
+	a := &task.Task{RunID: "a", Act: 1, Tenant: "A", Action: "a", Destination: "provider"}
+	b := &task.Task{RunID: "b", Act: 1, Tenant: "B", Action: "b", Destination: "provider"}
+	d.Submit(a)
+	d.Submit(b)
+
+	_, first := recv(t, pa, pb)
+	select {
+	case dl := <-pa.C:
+		t.Fatalf("shared destination exceeded concurrency with %+v", dl.Task)
+	case dl := <-pb.C:
+		t.Fatalf("shared destination exceeded concurrency with %+v", dl.Task)
+	case <-time.After(30 * time.Millisecond):
+	}
+	d.Done(first, 0)
+	_, second := recv(t, pa, pb)
+	if first.Action == second.Action {
+		t.Fatalf("delivered actions %q and %q", first.Action, second.Action)
+	}
+	d.Done(second, 0)
+	waitTracked(t, d, 0)
+}
+
+func TestIdleSharedDestinationRetiresAllActionIndexes(t *testing.T) {
+	var resolved atomic.Int64
+	d := NewDispatcher(func(string) DestLimits {
+		resolved.Add(1)
+		return DestLimits{}
+	})
+	defer d.Close()
+	pa := d.NewPoller([]string{"a"}, 1)
+	pb := d.NewPoller([]string{"b"}, 1)
+	a := &task.Task{RunID: "a", Act: 1, Tenant: "A", Action: "a", Destination: "provider"}
+	b := &task.Task{RunID: "b", Act: 1, Tenant: "B", Action: "b", Destination: "provider"}
+	d.Submit(a)
+	d.Submit(b)
+	recv(t, pa, pb)
+	recv(t, pa, pb)
+	waitTracked(t, d, 2)
+	d.Done(a, 0)
+	d.Done(b, 0)
+	waitTracked(t, d, 0)
+
+	d.Poll(pb, 1)
+	next := &task.Task{RunID: "b", Act: 2, Tenant: "B", Action: "b", Destination: "provider"}
+	d.Submit(next)
+	select {
+	case dl := <-pb.C:
+		if dl.Task != next {
+			t.Fatalf("action b worker got %+v", dl.Task)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("action index was not rebuilt after destination retirement")
+	}
+	if got := resolved.Load(); got != 2 {
+		t.Fatalf("destination limits resolved %d times, want 2 after retirement", got)
+	}
+}
+
 func TestDispatcherRateLimit(t *testing.T) {
 	d := NewDispatcher(func(string) DestLimits { return DestLimits{RPM: 600, BurstSeconds: 0.5} }) // 10/s, burst 5
 	defer d.Close()

@@ -153,15 +153,14 @@ type Poller struct {
 }
 
 type dest struct {
-	name     string
-	action   string
-	lim      DestLimits
-	rpm, tpm bucket
-	tenants  map[string]*tenantQ
-	ring     []string
-	rr       int
-	queued   int
-	listed   bool
+	name          string
+	queuedActions map[string]int
+	lim           DestLimits
+	rpm, tpm      bucket
+	tenants       map[string]*tenantQ
+	ring          []string
+	rr            int
+	queued        int
 
 	// Adaptive concurrency (ADR 0039). limited: the destination refused a
 	// task once; until then limit is the declared cap.
@@ -446,7 +445,7 @@ func (d *Dispatcher) loop() {
 			m := &buf[i]
 			switch m.kind {
 			case mSubmit:
-				ds := d.dest(m.task.Destination, m.task.Action)
+				ds := d.dest(m.task.Destination)
 				d.seq++
 				m.task.Seq = d.seq
 				tq := ds.tenants[m.task.Tenant]
@@ -459,11 +458,8 @@ func (d *Dispatcher) loop() {
 				}
 				tq.q = append(tq.q, m.task)
 				ds.queued++
+				d.queueAction(ds, m.task.Action)
 				d.pending[m.task.Key()] = struct{}{}
-				if !ds.listed {
-					ds.listed = true
-					d.byAction[ds.action] = append(d.byAction[ds.action], ds)
-				}
 				touched[ds] = struct{}{}
 			case mPoll:
 				p := m.poller
@@ -617,7 +613,7 @@ func (d *Dispatcher) arm(after time.Duration) {
 	d.timer.Reset(after)
 }
 
-func (d *Dispatcher) dest(name, action string) *dest {
+func (d *Dispatcher) dest(name string) *dest {
 	ds := d.dests[name]
 	if ds == nil {
 		now := d.now()
@@ -630,7 +626,7 @@ func (d *Dispatcher) dest(name, action string) *dest {
 			wpm = lim.TPM
 		}
 		ds = &dest{
-			name: name, action: action, lim: lim,
+			name: name, queuedActions: map[string]int{}, lim: lim,
 			rpm:     newBucket(lim.RPM, lim.BurstSeconds, now),
 			tpm:     newBucket(wpm, lim.BurstSeconds, now),
 			tenants: map[string]*tenantQ{},
@@ -655,7 +651,33 @@ func (ds *dest) forgetAfter(now time.Time) (bool, time.Duration) {
 
 func (d *Dispatcher) forget(ds *dest) {
 	delete(d.dests, ds.name)
-	list := d.byAction[ds.action]
+	for action := range ds.queuedActions {
+		d.unlistAction(ds, action)
+	}
+}
+
+// queueAction records that ds has a queued task of action. A destination
+// shares limits across actions, while each task still needs a worker for its
+// own action.
+func (d *Dispatcher) queueAction(ds *dest, action string) {
+	if ds.queuedActions[action] == 0 {
+		d.byAction[action] = append(d.byAction[action], ds)
+	}
+	ds.queuedActions[action]++
+}
+
+func (d *Dispatcher) unqueueAction(ds *dest, action string) {
+	n := ds.queuedActions[action]
+	if n > 1 {
+		ds.queuedActions[action] = n - 1
+		return
+	}
+	delete(ds.queuedActions, action)
+	d.unlistAction(ds, action)
+}
+
+func (d *Dispatcher) unlistAction(ds *dest, action string) {
+	list := d.byAction[action]
 	for i, item := range list {
 		if item == ds {
 			list = append(list[:i], list[i+1:]...)
@@ -663,9 +685,9 @@ func (d *Dispatcher) forget(ds *dest) {
 		}
 	}
 	if len(list) == 0 {
-		delete(d.byAction, ds.action)
+		delete(d.byAction, action)
 	} else {
-		d.byAction[ds.action] = list
+		d.byAction[action] = list
 	}
 }
 
@@ -674,7 +696,7 @@ func (d *Dispatcher) forget(ds *dest) {
 func (d *Dispatcher) requeue(t *task.Task) bool {
 	k := t.Key()
 	aborted := false
-	ds := d.dest(t.Destination, t.Action)
+	ds := d.dest(t.Destination)
 	ds.inflight-- // it was delivered
 	if h, ok := d.delivered[k]; ok && h.task == t {
 		aborted = h.ctx.Err() != nil
@@ -699,10 +721,7 @@ func (d *Dispatcher) requeue(t *task.Task) bool {
 	}
 	tq.q = append([]*task.Task{t}, tq.q...)
 	ds.queued++
-	if !ds.listed {
-		ds.listed = true
-		d.byAction[ds.action] = append(d.byAction[ds.action], ds)
-	}
+	d.queueAction(ds, t.Action)
 	return true
 }
 
@@ -733,16 +752,15 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		return ds.pauseUntil.Sub(now)
 	}
 	for ds.queued > 0 {
-		ps := d.pollers[ds.action]
-		if len(ps) == 0 {
-			return 0
-		}
 		if float64(ds.inflight) >= math.Floor(ds.limit) {
 			return 0 // a Done makes room
 		}
-		// Pick the next tenant round-robin that is under its concurrency cap.
+		// Pick the next tenant round-robin that is under its concurrency cap
+		// and whose head task has a worker for its own action. Tasks of one
+		// destination share quota, not action routing.
 		var t *task.Task
 		var tq *tenantQ
+		var ps []*Poller
 		for i := 0; i < len(ds.ring); i++ {
 			idx := (ds.rr + i) % len(ds.ring)
 			name := ds.ring[idx]
@@ -755,6 +773,7 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 				}
 				delete(d.aborted, k)
 				delete(d.pending, k)
+				d.unqueueAction(ds, q.q[0].Action)
 				q.q = q.q[1:]
 				ds.queued--
 			}
@@ -769,7 +788,12 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 			if c := ds.lim.TenantConcurrency; c > 0 && q.inflight >= c {
 				continue
 			}
-			t, tq = q.q[0], q
+			candidate := q.q[0]
+			workers := d.pollers[candidate.Action]
+			if len(workers) == 0 {
+				continue
+			}
+			t, tq, ps = candidate, q, workers
 			ds.rr = (idx + 1) % max(1, len(ds.ring))
 			break
 		}
@@ -793,6 +817,7 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		}
 		tq.q = tq.q[1:]
 		ds.queued--
+		d.unqueueAction(ds, t.Action)
 		tq.inflight++
 		if len(tq.q) == 0 {
 			for i, name := range ds.ring {
@@ -813,7 +838,7 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		d.delivered[k] = handed{t, ctx, cancel, now}
 		ds.inflight++
 		p, rotate := ps[0], true
-		if a := d.affine[t.RunID]; a != nil && !a.gone && a.credit > 0 && slices.Contains(a.Actions, ds.action) {
+		if a := d.affine[t.RunID]; a != nil && !a.gone && a.credit > 0 && slices.Contains(a.Actions, t.Action) {
 			// The run's poller (ADR 0046): it has credit, so it is waiting.
 			p, rotate = a, false
 		} else if p.affine {
@@ -833,7 +858,7 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 			d.removePoller(p)
 		} else if rotate {
 			// Rotate pollers so work spreads across workers.
-			d.pollers[ds.action] = append(ps[1:], p)
+			d.pollers[t.Action] = append(ps[1:], p)
 		}
 	}
 	return 0
