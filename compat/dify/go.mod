@@ -2,6 +2,6 @@ module github.com/r-hashi01/kairo/compat/dify
 
 go 1.27.4
 
-require github.com/r-hashi01/kairo v0.4.1
+require github.com/r-hashi01/kairo v0.5.0
 
 replace github.com/r-hashi01/kairo => ../..
