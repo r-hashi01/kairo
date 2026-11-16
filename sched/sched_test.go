@@ -139,6 +139,7 @@ func TestIdleDestinationStateIsRetired(t *testing.T) {
 	tk := &task.Task{RunID: "r", Act: 1, Tenant: "t", Action: "x", Destination: "ephemeral"}
 	d.Submit(tk)
 	<-p.C
+	waitTracked(t, d, 1)
 	d.Done(tk, 0)
 	waitTracked(t, d, 0)
 	d.Poll(p, 1)
