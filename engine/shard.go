@@ -550,6 +550,8 @@ func (s *shard) handle(m *msg) {
 		if r == nil {
 			if s.e.Finished(m.runID) {
 				m.errReply <- nil
+			} else if _, ok := s.e.marker(m.runID); ok {
+				m.errReply <- nil
 			} else {
 				m.errReply <- ErrUnknownRun
 			}

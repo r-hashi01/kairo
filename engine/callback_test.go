@@ -3,10 +3,13 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/task"
 	"github.com/r-hashi01/kairo/wal"
 )
@@ -54,6 +57,134 @@ func TestCallbackWaitsForDurabilityAndIsIdempotent(t *testing.T) {
 	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`{"ok":false}`)}); err != nil {
 		t.Fatalf("duplicate callback: %v", err)
 	}
+}
+
+func TestFinishedCallbackIsIdempotentAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Shards: 1, DataDir: dir, NoSync: true, RecentRuns: 1}
+	open := func() (*Engine, *sched.Poller) {
+		e := newEngine(t, cfg)
+		mustPlan(t, e, `{"name":"callback","root":{"kind":"step","id":"call","action":"llm"}}`)
+		p := e.Dispatcher().NewPoller([]string{"llm"}, 1)
+		if err := e.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return e, p
+	}
+	e1, p1 := open()
+	tk := pendingCallbackTask(t, e1, p1, "callback-restart")
+	if err := e1.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`{"first":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if ri := wait(t, e1, tk.RunID); ri.Status != "completed" {
+		t.Fatalf("run = %+v", ri)
+	}
+	e1.Close()
+	before := walRecordCount(t, dir, "shard-000")
+
+	e2, _ := open()
+	if _, ok := e2.marker(tk.RunID); !ok {
+		t.Fatal("finished marker was not recovered")
+	}
+	if err := e2.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`{"second":true}`)}); err != nil {
+		t.Fatalf("duplicate callback after restart: %v", err)
+	}
+	e2.Close()
+	if after := walRecordCount(t, dir, "shard-000"); after != before {
+		t.Fatalf("duplicate callback changed the run log: records %d -> %d", before, after)
+	}
+}
+
+func TestFinishedCallbackUsesMarkerUntilReuseWindowEnds(t *testing.T) {
+	var skew atomic.Int64
+	dir := t.TempDir()
+	cfg := Config{Shards: 1, DataDir: dir, NoSync: true, RecentRuns: 1, IdempotencyTTL: time.Hour,
+		Now: func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }}
+	e := newEngine(t, cfg)
+	defer e.Close()
+	mustPlan(t, e, `{"name":"callback","root":{"kind":"step","id":"call","action":"llm"}}`)
+	mustPlan(t, e, `{"name":"hold","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	p := e.Dispatcher().NewPoller([]string{"llm"}, 2)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	missing := &task.Task{RunID: "missing", Act: 1, Attempt: 1, Action: "llm", StepID: "call"}
+	if err := e.Callback(context.Background(), missing, task.Result{Output: json.RawMessage(`0`)}); !errors.Is(err, ErrUnknownRun) {
+		t.Fatalf("callback for missing run = %v, want ErrUnknownRun", err)
+	}
+	tk := pendingCallbackTask(t, e, p, "callback-window")
+	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`1`)}); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, e, tk.RunID)
+
+	// Finish another run to evict the callback run from RecentRuns. Its
+	// durable marker must still make the callback retry idempotent.
+	other, err := submit(e, SubmitRequest{Plan: "callback", RunID: "other", Tenant: "t", Tier: tierPtr(TierFile)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl := <-p.C
+	if dl.Task.RunID != other {
+		t.Fatalf("task = %s, want %s", dl.Task.RunID, other)
+	}
+	e.Complete(dl.Task, task.Result{Output: json.RawMessage(`2`)})
+	e.Dispatcher().Poll(p, 1)
+	wait(t, e, other)
+	e.waitMu.Lock()
+	_, cached := e.finished[tk.RunID]
+	e.waitMu.Unlock()
+	if cached {
+		t.Fatal("callback run was not evicted from RecentRuns")
+	}
+	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`3`)}); err != nil {
+		t.Fatalf("duplicate callback after cache eviction: %v", err)
+	}
+
+	// Once the same id may be reused, its old marker no longer authorizes a
+	// callback retry. The capability is bounded by the same external expiry.
+	skew.Store(int64(2 * time.Hour))
+	if err := e.Callback(context.Background(), tk, task.Result{Output: json.RawMessage(`4`)}); !errors.Is(err, ErrUnknownRun) {
+		t.Fatalf("callback after idempotency window = %v, want ErrUnknownRun", err)
+	}
+	r, err := e.Submit(context.Background(), SubmitRequest{Plan: "hold", RunID: tk.RunID, Tenant: "t", Tier: tierPtr(TierFile)})
+	if err != nil || r.Existing {
+		t.Fatalf("RunID was not reusable after the window: %+v, %v", r, err)
+	}
+}
+
+func pendingCallbackTask(t *testing.T, e *Engine, p *sched.Poller, runID string) *task.Task {
+	t.Helper()
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "callback", RunID: runID, Tenant: "t", Tier: tierPtr(TierFile)}); err != nil {
+		t.Fatal(err)
+	}
+	var tk *task.Task
+	select {
+	case dl := <-p.C:
+		tk = dl.Task
+	case <-time.After(5 * time.Second):
+		t.Fatal("task was not dispatched")
+	}
+	tk.Callback = &task.Callback{URL: "https://callbacks.example/token", Until: time.Now().Add(time.Minute).UnixMilli()}
+	e.Complete(tk, task.Result{Pending: true})
+	e.Dispatcher().Poll(p, 1)
+	return tk
+}
+
+func tierPtr(t Tier) *Tier { return &t }
+
+func walRecordCount(t *testing.T, dir, prefix string) int {
+	t.Helper()
+	s, err := wal.OpenFile(dir+"/wal", prefix, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	n := 0
+	if err := s.ReadAll(func(uint64, []byte) error { n++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestADR0070EventsUseVersionedLogRecord(t *testing.T) {
