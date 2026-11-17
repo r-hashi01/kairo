@@ -7,20 +7,28 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import ssl
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 #: How old a signed request may be (ms).
 SIGNATURE_TOLERANCE = 5 * 60 * 1000
+#: Maximum action or callback HTTP request/response body (bytes).
+MAX_BODY = 16 << 20
 
 _LOCAL = {"localhost", "127.0.0.1", "::1"}
 
 
 class SignatureError(Exception):
+    pass
+
+
+class BodyTooLargeError(OSError):
     pass
 
 
@@ -73,6 +81,8 @@ class Response:
 def post(url: str, body: bytes, *, ca: str | None = None, timeout: float = 30, headers: dict[str, str] | None = None) -> Response:
     """POSTs a JSON body (blocking); raises OSError on a network error or a
     timeout. ca: certificates to trust (PEM), besides the system's."""
+    if len(body) > MAX_BODY:
+        raise BodyTooLargeError(f"request body exceeds {MAX_BODY} bytes")
     req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", **(headers or {})})
     ctx = None
     if url.startswith("https:"):
@@ -81,7 +91,26 @@ def post(url: str, body: bytes, *, ca: str | None = None, timeout: float = 30, h
             ctx.load_verify_locations(cadata=ca)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            return Response(r.status, r.read())
+            return Response(r.status, _read_limited(r))
     except urllib.error.HTTPError as e:
         with e:
-            return Response(e.code, e.read())
+            return Response(e.code, _read_limited(e))
+
+
+def _read_limited(response: Any) -> bytes:
+    raw = response.headers.get("Content-Length")
+    try:
+        declared = int(raw) if raw is not None else None
+    except ValueError:
+        declared = None
+    if declared is not None and declared > MAX_BODY:
+        raise BodyTooLargeError(f"response body exceeds {MAX_BODY} bytes")
+    try:
+        body = response.read(MAX_BODY + 1)
+    except http.client.IncompleteRead as e:
+        raise OSError("response body was truncated") from e
+    if declared is not None and declared >= 0 and len(body) < declared:
+        raise OSError("response body was truncated")
+    if len(body) > MAX_BODY:
+        raise BodyTooLargeError(f"response body exceeds {MAX_BODY} bytes")
+    return body

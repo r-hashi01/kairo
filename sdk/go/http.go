@@ -90,6 +90,9 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	if err != nil {
 		return result{Err: err.Error()}
 	}
+	if len(body) > httpaction.MaxBody {
+		return result{Err: fmt.Sprintf("calling %s: request body exceeds %d bytes", a.url, httpaction.MaxBody), ErrType: "http_body_too_large"}
+	}
 	lease := 15 * time.Minute
 	if s, ok := a.spec["timeout"].(string); ok {
 		if d, err := time.ParseDuration(s); err == nil {
@@ -111,7 +114,10 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 		return result{Err: "calling " + a.url + ": " + err.Error(), Unknown: true, Retryable: true, ErrType: "http"}
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, httpaction.MaxBody))
+	data, err := readHTTPBody(resp)
+	if err != nil {
+		return result{Err: "calling " + a.url + ": " + err.Error(), Unknown: true, Retryable: true, ErrType: "http"}
+	}
 	switch {
 	case resp.StatusCode == http.StatusAccepted:
 		if callback == "" {
@@ -132,6 +138,20 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 		return result{Err: fmt.Sprintf("%s: %d %s", a.url, resp.StatusCode, msg), ErrType: fmt.Sprintf("http_%d", resp.StatusCode)}
 	}
 	return result{Err: fmt.Sprintf("%s: %d", a.url, resp.StatusCode), Unknown: true, Retryable: true, ErrType: fmt.Sprintf("http_%d", resp.StatusCode)}
+}
+
+func readHTTPBody(resp *http.Response) ([]byte, error) {
+	if resp.ContentLength > httpaction.MaxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", httpaction.MaxBody)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(httpaction.MaxBody)+1))
+	if err != nil {
+		return nil, fmt.Errorf("response body was truncated: %w", err)
+	}
+	if len(data) > httpaction.MaxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", httpaction.MaxBody)
+	}
+	return data, nil
 }
 
 func fromWire(w httpaction.Result) result {
@@ -170,9 +190,16 @@ func toWire(r result) (w httpaction.Result, unknown bool) {
 func (k *Kairo) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		answer := func(status int, v any) {
+			body, err := json.Marshal(v)
+			if err != nil {
+				status, body = http.StatusInternalServerError, []byte(`{"error":"encoding response"}`)
+			}
+			if len(body) > httpaction.MaxBody {
+				status, body = http.StatusBadGateway, []byte(`{"error":"response body too large"}`)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			json.NewEncoder(w).Encode(v)
+			_, _ = w.Write(body)
 		}
 		path := r.URL.Path
 		if strings.HasSuffix(path, "/tick") {
@@ -263,7 +290,14 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 			k.rt.logger.Warn("kairo: serving an action", "action", req.Action, "err", err)
 			return
 		}
-		cb, _ := json.Marshal(map[string]any{"run_id": req.RunID, "act": req.Act, "attempt": req.Attempt, "result": res})
+		cb, err := json.Marshal(map[string]any{"run_id": req.RunID, "act": req.Act, "attempt": req.Attempt, "result": res})
+		if err != nil || len(cb) > httpaction.MaxBody {
+			if err == nil {
+				err = fmt.Errorf("callback body exceeds %d bytes", httpaction.MaxBody)
+			}
+			k.rt.logger.Warn("kairo: an action's callback", "action", req.Action, "err", err)
+			return
+		}
 		hreq, err := http.NewRequest(http.MethodPost, req.Callback, bytes.NewReader(cb))
 		if err != nil {
 			return

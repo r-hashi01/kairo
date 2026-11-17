@@ -33,7 +33,7 @@ import (
 // Tolerance is how old (or how far ahead) a signed request may be.
 const Tolerance = 5 * time.Minute
 
-// MaxBody bounds a request body.
+// MaxBody bounds an action or callback request or response body.
 const MaxBody = 16 << 20
 
 // ErrSignature is wrapped by Verify's errors.
@@ -128,9 +128,16 @@ func FromTask(r task.Result) (res Result, unknown bool) {
 func Handler(secret string, serve func(ctx context.Context, t *task.Task, emit func([]byte)) task.Result) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		answer := func(status int, v any) {
+			body, err := json.Marshal(v)
+			if err != nil {
+				status, body = http.StatusInternalServerError, []byte(`{"error":"encoding response"}`)
+			}
+			if len(body) > MaxBody {
+				status, body = http.StatusBadGateway, []byte(`{"error":"response body too large"}`)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			json.NewEncoder(w).Encode(v)
+			_, _ = w.Write(body)
 		}
 		if !strings.HasSuffix(r.URL.Path, "/action") {
 			answer(http.StatusNotFound, map[string]string{"error": "no such path"})

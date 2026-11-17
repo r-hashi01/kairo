@@ -174,6 +174,64 @@ func TestSignaturesRefused(t *testing.T) {
 	}
 }
 
+func TestHandlerBoundsActionAndCallbackBodies(t *testing.T) {
+	var runs atomic.Int32
+	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	kairo.Action(k, "x", kairo.Real, func(*kairo.TaskContext, string) (int, error) {
+		runs.Add(1)
+		return 1, nil
+	})
+	srv := httptest.NewServer(k.Handler())
+	defer srv.Close()
+
+	prefix := []byte(`{"run_id":"r","act":1,"attempt":1,"action":"x","input":"`)
+	suffix := []byte(`"}`)
+	exact := make([]byte, 0, httpaction.MaxBody)
+	exact = append(exact, prefix...)
+	exact = append(exact, strings.Repeat("x", httpaction.MaxBody-len(prefix)-len(suffix))...)
+	exact = append(exact, suffix...)
+	post := func(path string, body []byte) int {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, bytes.NewReader(body))
+		req.Header.Set("Kairo-Signature", httpaction.Sign(secret, body, time.Now()))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := post("/kairo/action", exact); code != http.StatusOK || runs.Load() != 1 {
+		t.Fatalf("exact limit: %d, ran %d", code, runs.Load())
+	}
+	over := append(append([]byte(nil), exact...), ' ')
+	for _, path := range []string{"/kairo/action", "/kairo/callback"} {
+		if code := post(path, over); code != http.StatusRequestEntityTooLarge {
+			t.Errorf("%s over limit: %d", path, code)
+		}
+	}
+	if runs.Load() != 1 {
+		t.Fatalf("an oversized request ran the handler: %d", runs.Load())
+	}
+
+	large := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	kairo.Action(large, "x", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
+		return strings.Repeat("x", httpaction.MaxBody), nil
+	})
+	largeServer := httptest.NewServer(large.Handler())
+	defer largeServer.Close()
+	body := []byte(`{"run_id":"r","act":1,"attempt":1,"action":"x","input":null}`)
+	req, _ := http.NewRequest(http.MethodPost, largeServer.URL+"/kairo/action", bytes.NewReader(body))
+	req.Header.Set("Kairo-Signature", httpaction.Sign(secret, body, time.Now()))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversized response: %d", resp.StatusCode)
+	}
+}
+
 func TestPlainHTTPOnlyHere(t *testing.T) {
 	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret, CallbackURL: "http://10.0.0.5/cb"})
 	defer k.Close()

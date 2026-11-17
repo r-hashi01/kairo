@@ -204,6 +204,7 @@ k.defineAction('render', { effect: 'unprotected', url: 'https://gpu.example.com/
 
 - Calls are signed (`Kairo-Signature`, HMAC-SHA256 with a timestamp) and carry an `Idempotency-Key`.
 - A `200` answer is the result. A `202` means the result comes later, as a signed callback.
+- Action and callback request and response bodies are limited to 16 MiB. Oversized requests are rejected with `413`; oversized or truncated responses are never parsed as success.
 - `4xx` fails the step. `5xx`, a timeout or a broken connection make the outcome unknown.
 - HTTPS is required, except to `localhost` or with `allowInsecure`. Trust your own CA with `ca`.
 

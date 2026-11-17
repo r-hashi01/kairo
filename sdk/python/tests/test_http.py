@@ -18,7 +18,7 @@ import unittest
 from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
-from kairo_sdk.http import check_url, post, sign
+from kairo_sdk.http import BodyTooLargeError, MAX_BODY, check_url, post, sign
 from kairo_sdk.store import SQLiteStore
 from kairo_sdk.workflow import Kairo, RetryableError, Suspended, UnknownOutcomeError
 
@@ -74,7 +74,10 @@ async def serve(app: Any, tls: ssl.SSLContext | None = None) -> tuple[str, async
             await app({"type": "http", "method": line[0], "path": line[1], "headers": headers}, receive, send)
             data = out.get("body", b"")
             w.write(f"HTTP/1.1 {out['status']} X\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data)
-            await w.drain()
+            try:
+                await w.drain()
+            except (ConnectionError, BrokenPipeError):
+                pass  # a bounded client may close as soon as it sees Content-Length
         finally:
             w.close()
 
@@ -94,6 +97,98 @@ def plain(fn: Any) -> Any:
         await send({"type": "http.response.body", "body": json.dumps(body).encode()})
 
     return app
+
+
+async def asgi_request(app: Any, path: str, body: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
+    split = len(body) // 2
+    chunks = [body[:split], body[split:]]
+    sent: dict[str, Any] = {}
+
+    async def receive() -> dict[str, Any]:
+        chunk = chunks.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+
+    async def send(m: dict[str, Any]) -> None:
+        if m["type"] == "http.response.start":
+            sent["status"] = m["status"]
+        else:
+            sent["body"] = m.get("body", b"")
+
+    scope = {"type": "http", "method": "POST", "path": path, "headers": [(k.encode(), v.encode()) for k, v in headers.items()]}
+    await app(scope, receive, send)
+    return sent["status"], sent.get("body", b"")
+
+
+def action_body(size: int) -> bytes:
+    prefix = b'{"run_id":"r","act":1,"attempt":1,"action":"x","input":"'
+    suffix = b'"}'
+    assert size >= len(prefix) + len(suffix)
+    return prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix
+
+
+class HttpBodyLimitTest(unittest.TestCase):
+    def test_requests_are_bounded_before_execution(self) -> None:
+        async def main() -> None:
+            runs = []
+            k = Kairo(secret=SECRET)
+            k.action("x")(lambda i, ctx: runs.append(i) or 1)
+            app = k.asgi_app()
+            exact = action_body(MAX_BODY)
+            status, _ = await asgi_request(app, "/kairo/action", exact, {"kairo-signature": sign(SECRET, exact)})
+            self.assertEqual(status, 200)
+            self.assertEqual(len(runs), 1)
+
+            over = exact + b" "
+            for path in ("/kairo/action", "/kairo/callback"):
+                status, _ = await asgi_request(app, path, over, {"kairo-signature": sign(SECRET, over)})
+                self.assertEqual(status, 413, path)
+            self.assertEqual(len(runs), 1, "an oversized action request did not run")
+
+        run(main)
+
+    def test_client_bounds_requests_and_responses(self) -> None:
+        async def main() -> None:
+            async def sized(n: int, scope: Any, receive: Any, send: Any) -> None:
+                await receive()
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"x" * n})
+
+            exact_url, _ = await serve(lambda scope, receive, send: sized(MAX_BODY, scope, receive, send))
+            exact = await asyncio.to_thread(post, exact_url, b"{}")
+            self.assertEqual(len(exact.body), MAX_BODY)
+
+            over_url, _ = await serve(lambda scope, receive, send: sized(MAX_BODY + 1, scope, receive, send))
+            with self.assertRaises(BodyTooLargeError):
+                await asyncio.to_thread(post, over_url, b"{}")
+            with self.assertRaises(BodyTooLargeError):
+                post("http://127.0.0.1:1", b"x" * (MAX_BODY + 1))
+
+            async def truncated_conn(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+                try:
+                    await r.readuntil(b"\r\n\r\n")
+                    w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx")
+                    await w.drain()
+                finally:
+                    w.close()
+
+            truncated = await asyncio.start_server(truncated_conn, "127.0.0.1", 0)
+            SERVERS.append(truncated)
+            port = truncated.sockets[0].getsockname()[1]
+            with self.assertRaisesRegex(OSError, "truncated"):
+                await asyncio.to_thread(post, f"http://127.0.0.1:{port}", b"{}")
+
+        run(main)
+
+    def test_serving_side_does_not_emit_oversized_success(self) -> None:
+        async def main() -> None:
+            k = Kairo(secret=SECRET)
+            k.action("x")(lambda i, ctx: "x" * MAX_BODY)
+            body = json.dumps({"run_id": "r", "act": 1, "attempt": 1, "action": "x", "input": None}).encode()
+            status, response = await asgi_request(k.asgi_app(), "/kairo/action", body, {"kairo-signature": sign(SECRET, body)})
+            self.assertEqual(status, 502)
+            self.assertEqual(json.loads(response), {"error": "response body too large"})
+
+        run(main)
 
 
 class CallbackServer:
@@ -305,6 +400,32 @@ class HttpActionTest(unittest.TestCase):
             self.assertEqual(calls["flaky"], 2)
             self.assertIn("blocked", await k.run("w", "down", id="st-down"))
             self.assertEqual(calls["down"], 1)
+            await k.close()
+
+        run(main)
+
+    def test_oversized_response_is_unknown_for_a_real_action(self) -> None:
+        async def main() -> None:
+            async def large(_scope: Any, receive: Any, send: Any) -> None:
+                await receive()
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"x" * (MAX_BODY + 1)})
+
+            action_url, _ = await serve(large)
+            cb = CallbackServer()
+            k = Kairo(backend=await self.embedded("large-response.db"), secret=SECRET, callback_url=await cb.start())
+            k.action("large", url=action_url)(lambda i, ctx: None)
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                try:
+                    return await ctx.call("large", {})
+                except Exception as e:
+                    return str(e)
+
+            await k.start()
+            cb.current = k
+            self.assertIn("blocked", await k.run("w", None, id="large-response"))
             await k.close()
 
         run(main)

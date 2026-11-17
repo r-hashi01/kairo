@@ -7,7 +7,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { HttpBackend, type Backend } from './backend.ts';
-import { SignatureError, checkURL, post, sign, verify } from './http.ts';
+import { BodyTooLargeError, MAX_BODY, SignatureError, checkURL, post, readBody, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
 import { EffectWeakenedError, Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
@@ -1040,7 +1040,14 @@ export class Kairo {
 	 * 0053): it answers {"next": <unix ms> | null}.
 	 */
 	fetchHandler(): (req: Request) => Promise<Response> {
-		const json = (status: number, v: unknown) => new Response(JSON.stringify(v), { status, headers: { 'content-type': 'application/json' } });
+		const json = (status: number, v: unknown) => {
+			let body = JSON.stringify(v);
+			if (Buffer.byteLength(body) > MAX_BODY) {
+				status = 502;
+				body = JSON.stringify({ error: 'response body too large' });
+			}
+			return new Response(body, { status, headers: { 'content-type': 'application/json' } });
+		};
 		return async (req) => {
 			if (new URL(req.url).pathname.endsWith('/tick')) {
 				if (!this.opts.tickSecret || !this.suspend) return json(404, { error: 'no such path' });
@@ -1050,7 +1057,13 @@ export class Kairo {
 			}
 			if (req.method !== 'POST') return json(405, { error: 'POST only' });
 			if (!this.opts.secret) return json(500, { error: 'no secret configured' });
-			const body = await req.text();
+			let body: string;
+			try {
+				body = await readBody(req);
+			} catch (e) {
+				if (e instanceof BodyTooLargeError) return json(413, { error: e.message });
+				throw e;
+			}
 			try {
 				verify(this.opts.secret, body, req.headers.get('kairo-signature'));
 			} catch (e) {

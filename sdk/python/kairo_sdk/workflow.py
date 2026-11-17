@@ -40,7 +40,7 @@ from typing import Any
 from .backend import Backend, HttpBackend
 from .client import KairoError, finished
 from .embedded import EffectWeakenedError, Embedded, new_token
-from .http import SignatureError, check_url, post, sign, verify
+from .http import MAX_BODY, SignatureError, check_url, post, sign, verify
 from .metrics import (
     DRAIN,
     DRAIN_DURATION,
@@ -1213,24 +1213,43 @@ class Kairo:
         async def app(scope: dict[str, Any], receive: Callable[[], Awaitable[dict[str, Any]]], send: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
             if scope["type"] != "http":
                 return
-            body = b""
-            while True:
-                m = await receive()
-                body += m.get("body", b"")
-                if not m.get("more_body"):
-                    break
             headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
             try:
-                if scope["path"].endswith("/tick"):
-                    status, out = await self._handle_tick(scope["method"], headers.get("authorization"))
+                declared = int(headers.get("content-length", ""))
+            except ValueError:
+                declared = -1
+            if declared > MAX_BODY:
+                status, out = 413, {"error": f"request body exceeds {MAX_BODY} bytes"}
+            else:
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    m = await receive()
+                    chunk = m.get("body", b"")
+                    size += len(chunk)
+                    if size > MAX_BODY:
+                        chunks = []
+                        break
+                    chunks.append(chunk)
+                    if not m.get("more_body"):
+                        break
+                if size > MAX_BODY:
+                    status, out = 413, {"error": f"request body exceeds {MAX_BODY} bytes"}
                 else:
-                    status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
-            except Exception:
-                if not self._closing:
-                    raise
-                # Closed while it was answered (its store too): as before it.
-                status, out = 503, {"error": "closing"}
+                    body = b"".join(chunks)
+                    try:
+                        if scope["path"].endswith("/tick"):
+                            status, out = await self._handle_tick(scope["method"], headers.get("authorization"))
+                        else:
+                            status, out = await self._handle(scope["method"], scope["path"], headers.get("kairo-signature"), body)
+                    except Exception:
+                        if not self._closing:
+                            raise
+                        # Closed while it was answered (its store too): as before it.
+                        status, out = 503, {"error": "closing"}
             data = json.dumps(out).encode()
+            if len(data) > MAX_BODY:
+                status, data = 502, b'{"error":"response body too large"}'
             await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": data})
 
