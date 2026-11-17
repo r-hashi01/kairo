@@ -202,6 +202,14 @@ KAIRO_CALLBACK_KEYS="$CURRENT_KEY,$PREVIOUS_KEY" \
 
 Route only `/kairo/v1/action-results/*` to the callback listener. It intentionally does not expose the control API on `:8420`. SDK workers negotiate this capability per connection; URL-backed actions receive an attempt-scoped callback URL, while other actions and older workers keep the existing protocol.
 
+Workers use an owner-only Unix socket by default. To listen for workers over TCP, configure the same token in kairod and every worker:
+
+```sh
+KAIRO_WORKER_TOKEN="$WORKER_TOKEN" ./kairod -data ./data -tier file -worker-tcp 0.0.0.0:8422
+```
+
+kairod refuses `-worker-tcp` without a token. `-allow-insecure-worker-tcp` is an explicit development-only opt-in.
+
 ## Performance
 
 **Embedded runtime** (Apple M4 Max). Per event = decode the state, apply, encode it again.

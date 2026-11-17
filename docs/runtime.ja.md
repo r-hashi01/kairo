@@ -95,6 +95,11 @@ race 検出器付きの `go test -race ./...` も通っています。
 go build -o kairod ./cmd/kairod
 ./kairod -data ./data -tier file
 
+# worker を TCP で受ける場合は、kairod と worker に同じ token を渡す。
+# token なしの -worker-tcp は起動時に拒否される。
+KAIRO_WORKER_TOKEN="$WORKER_TOKEN" \
+  ./kairod -data ./data -tier file -worker-tcp 0.0.0.0:8422
+
 # HTTP action が 202 を返す場合。公開 HTTPS は callback 専用 listener へ中継する。
 # 鍵は 32 byte 以上を unpadded base64url にしたもの。先頭が発行用、残りも検証に使う。
 KAIRO_CALLBACK_KEYS="$CURRENT_KEY,$PREVIOUS_KEY" \

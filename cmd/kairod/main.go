@@ -40,7 +40,8 @@ func main() {
 		callbackURL  = flag.String("callback-url", "", "public HTTPS base for daemon-owned action callbacks (enables callbacks; keys come from KAIRO_CALLBACK_KEYS)")
 		callbackAddr = flag.String("callback-http", "127.0.0.1:8421", "callback-only listen address, normally behind the callback URL's TLS proxy")
 		sockPath     = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
-		tcpAddr      = flag.String("worker-tcp", "", "optional TCP address for workers")
+		tcpAddr      = flag.String("worker-tcp", "", "optional TCP address for workers (requires KAIRO_WORKER_TOKEN)")
+		insecureTCP  = flag.Bool("allow-insecure-worker-tcp", false, "allow worker TCP without authentication (development only)")
 		nodesFile    = flag.String("nodes", "", "JSON file with an array of node specs")
 		limitFile    = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
 		obsFile      = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
@@ -55,6 +56,10 @@ func main() {
 		idemTTL      = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
+	workerToken := os.Getenv("KAIRO_WORKER_TOKEN")
+	if err := validateWorkerListener(*tcpAddr, workerToken, *insecureTCP); err != nil {
+		log.Fatal(err)
+	}
 
 	var callbacks *httpaction.CallbackCapabilities
 	if *callbackURL != "" {
@@ -164,7 +169,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ws := &protocol.Server{E: e}
+	ws := &protocol.Server{E: e, Token: workerToken}
 	if callbacks != nil {
 		ws.Callback = func(t *task.Task) *task.Callback {
 			until := t.Deadline
@@ -177,14 +182,14 @@ func main() {
 	if *sockPath == "" {
 		*sockPath = filepath.Join(*dataDir, "worker.sock")
 	}
-	os.Remove(*sockPath)
-	ul, err := net.Listen("unix", *sockPath)
+	ul, err := listenUnixWorker(*sockPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	go ws.Serve(ul)
+	var tl net.Listener
 	if *tcpAddr != "" {
-		tl, err := net.Listen("tcp", *tcpAddr)
+		tl, err = net.Listen("tcp", *tcpAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -220,7 +225,39 @@ func main() {
 		callbackSrv.Shutdown(ctx)
 	}
 	ul.Close()
+	if tl != nil {
+		tl.Close()
+	}
 	e.Close()
+}
+
+func validateWorkerListener(tcpAddr, token string, allowInsecure bool) error {
+	if tcpAddr != "" && token == "" && !allowInsecure {
+		return errors.New("-worker-tcp requires KAIRO_WORKER_TOKEN (or -allow-insecure-worker-tcp for development)")
+	}
+	return nil
+}
+
+func listenUnixWorker(path string) (net.Listener, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("worker socket path exists and is not a socket: %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale worker socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect worker socket: %w", err)
+	}
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
+		return nil, fmt.Errorf("set worker socket permissions: %w", err)
+	}
+	return l, nil
 }
 
 func callbackKeys(raw string) ([][]byte, error) {
