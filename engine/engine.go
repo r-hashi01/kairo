@@ -1126,8 +1126,36 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 	case ri := <-ch:
 		return ri, nil
 	case <-ctx.Done():
-		return RunInfo{}, ctx.Err()
+		if e.removeWaiter(runID, ch) {
+			return RunInfo{}, ctx.Err()
+		}
+		// finish removed the waiter and owns its notification. Its send is
+		// buffered and happens immediately after releasing waitMu.
+		return <-ch, nil
 	}
+}
+
+// removeWaiter removes exactly ch. It is false when finish already claimed
+// the waiter, in which case the caller must receive the completion from ch.
+func (e *Engine) removeWaiter(runID string, ch chan RunInfo) bool {
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	ws := e.waiters[runID]
+	for i, w := range ws {
+		if w != ch {
+			continue
+		}
+		copy(ws[i:], ws[i+1:])
+		ws[len(ws)-1] = nil
+		ws = ws[:len(ws)-1]
+		if len(ws) == 0 {
+			delete(e.waiters, runID)
+		} else {
+			e.waiters[runID] = ws
+		}
+		return true
+	}
+	return false
 }
 
 // trimmed describes a run known only by its finished-run marker: with its

@@ -104,6 +104,148 @@ func TestFiveNodeRun(t *testing.T) {
 	}
 }
 
+func TestCanceledWaitersAreRemoved(t *testing.T) {
+	e := newEngine(t, Config{Shards: 2})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"hold","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "hold", RunID: "live", Tenant: "t"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 256; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		<-ctx.Done()
+		if _, err := e.Wait(ctx, fmt.Sprintf("missing-%d", i)); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unknown Wait error = %v", err)
+		}
+		cancel()
+
+		ctx, cancel = context.WithCancel(context.Background())
+		cancel()
+		if _, err := e.Wait(ctx, "live"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("live Wait error = %v", err)
+		}
+	}
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	if len(e.waiters) != 0 {
+		t.Fatalf("canceled Waits retained %d run entries", len(e.waiters))
+	}
+}
+
+func TestWaitCancellationRacesCompletion(t *testing.T) {
+	e := newEngine(t, Config{Shards: 2})
+	defer e.Close()
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 256; i++ {
+		id := fmt.Sprintf("race-%d", i)
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan struct {
+			ri  RunInfo
+			err error
+		}, 1)
+		go func() {
+			ri, err := e.Wait(ctx, id)
+			result <- struct {
+				ri  RunInfo
+				err error
+			}{ri, err}
+		}()
+		waitFor(t, func() bool {
+			e.waitMu.Lock()
+			defer e.waitMu.Unlock()
+			return len(e.waiters[id]) == 1
+		})
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			e.finish(RunInfo{RunID: id, Status: "completed"})
+		}()
+		close(start)
+		got := <-result
+		wg.Wait()
+		if got.err != nil && !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("Wait error = %v", got.err)
+		}
+		if got.err == nil && (got.ri.RunID != id || got.ri.Status != "completed") {
+			t.Fatalf("Wait completion = %+v", got.ri)
+		}
+		e.waitMu.Lock()
+		_, retained := e.waiters[id]
+		e.waitMu.Unlock()
+		if retained {
+			t.Fatalf("Wait retained after finish/cancel race for %s", id)
+		}
+	}
+}
+
+func TestCancelRemovesOnlyItsWaiter(t *testing.T) {
+	e := newEngine(t, Config{Shards: 2})
+	defer e.Close()
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	id := "shared"
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	type waitResult struct {
+		ri  RunInfo
+		err error
+	}
+	canceled := make(chan waitResult, 1)
+	active := make(chan waitResult, 1)
+	go func() {
+		ri, err := e.Wait(cancelCtx, id)
+		canceled <- waitResult{ri, err}
+	}()
+	go func() {
+		ri, err := e.Wait(context.Background(), id)
+		active <- waitResult{ri, err}
+	}()
+	waitFor(t, func() bool {
+		e.waitMu.Lock()
+		defer e.waitMu.Unlock()
+		return len(e.waiters[id]) == 2
+	})
+	cancel()
+	select {
+	case got := <-canceled:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("canceled Wait = %+v, %v", got.ri, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled Wait did not return")
+	}
+	e.waitMu.Lock()
+	remaining := len(e.waiters[id])
+	e.waitMu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("remaining waiters = %d, want 1", remaining)
+	}
+	e.finish(RunInfo{RunID: id, Status: "completed"})
+	select {
+	case got := <-active:
+		if got.err != nil || got.ri.RunID != id || got.ri.Status != "completed" {
+			t.Fatalf("active Wait = %+v, %v", got.ri, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active Wait did not receive completion")
+	}
+}
+
 func TestInitialSignalRecoversWithItsWaitAndDeduplicates(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *Engine {
