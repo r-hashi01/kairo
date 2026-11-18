@@ -175,8 +175,9 @@ func TestSignaturesRefused(t *testing.T) {
 }
 
 func TestHandlerBoundsActionAndCallbackBodies(t *testing.T) {
+	const limit = 1024
 	var runs atomic.Int32
-	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret, MaxBodyBytes: limit})
 	kairo.Action(k, "x", kairo.Real, func(*kairo.TaskContext, string) (int, error) {
 		runs.Add(1)
 		return 1, nil
@@ -186,9 +187,9 @@ func TestHandlerBoundsActionAndCallbackBodies(t *testing.T) {
 
 	prefix := []byte(`{"run_id":"r","act":1,"attempt":1,"action":"x","input":"`)
 	suffix := []byte(`"}`)
-	exact := make([]byte, 0, httpaction.MaxBody)
+	exact := make([]byte, 0, limit)
 	exact = append(exact, prefix...)
-	exact = append(exact, strings.Repeat("x", httpaction.MaxBody-len(prefix)-len(suffix))...)
+	exact = append(exact, strings.Repeat("x", limit-len(prefix)-len(suffix))...)
 	exact = append(exact, suffix...)
 	post := func(path string, body []byte) int {
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, bytes.NewReader(body))
@@ -213,9 +214,9 @@ func TestHandlerBoundsActionAndCallbackBodies(t *testing.T) {
 		t.Fatalf("an oversized request ran the handler: %d", runs.Load())
 	}
 
-	large := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	large := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret, MaxBodyBytes: limit})
 	kairo.Action(large, "x", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
-		return strings.Repeat("x", httpaction.MaxBody), nil
+		return strings.Repeat("x", limit), nil
 	})
 	largeServer := httptest.NewServer(large.Handler())
 	defer largeServer.Close()

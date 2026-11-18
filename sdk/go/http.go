@@ -34,6 +34,9 @@ type HTTPOptions struct {
 	CA *x509.CertPool
 	// AllowInsecure allows plain http to other machines.
 	AllowInsecure bool
+	// MaxBodyBytes bounds action and callback HTTP request and response
+	// bodies. Zero uses 16 MiB; the largest accepted value is 512 MiB.
+	MaxBodyBytes int64
 	// TickSecret, in suspend mode, is the bearer token a scheduler calls
 	// /tick with (Vercel Cron's CRON_SECRET, say). Without it /tick is not
 	// served.
@@ -90,8 +93,8 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	if err != nil {
 		return result{Err: err.Error()}
 	}
-	if len(body) > httpaction.MaxBody {
-		return result{Err: fmt.Sprintf("calling %s: request body exceeds %d bytes", a.url, httpaction.MaxBody), ErrType: "http_body_too_large"}
+	if int64(len(body)) > k.http.MaxBodyBytes {
+		return result{Err: fmt.Sprintf("calling %s: request body exceeds %d bytes", a.url, k.http.MaxBodyBytes), ErrType: "http_body_too_large"}
 	}
 	lease := 15 * time.Minute
 	if s, ok := a.spec["timeout"].(string); ok {
@@ -114,7 +117,7 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 		return result{Err: "calling " + a.url + ": " + err.Error(), Unknown: true, Retryable: true, ErrType: "http"}
 	}
 	defer resp.Body.Close()
-	data, err := readHTTPBody(resp)
+	data, err := readHTTPBody(resp, k.http.MaxBodyBytes)
 	if err != nil {
 		return result{Err: "calling " + a.url + ": " + err.Error(), Unknown: true, Retryable: true, ErrType: "http"}
 	}
@@ -140,16 +143,16 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	return result{Err: fmt.Sprintf("%s: %d", a.url, resp.StatusCode), Unknown: true, Retryable: true, ErrType: fmt.Sprintf("http_%d", resp.StatusCode)}
 }
 
-func readHTTPBody(resp *http.Response) ([]byte, error) {
-	if resp.ContentLength > httpaction.MaxBody {
-		return nil, fmt.Errorf("response body exceeds %d bytes", httpaction.MaxBody)
+func readHTTPBody(resp *http.Response, maxBody int64) ([]byte, error) {
+	if resp.ContentLength > maxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBody)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(httpaction.MaxBody)+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("response body was truncated: %w", err)
 	}
-	if len(data) > httpaction.MaxBody {
-		return nil, fmt.Errorf("response body exceeds %d bytes", httpaction.MaxBody)
+	if int64(len(data)) > maxBody {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBody)
 	}
 	return data, nil
 }
@@ -194,7 +197,7 @@ func (k *Kairo) Handler() http.Handler {
 			if err != nil {
 				status, body = http.StatusInternalServerError, []byte(`{"error":"encoding response"}`)
 			}
-			if len(body) > httpaction.MaxBody {
+			if int64(len(body)) > k.http.MaxBodyBytes {
 				status, body = http.StatusBadGateway, []byte(`{"error":"response body too large"}`)
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -214,7 +217,7 @@ func (k *Kairo) Handler() http.Handler {
 			answer(http.StatusInternalServerError, map[string]string{"error": "no secret configured"})
 			return
 		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, httpaction.MaxBody))
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, k.http.MaxBodyBytes))
 		if err != nil {
 			answer(http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error()})
 			return
@@ -291,9 +294,9 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 			return
 		}
 		cb, err := json.Marshal(map[string]any{"run_id": req.RunID, "act": req.Act, "attempt": req.Attempt, "result": res})
-		if err != nil || len(cb) > httpaction.MaxBody {
+		if err != nil || int64(len(cb)) > k.http.MaxBodyBytes {
 			if err == nil {
-				err = fmt.Errorf("callback body exceeds %d bytes", httpaction.MaxBody)
+				err = fmt.Errorf("callback body exceeds %d bytes", k.http.MaxBodyBytes)
 			}
 			k.rt.logger.Warn("kairo: an action's callback", "action", req.Action, "err", err)
 			return

@@ -18,7 +18,7 @@ import unittest
 from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
-from kairo_sdk.http import BodyTooLargeError, MAX_BODY, check_url, post, sign
+from kairo_sdk.http import BodyTooLargeError, MAX_BODY, MAXIMUM_MAX_BODY, check_url, normalize_max_body, post, sign
 from kairo_sdk.store import SQLiteStore
 from kairo_sdk.workflow import Kairo, RetryableError, Suspended, UnknownOutcomeError
 
@@ -187,6 +187,47 @@ class HttpBodyLimitTest(unittest.TestCase):
             status, response = await asgi_request(k.asgi_app(), "/kairo/action", body, {"kairo-signature": sign(SECRET, body)})
             self.assertEqual(status, 502)
             self.assertEqual(json.loads(response), {"error": "response body too large"})
+
+        run(main)
+
+    def test_limit_is_configurable_with_an_absolute_maximum(self) -> None:
+        self.assertEqual(normalize_max_body(MAXIMUM_MAX_BODY), MAXIMUM_MAX_BODY)
+        with self.assertRaisesRegex(ValueError, "between 1"):
+            Kairo(max_body_bytes=0)
+        with self.assertRaisesRegex(ValueError, "between 1"):
+            Kairo(max_body_bytes=MAXIMUM_MAX_BODY + 1)
+        with self.assertRaisesRegex(ValueError, "between 1"):
+            post("http://127.0.0.1:1", b"{}", max_body_bytes=MAXIMUM_MAX_BODY + 1)
+
+        async def main() -> None:
+            limit = 1024
+            runs = []
+            k = Kairo(secret=SECRET, max_body_bytes=limit)
+            k.action("x")(lambda i, ctx: runs.append(i) or 1)
+            exact = action_body(limit)
+            status, _ = await asgi_request(k.asgi_app(), "/kairo/action", exact, {"kairo-signature": sign(SECRET, exact)})
+            self.assertEqual(status, 200)
+            over = exact + b" "
+            status, _ = await asgi_request(k.asgi_app(), "/kairo/action", over, {"kairo-signature": sign(SECRET, over)})
+            self.assertEqual(status, 413)
+            self.assertEqual(len(runs), 1)
+
+            exact_url, _ = await serve(lambda scope, receive, send: sized_response(limit, scope, receive, send))
+            self.assertEqual(len((await asyncio.to_thread(post, exact_url, b"{}", max_body_bytes=limit)).body), limit)
+            over_url, _ = await serve(lambda scope, receive, send: sized_response(limit + 1, scope, receive, send))
+            with self.assertRaises(BodyTooLargeError):
+                await asyncio.to_thread(post, over_url, b"{}", max_body_bytes=limit)
+
+            large = Kairo(secret=SECRET, max_body_bytes=limit)
+            large.action("x")(lambda i, ctx: "x" * limit)
+            body = json.dumps({"run_id": "r", "act": 1, "attempt": 1, "action": "x", "input": None}).encode()
+            status, _ = await asgi_request(large.asgi_app(), "/kairo/action", body, {"kairo-signature": sign(SECRET, body)})
+            self.assertEqual(status, 502)
+
+        async def sized_response(n: int, scope: Any, receive: Any, send: Any) -> None:
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"x" * n})
 
         run(main)
 

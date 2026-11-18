@@ -8,11 +8,23 @@ import { request as httpsRequest } from 'node:https';
 
 /** How old a signed request may be (ms). */
 export const SIGNATURE_TOLERANCE = 5 * 60 * 1000;
-/** Maximum action or callback HTTP request/response body (bytes). */
-export const MAX_BODY = 16 << 20;
+/** Default action or callback HTTP request/response body limit (bytes). */
+export const DEFAULT_MAX_BODY = 16 << 20;
+/** Largest configurable body limit (ADR 0081). */
+export const MAXIMUM_MAX_BODY = 512 << 20;
+/** Kept as the default limit for compatibility. */
+export const MAX_BODY = DEFAULT_MAX_BODY;
 
 export class SignatureError extends Error {}
 export class BodyTooLargeError extends Error {}
+
+/** Returns the default when omitted and validates ADR 0081's range. */
+export function normalizeMaxBody(n?: number): number {
+	if (n === undefined) return DEFAULT_MAX_BODY;
+	if (!Number.isSafeInteger(n) || n < 1 || n > MAXIMUM_MAX_BODY)
+		throw new RangeError(`maxBodyBytes must be between 1 and ${MAXIMUM_MAX_BODY}`);
+	return n;
+}
 
 /** The Kairo-Signature header of body at time t: "t=<unix ms>,v1=<hex HMAC-SHA256(secret, t + '.' + body)>". */
 export function sign(secret: string, body: string, t = Date.now()): string {
@@ -54,6 +66,7 @@ export interface PostOptions {
 	ca?: string | Buffer | Array<string | Buffer>;
 	timeoutMs?: number;
 	headers?: Record<string, string>;
+	maxBodyBytes?: number;
 }
 
 export interface PostResponse {
@@ -63,7 +76,8 @@ export interface PostResponse {
 
 /** POSTs a JSON body; rejects on a network error or a timeout. */
 export function post(url: string, body: string, opts: PostOptions = {}): Promise<PostResponse> {
-	if (Buffer.byteLength(body) > MAX_BODY) return Promise.reject(new BodyTooLargeError(`request body exceeds ${MAX_BODY} bytes`));
+	const maxBody = normalizeMaxBody(opts.maxBodyBytes);
+	if (Buffer.byteLength(body) > maxBody) return Promise.reject(new BodyTooLargeError(`request body exceeds ${maxBody} bytes`));
 	const u = new URL(url);
 	const req = u.protocol === 'https:' ? httpsRequest : httpRequest;
 	return new Promise((resolve, reject) => {
@@ -86,13 +100,13 @@ export function post(url: string, body: string, opts: PostOptions = {}): Promise
 					reject(e);
 				};
 				const declared = Number(res.headers['content-length']);
-				if (Number.isFinite(declared) && declared > MAX_BODY) {
-					fail(new BodyTooLargeError(`response body exceeds ${MAX_BODY} bytes`));
+				if (Number.isFinite(declared) && declared > maxBody) {
+					fail(new BodyTooLargeError(`response body exceeds ${maxBody} bytes`));
 					return;
 				}
 				res.on('data', (c: Buffer) => {
 					size += c.length;
-					if (size > MAX_BODY) fail(new BodyTooLargeError(`response body exceeds ${MAX_BODY} bytes`));
+					if (size > maxBody) fail(new BodyTooLargeError(`response body exceeds ${maxBody} bytes`));
 					else chunks.push(c);
 				});
 				res.on('end', () => {
@@ -111,9 +125,10 @@ export function post(url: string, body: string, opts: PostOptions = {}): Promise
 }
 
 /** Reads a fetch request without allowing an unbounded req.text() allocation. */
-export async function readBody(req: Request): Promise<string> {
+export async function readBody(req: Request, maxBodyBytes?: number): Promise<string> {
+	const maxBody = normalizeMaxBody(maxBodyBytes);
 	const declared = Number(req.headers.get('content-length'));
-	if (Number.isFinite(declared) && declared > MAX_BODY) throw new BodyTooLargeError(`request body exceeds ${MAX_BODY} bytes`);
+	if (Number.isFinite(declared) && declared > maxBody) throw new BodyTooLargeError(`request body exceeds ${maxBody} bytes`);
 	if (!req.body) return '';
 	const reader = req.body.getReader();
 	const chunks: Uint8Array[] = [];
@@ -122,9 +137,9 @@ export async function readBody(req: Request): Promise<string> {
 		const { done, value } = await reader.read();
 		if (done) break;
 		size += value.byteLength;
-		if (size > MAX_BODY) {
+		if (size > maxBody) {
 			await reader.cancel();
-			throw new BodyTooLargeError(`request body exceeds ${MAX_BODY} bytes`);
+			throw new BodyTooLargeError(`request body exceeds ${maxBody} bytes`);
 		}
 		chunks.push(value);
 	}
@@ -138,7 +153,9 @@ export async function readBody(req: Request): Promise<string> {
 }
 
 /** Serves a fetch-style handler (Request -> Response) from node:http(s). */
-export function nodeHandler(handler: (req: Request) => Promise<Response>) {
+export function nodeHandler(handler: (req: Request) => Promise<Response>, opts: { maxBodyBytes?: number } = {}) {
+	const configured = opts.maxBodyBytes ?? (handler as { maxBodyBytes?: number }).maxBodyBytes;
+	const maxBody = normalizeMaxBody(configured);
 	return (req: IncomingMessage, res: ServerResponse) => {
 		const chunks: Buffer[] = [];
 		let size = 0;
@@ -147,17 +164,17 @@ export function nodeHandler(handler: (req: Request) => Promise<Response>) {
 			if (answered) return;
 			answered = true;
 			res.writeHead(413, { 'content-type': 'application/json' });
-			res.end(JSON.stringify({ error: `request body exceeds ${MAX_BODY} bytes` }));
+			res.end(JSON.stringify({ error: `request body exceeds ${maxBody} bytes` }));
 		};
 		const declared = Number(req.headers['content-length']);
-		if (Number.isFinite(declared) && declared > MAX_BODY) {
+		if (Number.isFinite(declared) && declared > maxBody) {
 			tooLarge();
 			req.resume();
 			return;
 		}
 		req.on('data', (c: Buffer) => {
 			size += c.length;
-			if (size > MAX_BODY) {
+			if (size > maxBody) {
 				chunks.length = 0;
 				tooLarge();
 			} else chunks.push(c);

@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
-import { BodyTooLargeError, MAX_BODY, checkURL, nodeHandler, post, sign } from './http.ts';
+import { BodyTooLargeError, MAX_BODY, MAXIMUM_MAX_BODY, checkURL, nodeHandler, normalizeMaxBody, post, sign } from './http.ts';
 import { SQLiteStore } from './store.ts';
 import { Kairo, RetryableError, Suspended, UnknownOutcomeError } from './workflow.ts';
 
@@ -138,6 +138,51 @@ test('the serving side does not emit an oversized successful result', async () =
 	}));
 	assert.equal(r.status, 502);
 	assert.deepEqual(await r.json(), { error: 'response body too large' });
+});
+
+test('the action body limit is configurable within its absolute maximum', async () => {
+	const limit = 1024;
+	assert.equal(normalizeMaxBody(MAXIMUM_MAX_BODY), MAXIMUM_MAX_BODY);
+	assert.throws(() => new Kairo({ maxBodyBytes: 0 }), /between 1/);
+	assert.throws(() => new Kairo({ maxBodyBytes: MAXIMUM_MAX_BODY + 1 }), /between 1/);
+	assert.throws(() => post('http://127.0.0.1:1', '{}', { maxBodyBytes: MAXIMUM_MAX_BODY + 1 }), /between 1/);
+
+	let runs = 0;
+	const k = new Kairo({ secret, maxBodyBytes: limit });
+	k.defineAction('x', { handler: async () => (runs++, 1) });
+	const exact = actionBody(limit);
+	let r = await k.fetchHandler()(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body: exact, headers: { 'kairo-signature': sign(secret, exact) },
+	}));
+	assert.equal(r.status, 200);
+
+	const over = exact + ' ';
+	const base = await listen(k.fetchHandler());
+	const status = await new Promise<number>((resolve, reject) => {
+		const req = httpRequest(base + '/kairo/action', {
+			method: 'POST', headers: { 'content-length': Buffer.byteLength(over), 'kairo-signature': sign(secret, over) },
+		}, (res) => {
+			res.resume();
+			res.on('end', () => resolve(res.statusCode ?? 0));
+		});
+		req.on('error', reject);
+		req.end(over);
+	});
+	assert.equal(status, 413, 'node:http inherits the Kairo deployment limit');
+	assert.equal(runs, 1);
+
+	const exactURL = await listen(async () => new Response('x'.repeat(limit)));
+	assert.equal((await post(exactURL, '{}', { maxBodyBytes: limit })).body.length, limit);
+	const overURL = await listen(async () => new Response('x'.repeat(limit + 1)));
+	await assert.rejects(post(overURL, '{}', { maxBodyBytes: limit }), BodyTooLargeError);
+
+	const large = new Kairo({ secret, maxBodyBytes: limit });
+	large.defineAction('x', { handler: async () => 'x'.repeat(limit) });
+	const body = JSON.stringify({ run_id: 'r', act: 1, attempt: 1, action: 'x', input: null });
+	r = await large.fetchHandler()(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body, headers: { 'kairo-signature': sign(secret, body) },
+	}));
+	assert.equal(r.status, 502);
 });
 
 describe('actions over HTTP(S)', { skip: !hasGo }, () => {

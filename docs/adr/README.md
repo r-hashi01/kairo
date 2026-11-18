@@ -85,6 +85,6 @@
 | [0078](0078-share-destination-rate-state-through-the-store.md) | 埋め込みランタイムは宛先の要求数・重み・再試行待ちを保存先でプロセス間共有できる | 承認 |
 | [0079](0079-wake-sqlite-processes-with-local-notifications.md) | SQLite の別 process の決着はローカル通知で起こし、保存先を再読取して確定する | 承認 |
 | [0080](0080-replay-code-workflows-from-records-without-effects.md) | 記録だけのリプレイは保存済みの呼び出しだけを読み、作用も実行状態も変えない | 承認 |
-| [0081](0081-configurable-http-action-body-limit.md) | HTTP アクションの本文上限は配備ごとに設定し、安全な既定値と絶対上限を持つ | 提案 |
+| [0081](0081-configurable-http-action-body-limit.md) | HTTP アクションの本文上限は配備ごとに設定し、安全な既定値と絶対上限を持つ | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。

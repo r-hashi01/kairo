@@ -40,7 +40,7 @@ from typing import Any
 from .backend import Backend, HttpBackend
 from .client import KairoError, finished
 from .embedded import EffectWeakenedError, Embedded, new_token
-from .http import MAX_BODY, SignatureError, check_url, post, sign, verify
+from .http import SignatureError, check_url, normalize_max_body, post, sign, verify
 from .metrics import (
     DRAIN,
     DRAIN_DURATION,
@@ -507,6 +507,7 @@ class Kairo:
         callback_url: str | None = None,
         ca: str | None = None,
         allow_insecure: bool = False,
+        max_body_bytes: int | None = None,
         wait_until: Callable[[Awaitable[Any]], None] | None = None,
         tick_secret: str | None = None,
         wake: Callable[[int], Awaitable[None]] | None = None,
@@ -523,7 +524,9 @@ class Kairo:
         callbacks; callback_url is where this process takes outcomes (the
         ASGI app's /callback); ca, certificates to trust (PEM) besides the
         system's; allow_insecure allows plain http to other machines;
-        wait_until keeps the host running async actions after the answer.
+        max_body_bytes bounds action and callback requests and responses
+        (default 16 MiB, maximum 512 MiB); wait_until keeps the host running
+        async actions after the answer.
 
         Suspend mode (ADR 0053): tick_secret is the bearer token a scheduler
         calls the ASGI app's /tick with (without it, /tick is not served);
@@ -581,6 +584,7 @@ class Kairo:
         self._callback_url = callback_url
         self._ca = ca
         self._allow_insecure = allow_insecure
+        self._max_body_bytes = normalize_max_body(max_body_bytes)
         self._wait_until = wait_until
         self._tick_secret = tick_secret
         self._wake = wake
@@ -1180,6 +1184,7 @@ class Kairo:
                 ca=self._ca,
                 timeout=min(lease_ms, 60_000) / 1000,
                 headers={"Idempotency-Key": task.idempotency_key, "Kairo-Signature": sign(self._secret, body)},
+                max_body_bytes=self._max_body_bytes,
             )
         except OSError as e:
             # It may have run: unknown (invariant 5).
@@ -1218,8 +1223,8 @@ class Kairo:
                 declared = int(headers.get("content-length", ""))
             except ValueError:
                 declared = -1
-            if declared > MAX_BODY:
-                status, out = 413, {"error": f"request body exceeds {MAX_BODY} bytes"}
+            if declared > self._max_body_bytes:
+                status, out = 413, {"error": f"request body exceeds {self._max_body_bytes} bytes"}
             else:
                 chunks: list[bytes] = []
                 size = 0
@@ -1227,14 +1232,14 @@ class Kairo:
                     m = await receive()
                     chunk = m.get("body", b"")
                     size += len(chunk)
-                    if size > MAX_BODY:
+                    if size > self._max_body_bytes:
                         chunks = []
                         break
                     chunks.append(chunk)
                     if not m.get("more_body"):
                         break
-                if size > MAX_BODY:
-                    status, out = 413, {"error": f"request body exceeds {MAX_BODY} bytes"}
+                if size > self._max_body_bytes:
+                    status, out = 413, {"error": f"request body exceeds {self._max_body_bytes} bytes"}
                 else:
                     body = b"".join(chunks)
                     try:
@@ -1248,7 +1253,7 @@ class Kairo:
                         # Closed while it was answered (its store too): as before it.
                         status, out = 503, {"error": "closing"}
             data = json.dumps(out).encode()
-            if len(data) > MAX_BODY:
+            if len(data) > self._max_body_bytes:
                 status, data = 502, b'{"error":"response body too large"}'
             await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": data})
@@ -1319,7 +1324,14 @@ class Kairo:
             cb = json.dumps({"run_id": m["run_id"], "act": m["act"], "attempt": m["attempt"], "result": result}).encode()
             try:
                 check_url(m["callback"], self._allow_insecure)
-                await asyncio.to_thread(post, m["callback"], cb, ca=self._ca, headers={"Kairo-Signature": sign(self._secret or "", cb)})
+                await asyncio.to_thread(
+                    post,
+                    m["callback"],
+                    cb,
+                    ca=self._ca,
+                    headers={"Kairo-Signature": sign(self._secret or "", cb)},
+                    max_body_bytes=self._max_body_bytes,
+                )
             except (OSError, ValueError) as e:
                 # A lost callback: the lease expires and the step is taken up.
                 self._logger.warning("kairo: action %s: its callback: %s", m.get("action"), e)

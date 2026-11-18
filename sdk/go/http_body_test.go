@@ -28,7 +28,8 @@ func actionResultBody(size int) []byte {
 }
 
 func TestRemoteActionHTTPBodiesAreBounded(t *testing.T) {
-	exact := actionResultBody(httpaction.MaxBody)
+	const limit = 1024
+	exact := actionResultBody(limit)
 	over := append(append([]byte(nil), exact...), ' ')
 	var requestReached atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,25 +51,28 @@ func TestRemoteActionHTTPBodiesAreBounded(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	k := &Kairo{http: HTTPOptions{Secret: "s"}, client: srv.Client()}
+	k := &Kairo{http: HTTPOptions{Secret: "s", MaxBodyBytes: limit}, client: srv.Client()}
 	call := func(path string, input json.RawMessage) result {
 		return k.callRemote(context.Background(), task{RunID: "r", Action: "x", IdemKey: "r/1"}, &actionDef{url: srv.URL + path}, input)
 	}
 	if got := call("/exact", json.RawMessage(`null`)); got.Err != "" || got.Unknown || len(got.Output) == 0 {
 		t.Fatalf("exact limit: %+v", got)
 	}
-	if got := call("/over", json.RawMessage(`null`)); !got.Unknown || !strings.Contains(got.Err, "exceeds "+strconv.Itoa(httpaction.MaxBody)) {
+	if got := call("/over", json.RawMessage(`null`)); !got.Unknown || !strings.Contains(got.Err, "exceeds "+strconv.Itoa(limit)) {
 		t.Fatalf("over limit: %+v", got)
 	}
 	if got := call("/truncated", json.RawMessage(`null`)); !got.Unknown || !strings.Contains(got.Err, "truncated") {
 		t.Fatalf("truncated: %+v", got)
 	}
 
-	largeInput := json.RawMessage(fmt.Sprintf("%q", strings.Repeat("x", httpaction.MaxBody)))
+	largeInput := json.RawMessage(fmt.Sprintf("%q", strings.Repeat("x", limit)))
 	if got := call("/request", largeInput); got.Unknown || got.ErrType != "http_body_too_large" {
 		t.Fatalf("oversized request: %+v", got)
 	}
 	if requestReached.Load() {
 		t.Fatal("an oversized request reached the action server")
+	}
+	if _, err := Open(context.Background(), Options{Store: NewMemStore(), HTTP: HTTPOptions{MaxBodyBytes: httpaction.MaximumMaxBody + 1}}); err == nil {
+		t.Fatal("an HTTP body limit over the absolute maximum was accepted")
 	}
 }

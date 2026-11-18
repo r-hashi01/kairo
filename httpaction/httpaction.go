@@ -33,8 +33,31 @@ import (
 // Tolerance is how old (or how far ahead) a signed request may be.
 const Tolerance = 5 * time.Minute
 
-// MaxBody bounds an action or callback request or response body.
-const MaxBody = 16 << 20
+const (
+	// DefaultMaxBody is the default action or callback request/response limit.
+	DefaultMaxBody = 16 << 20
+	// MaximumMaxBody is the largest configurable body limit (ADR 0081).
+	MaximumMaxBody = 512 << 20
+	// MaxBody is kept as the default limit for compatibility.
+	MaxBody = DefaultMaxBody
+)
+
+// NormalizeMaxBody returns the default for zero and rejects limits outside
+// ADR 0081's configurable range.
+func NormalizeMaxBody(n int64) (int64, error) {
+	if n == 0 {
+		return DefaultMaxBody, nil
+	}
+	if n < 1 || n > MaximumMaxBody {
+		return 0, fmt.Errorf("HTTP action body limit must be between 1 and %d bytes", MaximumMaxBody)
+	}
+	return n, nil
+}
+
+// HandlerOptions configure an action HTTP handler.
+type HandlerOptions struct {
+	MaxBodyBytes int64
+}
 
 // ErrSignature is wrapped by Verify's errors.
 var ErrSignature = errors.New("signature")
@@ -126,13 +149,26 @@ func FromTask(r task.Result) (res Result, unknown bool) {
 // shape (engine.Executor's Execute); it gets the request as a task (Input
 // is the step's input), and its chunks go nowhere (no live stream here).
 func Handler(secret string, serve func(ctx context.Context, t *task.Task, emit func([]byte)) task.Result) http.Handler {
+	return handler(secret, DefaultMaxBody, serve)
+}
+
+// HandlerWithOptions is Handler with a deployment-specific body limit.
+func HandlerWithOptions(secret string, opts HandlerOptions, serve func(ctx context.Context, t *task.Task, emit func([]byte)) task.Result) (http.Handler, error) {
+	maxBody, err := NormalizeMaxBody(opts.MaxBodyBytes)
+	if err != nil {
+		return nil, err
+	}
+	return handler(secret, maxBody, serve), nil
+}
+
+func handler(secret string, maxBody int64, serve func(ctx context.Context, t *task.Task, emit func([]byte)) task.Result) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		answer := func(status int, v any) {
 			body, err := json.Marshal(v)
 			if err != nil {
 				status, body = http.StatusInternalServerError, []byte(`{"error":"encoding response"}`)
 			}
-			if len(body) > MaxBody {
+			if int64(len(body)) > maxBody {
 				status, body = http.StatusBadGateway, []byte(`{"error":"response body too large"}`)
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -147,7 +183,7 @@ func Handler(secret string, serve func(ctx context.Context, t *task.Task, emit f
 			answer(http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
 			return
 		}
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBody))
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 		if err != nil {
 			answer(http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error()})
 			return

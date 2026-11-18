@@ -200,7 +200,7 @@ KAIRO_CALLBACK_KEYS="$CURRENT_KEY,$PREVIOUS_KEY" \
   -callback-http 127.0.0.1:8421
 ```
 
-Route only `/kairo/v1/action-results/*` to the callback listener. It intentionally does not expose the control API on `:8420`. SDK workers negotiate this capability per connection; URL-backed actions receive an attempt-scoped callback URL, while other actions and older workers keep the existing protocol.
+Route only `/kairo/v1/action-results/*` to the callback listener. It intentionally does not expose the control API on `:8420`. SDK workers negotiate this capability per connection; URL-backed actions receive an attempt-scoped callback URL, while other actions and older workers keep the existing protocol. Callback bodies default to 16 MiB; set `-callback-max-body-bytes` to a value from 1 byte through 512 MiB when the deployment needs a different bound.
 
 Workers use an owner-only Unix socket by default. To listen for workers over TCP, configure the same token in kairod and every worker:
 

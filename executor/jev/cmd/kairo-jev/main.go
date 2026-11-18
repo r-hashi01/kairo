@@ -36,6 +36,7 @@ func main() {
 	concurrency := flag.Int("concurrency", 16, "steps run at once (to kairod)")
 	addr := flag.String("http", "", "serve actions over HTTP(S) at this address (POST .../action)")
 	secret := flag.String("secret", os.Getenv("KAIRO_ACTION_SECRET"), "the secret the calls are signed with (ADR 0052)")
+	maxBody := flag.Int64("max-body-bytes", httpaction.DefaultMaxBody, "maximum action request/response body (1..512 MiB)")
 	cert := flag.String("tls-cert", "", "the certificate (PEM) to serve HTTPS with")
 	key := flag.String("tls-key", "", "its key (PEM)")
 	model := flag.String("model", os.Getenv("JEV_MODEL"), "the Jev model (default: the SDK's)")
@@ -85,7 +86,11 @@ func main() {
 		if *secret == "" {
 			log.Fatal("-http needs the secret (-secret or KAIRO_ACTION_SECRET)")
 		}
-		srv := &http.Server{Addr: *addr, Handler: httpaction.Handler(*secret, x.Execute), ReadHeaderTimeout: 10 * time.Second}
+		handler, err := httpaction.HandlerWithOptions(*secret, httpaction.HandlerOptions{MaxBodyBytes: *maxBody}, x.Execute)
+		if err != nil {
+			log.Fatal(err)
+		}
+		srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 		wg.Go(func() {
 			var err error
 			if *cert != "" {

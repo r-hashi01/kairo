@@ -7,7 +7,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { HttpBackend, type Backend } from './backend.ts';
-import { BodyTooLargeError, MAX_BODY, SignatureError, checkURL, post, readBody, sign, verify } from './http.ts';
+import { BodyTooLargeError, SignatureError, checkURL, normalizeMaxBody, post, readBody, sign, verify } from './http.ts';
 import { KairoError, finished, type EffectName, type NodeSpec, type RunInfo } from './client.ts';
 import { EffectWeakenedError, Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
@@ -133,6 +133,8 @@ export interface KairoOptions {
 	callbackUrl?: string;
 	/** Certificates to trust (PEM) for actions and callbacks over https, besides the system's. */
 	ca?: string | Buffer | Array<string | Buffer>;
+	/** Action/callback request and response limit; default 16 MiB, maximum 512 MiB (ADR 0081). */
+	maxBodyBytes?: number;
 	/** Allows plain http to other machines (callbackUrl, and actions that do not say otherwise). */
 	allowInsecure?: boolean;
 	/**
@@ -504,9 +506,11 @@ export class Kairo {
 	/** Tick drains process-wide work; concurrent callers take turns. */
 	private tickTail = Promise.resolve();
 	private readonly metrics?: MetricEmitter;
+	private readonly maxBodyBytes: number;
 
 	constructor(opts: KairoOptions = {}) {
 		this.opts = opts;
+		this.maxBodyBytes = normalizeMaxBody(opts.maxBodyBytes);
 		this.metrics = opts.metrics ? new MetricEmitter(opts.metrics) : undefined;
 		this.backend =
 			opts.backend ?? new HttpBackend({ url: opts.url, worker: opts.worker, token: opts.token, concurrency: opts.concurrency });
@@ -1011,6 +1015,7 @@ export class Kairo {
 				ca: this.opts.ca,
 				timeoutMs: Math.min(leaseMs, 60_000),
 				headers: { 'idempotency-key': task.idempotency_key, 'kairo-signature': sign(this.opts.secret!, body) },
+				maxBodyBytes: this.maxBodyBytes,
 			});
 		} catch (e) {
 			// It may have run: unknown (invariant 5).
@@ -1042,13 +1047,13 @@ export class Kairo {
 	fetchHandler(): (req: Request) => Promise<Response> {
 		const json = (status: number, v: unknown) => {
 			let body = JSON.stringify(v);
-			if (Buffer.byteLength(body) > MAX_BODY) {
+			if (Buffer.byteLength(body) > this.maxBodyBytes) {
 				status = 502;
 				body = JSON.stringify({ error: 'response body too large' });
 			}
 			return new Response(body, { status, headers: { 'content-type': 'application/json' } });
 		};
-		return async (req) => {
+		const handler = async (req: Request) => {
 			if (new URL(req.url).pathname.endsWith('/tick')) {
 				if (!this.opts.tickSecret || !this.suspend) return json(404, { error: 'no such path' });
 				if (req.method !== 'GET' && req.method !== 'POST') return json(405, { error: 'GET or POST' });
@@ -1059,7 +1064,7 @@ export class Kairo {
 			if (!this.opts.secret) return json(500, { error: 'no secret configured' });
 			let body: string;
 			try {
-				body = await readBody(req);
+				body = await readBody(req, this.maxBodyBytes);
 			} catch (e) {
 				if (e instanceof BodyTooLargeError) return json(413, { error: e.message });
 				throw e;
@@ -1107,7 +1112,11 @@ export class Kairo {
 				if (unknown) return; // no callback: the lease expires and the step is taken up
 				const cb = JSON.stringify({ run_id: m.run_id, act: m.act, attempt: m.attempt, result });
 				checkURL(m.callback, this.opts.allowInsecure);
-				await post(m.callback, cb, { ca: this.opts.ca, headers: { 'kairo-signature': sign(this.opts.secret!, cb) } });
+				await post(m.callback, cb, {
+					ca: this.opts.ca,
+					headers: { 'kairo-signature': sign(this.opts.secret!, cb) },
+					maxBodyBytes: this.maxBodyBytes,
+				});
 			})().catch((e) => {
 				// A lost callback: the lease expires and the step is taken up.
 				this.logger.warn("kairo: an action's callback", { action: m.action, err: e });
@@ -1115,6 +1124,8 @@ export class Kairo {
 			this.opts.waitUntil?.(work);
 			return json(202, { accepted: true });
 		};
+		Object.defineProperty(handler, 'maxBodyBytes', { value: this.maxBodyBytes });
+		return handler;
 	}
 
 	/**

@@ -66,3 +66,19 @@ func TestActionCallbackRejectsInvalidAndExpiredCapabilities(t *testing.T) {
 		t.Fatalf("expired status = %d", w.Code)
 	}
 }
+
+func TestActionCallbackUsesConfiguredBodyLimit(t *testing.T) {
+	now := time.Unix(100, 0)
+	caps, err := httpaction.NewCallbackCapabilities("https://callbacks.example", [][]byte{[]byte(strings.Repeat("k", 32))}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := caps.Issue(&task.Task{RunID: "r", StepID: "s", Action: "a", Act: 1, Attempt: 1}, now.Add(time.Minute).UnixMilli())
+	h := (&ActionCallbacks{Capabilities: caps, MaxBodyBytes: 16}).Handler()
+	req := httptest.NewRequest(http.MethodPost, callback.URL, strings.NewReader(`{"output":"more than sixteen bytes"}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("configured limit status = %d", w.Code)
+	}
+}

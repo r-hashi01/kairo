@@ -17,15 +17,26 @@ import (
 type ActionCallbacks struct {
 	E            *engine.Engine
 	Capabilities *httpaction.CallbackCapabilities
+	MaxBodyBytes int64
 }
 
 func (a *ActionCallbacks) Handler() http.Handler {
+	maxBody, err := httpaction.NormalizeMaxBody(a.MaxBodyBytes)
+	if err != nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid callback body limit"})
+		})
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/action-results/{capability}", a.post)
+	mux.HandleFunc("POST /v1/action-results/{capability}", func(w http.ResponseWriter, r *http.Request) {
+		a.post(w, r, maxBody)
+	})
 	return mux
 }
 
-func (a *ActionCallbacks) post(w http.ResponseWriter, r *http.Request) {
+func (a *ActionCallbacks) post(w http.ResponseWriter, r *http.Request, maxBody int64) {
 	answer := func(status int, v any) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -40,7 +51,7 @@ func (a *ActionCallbacks) post(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, httpaction.MaxBody))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		answer(http.StatusRequestEntityTooLarge, map[string]string{"error": "callback body too large"})
 		return

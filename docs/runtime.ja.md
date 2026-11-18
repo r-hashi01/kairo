@@ -124,6 +124,8 @@ curl localhost:8420/v1/runs/<id>/wait
 curl -N localhost:8420/v1/runs/<id>/stream     # SSE でライブ出力を受け取る
 ```
 
+daemon が受ける callback の本文上限は既定で 16 MiB です。配備に合わせて `-callback-max-body-bytes` を 1 byte〜512 MiB の範囲で変更できます。
+
 宛先ごとのクォータは `-limits limits.json`（`{"openai":{"RPM":500,"WPM":200000,"TenantConcurrency":50}}`）で指定します。`WPM` がなければ互換性のため `TPM` を重み上限として使います。ノード仕様の `destination_from` は解決済み入力のトップレベルフィールドから実行時の宛先を選び、未指定・`null` なら固定 `destination`（それもなければ action 名）へ戻ります。worker と HTTP action は結果の `weight` で実績を、確定した再試行可能な失敗の `retry_after_ms` で最短待ちを返せます。外部ワーカーは `<data>/worker.sock` に接続します。Go からは `protocol.Worker` を使います。
 
 ## 開発

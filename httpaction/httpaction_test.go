@@ -129,23 +129,27 @@ func TestHandler(t *testing.T) {
 }
 
 func TestHandlerBoundsRequestAndResponseBodies(t *testing.T) {
+	const limit = 1024
 	var runs int
 	responseOutput := func(size int) json.RawMessage {
 		const envelope = `{"output":}`
 		rawSize := size - len(envelope)
 		return json.RawMessage(`"` + strings.Repeat("x", rawSize-2) + `"`)
 	}
-	h := Handler("s", func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
+	h, err := HandlerWithOptions("s", HandlerOptions{MaxBodyBytes: limit}, func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
 		runs++
 		switch string(tk.Input) {
 		case `"exact-response"`:
-			return task.Result{Output: responseOutput(MaxBody)}
+			return task.Result{Output: responseOutput(limit)}
 		case `"over-response"`:
-			return task.Result{Output: responseOutput(MaxBody + 1)}
+			return task.Result{Output: responseOutput(limit + 1)}
 		default:
 			return task.Result{Output: json.RawMessage(`1`)}
 		}
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	post := func(body []byte) (int, []byte) {
@@ -170,17 +174,17 @@ func TestHandlerBoundsRequestAndResponseBodies(t *testing.T) {
 		body = append(body, strings.Repeat("x", size-len(prefix)-len(suffix))...)
 		return append(body, suffix...)
 	}
-	if code, _ := post(requestBody(MaxBody)); code != http.StatusOK || runs != 1 {
+	if code, _ := post(requestBody(limit)); code != http.StatusOK || runs != 1 {
 		t.Fatalf("exact request: %d, ran %d", code, runs)
 	}
-	if code, _ := post(requestBody(MaxBody + 1)); code != http.StatusRequestEntityTooLarge || runs != 1 {
+	if code, _ := post(requestBody(limit + 1)); code != http.StatusRequestEntityTooLarge || runs != 1 {
 		t.Fatalf("oversized request: %d, ran %d", code, runs)
 	}
 	for input, want := range map[string]struct {
 		code int
 		size int
 	}{
-		`"exact-response"`: {http.StatusOK, MaxBody},
+		`"exact-response"`: {http.StatusOK, limit},
 		`"over-response"`:  {http.StatusBadGateway, len(`{"error":"response body too large"}`)},
 	} {
 		body, _ := json.Marshal(Request{RunID: "r", Action: "x", Input: json.RawMessage(input)})
@@ -188,5 +192,16 @@ func TestHandlerBoundsRequestAndResponseBodies(t *testing.T) {
 		if code != want.code || len(response) != want.size {
 			t.Errorf("%s response: %d, %d bytes", input, code, len(response))
 		}
+	}
+	for _, n := range []int64{-1, MaximumMaxBody + 1} {
+		if _, err := HandlerWithOptions("s", HandlerOptions{MaxBodyBytes: n}, func(context.Context, *task.Task, func([]byte)) task.Result { return task.Result{} }); err == nil {
+			t.Errorf("limit %d accepted", n)
+		}
+	}
+	if got, err := NormalizeMaxBody(0); err != nil || got != DefaultMaxBody {
+		t.Fatalf("default limit = %d, %v", got, err)
+	}
+	if got, err := NormalizeMaxBody(MaximumMaxBody); err != nil || got != MaximumMaxBody {
+		t.Fatalf("absolute maximum = %d, %v", got, err)
 	}
 }
