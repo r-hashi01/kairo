@@ -2,7 +2,16 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { test } from 'node:test';
 
-import { CAPABILITY_ASYNC_ACTION_CALLBACK, CAPABILITY_GRACEFUL_DRAIN, FrameReader, MsgType, encodeFrame, resultBody } from './protocol.ts';
+import {
+	CAPABILITY_ASYNC_ACTION_CALLBACK,
+	CAPABILITY_GRACEFUL_DRAIN,
+	FrameReader,
+	MAX_FRAME,
+	MsgType,
+	ProtocolError,
+	encodeFrame,
+	resultBody,
+} from './protocol.ts';
 import { DrainUnsupportedError, Worker, iterationOf, nodeOf } from './worker.ts';
 
 // A fake runtime: hands out tasks, records what the worker says.
@@ -11,6 +20,9 @@ function runtime(onFrame: (type: number, body: any, send: (t: number, b: unknown
 		const server = net.createServer((sock) => {
 			const reader = new FrameReader();
 			const send = (t: number, b: unknown) => sock.write(encodeFrame(t, b));
+			sock.on('error', () => {
+				// Session-failure tests deliberately reset the worker connection.
+			});
 			sock.on('data', (d) => {
 				for (const [t, b] of reader.push(d)) onFrame(t, b, send);
 			});
@@ -71,6 +83,71 @@ test('frames split across reads', () => {
 	assert.deepEqual(r.push(f.subarray(0, 3)), []);
 	assert.deepEqual(r.push(f.subarray(3, 12)), [[MsgType.Credit, { n: 2 }]]);
 	assert.deepEqual(r.push(f.subarray(12)), [[MsgType.Credit, { n: 3 }]]);
+});
+
+test('malformed known messages fail the worker session', async () => {
+	const cases: Array<[number, unknown]> = [
+		[MsgType.Hello, null],
+		[MsgType.Task, {}],
+		[MsgType.Cancel, { seq: 0 }],
+		[MsgType.Credit, { n: 'bad' }],
+		[MsgType.RunEnd, {}],
+	];
+	for (const [messageType, messageBody] of cases) {
+		const rt = await runtime((type, _body, send) => {
+			if (type === MsgType.Hello) send(messageType, messageBody);
+		});
+		const worker = new Worker({ name: 'malformed', actions: ['echo'], concurrency: 1, handler: async () => ({ output: null }) });
+		await assert.rejects(worker.run({ host: '127.0.0.1', port: rt.port }), ProtocolError);
+		assert.equal(worker.inflightTasks, 0);
+		rt.close();
+	}
+});
+
+test('unserializable result fails drain and releases inflight', async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let taskStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		taskStarted = resolve;
+	});
+	const rt = await runtime((type, _body, send) => {
+		if (type === MsgType.Hello) {
+			send(MsgType.Hello, { capabilities: [CAPABILITY_GRACEFUL_DRAIN] });
+			send(MsgType.Task, { seq: 1, action: 'echo' });
+		}
+		if (type === MsgType.Credit) send(MsgType.Credit, { n: 0 });
+	});
+	const worker = new Worker({
+		name: 'bad-result',
+		actions: ['echo'],
+		concurrency: 1,
+		handler: async () => {
+			taskStarted();
+			await held;
+			const circular: unknown[] = [];
+			circular.push(circular);
+			return { output: circular };
+		},
+	});
+	const running = worker.run({ host: '127.0.0.1', port: rt.port });
+	const runFailed = assert.rejects(running);
+	await started;
+	const draining = worker.drain();
+	release();
+	await assert.rejects(draining);
+	await runFailed;
+	assert.equal(worker.inflightTasks, 0);
+	rt.close();
+});
+
+test('oversized result frame is rejected before writing', () => {
+	assert.throws(
+		() => encodeFrame(MsgType.Result, { seq: 1, output: 'x'.repeat(MAX_FRAME) }),
+		ProtocolError,
+	);
 });
 
 test('run ends, asked for in the hello', async () => {

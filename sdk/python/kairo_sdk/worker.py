@@ -20,6 +20,7 @@ from .protocol import (
     Credit,
     Hello,
     MsgType,
+    ProtocolError,
     Result,
     read_frame,
     write_frame,
@@ -212,6 +213,18 @@ class Worker:
             write_frame(w, t, body)
             w.flush()
 
+    def _fail_session(self, error: Exception) -> None:
+        with self._state:
+            if self._failed is None:
+                self._failed = error
+            self._state.notify_all()
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def run(self, addr: str | tuple[str, int]) -> None:
         if isinstance(addr, str):
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -252,18 +265,37 @@ class Worker:
                         typ, body = read_frame(r)
                     except (EOFError, OSError):
                         break
+                    except Exception as e:
+                        self._fail_session(e)
+                        break
                     if typ != MsgType.HELLO:
                         with self._state:
                             if not self._negotiated:
                                 self._negotiated = True
                                 self._state.notify_all()
                     if typ == MsgType.HELLO:
-                        capabilities = body.get("capabilities", []) if isinstance(body, dict) else []
+                        if not isinstance(body, dict):
+                            self._fail_session(ProtocolError("Hello body is not an object"))
+                            break
+                        capabilities = body.get("capabilities", [])
+                        if not isinstance(capabilities, list) or not all(
+                            isinstance(capability, str) for capability in capabilities
+                        ):
+                            self._fail_session(ProtocolError("Hello capabilities is not a string list"))
+                            break
                         with self._state:
                             self._negotiated = True
                             self._drain_cap = CAPABILITY_GRACEFUL_DRAIN in capabilities
                             self._state.notify_all()
                     elif typ == MsgType.TASK:
+                        if (
+                            not isinstance(body, dict)
+                            or not isinstance(body.get("seq"), int)
+                            or isinstance(body.get("seq"), bool)
+                            or body["seq"] <= 0
+                        ):
+                            self._fail_session(ProtocolError("Task body has no valid sequence"))
+                            break
                         task = Task.from_body(body)
                         ctx = TaskContext(lambda d, s=task.seq: self._send(w, MsgType.CHUNK, Chunk(s, d).body()))
                         with self._clock:
@@ -273,14 +305,29 @@ class Worker:
                             self._state.notify_all()
                         pool.submit(self._serve, w, task, ctx)
                     elif typ == MsgType.CANCEL:
-                        c = Cancel(body.get("seq", 0))
+                        if (
+                            not isinstance(body, dict)
+                            or not isinstance(body.get("seq"), int)
+                            or isinstance(body.get("seq"), bool)
+                            or body["seq"] <= 0
+                        ):
+                            self._fail_session(ProtocolError("Cancel body has no valid sequence"))
+                            break
+                        c = Cancel(body["seq"])
                         with self._clock:
                             ctx = self._cancels.get(c.seq)
                         if ctx is not None:
                             ctx.cancelled.set()
                     elif typ == MsgType.CREDIT:
+                        if (
+                            not isinstance(body, dict)
+                            or not isinstance(body.get("n"), int)
+                            or isinstance(body.get("n"), bool)
+                        ):
+                            self._fail_session(ProtocolError("Credit body has no valid count"))
+                            break
                         with self._state:
-                            n = int(body.get("n", 0))
+                            n = body["n"]
                             if self._draining and n == 0:
                                 self._drain_ack = True
                             elif self._draining and n > 0:
@@ -292,7 +339,7 @@ class Worker:
                     for ctx in self._cancels.values():
                         ctx.cancelled.set()
                 with self._state:
-                    if self._draining and not (self._drain_ack and self._inflight == 0 and self._pending_acks == 0):
+                    if self._failed is None and self._draining and not (self._drain_ack and self._inflight == 0 and self._pending_acks == 0):
                         self._failed = ConnectionError("worker connection closed while draining")
                     self._writer = None
                     self._state.notify_all()
@@ -316,11 +363,11 @@ class Worker:
             try:
                 write_frame(w, MsgType.RESULT, res.body())
                 w.flush()
-            except OSError as e:
+            except Exception as e:
                 with self._state:
                     if needs_ack:
                         self._pending_acks -= 1
-                    self._failed = e
+                self._fail_session(e)
             finally:
                 with self._state:
                     self._inflight -= 1
@@ -352,9 +399,11 @@ class Worker:
                     w.flush()
                     self._state.notify_all()
         with self._state:
-            while not (self._drain_ack and self._inflight == 0 and self._pending_acks == 0):
+            while True:
                 if self._failed is not None:
                     raise self._failed
+                if self._drain_ack and self._inflight == 0 and self._pending_acks == 0:
+                    return
                 self._state.wait()
 
     @property
