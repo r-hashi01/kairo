@@ -87,5 +87,6 @@
 | [0080](0080-replay-code-workflows-from-records-without-effects.md) | 記録だけのリプレイは保存済みの呼び出しだけを読み、作用も実行状態も変えない | 承認 |
 | [0081](0081-configurable-http-action-body-limit.md) | HTTP アクションの本文上限は配備ごとに設定し、安全な既定値と絶対上限を持つ | 承認 |
 | [0082](0082-durable-explicit-registry-catalog.md) | 永続レジストリは版付きカタログとして耐久化し、現行計画を明示する | 承認 |
+| [0083](0083-store-assigned-run-creation-order.md) | 列挙する実行は保存先が割り当てる作成序数で並べる | 提案 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
