@@ -39,7 +39,8 @@ type Sink interface {
 
 // Retirer is implemented by sinks that can drop records no longer needed.
 // Retire may discard records with LSN < lsn, and only whole segments: the
-// content of a segment is never rewritten or truncated.
+// content of a segment is never rewritten or truncated. Durable sinks return
+// only after the retirement metadata is durable.
 type Retirer interface {
 	Retire(lsn uint64) error
 }

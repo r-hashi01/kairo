@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -136,7 +137,9 @@ func (s *shard) recover() error {
 		if x.startLSN == 0 && !haveSnap {
 			// Its history is gone: it finished and its records were retired.
 			log.Printf("kairo: shard %d: run %s has no start record and no snapshot; treating it as finished", s.id, id)
-			s.e.deleteBlobs(id)
+			if err := s.e.deleteBlobs(id); err != nil {
+				return fmt.Errorf("run %s: deleting leftover blobs: %w", id, err)
+			}
 			continue
 		}
 		last := from
@@ -166,7 +169,9 @@ func (s *shard) recover() error {
 				s.e.addRecoveredChild(x.meta.Parent, id, true)
 			}
 			if x.tier < TierFile {
-				s.e.deleteBlobs(id)
+				if err := s.e.deleteBlobs(id); err != nil {
+					return fmt.Errorf("run %s: deleting blobs: %w", id, err)
+				}
 				continue
 			}
 			if d := s.doneLog; d != nil {
@@ -214,9 +219,8 @@ func (s *shard) recover() error {
 				s.pins[id] = r
 				s.waitFeed(r, func() {
 					s.e.doIO(func() {
-						s.e.snaps.Delete("snap/" + id)
-						s.e.deleteBlobs(id)
-						s.inbox.Push(msg{kind: mSnapDeleted, run: r})
+						err := errors.Join(s.e.snaps.Delete("snap/"+id), s.e.deleteBlobs(id))
+						s.inbox.Push(msg{kind: mSnapDeleted, run: r, err: err})
 					})
 				})
 				continue
@@ -267,8 +271,9 @@ func (s *shard) recover() error {
 		}
 	}
 	for _, id := range finished {
-		s.e.snaps.Delete("snap/" + id)
-		s.e.deleteBlobs(id)
+		if err := errors.Join(s.e.snaps.Delete("snap/"+id), s.e.deleteBlobs(id)); err != nil {
+			return fmt.Errorf("run %s: deleting snapshot and blobs: %w", id, err)
+		}
 	}
 	if d := s.doneLog; d != nil && d.expired > 0 {
 		d.expired = 0

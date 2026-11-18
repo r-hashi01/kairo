@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,8 @@ type Store interface {
 	// Put atomically replaces the object at key.
 	Put(key string, data []byte) error
 	Get(key string) ([]byte, error)
+	// Delete removes key. Durable stores return only after the deletion is
+	// durable; callers may retire the object's last reference after that.
 	Delete(key string) error
 }
 
@@ -29,7 +32,8 @@ type Store interface {
 // once (ADR 0024). The engine stores each run's blobs under the group
 // "run/<run id>" and deletes the group when the run is finished.
 type Grouper interface {
-	// DeleteGroup deletes every object whose key starts with group + "/".
+	// DeleteGroup durably deletes every object whose key starts with group
+	// + "/" before returning for a durable store.
 	DeleteGroup(group string) error
 }
 
@@ -120,15 +124,21 @@ func (s *Mem) Len() int {
 // Dir stores objects as files; Put writes a temp file, fsyncs and renames
 // it over the target, which is atomic on POSIX filesystems.
 type Dir struct {
-	root   string
-	noSync bool
+	root        string
+	noSync      bool
+	dirSync     func(string) error
+	dirMu       sync.Mutex
+	durableDirs map[string]struct{}
 }
 
 func NewDir(root string, noSync bool) (*Dir, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
-	return &Dir{root: root, noSync: noSync}, nil
+	return &Dir{
+		root: root, noSync: noSync, dirSync: syncDir,
+		durableDirs: map[string]struct{}{filepath.Clean(root): {}},
+	}, nil
 }
 
 // path is where key is stored: the SHA-256 of the name, so any name maps
@@ -155,10 +165,13 @@ func (s *Dir) DeleteGroup(group string) error {
 	if err := os.RemoveAll(d); err != nil {
 		return err
 	}
+	s.dirMu.Lock()
+	delete(s.durableDirs, filepath.Clean(d))
+	s.dirMu.Unlock()
 	if s.noSync {
 		return nil
 	}
-	if err := syncDir(filepath.Dir(d)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.dirSync(filepath.Dir(d)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -185,7 +198,7 @@ func (s *Dir) legacyPath(key string) (string, bool) {
 
 func (s *Dir) Put(key string, data []byte) error {
 	p := s.path(key)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := s.ensureDir(filepath.Dir(p)); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
@@ -209,24 +222,57 @@ func (s *Dir) Put(key string, data []byte) error {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), p); err != nil {
+		os.Remove(tmp.Name())
 		return err
 	}
 	if !s.noSync {
-		// Make the rename (and a newly created subdirectory) durable:
-		// callers such as log compaction rely on the object surviving a
-		// power loss.
-		if err := syncDir(filepath.Dir(p)); err != nil {
-			return err
-		}
-		if err := syncDir(s.root); err != nil {
+		// Make the rename durable. ensureDir made each directory entry from
+		// root through the leaf durable before the file was created.
+		if err := s.dirSync(filepath.Dir(p)); err != nil {
 			return err
 		}
 	}
 	// The new copy is in place: a copy in the previous format is stale.
 	if lp, ok := s.legacyPath(key); ok {
-		if err := os.Remove(lp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.removeDurable(lp); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ensureDir creates each directory below root separately and makes its
+// entry durable before using it. Directories whose entry has already been
+// synced are remembered, avoiding repeated parent fsyncs on later puts.
+func (s *Dir) ensureDir(dir string) error {
+	if s.noSync {
+		return os.MkdirAll(dir, 0o755)
+	}
+	root, dir := filepath.Clean(s.root), filepath.Clean(dir)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("blob: directory %s is outside root %s", dir, root)
+	}
+	if rel == "." {
+		return nil
+	}
+	s.dirMu.Lock()
+	defer s.dirMu.Unlock()
+	parent := root
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		next := filepath.Join(parent, part)
+		if _, ok := s.durableDirs[next]; ok {
+			parent = next
+			continue
+		}
+		if err := os.Mkdir(next, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if err := s.dirSync(parent); err != nil {
+			return err
+		}
+		s.durableDirs[next] = struct{}{}
+		parent = next
 	}
 	return nil
 }
@@ -236,8 +282,11 @@ func syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func (s *Dir) Get(key string) ([]byte, error) {
@@ -254,13 +303,35 @@ func (s *Dir) Get(key string) ([]byte, error) {
 }
 
 func (s *Dir) Delete(key string) error {
-	if err := os.Remove(s.path(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.removeDurable(s.path(key)); err != nil {
 		return err
 	}
 	if lp, ok := s.legacyPath(key); ok {
-		if err := os.Remove(lp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.removeDurable(lp); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Dir) removeDurable(path string) error {
+	if err := os.Remove(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		// A prior attempt may have removed the file but failed to sync its
+		// parent. Sync again so retrying a deletion cannot report success
+		// while its directory entry is still not known to be durable.
+		if s.noSync {
+			return nil
+		}
+		if err := s.dirSync(filepath.Dir(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if s.noSync {
+		return nil
+	}
+	return s.dirSync(filepath.Dir(path))
 }
