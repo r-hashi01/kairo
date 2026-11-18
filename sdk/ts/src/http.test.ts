@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import { createServer as createTLSServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
-import { checkURL, nodeHandler, post, sign } from './http.ts';
+import { BodyTooLargeError, MAX_BODY, MAXIMUM_MAX_BODY, checkURL, nodeHandler, normalizeMaxBody, post, sign } from './http.ts';
 import { SQLiteStore } from './store.ts';
 import { Kairo, RetryableError, Suspended, UnknownOutcomeError } from './workflow.ts';
 
@@ -68,6 +68,122 @@ async function callbackServer(): Promise<{ url: string; to: (k: Kairo) => void }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function actionBody(size: number): string {
+	const prefix = '{"run_id":"r","act":1,"attempt":1,"action":"x","input":"';
+	const suffix = '"}';
+	assert.ok(size >= prefix.length + suffix.length);
+	return prefix + 'x'.repeat(size - prefix.length - suffix.length) + suffix;
+}
+
+test('action and callback request bodies are bounded before execution', async () => {
+	let runs = 0;
+	const k = new Kairo({ secret });
+	k.defineAction('x', { handler: async () => (runs++, 1) });
+	const serve = k.fetchHandler();
+	const exact = actionBody(MAX_BODY);
+	let r = await serve(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body: exact, headers: { 'kairo-signature': sign(secret, exact) },
+	}));
+	assert.equal(r.status, 200);
+	assert.equal(runs, 1);
+
+	const over = exact + ' ';
+	for (const path of ['/kairo/action', '/kairo/callback']) {
+		r = await serve(new Request(`http://127.0.0.1${path}`, {
+			method: 'POST', body: over, headers: { 'kairo-signature': sign(secret, over) },
+		}));
+		assert.equal(r.status, 413, path);
+	}
+	assert.equal(runs, 1, 'an oversized action request did not run');
+
+	const base = await listen(serve);
+	const status = await new Promise<number>((resolve, reject) => {
+		const req = httpRequest(base + '/kairo/action', { method: 'POST', headers: { 'kairo-signature': sign(secret, over) } }, (res) => {
+			res.resume();
+			res.on('end', () => resolve(res.statusCode ?? 0));
+		});
+		req.on('error', reject);
+		req.write(over.slice(0, MAX_BODY));
+		req.end(over.slice(MAX_BODY));
+	});
+	assert.equal(status, 413, 'node:http adapter also bounds a chunked request');
+});
+
+test('action HTTP client bounds requests and responses', async () => {
+	const exactURL = await listen(async () => new Response('x'.repeat(MAX_BODY)));
+	const exact = await post(exactURL, '{}');
+	assert.equal(Buffer.byteLength(exact.body), MAX_BODY);
+
+	const overURL = await listen(async () => new Response('x'.repeat(MAX_BODY + 1)));
+	await assert.rejects(post(overURL, '{}'), BodyTooLargeError);
+	await assert.rejects(post('http://127.0.0.1:1', 'x'.repeat(MAX_BODY + 1)), BodyTooLargeError);
+
+	const truncated = createServer((_req, res) => {
+		res.writeHead(200, { 'content-length': '10', connection: 'close' });
+		res.end('x');
+	});
+	servers.push(truncated);
+	await new Promise<void>((r) => truncated.listen(0, '127.0.0.1', r));
+	const port = (truncated.address() as AddressInfo).port;
+	await assert.rejects(post(`http://127.0.0.1:${port}`, '{}'), /truncated|aborted/);
+});
+
+test('the serving side does not emit an oversized successful result', async () => {
+	const k = new Kairo({ secret });
+	k.defineAction('x', { handler: async () => 'x'.repeat(MAX_BODY) });
+	const body = JSON.stringify({ run_id: 'r', act: 1, attempt: 1, action: 'x', input: null });
+	const r = await k.fetchHandler()(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body, headers: { 'kairo-signature': sign(secret, body) },
+	}));
+	assert.equal(r.status, 502);
+	assert.deepEqual(await r.json(), { error: 'response body too large' });
+});
+
+test('the action body limit is configurable within its absolute maximum', async () => {
+	const limit = 1024;
+	assert.equal(normalizeMaxBody(MAXIMUM_MAX_BODY), MAXIMUM_MAX_BODY);
+	assert.throws(() => new Kairo({ maxBodyBytes: 0 }), /between 1/);
+	assert.throws(() => new Kairo({ maxBodyBytes: MAXIMUM_MAX_BODY + 1 }), /between 1/);
+	assert.throws(() => post('http://127.0.0.1:1', '{}', { maxBodyBytes: MAXIMUM_MAX_BODY + 1 }), /between 1/);
+
+	let runs = 0;
+	const k = new Kairo({ secret, maxBodyBytes: limit });
+	k.defineAction('x', { handler: async () => (runs++, 1) });
+	const exact = actionBody(limit);
+	let r = await k.fetchHandler()(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body: exact, headers: { 'kairo-signature': sign(secret, exact) },
+	}));
+	assert.equal(r.status, 200);
+
+	const over = exact + ' ';
+	const base = await listen(k.fetchHandler());
+	const status = await new Promise<number>((resolve, reject) => {
+		const req = httpRequest(base + '/kairo/action', {
+			method: 'POST', headers: { 'content-length': Buffer.byteLength(over), 'kairo-signature': sign(secret, over) },
+		}, (res) => {
+			res.resume();
+			res.on('end', () => resolve(res.statusCode ?? 0));
+		});
+		req.on('error', reject);
+		req.end(over);
+	});
+	assert.equal(status, 413, 'node:http inherits the Kairo deployment limit');
+	assert.equal(runs, 1);
+
+	const exactURL = await listen(async () => new Response('x'.repeat(limit)));
+	assert.equal((await post(exactURL, '{}', { maxBodyBytes: limit })).body.length, limit);
+	const overURL = await listen(async () => new Response('x'.repeat(limit + 1)));
+	await assert.rejects(post(overURL, '{}', { maxBodyBytes: limit }), BodyTooLargeError);
+
+	const large = new Kairo({ secret, maxBodyBytes: limit });
+	large.defineAction('x', { handler: async () => 'x'.repeat(limit) });
+	const body = JSON.stringify({ run_id: 'r', act: 1, attempt: 1, action: 'x', input: null });
+	r = await large.fetchHandler()(new Request('http://127.0.0.1/kairo/action', {
+		method: 'POST', body, headers: { 'kairo-signature': sign(secret, body) },
+	}));
+	assert.equal(r.status, 502);
+});
 
 describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 	test('an action answers at once (200)', async () => {
@@ -241,6 +357,24 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 		assert.equal(calls.flaky, 2);
 		assert.match(String(await k.run('w', 'down', { id: 'st-down' })), /blocked/);
 		assert.equal(calls.down, 1);
+		await k.close();
+	});
+
+	test('an oversized response is an unknown real-action outcome', async () => {
+		const actionURL = await listen(async () => new Response('x'.repeat(MAX_BODY + 1)));
+		const cb = await callbackServer();
+		const k = new Kairo({ backend: await EmbeddedBackend.open({ store: new SQLiteStore(join(dir, 'large-response.db')), wasm }), secret, callbackUrl: cb.url });
+		k.defineAction('large', { effect: 'real', url: actionURL, handler: async () => null });
+		k.workflow('w', async (ctx) => {
+			try {
+				return await ctx.call('large', {});
+			} catch (e) {
+				return String((e as Error).message);
+			}
+		});
+		await k.start();
+		cb.to(k);
+		assert.match(String(await k.run('w', null, { id: 'large-response' })), /blocked/);
 		await k.close();
 	});
 

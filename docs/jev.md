@@ -31,7 +31,7 @@ go run ./cmd/kairo-jev -worker /var/lib/kairo/worker.sock -actions jev.noul,jev.
 KAIRO_ACTION_SECRET=... go run ./cmd/kairo-jev -http :8443 -tls-cert cert.pem -tls-key key.pem
 ```
 
-両方を同時に指定することもできます。
+両方を同時に指定することもできます。HTTP の要求・応答本文は既定で 16 MiB までで、`-max-body-bytes` を 1 byte〜512 MiB の範囲で配備ごとに変更できます。
 
 ## kairod の定義で分岐する
 

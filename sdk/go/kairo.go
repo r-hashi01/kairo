@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/r-hashi01/kairo/httpaction"
 	opmetrics "github.com/r-hashi01/kairo/metrics"
 	"github.com/r-hashi01/kairo/protocol"
 	"github.com/r-hashi01/kairo/wasmcore"
@@ -381,6 +382,11 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	if opts.Store == nil {
 		return nil, errors.New("kairo: Options.Store is required")
 	}
+	maxBody, err := httpaction.NormalizeMaxBody(opts.HTTP.MaxBodyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("kairo: HTTP.MaxBodyBytes: %w", err)
+	}
+	opts.HTTP.MaxBodyBytes = maxBody
 	nowFn := opts.Now
 	if nowFn == nil {
 		nowFn = time.Now

@@ -39,6 +39,7 @@ func main() {
 		httpAddr     = flag.String("http", "127.0.0.1:8420", "control API listen address")
 		callbackURL  = flag.String("callback-url", "", "public HTTPS base for daemon-owned action callbacks (enables callbacks; keys come from KAIRO_CALLBACK_KEYS)")
 		callbackAddr = flag.String("callback-http", "127.0.0.1:8421", "callback-only listen address, normally behind the callback URL's TLS proxy")
+		callbackMax  = flag.Int64("callback-max-body-bytes", httpaction.DefaultMaxBody, "maximum daemon-owned action callback body (1..512 MiB)")
 		sockPath     = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
 		tcpAddr      = flag.String("worker-tcp", "", "optional TCP address for workers (requires KAIRO_WORKER_TOKEN)")
 		insecureTCP  = flag.Bool("allow-insecure-worker-tcp", false, "allow worker TCP without authentication (development only)")
@@ -56,6 +57,10 @@ func main() {
 		idemTTL      = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
+	maxCallbackBody, err := httpaction.NormalizeMaxBody(*callbackMax)
+	if err != nil {
+		log.Fatal(err)
+	}
 	workerToken := os.Getenv("KAIRO_WORKER_TOKEN")
 	if err := validateWorkerListener(*tcpAddr, workerToken, *insecureTCP); err != nil {
 		log.Fatal(err)
@@ -204,7 +209,7 @@ func main() {
 	}()
 	var callbackSrv *http.Server
 	if callbacks != nil {
-		callbackSrv = &http.Server{Addr: *callbackAddr, Handler: (&api.ActionCallbacks{E: e, Capabilities: callbacks}).Handler()}
+		callbackSrv = &http.Server{Addr: *callbackAddr, Handler: (&api.ActionCallbacks{E: e, Capabilities: callbacks, MaxBodyBytes: maxCallbackBody}).Handler()}
 		go func() {
 			if err := callbackSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatal(err)

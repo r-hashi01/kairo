@@ -7,21 +7,42 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import ssl
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 #: How old a signed request may be (ms).
 SIGNATURE_TOLERANCE = 5 * 60 * 1000
+#: Default action or callback HTTP request/response body limit (bytes).
+DEFAULT_MAX_BODY = 16 << 20
+#: Largest configurable body limit (ADR 0081).
+MAXIMUM_MAX_BODY = 512 << 20
+#: Kept as the default limit for compatibility.
+MAX_BODY = DEFAULT_MAX_BODY
 
 _LOCAL = {"localhost", "127.0.0.1", "::1"}
 
 
 class SignatureError(Exception):
     pass
+
+
+class BodyTooLargeError(OSError):
+    pass
+
+
+def normalize_max_body(n: int | None = None) -> int:
+    """Returns the default for None and validates ADR 0081's range."""
+    if n is None:
+        return DEFAULT_MAX_BODY
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1 or n > MAXIMUM_MAX_BODY:
+        raise ValueError(f"max_body_bytes must be between 1 and {MAXIMUM_MAX_BODY}")
+    return n
 
 
 def _mac(secret: str, t: int, body: bytes) -> str:
@@ -70,9 +91,20 @@ class Response:
     body: bytes
 
 
-def post(url: str, body: bytes, *, ca: str | None = None, timeout: float = 30, headers: dict[str, str] | None = None) -> Response:
+def post(
+    url: str,
+    body: bytes,
+    *,
+    ca: str | None = None,
+    timeout: float = 30,
+    headers: dict[str, str] | None = None,
+    max_body_bytes: int | None = None,
+) -> Response:
     """POSTs a JSON body (blocking); raises OSError on a network error or a
     timeout. ca: certificates to trust (PEM), besides the system's."""
+    limit = normalize_max_body(max_body_bytes)
+    if len(body) > limit:
+        raise BodyTooLargeError(f"request body exceeds {limit} bytes")
     req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json", **(headers or {})})
     ctx = None
     if url.startswith("https:"):
@@ -81,7 +113,26 @@ def post(url: str, body: bytes, *, ca: str | None = None, timeout: float = 30, h
             ctx.load_verify_locations(cadata=ca)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            return Response(r.status, r.read())
+            return Response(r.status, _read_limited(r, limit))
     except urllib.error.HTTPError as e:
         with e:
-            return Response(e.code, e.read())
+            return Response(e.code, _read_limited(e, limit))
+
+
+def _read_limited(response: Any, limit: int) -> bytes:
+    raw = response.headers.get("Content-Length")
+    try:
+        declared = int(raw) if raw is not None else None
+    except ValueError:
+        declared = None
+    if declared is not None and declared > limit:
+        raise BodyTooLargeError(f"response body exceeds {limit} bytes")
+    try:
+        body = response.read(limit + 1)
+    except (http.client.IncompleteRead, OSError) as e:
+        raise OSError("response body was truncated") from e
+    if declared is not None and declared >= 0 and len(body) < declared:
+        raise OSError("response body was truncated")
+    if len(body) > limit:
+        raise BodyTooLargeError(f"response body exceeds {limit} bytes")
+    return body

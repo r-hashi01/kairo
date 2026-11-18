@@ -24,6 +24,7 @@ suspend モードの `Kairo` は、今進められるところまで進めて返
 - **保存先は PostgreSQL にします。** サーバーレスの関数のファイルシステムは呼び出しをまたいで残らないので、SQLite は使えません。
 - **呼び出しのたびに `Kairo` を作り、`start()` します。** 作るたびに WASM の読み込みがかかります（Node で約 20ms、Python で約 240ms。ADR 0051 の計測）。
 - **秘密を 2 つ用意します。** `tickSecret` は `/tick` の Bearer トークン、`secret` は HTTP のアクションとコールバックの署名に使います。HTTP のアクションを使わないなら、`secret` は要りません。
+- **HTTP アクションとコールバックの本文は、要求・応答とも既定で 16 MiB までです。** 配備ごとに `maxBodyBytes`（Python は `max_body_bytes`、Go は `HTTP.MaxBodyBytes`）を 1 byte〜512 MiB で変更できます。大きすぎる要求は handler を動かす前に 413 で拒み、大きすぎる応答や途中で切れた応答は成功として読みません。
 
 ```ts
 // kairo.ts
