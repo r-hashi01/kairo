@@ -2,9 +2,8 @@ package engine
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -72,18 +71,15 @@ func (e *Engine) DriveCandidates(ctx context.Context) ([]DriveCandidate, error) 
 	return out, nil
 }
 
-func driveToken() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
 // ClaimWorkflow atomically claims a ready code workflow.
 func (e *Engine) ClaimWorkflow(ctx context.Context, runID, owner string, lease time.Duration) (DriveClaim, bool, error) {
 	if owner == "" || lease <= 0 {
 		return DriveClaim{}, false, errors.New("engine: drive owner and positive lease are required")
 	}
-	token := driveToken()
+	token, err := e.randomHex(16)
+	if err != nil {
+		return DriveClaim{}, false, fmt.Errorf("engine: generating workflow claim token: %w", err)
+	}
 	until := e.cfg.Now().Add(lease).UnixMilli()
 	reply := make(chan driveReply, 1)
 	e.shardFor(runID).inbox.Push(msg{kind: mDriveClaim, runID: runID, driveToken: token, driveOwner: owner, driveUntil: until, driveReply: reply})

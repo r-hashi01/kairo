@@ -3,10 +3,32 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestWorkflowClaimEntropyFailureLeavesWorkflowReady(t *testing.T) {
+	entropyErr := errors.New("entropy unavailable")
+	e := newEngine(t, Config{Shards: 2, Random: errorReader{err: entropyErr}})
+	defer e.Close()
+	registerParentPlans(t, e)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submit(e, SubmitRequest{Plan: "kairo.workflow", RunID: "wf", Input: json.RawMessage(`{"workflow":"orders","version":"1"}`), Drive: true}); err != nil {
+		t.Fatal(err)
+	}
+	claim, ok, err := e.ClaimWorkflow(context.Background(), "wf", "driver", time.Minute)
+	if !errors.Is(err, entropyErr) || ok || claim.Token != "" {
+		t.Fatalf("claim = %+v, %v, %v", claim, ok, err)
+	}
+	rows, err := e.DriveCandidates(context.Background())
+	if err != nil || len(rows) != 1 || !rows[0].Ready || rows[0].Until != 0 {
+		t.Fatalf("candidates after entropy failure = %+v, %v", rows, err)
+	}
+}
 
 func TestWorkflowDriveClaimsAreFencedAndExpire(t *testing.T) {
 	var add atomic.Int64

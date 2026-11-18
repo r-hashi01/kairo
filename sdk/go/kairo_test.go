@@ -2,14 +2,90 @@ package kairo
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+type entropyErrorReader struct{ err error }
+
+func (r entropyErrorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestOpenAndRunPropagateEntropyFailures(t *testing.T) {
+	entropyErr := errors.New("entropy unavailable")
+	if _, err := Open(context.Background(), Options{Store: NewMemStore(), Random: entropyErrorReader{err: entropyErr}}); !errors.Is(err, entropyErr) {
+		t.Fatalf("Open error = %v", err)
+	}
+
+	k, err := Open(context.Background(), Options{Store: NewMemStore(), Owner: "test", Mode: Suspend, Random: entropyErrorReader{err: entropyErr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	Workflow(k, "entropy", func(*Context, any) (string, error) { return "ok", nil })
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run[string](context.Background(), k, "entropy", nil, WithID("entropy-run")); !errors.Is(err, entropyErr) {
+		t.Fatalf("Run error = %v", err)
+	}
+	if _, err := k.Get(context.Background(), "entropy-run"); !errors.Is(err, ErrUnknownRun) {
+		t.Fatalf("run was created after entropy failure: %v", err)
+	}
+	if _, err := k.SendSignal(context.Background(), "entropy-run", "go", nil); !errors.Is(err, entropyErr) {
+		t.Fatalf("SendSignal error = %v", err)
+	}
+}
+
+func TestGeneratedWorkflowIDRetriesCollision(t *testing.T) {
+	firstToken := []byte{0, 0, 0, 1}
+	collisionBytes := bytes.Repeat([]byte{0x11}, 16)
+	collisionToken := []byte{0, 0, 0, 2}
+	uniqueBytes := bytes.Repeat([]byte{0x22}, 16)
+	uniqueToken := []byte{0, 0, 0, 3}
+	stream := append([]byte{}, firstToken...)
+	stream = append(stream, collisionBytes...)
+	stream = append(stream, collisionToken...)
+	stream = append(stream, uniqueBytes...)
+	stream = append(stream, uniqueToken...)
+	k, err := Open(context.Background(), Options{Store: NewMemStore(), Owner: "test", Mode: Suspend, Random: bytes.NewReader(stream)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	Workflow(k, "collision", func(*Context, any) (string, error) { return "ok", nil })
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	collisionID := strings.Repeat("11", 16)
+	if got, err := Run[string](context.Background(), k, "collision", nil, WithID(collisionID)); err != nil || got != "ok" {
+		t.Fatalf("first Run = %q, %v", got, err)
+	}
+	id, err := k.Submit(context.Background(), "collision", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Repeat("22", 16); id != want {
+		t.Fatalf("generated id = %s, want %s", id, want)
+	}
+}
+
+func TestDriveTokenUsesInjectedCryptographicBytes(t *testing.T) {
+	random := newRandomSource(bytes.NewReader([]byte{0, 0, 0, 0, 0x80, 0, 0, 1}))
+	token, err := random.token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int32(-2147483647); token != want {
+		t.Fatalf("token = %d, want %d", token, want)
+	}
+}
 
 // Call ids are the TypeScript SDK's: sdk/testdata/callids.jsonl (shared
 // with the Python SDK's tests) was made by its

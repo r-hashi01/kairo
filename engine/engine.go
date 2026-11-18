@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -156,6 +157,10 @@ type Config struct {
 
 	// Now is the clock (tests may override).
 	Now func() time.Time
+	// Random supplies cryptographically secure bytes for generated RunIDs
+	// and workflow fencing tokens. Nil uses crypto/rand.Reader. Tests may
+	// replace it with an erroring reader.
+	Random io.Reader
 }
 
 // SubmitRequest starts a run.
@@ -313,6 +318,7 @@ type Engine struct {
 	driveMu      sync.Mutex
 	driveChanged chan struct{}
 	quietID      atomic.Uint64
+	randomMu     sync.Mutex
 }
 
 // Open creates an engine and recovers the runs found in its logs. Plans
@@ -348,6 +354,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.Random == nil {
+		cfg.Random = rand.Reader
 	}
 	if cfg.EstimateTokens == nil {
 		cfg.EstimateTokens = func(t *task.Task) int { return len(t.Input)/4 + 1 }
@@ -679,11 +688,28 @@ func (e *Engine) shardFor(runID string) *shard {
 	return e.shards[h%uint64(len(e.shards))]
 }
 
-func newRunID() string {
-	var b [12]byte
-	rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+func (e *Engine) randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	e.randomMu.Lock()
+	_, err := io.ReadFull(e.cfg.Random, b)
+	e.randomMu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
+
+func (e *Engine) newRunID() (string, error) {
+	id, err := e.randomHex(12)
+	if err != nil {
+		return "", fmt.Errorf("engine: generating run id: %w", err)
+	}
+	return id, nil
+}
+
+var errGeneratedRunIDCollision = errors.New("engine: generated run id collision")
+
+const generatedRunIDAttempts = 16
 
 // SubmitResult describes an accepted submission.
 type SubmitResult struct {
@@ -754,33 +780,49 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 	if tier >= tierCount || !e.tiers[tier] {
 		return SubmitResult{}, fmt.Errorf("%w: %s", ErrTier, tier)
 	}
-	id := req.RunID
-	if id == "" {
-		id = newRunID()
-	} else {
+	if req.RunID != "" {
+		return e.submitID(ctx, req, p, tier, req.RunID, false)
+	}
+	for range generatedRunIDAttempts {
+		id, err := e.newRunID()
+		if err != nil {
+			return SubmitResult{}, err
+		}
+		result, err := e.submitID(ctx, req, p, tier, id, true)
+		if errors.Is(err, errGeneratedRunIDCollision) {
+			continue
+		}
+		return result, err
+	}
+	return SubmitResult{}, fmt.Errorf("engine: generating run id: %d consecutive collisions", generatedRunIDAttempts)
+}
+
+func (e *Engine) submitID(ctx context.Context, req SubmitRequest, p *ir.Plan, tier Tier, id string, generated bool) (SubmitResult, error) {
+	e.waitMu.Lock()
+	_, done := e.finished[id]
+	e.waitMu.Unlock()
+	if !done {
+		_, done = e.marker(id)
+	}
+	if done {
+		if generated {
+			return SubmitResult{}, errGeneratedRunIDCollision
+		}
+		var parent string
 		e.waitMu.Lock()
-		_, done := e.finished[id]
+		if ri, ok := e.finished[id]; ok {
+			parent = ri.Parent
+		}
 		e.waitMu.Unlock()
-		if !done {
-			_, done = e.marker(id)
+		if parent == "" {
+			if en, ok := e.marker(id); ok {
+				parent = en.parent
+			}
 		}
-		if done {
-			var parent string
-			e.waitMu.Lock()
-			if ri, ok := e.finished[id]; ok {
-				parent = ri.Parent
-			}
-			e.waitMu.Unlock()
-			if parent == "" {
-				if en, ok := e.marker(id); ok {
-					parent = en.parent
-				}
-			}
-			if req.Parent != "" && req.Parent != parent {
-				return SubmitResult{}, ErrParentUnavailable
-			}
-			return SubmitResult{RunID: id, Existing: true}, nil
+		if req.Parent != "" && req.Parent != parent {
+			return SubmitResult{}, ErrParentUnavailable
 		}
+		return SubmitResult{RunID: id, Existing: true}, nil
 	}
 	attached := false
 	if req.Parent != "" {
@@ -801,7 +843,7 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 			lim.MaxDuration = l.MaxDuration
 		}
 	}
-	sr := &startReq{runID: id, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive, initialSignal: req.InitialSignal,
+	sr := &startReq{runID: id, generated: generated, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive, initialSignal: req.InitialSignal,
 		keep: req.KeepOutput && tier >= TierFile, reply: reply}
 	sh := e.shardFor(id)
 	active := make(chan struct{}, 1)
@@ -849,6 +891,12 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 				e.detach(req.Parent, id)
 			}
 			return SubmitResult{}, r.err
+		}
+		if r.collision {
+			if attached {
+				e.detach(req.Parent, id)
+			}
+			return SubmitResult{}, errGeneratedRunIDCollision
 		}
 		return SubmitResult{RunID: id, Existing: r.existing}, nil
 	case <-ctx.Done():

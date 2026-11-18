@@ -171,6 +171,7 @@ type timerRef struct {
 
 type startReq struct {
 	runID         string
+	generated     bool
 	parent        string
 	workflow      string
 	meta          json.RawMessage
@@ -191,8 +192,9 @@ type startReq struct {
 }
 
 type startReply struct {
-	existing bool
-	err      error
+	existing  bool
+	collision bool
+	err       error
 }
 
 type attachReply struct {
@@ -794,6 +796,11 @@ func (s *shard) startRun(sr *startReq) {
 	}
 	if r, dup := s.runs[sr.runID]; dup {
 		s.e.starts.Drop(sr.startTicket)
+		if sr.generated {
+			s.e.adm.Release(sr.tenant)
+			sr.reply <- startReply{collision: true}
+			return
+		}
 		if sr.parent != "" && sr.parent != r.parent {
 			s.e.adm.Release(sr.tenant)
 			s.e.detach(sr.parent, sr.runID)
@@ -821,11 +828,17 @@ func (s *shard) startRun(sr *startReq) {
 			s.e.starts.Drop(sr.startTicket)
 			// Finished within IdempotencyTTL (ADR 0027).
 			s.e.adm.Release(sr.tenant)
-			sr.reply <- startReply{existing: true}
+			sr.reply <- startReply{existing: !sr.generated, collision: sr.generated}
 			return
 		}
 	}
 	if old := s.pins[sr.runID]; old != nil {
+		if sr.generated {
+			s.e.starts.Drop(sr.startTicket)
+			s.e.adm.Release(sr.tenant)
+			sr.reply <- startReply{collision: true}
+			return
+		}
 		old.starts = append(old.starts, sr)
 		return
 	}
