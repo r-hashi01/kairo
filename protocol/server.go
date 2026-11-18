@@ -33,6 +33,13 @@ type Server struct {
 	// By run: the connections that asked for RunEnd and were sent a task
 	// of it (ADR 0044).
 	runs map[string]map[*endConn]struct{}
+
+	lifeMu       sync.Mutex
+	listeners    map[net.Listener]struct{}
+	connections  map[net.Conn]struct{}
+	shuttingDown bool
+	shutdownDone chan struct{}
+	lifeWG       sync.WaitGroup
 }
 
 // endConn is a connection that asked for RunEnd: its writer sends the
@@ -109,14 +116,114 @@ func (s *Server) forget(c *endConn) {
 	c.runs = nil
 }
 
+// Shutdown stops accepting workers, closes active sessions, and waits until
+// their outstanding tasks have been returned to the dispatcher or completed
+// as unknown. The engine must remain open until Shutdown returns.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.lifeMu.Lock()
+	s.initLifecycleLocked()
+	first := !s.shuttingDown
+	var listeners []net.Listener
+	var connections []net.Conn
+	if first {
+		s.shuttingDown = true
+		listeners = make([]net.Listener, 0, len(s.listeners))
+		for l := range s.listeners {
+			listeners = append(listeners, l)
+		}
+		connections = make([]net.Conn, 0, len(s.connections))
+		for c := range s.connections {
+			connections = append(connections, c)
+		}
+	}
+	done := s.shutdownDone
+	s.lifeMu.Unlock()
+
+	if first {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+		for _, c := range connections {
+			_ = c.Close()
+		}
+		go func() {
+			s.lifeWG.Wait()
+			close(done)
+		}()
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) initLifecycleLocked() {
+	if s.listeners == nil {
+		s.listeners = map[net.Listener]struct{}{}
+	}
+	if s.connections == nil {
+		s.connections = map[net.Conn]struct{}{}
+	}
+	if s.shutdownDone == nil {
+		s.shutdownDone = make(chan struct{})
+	}
+}
+
 func (s *Server) Serve(l net.Listener) error {
+	s.lifeMu.Lock()
+	s.initLifecycleLocked()
+	if s.shuttingDown {
+		s.lifeMu.Unlock()
+		_ = l.Close()
+		return net.ErrClosed
+	}
+	s.listeners[l] = struct{}{}
+	s.lifeWG.Add(1)
+	s.lifeMu.Unlock()
+	defer func() {
+		s.lifeMu.Lock()
+		delete(s.listeners, l)
+		s.lifeMu.Unlock()
+		s.lifeWG.Done()
+	}()
+
 	s.once.Do(func() { s.E.OnRunEnd(s.runEnded) })
 	for {
 		c, err := l.Accept()
 		if err != nil {
+			s.lifeMu.Lock()
+			stopping := s.shuttingDown
+			s.lifeMu.Unlock()
+			if stopping {
+				return nil
+			}
 			return err
 		}
-		go s.handle(c)
+		s.lifeMu.Lock()
+		if s.shuttingDown {
+			s.lifeMu.Unlock()
+			_ = c.Close()
+			return nil
+		}
+		s.connections[c] = struct{}{}
+		s.lifeWG.Add(1)
+		s.lifeMu.Unlock()
+		go func() {
+			defer func() {
+				s.lifeMu.Lock()
+				delete(s.connections, c)
+				s.lifeMu.Unlock()
+				s.lifeWG.Done()
+			}()
+			s.handle(c)
+		}()
 	}
 }
 

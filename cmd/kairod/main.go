@@ -198,9 +198,8 @@ func main() {
 		log.Fatal(err)
 	}
 	go ws.Serve(ul)
-	var tl net.Listener
 	if *tcpAddr != "" {
-		tl, err = net.Listen("tcp", *tcpAddr)
+		tl, err := net.Listen("tcp", *tcpAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -235,9 +234,9 @@ func main() {
 	if callbackSrv != nil {
 		callbackSrv.Shutdown(ctx)
 	}
-	ul.Close()
-	if tl != nil {
-		tl.Close()
+	if err := ws.Shutdown(ctx); err != nil {
+		log.Printf("kairod: worker shutdown: %v", err)
+		return
 	}
 	e.Close()
 }

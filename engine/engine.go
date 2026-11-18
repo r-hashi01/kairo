@@ -308,12 +308,13 @@ type Engine struct {
 	doneMax int      // markers per shard (ADR 0027)
 	feed    *feedHub // nil without Config.Feeds (ADR 0034)
 
-	execMu  sync.Mutex
-	pollers []*sched.Poller
-	budgets map[string]chan struct{} // in-process tasks at once, by resource (ADR 0039)
-	stopped chan struct{}
-	wg      sync.WaitGroup // shard loops
-	ioWG    sync.WaitGroup
+	execMu    sync.Mutex
+	pollers   []*sched.Poller
+	budgets   map[string]chan struct{} // in-process tasks at once, by resource (ADR 0039)
+	stopped   chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup // shard loops
+	ioWG      sync.WaitGroup
 
 	driveMu      sync.Mutex
 	driveChanged chan struct{}
@@ -525,11 +526,10 @@ func (e *Engine) Start() error {
 // Close stops the engine. Runs stay in their logs and are recovered by the
 // next Start.
 func (e *Engine) Close() {
-	select {
-	case <-e.stopped:
-		return
-	default:
-	}
+	e.closeOnce.Do(e.closeEngine)
+}
+
+func (e *Engine) closeEngine() {
 	close(e.stopped)
 	e.execMu.Lock()
 	for _, p := range e.pollers {
