@@ -59,14 +59,85 @@ func TestSSEStreaming(t *testing.T) {
 			fmt.Fprintf(w, "data: {\"delta\":\"t%d\"}\n\n", i)
 			w.(http.Flusher).Flush()
 		}
+		fmt.Fprint(w, "data: {\"usage\":{\"total_tokens\":7}}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()
 	var chunks []string
 	res := New().Execute(context.Background(), &task.Task{Params: json.RawMessage(`{"url":"` + srv.URL + `","stream":true}`)},
 		func(b []byte) { chunks = append(chunks, string(b)) })
-	if res.Err != "" || len(chunks) != 3 || !strings.Contains(string(res.Output), `t2`) {
+	if res.Err != "" || res.Tokens != 7 || len(chunks) != 4 || !strings.Contains(string(res.Output), `t2`) {
 		t.Fatalf("%+v %v", res, chunks)
+	}
+}
+
+func TestSuccessfulResponseBodyLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/json":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"text":%q}`, strings.Repeat("x", 80))
+		case "/text":
+			fmt.Fprint(w, strings.Repeat("x", 80))
+		}
+	}))
+	defer srv.Close()
+
+	for _, path := range []string{"/json", "/text"} {
+		t.Run(path[1:], func(t *testing.T) {
+			x := New()
+			x.MaxResponseBytes = 64
+			res := x.Execute(context.Background(), &task.Task{Params: json.RawMessage(`{"url":"` + srv.URL + path + `"}`)}, nil)
+			if !res.Unknown || !strings.Contains(res.Err, "exceeds 64 bytes") || len(res.Output) != 0 {
+				t.Fatalf("over-limit response treated as success: %+v", res)
+			}
+		})
+	}
+}
+
+func TestSSERetainedOutputLimit(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []string
+	}{
+		{name: "one oversized event", events: []string{`{"delta":"` + strings.Repeat("x", 80) + `"}`}},
+		{name: "many events", events: []string{`{"delta":"one"}`, `{"delta":"two"}`, `{"delta":"three"}`, `{"delta":"four"}`}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				for _, event := range tt.events {
+					fmt.Fprintf(w, "data: %s\n\n", event)
+					w.(http.Flusher).Flush()
+				}
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer srv.Close()
+
+			x := New()
+			x.MaxResponseBytes = 48
+			var chunks []string
+			res := x.Execute(context.Background(), &task.Task{Params: json.RawMessage(`{"url":"` + srv.URL + `","stream":true}`)},
+				func(b []byte) { chunks = append(chunks, string(b)) })
+			if !res.Unknown || !strings.Contains(res.Err, "exceeds 48 bytes") || len(res.Output) != 0 {
+				t.Fatalf("over-limit SSE treated as success: %+v", res)
+			}
+			if len(chunks) != len(tt.events) {
+				t.Fatalf("live relay stopped at retained-output limit: got %d chunks, want %d", len(chunks), len(tt.events))
+			}
+		})
+	}
+}
+
+func TestResponseLimitValidation(t *testing.T) {
+	for _, limit := range []int64{-1, MaximumMaxResponseBytes + 1} {
+		if _, err := NormalizeMaxResponseBytes(limit); err == nil {
+			t.Fatalf("NormalizeMaxResponseBytes(%d) succeeded", limit)
+		}
+	}
+	if got, err := NormalizeMaxResponseBytes(0); err != nil || got != DefaultMaxResponseBytes {
+		t.Fatalf("default = %d, %v", got, err)
 	}
 }
 

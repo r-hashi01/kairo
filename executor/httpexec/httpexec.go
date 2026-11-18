@@ -40,7 +40,28 @@ import (
 )
 
 type Executor struct {
-	Client *http.Client
+	Client           *http.Client
+	MaxResponseBytes int64
+}
+
+const (
+	// DefaultMaxResponseBytes is the default limit for a successful response
+	// body or the SSE data retained for the durable result (ADR 0081).
+	DefaultMaxResponseBytes int64 = 16 << 20
+	// MaximumMaxResponseBytes is the largest configurable response limit.
+	MaximumMaxResponseBytes int64 = 512 << 20
+)
+
+// NormalizeMaxResponseBytes returns the default for zero and rejects limits
+// outside ADR 0081's configurable range.
+func NormalizeMaxResponseBytes(n int64) (int64, error) {
+	if n == 0 {
+		return DefaultMaxResponseBytes, nil
+	}
+	if n < 1 || n > MaximumMaxResponseBytes {
+		return 0, fmt.Errorf("HTTP executor response limit must be between 1 and %d bytes", MaximumMaxResponseBytes)
+	}
+	return n, nil
 }
 
 // New returns an executor with a transport that speaks HTTP/2 over TLS and
@@ -88,6 +109,10 @@ func expandEnv(s string) string {
 }
 
 func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte)) task.Result {
+	maxResponse, err := NormalizeMaxResponseBytes(x.MaxResponseBytes)
+	if err != nil {
+		return task.Result{Err: err.Error()}
+	}
 	var p params
 	if len(t.Params) > 0 {
 		if err := json.Unmarshal(t.Params, &p); err != nil {
@@ -145,9 +170,9 @@ func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte))
 		return task.Result{Err: msg}
 	}
 	if p.Stream && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
-		return readSSE(resp.Body, emit)
+		return readSSE(resp.Body, emit, maxResponse)
 	}
-	b, err := io.ReadAll(resp.Body)
+	b, err := readAtMost(resp.Body, maxResponse)
 	if err != nil {
 		return task.Result{Err: err.Error(), Unknown: true}
 	}
@@ -156,6 +181,17 @@ func (x *Executor) Execute(ctx context.Context, t *task.Task, emit func([]byte))
 	}
 	out, _ := json.Marshal(map[string]any{"status": resp.StatusCode, "body": string(b)})
 	return task.Result{Output: out}
+}
+
+func readAtMost(r io.Reader, max int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("HTTP response body exceeds %d bytes", max)
+	}
+	return b, nil
 }
 
 func retryAfter(value string, now time.Time) time.Duration {
@@ -171,11 +207,16 @@ func retryAfter(value string, now time.Time) time.Duration {
 // readSSE relays each "data:" payload to the live stream and returns the
 // last JSON event (which for most LLM APIs carries the final state/usage)
 // plus the concatenated text of all data lines.
-func readSSE(r io.Reader, emit func([]byte)) task.Result {
+func readSSE(r io.Reader, emit func([]byte), max int64) task.Result {
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	var all strings.Builder
-	var last json.RawMessage
+	maxToken := 4 << 20
+	if configured := int(max) + len("data: ") + 1; configured < maxToken {
+		maxToken = configured
+	}
+	sc.Buffer(make([]byte, 64<<10), maxToken)
+	var all bytes.Buffer
+	lastStart, lastEnd := -1, -1
+	overLimit := false
 	for sc.Scan() {
 		line := sc.Bytes()
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -185,15 +226,33 @@ func readSSE(r io.Reader, emit func([]byte)) task.Result {
 		if string(data) == "[DONE]" {
 			break
 		}
-		emit(append([]byte(nil), data...))
-		if json.Valid(data) {
-			last = append(last[:0], data...)
+		if emit != nil {
+			emit(append([]byte(nil), data...))
 		}
-		all.Write(data)
+		if overLimit {
+			continue
+		}
+		if int64(all.Len())+int64(len(data))+1 > max {
+			overLimit = true
+			continue
+		}
+		start := all.Len()
+		_, _ = all.Write(data)
+		end := all.Len()
 		all.WriteByte('\n')
+		if json.Valid(data) {
+			lastStart, lastEnd = start, end
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return task.Result{Err: err.Error(), Unknown: true}
+	}
+	if overLimit {
+		return task.Result{Err: fmt.Sprintf("HTTP SSE retained output exceeds %d bytes", max), Unknown: true}
+	}
+	var last json.RawMessage
+	if lastStart >= 0 {
+		last = all.Bytes()[lastStart:lastEnd]
 	}
 	out, _ := json.Marshal(map[string]any{"last": last, "events": all.String()})
 	return task.Result{Output: out, Tokens: usage(last)}

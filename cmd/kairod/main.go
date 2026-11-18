@@ -54,10 +54,15 @@ func main() {
 		perTenant    = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
 		maxStarting  = flag.Int("max-starting", 0, "admission: safety ceiling per shard/tier for starts awaiting durable acknowledgement (0 = adaptive)")
 		httpConc     = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
+		httpMaxBody  = flag.Int64("http-max-response-bytes", httpexec.DefaultMaxResponseBytes, "maximum successful response or retained SSE output of the built-in HTTP executor (1..512 MiB)")
 		idemTTL      = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
 	)
 	flag.Parse()
 	maxCallbackBody, err := httpaction.NormalizeMaxBody(*callbackMax)
+	if err != nil {
+		log.Fatal(err)
+	}
+	maxHTTPResponse, err := httpexec.NormalizeMaxResponseBytes(*httpMaxBody)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -155,6 +160,7 @@ func main() {
 	}
 	// The built-in HTTP executor serves every action named "http.*".
 	hx := httpexec.New()
+	hx.MaxResponseBytes = maxHTTPResponse
 	var hmu sync.Mutex
 	served := map[string]bool{}
 	serveHTTP := func(action string) {
