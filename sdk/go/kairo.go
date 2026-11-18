@@ -16,11 +16,10 @@ package kairo
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	mrand "math/rand/v2"
@@ -201,6 +200,10 @@ type Options struct {
 	HTTP HTTPOptions
 	// Now is the clock (tests).
 	Now func() time.Time
+	// Random supplies cryptographically secure bytes for generated IDs and
+	// workflow fencing tokens. Nil uses crypto/rand.Reader. Tests may replace
+	// it with an erroring reader.
+	Random io.Reader
 	// WorkerToken is kairod's worker token, if it has one (Connect only,
 	// ADR 0037).
 	WorkerToken string
@@ -399,15 +402,19 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	if err != nil {
 		return nil, err
 	}
+	random := newRandomSource(opts.Random)
 	owner := opts.Owner
 	if owner == "" {
-		owner = newID()
+		owner, err = random.id()
+		if err != nil {
+			return nil, err
+		}
 	}
 	keepMs := int64(-1)
 	if keep >= 0 {
 		keepMs = keep.Milliseconds()
 	}
-	rt := newRuntime(opts.Store, func() int64 { return nowFn().UnixMilli() }, owner, lease.Milliseconds(), keepMs)
+	rt := newRuntime(opts.Store, func() int64 { return nowFn().UnixMilli() }, owner, lease.Milliseconds(), keepMs, random)
 	if opts.Logger != nil {
 		rt.logger = opts.Logger
 	}
@@ -453,21 +460,6 @@ func keepFinished(opt time.Duration, env string) (time.Duration, error) {
 	n, _ := strconv.ParseFloat(m[1], 64)
 	unit := map[string]time.Duration{"ms": time.Millisecond, "s": time.Second, "m": time.Minute, "h": time.Hour, "d": 24 * time.Hour}[m[2]]
 	return time.Duration(n * float64(unit)), nil
-}
-
-func newID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-// newToken is a drive lease's token (never 0: no lease).
-func newToken() int32 {
-	for {
-		if t := mrand.Int32(); t != 0 {
-			return t
-		}
-	}
 }
 
 // ActionOption configures an action.
@@ -1018,9 +1010,7 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 	for _, f := range opts {
 		f(&o)
 	}
-	if o.id == "" {
-		o.id = newID()
-	}
+	generated := o.id == ""
 	version, ok := k.currentVersion(name)
 	if !ok {
 		return "", 0, nil, "", fmt.Errorf("kairo: no workflow %s", name)
@@ -1037,46 +1027,65 @@ func (k *Kairo) start(ctx context.Context, name string, in any, opts []RunOption
 	if err := k.planWorkflow(); err != nil {
 		return "", 0, nil, "", err
 	}
-	token = newToken()
 	workflowIn := workflowInput(name, version, raw)
 	if o.parent != "" {
 		workflowIn["external_parent"] = true
 	}
-	existing, err := k.runs.run(ctx, planWorkflow, workflowIn, o.id, runSpec{
-		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: o.parent, guardParent: o.parent != "", workflow: name, meta: meta, drive: token})
-	if err != nil {
-		return "", 0, nil, "", err
+	attempts := 1
+	if generated {
+		attempts = generatedIDAttempts
 	}
-	parent = o.parent
-	if existing {
-		token = 0
-		if k.remote == nil {
-			ri, getErr := k.runs.get(ctx, o.id)
-			if getErr != nil {
-				return "", 0, nil, "", getErr
+	for range attempts {
+		if generated {
+			o.id, err = k.rt.random.id()
+			if err != nil {
+				return "", 0, nil, "", err
 			}
-			parent = ri.Parent
-			if o.parent != "" && o.parent != parent {
-				return "", 0, nil, "", fmt.Errorf("%w: %s: run %s already belongs to parent %q", ErrParentUnavailable, o.parent, o.id, parent)
-			}
-			if parent != "" && !ri.Finished() {
-				p, parentErr := k.runs.get(ctx, parent)
-				if errors.Is(parentErr, ErrUnknownRun) {
-					return "", 0, nil, "", fmt.Errorf("%w: %s: it does not exist", ErrParentUnavailable, parent)
+		}
+		token, err = k.rt.random.token()
+		if err != nil {
+			return "", 0, nil, "", err
+		}
+		existing, runErr := k.runs.run(ctx, planWorkflow, workflowIn, o.id, runSpec{
+			vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: o.parent, guardParent: o.parent != "", workflow: name, meta: meta, drive: token})
+		if runErr != nil {
+			return "", 0, nil, "", runErr
+		}
+		if generated && existing {
+			continue
+		}
+		parent = o.parent
+		if existing {
+			token = 0
+			if k.remote == nil {
+				ri, getErr := k.runs.get(ctx, o.id)
+				if getErr != nil {
+					return "", 0, nil, "", getErr
 				}
-				if parentErr != nil {
-					return "", 0, nil, "", parentErr
+				parent = ri.Parent
+				if o.parent != "" && o.parent != parent {
+					return "", 0, nil, "", fmt.Errorf("%w: %s: run %s already belongs to parent %q", ErrParentUnavailable, o.parent, o.id, parent)
 				}
-				if p.Plan != planWorkflow || p.Workflow == "" {
-					return "", 0, nil, "", fmt.Errorf("%w: %s: it is not a workflow", ErrParentUnavailable, parent)
-				}
-				if p.Finished() {
-					return "", 0, nil, "", fmt.Errorf("%w: %s: it has finished", ErrParentUnavailable, parent)
+				if parent != "" && !ri.Finished() {
+					p, parentErr := k.runs.get(ctx, parent)
+					if errors.Is(parentErr, ErrUnknownRun) {
+						return "", 0, nil, "", fmt.Errorf("%w: %s: it does not exist", ErrParentUnavailable, parent)
+					}
+					if parentErr != nil {
+						return "", 0, nil, "", parentErr
+					}
+					if p.Plan != planWorkflow || p.Workflow == "" {
+						return "", 0, nil, "", fmt.Errorf("%w: %s: it is not a workflow", ErrParentUnavailable, parent)
+					}
+					if p.Finished() {
+						return "", 0, nil, "", fmt.Errorf("%w: %s: it has finished", ErrParentUnavailable, parent)
+					}
 				}
 			}
 		}
+		return o.id, token, raw, parent, nil
 	}
-	return o.id, token, raw, parent, nil
+	return "", 0, nil, "", fmt.Errorf("kairo: generating id: %d consecutive collisions", generatedIDAttempts)
 }
 
 // drive runs workflow id's function here, holding its drive lease (ADR
@@ -1131,7 +1140,10 @@ func (k *Kairo) drive(ctx context.Context, id, name string, in json.RawMessage, 
 		if _, version, _, ok := workflowOf(ri.Input); ok && k.fnFor(name, version) == nil {
 			return nil, notHere(name, version) // not claimed: another process's
 		}
-		token = newToken()
+		token, err = k.rt.random.token()
+		if err != nil {
+			return nil, err
+		}
 		now := k.rt.now()
 		ok, err := k.rt.store.ClaimDrive(ctx, LeaseRow{Run: id, Attempt: token, Owner: k.rt.owner, Until: now + k.rt.leaseMs}, now)
 		if err != nil {
@@ -1195,8 +1207,12 @@ func (k *Kairo) runChildAs(ctx context.Context, name string, in json.RawMessage,
 	if err := k.planWorkflow(); err != nil {
 		return nil, err
 	}
+	token, err := k.rt.random.token()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := k.runs.run(ctx, planWorkflow, workflowInput(name, version, in), id, runSpec{
-		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, drive: newToken(),
+		vars: map[string]any{"started_at": k.nowFn().UnixMilli()}, parent: parent, drive: token,
 	}); err != nil {
 		return nil, err
 	}
@@ -1679,7 +1695,11 @@ func (k *Kairo) SendSignal(ctx context.Context, id, name string, payload any, op
 		opt(&o)
 	}
 	if !o.idSet {
-		o.id = newID()
+		var err error
+		o.id, err = k.rt.random.id()
+		if err != nil {
+			return receipt, err
+		}
 	} else if o.id == "" || len(o.id) > 256 {
 		return receipt, errors.New("kairo: signal id must be non-empty and at most 256 bytes")
 	}

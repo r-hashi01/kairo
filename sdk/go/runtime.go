@@ -126,6 +126,7 @@ type runtime struct {
 	owner   string
 	leaseMs int64
 	keepMs  int64 // < 0: kept for ever
+	random  *randomSource
 
 	mu        sync.Mutex
 	plans     map[string]wasmcore.Compiled
@@ -174,8 +175,8 @@ type subscription struct {
 
 const removePerTick = 100
 
-func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int64) *runtime {
-	r := &runtime{core: wasmcore.New(), store: wrapStore(store), now: now, owner: owner, leaseMs: leaseMs, keepMs: keepMs,
+func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int64, random *randomSource) *runtime {
+	r := &runtime{core: wasmcore.New(), store: wrapStore(store), now: now, owner: owner, leaseMs: leaseMs, keepMs: keepMs, random: random,
 		plans: map[string]wasmcore.Compiled{}, waiters: map[string]map[chan RunInfo]struct{}{}, hooks: map[int]func(RunInfo){},
 		timers: map[string]*time.Timer{}, running: map[string]context.CancelFunc{}, reached: map[string]int{}, subs: map[int]*subscription{}, closedCh: make(chan struct{})}
 	r.busyCond = sync.NewCond(&r.busyMu)
@@ -1007,7 +1008,11 @@ func (r *runtime) processReportedWithRates(ctx context.Context, runID string, ev
 		if settled && next.Parent != "" && r.leaseParents && !parentIsDriving {
 			// Its workflow is to be driven on: by this process, or, if it
 			// stops first, by whichever takes the lease up (ADR 0059).
-			ch.SetLeases = append(ch.SetLeases, LeaseRow{Run: next.Parent, Act: 0, Attempt: newToken(), Owner: r.owner, Until: at + r.leaseMs})
+			token, tokenErr := r.random.token()
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
+			ch.SetLeases = append(ch.SetLeases, LeaseRow{Run: next.Parent, Act: 0, Attempt: token, Owner: r.owner, Until: at + r.leaseMs})
 		}
 		newRow = next
 		return ch, nil

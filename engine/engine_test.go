@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,10 @@ import (
 	"github.com/r-hashi01/kairo/task"
 	"github.com/r-hashi01/kairo/wal"
 )
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func testRegistry() *ir.Registry {
 	r := ir.NewRegistry()
@@ -101,6 +106,46 @@ func TestFiveNodeRun(t *testing.T) {
 				t.Fatalf("%+v", ri)
 			}
 		})
+	}
+}
+
+func TestSubmitStopsBeforeCreatingStateWhenEntropyFails(t *testing.T) {
+	entropyErr := errors.New("entropy unavailable")
+	e := newEngine(t, Config{Shards: 2, Random: errorReader{err: entropyErr}})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"hold","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.Submit(context.Background(), SubmitRequest{Plan: "hold", Tenant: "t"})
+	if !errors.Is(err, entropyErr) || result.RunID != "" {
+		t.Fatalf("Submit = %+v, %v", result, err)
+	}
+	if stats := e.Stats(); stats.Active != 0 || stats.InMemory != 0 {
+		t.Fatalf("state created after entropy failure: %+v", stats)
+	}
+}
+
+func TestGeneratedRunIDRetriesCollision(t *testing.T) {
+	collisionBytes := bytes.Repeat([]byte{0x11}, 12)
+	uniqueBytes := bytes.Repeat([]byte{0x22}, 12)
+	random := bytes.NewReader(append(append([]byte{}, collisionBytes...), uniqueBytes...))
+	e := newEngine(t, Config{Shards: 2, Random: random})
+	defer e.Close()
+	mustPlan(t, e, `{"name":"hold","root":{"kind":"wait","id":"w","signal":"go"}}`)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	collisionID := strings.Repeat("11", 12)
+	if _, err := e.Submit(context.Background(), SubmitRequest{Plan: "hold", Tenant: "t", RunID: collisionID}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := e.Submit(context.Background(), SubmitRequest{Plan: "hold", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.Repeat("22", 12); result.RunID != want || result.Existing {
+		t.Fatalf("Submit = %+v, want new run %s", result, want)
 	}
 }
 
