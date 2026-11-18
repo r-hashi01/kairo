@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"sort"
@@ -637,6 +638,10 @@ func (s *shard) handle(m *msg) {
 		s.writeSnapshot(r)
 	case mSnapDeleted:
 		r := m.run
+		if m.err != nil {
+			log.Printf("kairo: shard %d: deleting snapshot and blobs of %s: %v (records remain pinned)", s.id, r.id, m.err)
+			return
+		}
 		if s.pins[r.id] == r {
 			delete(s.pins, r.id)
 		}
@@ -1289,19 +1294,30 @@ func (s *shard) finish(r *run) {
 	}
 	id, tier := r.id, r.tier
 	job := func() {
+		var err error
 		if inline {
-			if out, err := s.e.ResolveInput(ri.Output); err == nil {
+			if out, resolveErr := s.e.ResolveInput(ri.Output); resolveErr == nil {
 				ri.Output = out
 			} else {
-				log.Printf("kairo: run %s: inlining its output: %v", id, err)
+				err = fmt.Errorf("inlining output: %w", resolveErr)
 			}
-			s.e.finish(ri)
+			if err == nil {
+				s.e.finish(ri)
+			}
 		}
-		s.e.deleteBlobs(id)
-		if tier >= TierFile {
-			s.e.snaps.Delete("snap/" + id)
-			s.inbox.Push(msg{kind: mSnapDeleted, run: r})
+		if err == nil {
+			err = s.e.deleteBlobs(id)
+			if tier >= TierFile {
+				err = errors.Join(err, s.e.snaps.Delete("snap/"+id))
+			}
 		}
+		if tier < TierFile {
+			if err != nil {
+				log.Printf("kairo: run %s: deleting blobs: %v", id, err)
+			}
+			return
+		}
+		s.inbox.Push(msg{kind: mSnapDeleted, run: r, err: err})
 	}
 	if tier < TierFile {
 		s.e.doIO(job)

@@ -23,15 +23,17 @@ const DefaultSegmentSize = 64 << 20
 // Segments written by v0 ("<prefix>.<8-digit sequence>.wal") are still
 // read; their LSNs continue from the previous segment.
 type FileSink struct {
-	dir    string
-	prefix string
-	noSync bool
+	dir     string
+	prefix  string
+	noSync  bool
+	dirSync func(string) error
+	remove  func(string) error
 	// SegmentSize bounds a segment (default DefaultSegmentSize).
 	SegmentSize int64
 
 	f      *os.File
 	size   int64
-	broken error     // set after a failed write: later appends are refused
+	broken error     // set after an unsafe durability failure: later appends are refused
 	next   uint64    // LSN of the next record appended
 	segs   []segment // all segments, oldest first; the last is current
 }
@@ -49,7 +51,10 @@ func OpenFile(dir, prefix string, noSync bool) (*FileSink, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &FileSink{dir: dir, prefix: prefix, noSync: noSync, SegmentSize: DefaultSegmentSize}
+	s := &FileSink{
+		dir: dir, prefix: prefix, noSync: noSync, SegmentSize: DefaultSegmentSize,
+		dirSync: syncDirectory, remove: os.Remove,
+	}
 	segs, err := s.list()
 	if err != nil {
 		return nil, err
@@ -74,6 +79,9 @@ func OpenFile(dir, prefix string, noSync bool) (*FileSink, error) {
 	}
 	s.segs, s.next = segs, next
 	if err := s.startSegment(); err != nil {
+		if s.f != nil {
+			_ = s.f.Close()
+		}
 		return nil, err
 	}
 	return s, nil
@@ -119,34 +127,58 @@ func (s *FileSink) startSegment() error {
 	}
 	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
+		if s.f != nil {
+			return s.fail("segment rotation", err)
+		}
 		return err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
+		if s.f != nil {
+			return s.fail("segment rotation", err)
+		}
 		return err
 	}
 	if st.Size() != 0 {
 		f.Close()
-		return fmt.Errorf("wal: segment %s already holds data", p)
+		err := fmt.Errorf("wal: segment %s already holds data", p)
+		if s.f != nil {
+			return s.fail("segment rotation", err)
+		}
+		return err
 	}
 	if s.f != nil {
-		s.f.Close()
+		if err := s.f.Close(); err != nil {
+			f.Close()
+			return s.fail("close", err)
+		}
 	}
 	s.f, s.size = f, 0
 	s.segs = append(s.segs, segment{path: p, first: s.next})
-	s.syncDir()
+	if !s.noSync {
+		if err := s.dirSync(s.dir); err != nil {
+			return s.fail("directory sync", err)
+		}
+	}
 	return nil
 }
 
-func (s *FileSink) syncDir() {
-	if s.noSync {
-		return
+func syncDirectory(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
 	}
-	if d, err := os.Open(s.dir); err == nil {
-		d.Sync()
-		d.Close()
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
 	}
+	return d.Close()
+}
+
+func (s *FileSink) fail(op string, err error) error {
+	s.broken = fmt.Errorf("wal: segment broken by %s error: %w", op, err)
+	return s.broken
 }
 
 // Append writes and syncs batch. After a failed write or sync the sink is
@@ -157,12 +189,12 @@ func (s *FileSink) Append(batch []byte) error {
 		return s.broken
 	}
 	if _, err := s.f.Write(batch); err != nil {
-		s.broken = fmt.Errorf("wal: segment broken by earlier write error: %w", err)
+		s.broken = fmt.Errorf("wal: segment broken by write error: %w", err)
 		return err
 	}
 	if !s.noSync {
 		if err := s.f.Sync(); err != nil {
-			s.broken = fmt.Errorf("wal: segment broken by earlier sync error: %w", err)
+			s.broken = fmt.Errorf("wal: segment broken by sync error: %w", err)
 			return err
 		}
 	}
@@ -202,17 +234,23 @@ func (s *FileSink) Retire(lsn uint64) error {
 		return s.broken
 	}
 	i := 0
+	var removeErr error
 	for i+1 < len(s.segs) && s.segs[i+1].first <= lsn {
-		if err := os.Remove(s.segs[i].path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.remove(s.segs[i].path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr = err
 			break
 		}
 		i++
 	}
 	if i > 0 {
 		s.segs = append([]segment(nil), s.segs[i:]...)
-		s.syncDir()
+		if !s.noSync {
+			if err := s.dirSync(s.dir); err != nil {
+				return s.fail("directory sync after retirement", err)
+			}
+		}
 	}
-	return nil
+	return removeErr
 }
 
 func (s *FileSink) Next() uint64 { return s.next }

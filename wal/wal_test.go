@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -247,6 +248,85 @@ func TestFileSinkSegmentsAndRetire(t *testing.T) {
 		t.Fatalf("numbering after full retire: %v", lsns)
 	}
 	s.Close()
+}
+
+func TestFileSinkPropagatesDirectoryDurabilityFailures(t *testing.T) {
+	injected := errors.New("injected directory failure")
+
+	t.Run("segment creation breaks the sink", func(t *testing.T) {
+		s, err := OpenFile(t.TempDir(), "shard-000", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		s.SegmentSize = 1
+		s.dirSync = func(string) error { return injected }
+		if err := s.Append(Frame(nil, []byte("durable batch"))); !errors.Is(err, injected) {
+			t.Fatalf("rotation error = %v", err)
+		}
+		if err := s.Append(Frame(nil, []byte("must not append"))); !errors.Is(err, injected) {
+			t.Fatalf("append after directory failure = %v", err)
+		}
+	})
+
+	t.Run("segment open failure breaks the sink", func(t *testing.T) {
+		s, err := OpenFile(t.TempDir(), "shard-000", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		s.SegmentSize = 1
+		s.dir = filepath.Join(s.dir, "missing", "directory")
+		if err := s.Append(Frame(nil, []byte("durable batch"))); err == nil {
+			t.Fatal("rotation into a missing directory succeeded")
+		}
+		if err := s.Append(Frame(nil, []byte("must not append"))); err == nil {
+			t.Fatal("append after segment open failure succeeded")
+		}
+	})
+
+	t.Run("retirement sync breaks the sink", func(t *testing.T) {
+		s, err := OpenFile(t.TempDir(), "shard-000", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		s.SegmentSize = 1
+		for i := 0; i < 3; i++ {
+			if err := s.Append(Frame(nil, []byte{byte(i)})); err != nil {
+				t.Fatal(err)
+			}
+		}
+		s.dirSync = func(string) error { return injected }
+		if err := s.Retire(s.Next()); !errors.Is(err, injected) {
+			t.Fatalf("Retire error = %v", err)
+		}
+		if err := s.Append(Frame(nil, []byte("must not append"))); !errors.Is(err, injected) {
+			t.Fatalf("append after retirement sync failure = %v", err)
+		}
+	})
+
+	t.Run("remove error is returned", func(t *testing.T) {
+		s, err := OpenFile(t.TempDir(), "shard-000", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		s.SegmentSize = 1
+		if err := s.Append(Frame(nil, []byte("one"))); err != nil {
+			t.Fatal(err)
+		}
+		s.remove = func(string) error { return injected }
+		if err := s.Retire(s.Next()); !errors.Is(err, injected) {
+			t.Fatalf("Retire remove error = %v", err)
+		}
+	})
+
+	t.Run("directory open error is returned", func(t *testing.T) {
+		if err := syncDirectory(filepath.Join(t.TempDir(), "missing")); err == nil {
+			t.Fatal("syncing a missing directory succeeded")
+		}
+	})
 }
 
 func TestMemSinkRetire(t *testing.T) {

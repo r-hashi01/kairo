@@ -104,6 +104,19 @@ func TestFiveNodeRun(t *testing.T) {
 	}
 }
 
+func TestSnapshotDeleteFailureKeepsLogPinned(t *testing.T) {
+	r := &run{id: "r"}
+	s := &shard{id: 7, pins: map[string]*run{"r": r}}
+	s.handle(&msg{kind: mSnapDeleted, run: r, err: errors.New("injected delete failure")})
+	if s.pins[r.id] != r {
+		t.Fatal("a deletion failure released the run's log pin")
+	}
+	s.handle(&msg{kind: mSnapDeleted, run: r})
+	if _, ok := s.pins[r.id]; ok {
+		t.Fatal("a successful deletion did not release the run's log pin")
+	}
+}
+
 func TestCanceledWaitersAreRemoved(t *testing.T) {
 	e := newEngine(t, Config{Shards: 2})
 	defer e.Close()

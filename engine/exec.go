@@ -192,15 +192,20 @@ func (e *Engine) resultEvent(t *task.Task, res task.Result, callback bool) (core
 }
 
 // deleteBlobs drops a finished run's blobs (ADR 0024). Stores that cannot
-// delete groups keep them.
-func (e *Engine) deleteBlobs(runID string) {
+// delete groups keep them. A failure must reach the caller: file-tier logs
+// stay pinned until deletion is durable (ADR 0016).
+func (e *Engine) deleteBlobs(runID string) error {
 	g, ok := e.blobs.(blob.Grouper)
 	if !ok {
-		return
+		return nil
 	}
-	if err := g.DeleteGroup(blob.RunGroup(runID)); err != nil && !errors.Is(err, blob.ErrNoGroups) {
-		log.Printf("kairo: deleting blobs of run %s: %v", runID, err)
+	if err := g.DeleteGroup(blob.RunGroup(runID)); err != nil {
+		if errors.Is(err, blob.ErrNoGroups) {
+			return nil
+		}
+		return err
 	}
+	return nil
 }
 
 // externalize stores out as a blob and returns the envelope that replaces
