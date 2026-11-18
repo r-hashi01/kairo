@@ -38,12 +38,15 @@ func (f SinkFunc) Write(b []Record) error { return f(b) }
 // background goroutine. When the buffer is full, records are dropped and
 // counted.
 type Stream struct {
-	ch      chan Record
-	sink    Sink
-	dropped atomic.Uint64
-	failed  atomic.Uint64
-	wg      sync.WaitGroup
-	max     int
+	ch        chan Record
+	sink      Sink
+	dropped   atomic.Uint64
+	failed    atomic.Uint64
+	closed    atomic.Bool
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	max       int
+	stop      chan struct{}
 }
 
 func NewStream(sink Sink, buffer, maxBatch int) *Stream {
@@ -53,7 +56,7 @@ func NewStream(sink Sink, buffer, maxBatch int) *Stream {
 	if maxBatch <= 0 {
 		maxBatch = 512
 	}
-	s := &Stream{ch: make(chan Record, buffer), sink: sink, max: maxBatch}
+	s := &Stream{ch: make(chan Record, buffer), sink: sink, max: maxBatch, stop: make(chan struct{})}
 	s.wg.Add(1)
 	go s.loop()
 	return s
@@ -62,6 +65,9 @@ func NewStream(sink Sink, buffer, maxBatch int) *Stream {
 // Emit never blocks.
 func (s *Stream) Emit(r Record) {
 	if s == nil {
+		return
+	}
+	if s.closed.Load() {
 		return
 	}
 	select {
@@ -75,22 +81,32 @@ func (s *Stream) Dropped() uint64 { return s.dropped.Load() }
 
 // Close flushes what is buffered and stops the stream.
 func (s *Stream) Close() {
-	close(s.ch)
-	s.wg.Wait()
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		close(s.stop)
+		s.wg.Wait()
+	})
 }
 
 func (s *Stream) loop() {
 	defer s.wg.Done()
 	batch := make([]Record, 0, s.max)
-	for r := range s.ch {
+	for {
+		var r Record
+		select {
+		case r = <-s.ch:
+		case <-s.stop:
+			s.flushRemaining(batch[:0])
+			return
+		}
 		batch = append(batch[:0], r)
 	fill:
 		for len(batch) < s.max {
 			select {
-			case r, ok := <-s.ch:
-				if !ok {
-					break fill
-				}
+			case r := <-s.ch:
 				batch = append(batch, r)
 			default:
 				break fill
@@ -98,6 +114,28 @@ func (s *Stream) loop() {
 		}
 		if err := s.sink.Write(batch); err != nil {
 			s.failed.Add(uint64(len(batch)))
+		}
+	}
+}
+
+func (s *Stream) flushRemaining(batch []Record) {
+	for {
+		select {
+		case r := <-s.ch:
+			batch = append(batch, r)
+			if len(batch) == s.max {
+				if err := s.sink.Write(batch); err != nil {
+					s.failed.Add(uint64(len(batch)))
+				}
+				batch = batch[:0]
+			}
+		default:
+			if len(batch) > 0 {
+				if err := s.sink.Write(batch); err != nil {
+					s.failed.Add(uint64(len(batch)))
+				}
+			}
+			return
 		}
 	}
 }

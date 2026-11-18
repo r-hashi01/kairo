@@ -145,7 +145,10 @@ func main() {
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(sctx)
-	ul.Close()
+	if err := ws.Shutdown(sctx); err != nil {
+		log.Printf("kairo-dify: worker shutdown: %v", err)
+		return
+	}
 	stop()
 	e.Close()
 }

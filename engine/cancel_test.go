@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,4 +118,24 @@ func TestCloseCancelsRunningTask(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not cancel the running task")
 	}
+}
+
+func TestCloseIsConcurrentAndIdempotent(t *testing.T) {
+	e := newEngine(t, Config{Shards: 2})
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			e.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	e.Close()
 }

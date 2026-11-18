@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,20 @@ func waitProtocol(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+type stalledListener struct{ release chan struct{} }
+
+func (l *stalledListener) Accept() (net.Conn, error) {
+	<-l.release
+	return nil, net.ErrClosed
+}
+func (*stalledListener) Close() error   { return nil }
+func (*stalledListener) Addr() net.Addr { return stalledAddr{} }
+
+type stalledAddr struct{}
+
+func (stalledAddr) Network() string { return "stalled" }
+func (stalledAddr) String() string  { return "stalled" }
 
 func setup(t *testing.T) (*engine.Engine, string) {
 	return setupServer(t, nil)
@@ -252,8 +267,129 @@ func setupServer(t *testing.T, configure func(*Server)) (*engine.Engine, string)
 	if err := e.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(e.Close)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Errorf("server shutdown: %v", err)
+		}
+		e.Close()
+	})
 	return e, sock
+}
+
+func TestServerShutdownClosesSessionsAndReconcilesOutstandingTasks(t *testing.T) {
+	reg := ir.NewRegistry()
+	reg.Register(ir.NodeSpec{Action: "send", Effect: ir.EffectReal})
+	e, err := engine.New(engine.Config{Shards: 1, Registry: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	s := &Server{E: e}
+	listeners := make([]net.Listener, 2)
+	served := make(chan error, len(listeners))
+	for i := range listeners {
+		listeners[i], err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func(l net.Listener) { served <- s.Serve(l) }(listeners[i])
+	}
+	waitProtocol(t, func() bool {
+		s.lifeMu.Lock()
+		defer s.lifeMu.Unlock()
+		return len(s.listeners) == len(listeners)
+	})
+
+	c, err := net.Dial("tcp", listeners[0].Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "shutdown", Actions: []string{"send"}, Credit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"send","action":"send"}}`)
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ, _, err := ReadFrame(r); err != nil || typ != MsgTask {
+		t.Fatalf("task frame = %v, %v", typ, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var shutdowns sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < cap(errs); i++ {
+		shutdowns.Add(1)
+		go func() {
+			defer shutdowns.Done()
+			errs <- s.Shutdown(ctx)
+		}()
+	}
+	shutdowns.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("Shutdown = %v", err)
+		}
+	}
+	for range listeners {
+		if err := <-served; err != nil {
+			t.Fatalf("Serve = %v", err)
+		}
+	}
+	_ = c.Close()
+	waitProtocol(t, func() bool {
+		ri, err := e.Get(context.Background(), id)
+		return err == nil && ri.Status == "blocked" && len(ri.Reviews) == 1 && e.Dispatcher().Tracked() == 0
+	})
+}
+
+func TestServerShutdownHonorsContextAndCanBeWaitedAgain(t *testing.T) {
+	e, err := engine.New(engine.Config{Shards: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	s := &Server{E: e}
+	l := &stalledListener{release: make(chan struct{})}
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(l) }()
+	waitProtocol(t, func() bool {
+		s.lifeMu.Lock()
+		defer s.lifeMu.Unlock()
+		return len(s.listeners) == 1
+	})
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Shutdown(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown = %v, want context.Canceled", err)
+	}
+	close(l.release)
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("second Shutdown = %v", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("Serve = %v", err)
+	}
 }
 
 func TestAsyncCallbackCapabilityCompletesPendingTask(t *testing.T) {
@@ -731,7 +867,15 @@ func TestWorkerToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	go (&Server{E: e, Token: "secret"}).Serve(l)
+	srv := &Server{E: e, Token: "secret"}
+	go srv.Serve(l)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("server shutdown: %v", err)
+		}
+	}()
 
 	for _, tok := range []string{"", "wrong"} {
 		c, err := net.Dial("unix", sock)
@@ -788,7 +932,14 @@ func TestRunEnd(t *testing.T) {
 	if err := e.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(e.Close)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("server shutdown: %v", err)
+		}
+		e.Close()
+	})
 	plan(t, e, `{"name":"p","root":{"kind":"seq","nodes":[
 	  {"kind":"step","id":"a","action":"code.run"},
 	  {"kind":"step","id":"b","action":"code.run"},
