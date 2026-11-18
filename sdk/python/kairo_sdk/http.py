@@ -129,7 +129,7 @@ def _read_limited(response: Any, limit: int) -> bytes:
         raise BodyTooLargeError(f"response body exceeds {limit} bytes")
     try:
         body = response.read(limit + 1)
-    except http.client.IncompleteRead as e:
+    except (http.client.IncompleteRead, OSError) as e:
         raise OSError("response body was truncated") from e
     if declared is not None and declared >= 0 and len(body) < declared:
         raise OSError("response body was truncated")
