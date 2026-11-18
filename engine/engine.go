@@ -288,7 +288,11 @@ type Engine struct {
 	ioStop  chan struct{}
 
 	plansMu sync.RWMutex
-	plans   map[string]*ir.Plan // by name and by name@hash
+	plans   map[string]*ir.Plan // working set, by name and by name@hash
+	// planLoader reads a frozen historical plan outside the shard loops.
+	// Current plans are registered directly; recovered and explicitly
+	// versioned plans enter the working set only when referenced (ADR 0082).
+	planLoader func(name, hash string) (*ir.Plan, error)
 
 	waitMu   sync.Mutex
 	waiters  map[string][]chan RunInfo
@@ -601,10 +605,57 @@ func (e *Engine) AddPlan(p *ir.Plan, latest bool) {
 	e.plansMu.Unlock()
 }
 
+// AddPlanVersion adds a compiled historical plan without making it current.
+// A recovered run may use it by name and hash, while unversioned Submit keeps
+// using the explicitly registered current plan (ADR 0082).
+func (e *Engine) AddPlanVersion(p *ir.Plan) {
+	e.plansMu.Lock()
+	e.plans[p.Name+"@"+p.Hash] = p
+	e.plansMu.Unlock()
+}
+
+// SetPlanLoader installs the durable source for historical frozen plans.
+// The loader is called by Submit or startup recovery, never by a shard loop.
+func (e *Engine) SetPlanLoader(loader func(name, hash string) (*ir.Plan, error)) {
+	e.plansMu.Lock()
+	e.planLoader = loader
+	e.plansMu.Unlock()
+}
+
 func (e *Engine) plan(name string) *ir.Plan {
 	e.plansMu.RLock()
 	defer e.plansMu.RUnlock()
 	return e.plans[name]
+}
+
+func (e *Engine) loadPlan(name, hash string) (*ir.Plan, error) {
+	key := name + "@" + hash
+	e.plansMu.RLock()
+	p, loader := e.plans[key], e.planLoader
+	e.plansMu.RUnlock()
+	if p != nil || loader == nil {
+		return p, nil
+	}
+	p, err := loader(name, hash)
+	if err != nil || p == nil {
+		return p, err
+	}
+	if p.Name != name || p.Hash != hash {
+		return nil, fmt.Errorf("engine: plan loader returned %s@%s for %s", p.Name, p.Hash, key)
+	}
+	e.AddPlanVersion(p)
+	return p, nil
+}
+
+func (e *Engine) planForSubmit(ref string) (*ir.Plan, error) {
+	if p := e.plan(ref); p != nil {
+		return p, nil
+	}
+	i := strings.LastIndexByte(ref, '@')
+	if i <= 0 || i == len(ref)-1 {
+		return nil, nil
+	}
+	return e.loadPlan(ref[:i], ref[i+1:])
 }
 
 func (e *Engine) Registry() *ir.Registry { return e.cfg.Registry }
@@ -666,7 +717,10 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (SubmitResult, e
 		return SubmitResult{}, ErrClosed
 	default:
 	}
-	p := e.plan(req.Plan)
+	p, err := e.planForSubmit(req.Plan)
+	if err != nil {
+		return SubmitResult{}, err
+	}
 	if p == nil {
 		return SubmitResult{}, fmt.Errorf("%w: %q", ErrUnknownPlan, req.Plan)
 	}

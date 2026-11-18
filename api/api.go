@@ -10,10 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/r-hashi01/kairo/engine"
@@ -29,6 +26,9 @@ type API struct {
 	Dir string
 	// OnNode is called for every node spec registered through the API.
 	OnNode func(ir.NodeSpec)
+
+	registry   registryState
+	catalogOps *catalogFileOps
 }
 
 func (a *API) Handler() http.Handler {
@@ -96,15 +96,35 @@ func (a *API) postNodes(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, errors.New("node spec without action"))
 			return
 		}
+	}
+	a.registry.mu.Lock()
+	defer a.registry.mu.Unlock()
+	if a.registry.uncertain {
+		fail(w, 503, registryUnavailableError())
+		return
+	}
+	if a.Dir != "" {
+		catalog, err := loadOrMigrateRegistry(a.Dir, a.fileOps())
+		if err != nil {
+			a.markRegistryWriteError(err)
+			fail(w, 500, err)
+			return
+		}
+		upsertCatalogNodes(&catalog, specs)
+		if _, err := validateRegistryCatalog(&catalog); err != nil {
+			fail(w, 500, err)
+			return
+		}
+		if err := writeRegistryCatalog(a.Dir, &catalog, a.fileOps()); err != nil {
+			a.markRegistryWriteError(err)
+			fail(w, 500, err)
+			return
+		}
+	}
+	for _, s := range specs {
 		a.E.Registry().Register(s)
 		if a.OnNode != nil {
 			a.OnNode(s)
-		}
-		if a.Dir != "" {
-			if err := writeJSON(filepath.Join(a.Dir, "nodes", fileName(s.Action)+".json"), s); err != nil {
-				fail(w, 500, err)
-				return
-			}
 		}
 	}
 	reply(w, 200, map[string]int{"registered": len(specs)})
@@ -120,17 +140,39 @@ func (a *API) postPlan(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, errors.New("plan needs a name"))
 		return
 	}
-	p, err := a.E.RegisterPlan(&def)
+	a.registry.mu.Lock()
+	defer a.registry.mu.Unlock()
+	if a.registry.uncertain {
+		fail(w, 503, registryUnavailableError())
+		return
+	}
+	p, err := ir.Compile(&def, a.E.Registry())
 	if err != nil {
 		fail(w, 400, err)
 		return
 	}
 	if a.Dir != "" {
-		if err := writeJSON(filepath.Join(a.Dir, "plans", fileName(p.Name)+"@"+p.Hash+".json"), p.Freeze()); err != nil {
+		catalog, err := loadOrMigrateRegistry(a.Dir, a.fileOps())
+		if err != nil {
+			a.markRegistryWriteError(err)
+			fail(w, 500, err)
+			return
+		}
+		if err := upsertCatalogPlan(&catalog, p); err != nil {
+			fail(w, 500, err)
+			return
+		}
+		if _, err := validateRegistryCatalog(&catalog); err != nil {
+			fail(w, 500, err)
+			return
+		}
+		if err := writeRegistryCatalog(a.Dir, &catalog, a.fileOps()); err != nil {
+			a.markRegistryWriteError(err)
 			fail(w, 500, err)
 			return
 		}
 	}
+	a.E.AddPlan(p, true)
 	effects := map[string]string{}
 	for _, s := range p.Specs() {
 		effects[s.Action] = s.Effect.String()
@@ -142,6 +184,10 @@ func (a *API) postPlan(w http.ResponseWriter, r *http.Request) {
 // 201 for a new run, 200 if the Idempotency-Key (the run id) was already
 // running or recently finished. ?timeout= bounds the wait (default 30s).
 func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
+	if a.registryUnavailable() {
+		fail(w, 503, registryUnavailableError())
+		return
+	}
 	var req engine.SubmitRequest
 	if err := readJSON(r, &req); err != nil {
 		fail(w, 400, err)
@@ -685,89 +731,4 @@ func (a *API) cancel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	reply(w, 202, map[string]bool{"accepted": true})
-}
-
-func fileName(s string) string {
-	return strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(s)
-}
-
-func writeJSON(path string, v any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err := f.Chmod(0o644); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// Load restores persisted node specs and plans from dir into e. Plans are
-// added oldest first, so the newest version of each name becomes current.
-func Load(e *engine.Engine, dir string) error {
-	nodes, _ := filepath.Glob(filepath.Join(dir, "nodes", "*.json"))
-	for _, n := range nodes {
-		b, err := os.ReadFile(n)
-		if err != nil {
-			return err
-		}
-		var s ir.NodeSpec
-		if err := json.Unmarshal(b, &s); err != nil {
-			return fmt.Errorf("%s: %w", n, err)
-		}
-		e.Registry().Register(s)
-	}
-	plans, _ := filepath.Glob(filepath.Join(dir, "plans", "*.json"))
-	type pf struct {
-		path string
-		mod  time.Time
-	}
-	var files []pf
-	for _, p := range plans {
-		st, err := os.Stat(p)
-		if err != nil {
-			return err
-		}
-		files = append(files, pf{p, st.ModTime()})
-	}
-	for i := range files {
-		for j := i + 1; j < len(files); j++ {
-			if files[j].mod.Before(files[i].mod) {
-				files[i], files[j] = files[j], files[i]
-			}
-		}
-	}
-	for _, f := range files {
-		b, err := os.ReadFile(f.path)
-		if err != nil {
-			return err
-		}
-		var fr ir.Frozen
-		if err := json.Unmarshal(b, &fr); err != nil {
-			return fmt.Errorf("%s: %w", f.path, err)
-		}
-		p, err := fr.Thaw()
-		if err != nil {
-			return fmt.Errorf("%s: %w", f.path, err)
-		}
-		e.AddPlan(p, true)
-	}
-	return nil
 }

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -19,42 +17,6 @@ import (
 	"github.com/r-hashi01/kairo/sched"
 	"github.com/r-hashi01/kairo/wal"
 )
-
-func TestWriteJSONConcurrentAtomicReplace(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "plans", "same.json")
-	const writers = 100
-	start := make(chan struct{})
-	errs := make(chan error, writers)
-	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			<-start
-			errs <- writeJSON(path, map[string]int{"writer": n})
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got map[string]int
-	if err := json.Unmarshal(b, &got); err != nil || got["writer"] < 0 || got["writer"] >= writers {
-		t.Fatalf("final file: %s: %v", b, err)
-	}
-	left, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".same.json.tmp-*"))
-	if err != nil || len(left) != 0 {
-		t.Fatalf("temporary files: %v: %v", left, err)
-	}
-}
 
 func TestClaimWorkflowByRunID(t *testing.T) {
 	measured := make(chan opmetrics.Measurement, 4)

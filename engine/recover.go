@@ -112,7 +112,10 @@ func (s *shard) recover() error {
 	}
 	for _, id := range order {
 		x := runs[id]
-		p := s.e.plan(x.meta.Plan + "@" + x.meta.PlanHash)
+		p, err := s.e.loadPlan(x.meta.Plan, x.meta.PlanHash)
+		if err != nil {
+			return fmt.Errorf("run %s: load plan %s@%s: %w", id, x.meta.Plan, x.meta.PlanHash, err)
+		}
 		if p == nil {
 			return fmt.Errorf("run %s: %w: %s@%s", id, errPlanMissing, x.meta.Plan, x.meta.PlanHash)
 		}
