@@ -1,6 +1,8 @@
 name: ci
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -31,13 +33,16 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: SDK test dependencies (the embedded extra; the database drivers)
+      - name: SDK test and package dependencies
         run: |
-          python3 -m pip install wasmtime "psycopg[binary,pool]"
+          python3 -m pip install build wasmtime "psycopg[binary,pool]"
+          npm install --prefix sdk/ts --no-audit --no-fund --loglevel=error
           mkdir -p "$RUNNER_TEMP/pg" && npm install --prefix "$RUNNER_TEMP/pg" pg
           echo "KAIRO_SDK_PG_MODULE=$RUNNER_TEMP/pg" >> "$GITHUB_ENV"
       - name: check (fmt, vet, build, tests, invariants, race; all modules)
         run: KAIRO_WASM="$RUNNER_TEMP/kairo.wasm" scripts/check.sh --race
+      - name: compile TypeScript and build Python packages
+        run: KAIRO_WASM="$RUNNER_TEMP/kairo.wasm" PACKAGE_OUT="$RUNNER_TEMP/sdk-packages" scripts/check-packages.sh
       # The WASM core the SDKs embed (ADR 0051), as built and tested above.
       - name: kairo.wasm checksum
         run: (cd "$RUNNER_TEMP" && sha256sum kairo.wasm | tee kairo.wasm.sha256)
