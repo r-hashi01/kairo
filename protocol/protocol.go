@@ -42,9 +42,11 @@ package protocol
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/r-hashi01/kairo/sched"
@@ -142,11 +144,16 @@ type Chunk struct {
 }
 
 var ErrFrameTooLarge = errors.New("protocol: frame too large")
+var errMissingSeq = errors.New("protocol: message body has no sequence")
+var errMissingCredit = errors.New("protocol: Credit body has no count")
 
 func WriteFrame(w *bufio.Writer, t MsgType, v any) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return err
+	}
+	if len(body)+1 > maxFrame {
+		return ErrFrameTooLarge
 	}
 	var hdr [5]byte
 	binary.BigEndian.PutUint32(hdr[:4], uint32(len(body)+1))
@@ -156,6 +163,27 @@ func WriteFrame(w *bufio.Writer, t MsgType, v any) error {
 	}
 	_, err = w.Write(body)
 	return err
+}
+
+func decodeObject(body []byte, v any) error {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 || body[0] != '{' {
+		return fmt.Errorf("protocol: message body is not a JSON object")
+	}
+	return json.Unmarshal(body, v)
+}
+
+func decodeCredit(body []byte) (Credit, error) {
+	var value struct {
+		N *int `json:"n"`
+	}
+	if err := decodeObject(body, &value); err != nil {
+		return Credit{}, err
+	}
+	if value.N == nil {
+		return Credit{}, errMissingCredit
+	}
+	return Credit{N: *value.N}, nil
 }
 
 func ReadFrame(r *bufio.Reader) (MsgType, []byte, error) {

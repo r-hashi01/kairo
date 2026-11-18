@@ -314,8 +314,13 @@ reading:
 		switch typ {
 		case MsgResult:
 			var res Result
-			if json.Unmarshal(body, &res) != nil {
-				continue
+			err := decodeObject(body, &res)
+			if err == nil && res.Seq == 0 {
+				err = errMissingSeq
+			}
+			if err != nil {
+				log.Printf("kairo: worker %q sent malformed Result: %v", h.Worker, err)
+				break reading
 			}
 			t := take(res.Seq)
 			if t == nil {
@@ -344,9 +349,10 @@ reading:
 				d.Poll(p, 1)
 			}
 		case MsgCredit:
-			var cr Credit
-			if json.Unmarshal(body, &cr) != nil {
-				continue
+			cr, err := decodeCredit(body)
+			if err != nil {
+				log.Printf("kairo: worker %q sent malformed Credit: %v", h.Worker, err)
+				break reading
 			}
 			if cr.N > 0 && !drained {
 				if !d.Grant(p, cr.N) {
@@ -371,8 +377,13 @@ reading:
 			}
 		case MsgChunk:
 			var ch Chunk
-			if json.Unmarshal(body, &ch) != nil {
-				continue
+			err := decodeObject(body, &ch)
+			if err == nil && ch.Seq == 0 {
+				err = errMissingSeq
+			}
+			if err != nil {
+				log.Printf("kairo: worker %q sent malformed Chunk: %v", h.Worker, err)
+				break reading
 			}
 			mu.Lock()
 			o, ok := outstanding[ch.Seq]

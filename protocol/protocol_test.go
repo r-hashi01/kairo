@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -20,8 +22,209 @@ import (
 	"github.com/r-hashi01/kairo/task"
 )
 
+func writeRawFrame(w *bufio.Writer, typ MsgType, body []byte) error {
+	var header [5]byte
+	binary.BigEndian.PutUint32(header[:4], uint32(len(body)+1))
+	header[4] = byte(typ)
+	if _, err := w.Write(header[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(body); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+func waitProtocol(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition was not met")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func setup(t *testing.T) (*engine.Engine, string) {
 	return setupServer(t, nil)
+}
+
+func TestWriteFrameRejectsOversizedBody(t *testing.T) {
+	w := bufio.NewWriter(io.Discard)
+	err := WriteFrame(w, MsgResult, map[string]string{"output": strings.Repeat("x", maxFrame)})
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("WriteFrame error = %v, want ErrFrameTooLarge", err)
+	}
+}
+
+func TestServerClosesSessionOnMalformedKnownMessage(t *testing.T) {
+	_, sock := setup(t)
+	for _, typ := range []MsgType{MsgResult, MsgCredit, MsgChunk} {
+		t.Run(fmt.Sprint(typ), func(t *testing.T) {
+			c, err := net.Dial("unix", sock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			r, w := bufio.NewReader(c), bufio.NewWriter(c)
+			if err := WriteFrame(w, MsgHello, Hello{Worker: "malformed", Actions: []string{"code.run"}, Credit: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			body := []byte("{")
+			if typ == MsgCredit {
+				body = []byte("{}")
+			}
+			if err := writeRawFrame(w, typ, body); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := ReadFrame(r); !errors.Is(err, io.EOF) {
+				t.Fatalf("read after malformed %v = %v, want EOF", typ, err)
+			}
+		})
+	}
+}
+
+func TestMalformedResultMakesOutstandingRealTaskUnknown(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"send","action":"send"}}`)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r, w := bufio.NewReader(c), bufio.NewWriter(c)
+	if err := WriteFrame(w, MsgHello, Hello{Worker: "malformed", Actions: []string{"send"}, Credit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ, _, err := ReadFrame(r); err != nil || typ != MsgTask {
+		t.Fatalf("task frame = %v, %v", typ, err)
+	}
+	if err := writeRawFrame(w, MsgResult, []byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	waitProtocol(t, func() bool {
+		ri, err := e.Get(context.Background(), id)
+		return err == nil && ri.Status == "blocked" && len(ri.Reviews) == 1
+	})
+}
+
+func TestWorkerClosesSessionOnMalformedKnownMessage(t *testing.T) {
+	for _, typ := range []MsgType{MsgHello, MsgTask, MsgCancel, MsgCredit} {
+		t.Run(fmt.Sprint(typ), func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			serverErr := make(chan error, 1)
+			go func() {
+				c, err := listener.Accept()
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				defer c.Close()
+				r, w := bufio.NewReader(c), bufio.NewWriter(c)
+				if got, _, err := ReadFrame(r); err != nil || got != MsgHello {
+					serverErr <- fmt.Errorf("worker hello = %v, %v", got, err)
+					return
+				}
+				body := []byte("null")
+				if typ == MsgCredit {
+					body = []byte("{}")
+				}
+				serverErr <- writeRawFrame(w, typ, body)
+			}()
+			wk := &Worker{Name: "malformed", Actions: []string{"x"}, Concurrency: 1,
+				Handler: func(context.Context, *task.Task, func([]byte)) task.Result { return task.Result{} }}
+			err = wk.Run(context.Background(), "tcp", listener.Addr().String())
+			if err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("Worker.Run error = %v, want malformed message error", err)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestWorkerResultEncodingFailureFailsDrainAndRealTask(t *testing.T) {
+	e, sock := setup(t)
+	plan(t, e, `{"name":"p","root":{"kind":"step","id":"send","action":"send"}}`)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	wk := &Worker{Name: "bad-result", Actions: []string{"send"}, Concurrency: 1,
+		Handler: func(context.Context, *task.Task, func([]byte)) task.Result {
+			close(started)
+			<-release
+			return task.Result{Output: json.RawMessage(`{`)}
+		}}
+	runErr := make(chan error, 1)
+	go func() { runErr <- wk.Run(context.Background(), "unix", sock) }()
+	id, err := submit(e, engine.SubmitRequest{Plan: "p", Tenant: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("task did not start")
+	}
+	drainErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		drainErr <- wk.Drain(ctx)
+	}()
+	waitProtocol(t, func() bool {
+		wk.mu.Lock()
+		s := wk.session
+		wk.mu.Unlock()
+		if s == nil {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.drainAck
+	})
+	close(release)
+	select {
+	case err := <-drainErr:
+		if err == nil {
+			t.Fatal("Drain succeeded after the result failed to encode")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not settle after the result failed to encode")
+	}
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Fatal("Worker.Run succeeded after the result failed to encode")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Worker.Run did not stop after the result failed to encode")
+	}
+	if got := wk.Inflight(); got != 0 {
+		t.Fatalf("inflight = %d, want 0", got)
+	}
+	waitProtocol(t, func() bool {
+		ri, err := e.Get(context.Background(), id)
+		return err == nil && ri.Status == "blocked" && len(ri.Reviews) == 1
+	})
 }
 
 func setupServer(t *testing.T, configure func(*Server)) (*engine.Engine, string) {

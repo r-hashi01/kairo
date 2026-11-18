@@ -8,6 +8,7 @@ import {
 	CAPABILITY_GRACEFUL_DRAIN,
 	FrameReader,
 	MsgType,
+	ProtocolError,
 	encodeFrame,
 	resultBody,
 	type Result,
@@ -34,6 +35,17 @@ export class DrainUnsupportedError extends Error {
 }
 
 const CAPABILITY_NEGOTIATION_TIMEOUT = 1000;
+
+function objectBody(name: string, body: unknown): Record<string, unknown> {
+	if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new ProtocolError(`${name} body is not an object`);
+	return body as Record<string, unknown>;
+}
+
+function sequenceBody(name: string, body: unknown): Record<string, unknown> {
+	const value = objectBody(name, body);
+	if (!Number.isSafeInteger(value.seq) || (value.seq as number) <= 0) throw new ProtocolError(`${name} body has no valid sequence`);
+	return value;
+}
 
 export interface WorkerOptions {
 	name: string;
@@ -101,7 +113,18 @@ export class Worker {
 			this.socket = socket;
 			const reader = new FrameReader();
 			const send = (type: number, body: unknown) => {
-				if (!socket.destroyed) socket.write(encodeFrame(type, body));
+				if (socket.destroyed) throw new Error('worker connection is closed');
+				let frame: Buffer;
+				try {
+					frame = encodeFrame(type, body);
+				} catch (e) {
+					const error = e instanceof Error ? e : new Error(String(e));
+					this.failSession(error);
+					throw error;
+				}
+				socket.write(frame, (error) => {
+					if (error) this.failSession(error);
+				});
 			};
 			this.sendFrame = send;
 			this.drainFailure = undefined;
@@ -121,43 +144,54 @@ export class Worker {
 					hello.callback_actions = this.opts.callbackActions;
 				}
 				hello.capabilities = capabilities;
-				send(MsgType.Hello, hello);
+				try {
+					send(MsgType.Hello, hello);
+				} catch {
+					// send failed the session and closed the socket.
+				}
 			});
 			socket.on('data', (data: Buffer) => {
-				let frames: Array<[number, unknown]>;
 				try {
-					frames = reader.push(data);
-				} catch (e) {
-					socket.destroy(e as Error);
-					return;
-				}
-				for (const [type, body] of frames) {
-					if (type !== MsgType.Hello) this.finishNegotiation(false);
-					if (type === MsgType.Hello) {
-						const capabilities = Array.isArray((body as { capabilities?: unknown }).capabilities)
-							? (body as { capabilities: unknown[] }).capabilities
-							: [];
-						this.finishNegotiation(capabilities.includes(CAPABILITY_GRACEFUL_DRAIN));
-					}
-					else if (type === MsgType.Task) {
-						this.inflight++;
-						this.serve(body as Task, send);
-					}
-					else if (type === MsgType.Cancel) this.cancels.get((body as { seq: number }).seq)?.abort();
-					else if (type === MsgType.Credit) {
-						const n = Number((body as { n?: number }).n ?? 0);
-						if (this.draining && n === 0) this.drainAck = true;
-						else if (this.draining && n > 0) this.pendingAcks = Math.max(this.pendingAcks - n, 0);
-						this.checkDrain();
-					}
-					else if (type === MsgType.RunEnd) {
-						try {
-							this.opts.onRunEnd?.((body as { run_id: string }).run_id);
-						} catch {
-							// The worker's own bookkeeping: the connection goes on.
+					for (const [type, body] of reader.push(data)) {
+						if (type !== MsgType.Hello) this.finishNegotiation(false);
+						if (type === MsgType.Hello) {
+							const value = objectBody('Hello', body);
+							const capabilities = value.capabilities ?? [];
+							if (!Array.isArray(capabilities) || capabilities.some((v) => typeof v !== 'string')) {
+								throw new ProtocolError('Hello capabilities is not a string array');
+							}
+							this.finishNegotiation(capabilities.includes(CAPABILITY_GRACEFUL_DRAIN));
 						}
+						else if (type === MsgType.Task) {
+							const task = sequenceBody('Task', body) as unknown as Task;
+							this.inflight++;
+							this.serve(task, send);
+						}
+						else if (type === MsgType.Cancel) {
+							const value = sequenceBody('Cancel', body);
+							this.cancels.get(value.seq as number)?.abort();
+						}
+						else if (type === MsgType.Credit) {
+							const value = objectBody('Credit', body);
+							if (!Number.isSafeInteger(value.n)) throw new ProtocolError('Credit body has no valid count');
+							const n = value.n as number;
+							if (this.draining && n === 0) this.drainAck = true;
+							else if (this.draining && n > 0) this.pendingAcks = Math.max(this.pendingAcks - n, 0);
+							this.checkDrain();
+						}
+						else if (type === MsgType.RunEnd) {
+							const value = objectBody('RunEnd', body);
+							if (typeof value.run_id !== 'string') throw new ProtocolError('RunEnd body has no run id');
+							try {
+								this.opts.onRunEnd?.(value.run_id);
+							} catch {
+								// The worker's own bookkeeping: the connection goes on.
+							}
+						}
+						// Unknown types are skipped.
 					}
-					// Unknown types are skipped.
+				} catch (e) {
+					this.failSession(e instanceof Error ? e : new Error(String(e)));
 				}
 			});
 			socket.on('error', reject);
@@ -167,7 +201,7 @@ export class Worker {
 				this.cancels.clear();
 				this.sendFrame = undefined;
 				if (this.draining && !(this.drainAck && this.inflight === 0 && this.pendingAcks === 0)) {
-					this.drainFailure = new Error('worker connection closed while draining');
+					this.drainFailure ??= new Error('worker connection closed while draining');
 					this.checkDrain();
 				}
 				resolve();
@@ -261,6 +295,12 @@ export class Worker {
 		this.drainWaiters.clear();
 	}
 
+	private failSession(error: Error): void {
+		if (!this.drainFailure) this.drainFailure = error;
+		this.checkDrain();
+		if (this.socket && !this.socket.destroyed) this.socket.destroy(error);
+	}
+
 	private serve(task: Task, send: (type: number, body: unknown) => void): void {
 		const controller = new AbortController();
 		let weight = 0;
@@ -278,19 +318,29 @@ export class Worker {
 			},
 		};
 		void (async () => {
-			let result: Result;
+			let needsAck = false;
 			try {
-				result = await this.opts.handler(task, ctx);
+				let result: Result;
+				try {
+					result = await this.opts.handler(task, ctx);
+				} catch (e) {
+					// A handler that throws: the step failed, definitely.
+					result = { error: e instanceof Error ? e.message : String(e) };
+				}
+				if (result.weight === undefined && weight > 0) result = { ...result, weight };
+				if (this.draining) {
+					this.pendingAcks++;
+					needsAck = true;
+				}
+				send(MsgType.Result, resultBody(task.seq, result));
 			} catch (e) {
-				// A handler that throws: the step failed, definitely.
-				result = { error: e instanceof Error ? e.message : String(e) };
+				if (needsAck) this.pendingAcks--;
+				this.failSession(e instanceof Error ? e : new Error(String(e)));
+			} finally {
+				this.cancels.delete(task.seq);
+				this.inflight--;
+				this.checkDrain();
 			}
-			if (result.weight === undefined && weight > 0) result = { ...result, weight };
-			this.cancels.delete(task.seq);
-			if (this.draining) this.pendingAcks++;
-			send(MsgType.Result, resultBody(task.seq, result));
-			this.inflight--;
-			this.checkDrain();
 		})();
 	}
 }

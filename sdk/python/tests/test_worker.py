@@ -5,13 +5,18 @@ from __future__ import annotations
 import base64
 import socket
 import threading
+import time
 import unittest
+from collections.abc import Callable
+from typing import Any
+from unittest import mock
 
 from kairo_sdk import (
     CAPABILITY_ASYNC_ACTION_CALLBACK,
     CAPABILITY_GRACEFUL_DRAIN,
     DrainUnsupportedError,
     MsgType,
+    ProtocolError,
     Result,
     Task,
     TaskContext,
@@ -28,12 +33,23 @@ class FakeRuntime:
         self.w = self.server.makefile("wb")
         self.client = client
 
-    def send(self, t: MsgType, body: dict) -> None:
+    def send(self, t: MsgType, body: Any) -> None:
         write_frame(self.w, t, body)
         self.w.flush()
 
     def recv(self) -> tuple[int, dict]:
         return read_frame(self.r)
+
+    def close(self) -> None:
+        for sock in (self.server, self.client):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.r.close()
+        self.w.close()
+        self.server.close()
+        self.client.close()
 
 
 def serve(worker: Worker, rt: FakeRuntime) -> threading.Thread:
@@ -46,7 +62,89 @@ def serve(worker: Worker, rt: FakeRuntime) -> threading.Thread:
     return th
 
 
+def wait_for(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 5
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition was not met")
+        threading.Event().wait(0.001)
+
+
 class WorkerTest(unittest.TestCase):
+    def test_malformed_known_message_fails_the_session(self) -> None:
+        cases = (
+            (MsgType.HELLO, None),
+            (MsgType.TASK, {}),
+            (MsgType.CANCEL, {"seq": True}),
+            (MsgType.CREDIT, {"n": "bad"}),
+        )
+        for typ, body in cases:
+            with self.subTest(typ=typ):
+                rt = FakeRuntime()
+                worker = Worker("w", ["x"], lambda _t, _c: Result(), 1)
+                th = serve(worker, rt)
+                rt.recv()
+                rt.send(typ, body)
+                th.join(5)
+                self.assertFalse(th.is_alive())
+                self.assertIsInstance(worker._failed, ProtocolError)
+                rt.close()
+
+    def test_unserializable_result_fails_drain_and_releases_inflight(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(_task: Task, _ctx: TaskContext) -> Result:
+            started.set()
+            release.wait(5)
+            circular: list[Any] = []
+            circular.append(circular)
+            return Result(output=circular)
+
+        rt = FakeRuntime()
+        worker = Worker("w", ["x"], handler, 1)
+        th = serve(worker, rt)
+        rt.recv()
+        rt.send(MsgType.HELLO, {"capabilities": [CAPABILITY_GRACEFUL_DRAIN]})
+        rt.send(MsgType.TASK, {"seq": 1, "action": "x"})
+        self.assertTrue(started.wait(5))
+        drained = threading.Event()
+        drain_errors: list[Exception] = []
+
+        def drain() -> None:
+            try:
+                worker.drain()
+            except Exception as error:
+                drain_errors.append(error)
+            finally:
+                drained.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        self.assertEqual(rt.recv(), (MsgType.CREDIT, {"n": -1}))
+        rt.send(MsgType.CREDIT, {"n": 0})
+        release.set()
+        self.assertTrue(drained.wait(5))
+        self.assertTrue(drain_errors)
+        wait_for(lambda: worker.inflight == 0)
+        self.assertIsNotNone(worker._failed)
+        rt.close()
+        th.join(5)
+        self.assertFalse(th.is_alive())
+
+    def test_oversized_result_fails_the_session(self) -> None:
+        rt = FakeRuntime()
+        worker = Worker("w", ["x"], lambda _t, _c: Result(output="x" * 512), 1)
+        with mock.patch("kairo_sdk.protocol.MAX_FRAME", 256):
+            th = serve(worker, rt)
+            rt.recv()
+            rt.send(MsgType.TASK, {"seq": 1, "action": "x"})
+            wait_for(lambda: worker._failed is not None)
+        self.assertIsInstance(worker._failed, ProtocolError)
+        wait_for(lambda: worker.inflight == 0)
+        rt.close()
+        th.join(5)
+        self.assertFalse(th.is_alive())
+
     def test_task_chunks_and_result(self) -> None:
         def handler(task: Task, ctx: TaskContext) -> Result:
             ctx.emit("he")

@@ -3,7 +3,6 @@ package protocol
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -96,6 +95,11 @@ func (s *workerSession) sendResult(v Result) error {
 	if err == nil {
 		err = s.w.Flush()
 	}
+	if err != nil {
+		// Publish the session failure before inflight reaches zero. Otherwise
+		// Drain could observe a completed result that was never written.
+		s.finish(err)
+	}
 	s.mu.Lock()
 	s.inflight--
 	if err != nil && needsAck {
@@ -159,6 +163,11 @@ func (s *workerSession) beginDrain(ctx context.Context) error {
 func (s *workerSession) waitDrained(ctx context.Context) error {
 	for {
 		s.mu.Lock()
+		if s.err != nil {
+			err := s.err
+			s.mu.Unlock()
+			return err
+		}
 		if s.drainAck && s.inflight == 0 && s.pendingAcks == 0 {
 			s.mu.Unlock()
 			return nil
@@ -218,6 +227,7 @@ func (wk *Worker) Inflight() int {
 // Run connects to the runtime and serves tasks until ctx is cancelled or
 // the connection breaks.
 func (wk *Worker) Run(ctx context.Context, network, addr string) error {
+	callerCtx := ctx
 	conc := max(wk.Concurrency, 1)
 	if conc > MaxCredit {
 		return fmt.Errorf("protocol: concurrency %d exceeds maximum credit %d", conc, MaxCredit)
@@ -283,12 +293,14 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 				if err := s.sendResult(Result{Seq: seq, Output: res.Output, Err: res.Err, Retryable: res.Retryable, Unknown: res.Unknown,
 					Tokens: res.Tokens, Weight: res.Weight, ErrType: res.ErrType, Meta: res.Meta, RateLimited: res.RateLimited,
 					RetryAfter: res.RetryAfter, Wait: res.Wait, Pending: res.Pending}); err != nil {
-					s.finish(err)
+					c.Close()
 				}
 			}
 		}()
 	}
 	var rerr error
+
+reading:
 	for {
 		typ, body, err := ReadFrame(r)
 		if err != nil {
@@ -307,8 +319,10 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 		switch typ {
 		case MsgHello:
 			var welcome Welcome
-			if json.Unmarshal(body, &welcome) != nil {
-				continue
+			if err := decodeObject(body, &welcome); err != nil {
+				rerr = fmt.Errorf("protocol: malformed Hello: %w", err)
+				s.finish(rerr)
+				break reading
 			}
 			s.mu.Lock()
 			s.negotiated = true
@@ -317,8 +331,14 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 			s.mu.Unlock()
 		case MsgTask:
 			var t task.Task
-			if err := json.Unmarshal(body, &t); err != nil {
-				continue
+			err := decodeObject(body, &t)
+			if err == nil && t.Seq == 0 {
+				err = errMissingSeq
+			}
+			if err != nil {
+				rerr = fmt.Errorf("protocol: malformed Task: %w", err)
+				s.finish(rerr)
+				break reading
 			}
 			tctx, cancel := context.WithCancel(ctx)
 			cmu.Lock()
@@ -331,8 +351,14 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 			tasks <- job{t: &t, ctx: tctx}
 		case MsgCancel:
 			var cn Cancel
-			if json.Unmarshal(body, &cn) != nil {
-				continue
+			err := decodeObject(body, &cn)
+			if err == nil && cn.Seq == 0 {
+				err = errMissingSeq
+			}
+			if err != nil {
+				rerr = fmt.Errorf("protocol: malformed Cancel: %w", err)
+				s.finish(rerr)
+				break reading
 			}
 			cmu.Lock()
 			if cancel := cancels[cn.Seq]; cancel != nil {
@@ -340,9 +366,11 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 			}
 			cmu.Unlock()
 		case MsgCredit:
-			var cr Credit
-			if json.Unmarshal(body, &cr) != nil {
-				continue
+			cr, err := decodeCredit(body)
+			if err != nil {
+				rerr = fmt.Errorf("protocol: malformed Credit: %w", err)
+				s.finish(rerr)
+				break reading
 			}
 			s.mu.Lock()
 			if s.draining && cr.N == 0 {
@@ -354,11 +382,19 @@ func (wk *Worker) Run(ctx context.Context, network, addr string) error {
 			s.mu.Unlock()
 		}
 	}
+	cancel()
+	c.Close()
 	close(tasks)
 	wg.Wait()
 	s.finish(rerr)
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if callerCtx.Err() != nil {
+		return callerCtx.Err()
+	}
+	s.mu.Lock()
+	err = s.err
+	s.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return rerr
 }
