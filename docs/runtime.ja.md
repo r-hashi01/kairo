@@ -23,6 +23,8 @@
 
 耐久性 ack は未達です。macOS の `File.Sync` は `F_FULLFSYNC`（ドライブキャッシュまでフラッシュ）を使うため遅くなります。Linux の NVMe で fdatasync を使えば 1〜2 ms 程度が見込めますが、まだ測っていません。100万件保持（32コア / 128GB）の規模試験も未実施です。
 
+process-level workflow claim の全候補走査は、active workflow数と同時claimant数に応じて線形に重くなります。Apple M4 Maxでは、active 1,000件・同時claimant 8のshard問い合わせp99は0.255msでしたが、5,000件・8では4.585msでした。測定方法、CPU・割り当て、設計を見直す条件は [process-level workflow claim scan の計測](claim-scan-2026-11-18.ja.md) に記録しています。
+
 ## 構成
 
 ```
