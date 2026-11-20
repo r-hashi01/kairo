@@ -71,8 +71,8 @@
 | [0064](0064-atomic-signal-receipts-and-only-if-waiting.md) | Signal の適用を原子的に確認し、待ちの番号と先取りかどうかを返す | 承認 |
 | [0065](0065-attach-external-workflow-to-parent.md) | 外から始めるワークフローを、未完了の親の木へ原子的に加える | 承認 |
 | [0066](0066-resolve-code-calls-over-kairod.md) | コードワークフローの Resolve を、既存の kairod API へ接続する | 承認 |
-| [0067](0067-parent-trees-over-kairod.md) | kairod の親子を耐久化し、親 shard で子の開始と親の終端を直列化する | 承認 |
-| [0068](0068-list-code-workflows-over-kairod.md) | kairod のコードワークフローを shard 横断で一覧する | 承認 |
+| [0067](0067-parent-trees-over-kairod.md) | kairod の親子を耐久化し、親 shard で子の開始と親の終端を直列化する | 承認（決定項 4 の順序を 0083 で置き換え） |
+| [0068](0068-list-code-workflows-over-kairod.md) | kairod のコードワークフローを shard 横断で一覧する | 承認（決定項 2 の順序と cursor 比較を 0083 で置き換え） |
 | [0069](0069-suspend-code-workflows-over-kairod.md) | kairod のコードワークフローを、期限付きの駆動権と起床通知で suspend できるようにする | 承認 |
 | [0070](0070-kairod-owns-async-action-callbacks.md) | kairod が非同期 HTTP アクションのコールバックと期限切れを所有する | 承認 |
 | [0071](0071-atomic-early-signals-over-kairod.md) | kairod の論理 Signal は耐久化した wait outcome を receipt とし、再送で二重配送しない | 承認 |
@@ -87,5 +87,6 @@
 | [0080](0080-replay-code-workflows-from-records-without-effects.md) | 記録だけのリプレイは保存済みの呼び出しだけを読み、作用も実行状態も変えない | 承認 |
 | [0081](0081-configurable-http-action-body-limit.md) | HTTP アクションの本文上限は配備ごとに設定し、安全な既定値と絶対上限を持つ | 承認 |
 | [0082](0082-durable-explicit-registry-catalog.md) | 永続レジストリは版付きカタログとして耐久化し、現行計画を明示する | 承認 |
+| [0083](0083-store-assigned-run-creation-order.md) | 列挙する実行は保存先が割り当てる作成序数で並べる | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
