@@ -99,6 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: release
@@ -106,5 +107,8 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+          notes="docs/releases/${{ needs.build.outputs.version }}.md"
+          test -f "$notes"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --fail-on-no-commits --generate-notes --notes "$(cat "$notes")" \
             dist/kairo.wasm dist/bin/* dist/SHA256SUMS
