@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/r-hashi01/kairo/internal/durablefs"
 )
 
 var ErrNotFound = errors.New("blob: not found")
@@ -132,11 +134,15 @@ type Dir struct {
 }
 
 func NewDir(root string, noSync bool) (*Dir, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	return newDir(root, noSync, syncDir)
+}
+
+func newDir(root string, noSync bool, dirSync func(string) error) (*Dir, error) {
+	if err := durablefs.MkdirAll(root, 0o755, noSync, dirSync); err != nil {
 		return nil, err
 	}
 	return &Dir{
-		root: root, noSync: noSync, dirSync: syncDir,
+		root: root, noSync: noSync, dirSync: dirSync,
 		durableDirs: map[string]struct{}{filepath.Clean(root): {}},
 	}, nil
 }
@@ -278,15 +284,7 @@ func (s *Dir) ensureDir(dir string) error {
 }
 
 func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
+	return durablefs.SyncDir(dir)
 }
 
 func (s *Dir) Get(key string) ([]byte, error) {
