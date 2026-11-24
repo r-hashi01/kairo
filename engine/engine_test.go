@@ -751,6 +751,28 @@ func BenchmarkFiveNodeRun(b *testing.B) {
 	}
 }
 
+func BenchmarkWorkflowCreation(b *testing.B) {
+	e := newEngine(b, Config{Shards: 8})
+	defer e.Close()
+	mustPlan(b, e, workflowPlan)
+	if err := e.Start(); err != nil {
+		b.Fatal(err)
+	}
+	tier := TierNone
+	b.ReportAllocs()
+	b.ResetTimer()
+	start := time.Now()
+	cpu0 := cpuTime()
+	for i := 0; i < b.N; i++ {
+		if _, err := submit(e, SubmitRequest{Plan: "kairo.workflow", RunID: fmt.Sprint(i), Workflow: "orders", Tenant: fmt.Sprint(i % 8), Tier: &tier}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	elapsed := time.Since(start)
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "runs/s")
+	b.ReportMetric(float64((cpuTime()-cpu0).Microseconds())/float64(b.N), "cpu-µs/run")
+}
+
 // Hand-off latency between nodes: from an executor returning the result of
 // step k to the executor receiving step k+1 of the same run. A measurement,
 // not a check (ADR 0056): it depends on the machine, so it runs only for

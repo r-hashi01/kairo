@@ -743,6 +743,7 @@ class Embedded:
                 output=None if res["output"] is None else json.dumps(res["output"]),
                 error=res["error"] or None,
                 seq=0,
+                created_order=row.created_order if row is not None else 0,
                 created_at=row.created_at if row is not None else at,
                 updated_at=at,
                 parent=row.parent if row is not None else begin["parent"],  # type: ignore[index]

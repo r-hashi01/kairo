@@ -37,6 +37,9 @@ out=$(go test ./engine -run '^$' -bench '^BenchmarkFiveNodeRun/none$' -benchtime
 check "runtime CPU per 5-node run" "$(metric "$out" cpu-µs/run)" 1000 µs
 echo "  info  throughput: $(metric "$out" runs/s) runs/s"
 
+out=$(go test ./engine -run '^$' -bench '^BenchmarkWorkflowCreation$' -benchtime 20000x)
+echo "  info  workflow creation: $(metric "$out" cpu-µs/run) µs/run, $(metric "$out" runs/s) runs/s"
+
 # Timing tests fail when over budget; keep going and report the value.
 out=$(KAIRO_MEASURE=1 go test -count=1 ./engine -run '^TestHandoffLatency$' -v || true)
 p99=$(grep -o 'p99=[^ ]*' <<<"$out" | head -1 | cut -d= -f2 || true)

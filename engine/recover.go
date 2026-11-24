@@ -41,6 +41,7 @@ func (s *shard) recover() error {
 	var order []string
 	var first [tierCount]uint64 // first retained LSN per tier log
 	get := func(t Tier, m *startMeta) *recovered {
+		s.e.observeCreationOrder(m.CreationOrder)
 		x := runs[m.RunID]
 		if x == nil {
 			x = &recovered{meta: m, tier: t}
@@ -189,7 +190,7 @@ func (s *shard) recover() error {
 					// TTL runs from when the run finished. An expired one
 					// is not written at all.
 					if at >= s.markerCut() {
-						m := marker{runID: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta,
+						m := marker{runID: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta, creationOrder: x.meta.CreationOrder,
 							created: startAt, updated: lastAt, at: at, status: st.Status.String()}
 						if x.meta.Keep {
 							// Its output before its marker, as when it
@@ -231,7 +232,7 @@ func (s *shard) recover() error {
 			finished = append(finished, id)
 			continue
 		}
-		r := &run{id: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta, created: startAt, updated: lastAt,
+		r := &run{id: id, parent: x.meta.Parent, workflow: x.meta.Workflow, meta: x.meta.Meta, creationOrder: x.meta.CreationOrder, created: startAt, updated: lastAt,
 			plan: p, tenant: x.meta.Tenant, tier: x.tier, keep: x.meta.Keep, st: st, timers: map[uint32]timerwheel.Handle{},
 			lastLSN: last, startLSN: x.startLSN, status: st.Status, started: true, feedLSN: feedLast}
 		if r.parent != "" {
