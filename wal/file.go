@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/r-hashi01/kairo/internal/durablefs"
 )
 
 // DefaultSegmentSize is the size after which a FileSink starts a new
@@ -48,12 +50,16 @@ type segment struct {
 // is set, Append returns after write(2) without fsync (use for a tmpfs /
 // shared-memory directory, where the failure domain is the machine).
 func OpenFile(dir, prefix string, noSync bool) (*FileSink, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	return openFile(dir, prefix, noSync, syncDirectory)
+}
+
+func openFile(dir, prefix string, noSync bool, dirSync func(string) error) (*FileSink, error) {
+	if err := durablefs.MkdirAll(dir, 0o755, noSync, dirSync); err != nil {
 		return nil, err
 	}
 	s := &FileSink{
 		dir: dir, prefix: prefix, noSync: noSync, SegmentSize: DefaultSegmentSize,
-		dirSync: syncDirectory, remove: os.Remove,
+		dirSync: dirSync, remove: os.Remove,
 	}
 	segs, err := s.list()
 	if err != nil {
@@ -165,15 +171,7 @@ func (s *FileSink) startSegment() error {
 }
 
 func syncDirectory(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-		return err
-	}
-	return d.Close()
+	return durablefs.SyncDir(dir)
 }
 
 func (s *FileSink) fail(op string, err error) error {

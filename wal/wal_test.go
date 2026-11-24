@@ -253,6 +253,13 @@ func TestFileSinkSegmentsAndRetire(t *testing.T) {
 func TestFileSinkPropagatesDirectoryDurabilityFailures(t *testing.T) {
 	injected := errors.New("injected directory failure")
 
+	t.Run("root creation", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "wal")
+		if _, err := openFile(dir, "shard-000", false, func(string) error { return injected }); !errors.Is(err, injected) {
+			t.Fatalf("OpenFile error = %v", err)
+		}
+	})
+
 	t.Run("segment creation breaks the sink", func(t *testing.T) {
 		s, err := OpenFile(t.TempDir(), "shard-000", false)
 		if err != nil {

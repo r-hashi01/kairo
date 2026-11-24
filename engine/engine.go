@@ -26,6 +26,7 @@ import (
 
 	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/core"
+	"github.com/r-hashi01/kairo/internal/durablefs"
 	"github.com/r-hashi01/kairo/ir"
 	"github.com/r-hashi01/kairo/live"
 	"github.com/r-hashi01/kairo/metrics"
@@ -444,7 +445,7 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 	if cfg.DataDir != "" {
-		if err := checkShardCount(cfg.DataDir, cfg.Shards); err != nil {
+		if err := checkShardCount(cfg.DataDir, cfg.Shards, cfg.NoSync); err != nil {
 			return nil, err
 		}
 		if err := e.loadCreationOrder(); err != nil {
@@ -1529,16 +1530,34 @@ func (e *Engine) observeStart(o sched.StartObservation) {
 	}
 }
 
+type shardCountFileOps struct {
+	syncFile func(*os.File) error
+	rename   func(string, string) error
+	syncDir  func(string) error
+}
+
+func defaultShardCountFileOps() shardCountFileOps {
+	return shardCountFileOps{
+		syncFile: func(f *os.File) error { return f.Sync() },
+		rename:   os.Rename,
+		syncDir:  durablefs.SyncDir,
+	}
+}
+
 // checkShardCount pins the number of shards of a data directory: runs are
 // routed by hash, so changing it would strand recovered runs.
-func checkShardCount(dir string, n int) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+func checkShardCount(dir string, n int, noSync bool) error {
+	return checkShardCountWithOps(dir, n, noSync, defaultShardCountFileOps())
+}
+
+func checkShardCountWithOps(dir string, n int, noSync bool, ops shardCountFileOps) error {
+	if err := durablefs.MkdirAll(dir, 0o755, noSync, ops.syncDir); err != nil {
 		return err
 	}
 	p := filepath.Join(dir, "SHARDS")
 	b, err := os.ReadFile(p)
 	if errors.Is(err, os.ErrNotExist) {
-		return os.WriteFile(p, []byte(strconv.Itoa(n)), 0o644)
+		return writeShardCount(p, n, noSync, ops)
 	}
 	if err != nil {
 		return err
@@ -1546,7 +1565,59 @@ func checkShardCount(dir string, n int) error {
 	if got, _ := strconv.Atoi(strings.TrimSpace(string(b))); got != n {
 		return fmt.Errorf("engine: %s was created with %d shards, configured %d", dir, got, n)
 	}
-	return nil
+	if noSync {
+		return nil
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := ops.syncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return ops.syncDir(dir)
+}
+
+func writeShardCount(path string, n int, noSync bool, ops shardCountFileOps) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".shards-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(name)
+	}()
+	if err := f.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := f.WriteString(strconv.Itoa(n)); err != nil {
+		return err
+	}
+	if !noSync {
+		if err := ops.syncFile(f); err != nil {
+			return err
+		}
+	}
+	if err := f.Close(); err != nil {
+		closed = true
+		return err
+	}
+	closed = true
+	if err := ops.rename(name, path); err != nil {
+		return err
+	}
+	if noSync {
+		return nil
+	}
+	return ops.syncDir(filepath.Dir(path))
 }
 
 const creationOrderReserve = 1024

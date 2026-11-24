@@ -37,6 +37,13 @@ func TestDirSyncsEveryGroupedDirectoryAndRename(t *testing.T) {
 func TestDirPropagatesDirectoryDurabilityFailures(t *testing.T) {
 	injected := errors.New("injected directory failure")
 
+	t.Run("root creation", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "blobs")
+		if _, err := newDir(root, false, func(string) error { return injected }); !errors.Is(err, injected) {
+			t.Fatalf("NewDir error = %v", err)
+		}
+	})
+
 	t.Run("parent creation", func(t *testing.T) {
 		s, err := NewDir(t.TempDir(), false)
 		if err != nil {
