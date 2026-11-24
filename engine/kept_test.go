@@ -284,6 +284,10 @@ func TestMarkerVersion1(t *testing.T) {
 	if got, err := decodeMarker(encodeMarker(nil, m)); err != nil || !reflect.DeepEqual(got, m) {
 		t.Fatalf("v4: %+v %v", got, err)
 	}
+	m.creationOrder = 7
+	if got, err := decodeMarker(encodeMarker(nil, m)); err != nil || !reflect.DeepEqual(got, m) {
+		t.Fatalf("v5: %+v %v", got, err)
+	}
 }
 
 // Optional metadata rides after flags in the tier byte; workflowless records
@@ -300,7 +304,7 @@ func TestStartMetaKeep(t *testing.T) {
 	}
 	for _, keep := range []bool{false, true} {
 		m := &startMeta{RunID: "r", Parent: "parent", Plan: "p", PlanHash: "h", Tenant: "t", Workflow: "orders",
-			Meta: []byte(`{"user":"a"}`), Created: 40, Updated: 42, Tier: TierFile, Keep: keep}
+			Meta: []byte(`{"user":"a"}`), CreationOrder: 7, Created: 40, Updated: 42, Tier: TierFile, Keep: keep}
 		rec, err := decodeRecord(encodeStart(nil, m))
 		if err != nil || !reflect.DeepEqual(*rec.meta, *m) {
 			t.Fatalf("keep=%v: %+v %v", keep, rec.meta, err)

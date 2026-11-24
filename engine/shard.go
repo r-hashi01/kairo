@@ -105,24 +105,25 @@ type held struct {
 }
 
 type run struct {
-	id       string
-	parent   string
-	workflow string
-	meta     json.RawMessage
-	created  int64
-	updated  int64
-	plan     *ir.Plan
-	tenant   string
-	tier     Tier
-	keep     bool // keep the output after it finishes (ADR 0050)
-	st       *core.State
-	snap     []byte // encoded state while evicted (in memory, or pending write)
-	onDisk   bool   // evicted and the snapshot is in the snapshot store
-	loading  bool
-	writing  bool           // a snapshot write is in progress
-	pending  []pendingEvent // events that arrived while loading
-	timers   map[uint32]timerwheel.Handle
-	lastLSN  uint64
+	id            string
+	parent        string
+	workflow      string
+	meta          json.RawMessage
+	creationOrder int64
+	created       int64
+	updated       int64
+	plan          *ir.Plan
+	tenant        string
+	tier          Tier
+	keep          bool // keep the output after it finishes (ADR 0050)
+	st            *core.State
+	snap          []byte // encoded state while evicted (in memory, or pending write)
+	onDisk        bool   // evicted and the snapshot is in the snapshot store
+	loading       bool
+	writing       bool           // a snapshot write is in progress
+	pending       []pendingEvent // events that arrived while loading
+	timers        map[uint32]timerwheel.Handle
+	lastLSN       uint64
 	// Log retention (ADR 0016). Before its first durable checkpoint a run
 	// needs everything from its start record. After it, only its latest
 	// checkpoint record (cpRec, so recovery can find it) and its own
@@ -175,6 +176,7 @@ type startReq struct {
 	parent        string
 	workflow      string
 	meta          json.RawMessage
+	creationOrder int64
 	tenant        string
 	plan          *ir.Plan
 	tier          Tier
@@ -700,7 +702,7 @@ func (s *shard) answerInputs(r *run) {
 
 func (s *shard) info(r *run) RunInfo {
 	ri := RunInfo{RunID: r.id, Parent: r.parent, Workflow: r.workflow, Meta: r.meta, Plan: r.plan.Name, Tenant: r.tenant, Tier: r.tier,
-		Status: r.status.String(), Evicted: r.st == nil, Reviews: r.reviews, Waits: r.waits}
+		Status: r.status.String(), Evicted: r.st == nil, Reviews: r.reviews, Waits: r.waits, creationOrder: r.creationOrder}
 	ri.CreatedAt, ri.UpdatedAt = r.created, r.updated
 	if st := r.st; st != nil {
 		ri.Output, ri.Error, ri.Exceptions = st.Output, st.Error, int(st.Exceptions)
@@ -842,7 +844,7 @@ func (s *shard) startRun(sr *startReq) {
 		old.starts = append(old.starts, sr)
 		return
 	}
-	r := &run{id: sr.runID, parent: sr.parent, workflow: sr.workflow, meta: sr.meta, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, keep: sr.keep, startTicket: sr.startTicket,
+	r := &run{id: sr.runID, parent: sr.parent, workflow: sr.workflow, meta: sr.meta, creationOrder: sr.creationOrder, plan: sr.plan, tenant: sr.tenant, tier: sr.tier, keep: sr.keep, startTicket: sr.startTicket,
 		st: core.NewState(sr.runID), timers: map[uint32]timerwheel.Handle{}}
 	s.forgetMarker(r.id) // an expired marker of an earlier run with this id
 	s.forgetTree(r.id)
@@ -890,7 +892,7 @@ func (s *shard) startRun(sr *startReq) {
 
 func (s *shard) meta(r *run) *startMeta {
 	return &startMeta{RunID: r.id, Parent: r.parent, Plan: r.plan.Name, PlanHash: r.plan.Hash, Tenant: r.tenant, Workflow: r.workflow,
-		Meta: r.meta, Created: r.created, Updated: r.updated, Tier: r.tier, Keep: r.keep}
+		Meta: r.meta, CreationOrder: r.creationOrder, Created: r.created, Updated: r.updated, Tier: r.tier, Keep: r.keep}
 }
 
 func (s *shard) logFor(r *run) *shardLog {

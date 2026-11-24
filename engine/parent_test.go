@@ -142,6 +142,28 @@ func TestParentTreeGuardsSettlement(t *testing.T) {
 	}
 }
 
+func TestChildrenUseCreationOrderWithinOneMillisecond(t *testing.T) {
+	at := time.UnixMilli(1_800_000_000_000)
+	e := newEngine(t, Config{Shards: 4, DataDir: t.TempDir(), NoSync: true, Now: func() time.Time { return at }})
+	defer e.Close()
+	registerParentPlans(t, e)
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := submit(e, SubmitRequest{Plan: "kairo.workflow", Tenant: "t", RunID: "parent"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"z-first", "a-second"} {
+		if _, err := submit(e, SubmitRequest{Plan: "child-wait", Tenant: "t", RunID: id, Parent: "parent"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	children, err := e.Children(context.Background(), "parent")
+	if err != nil || len(children) != 2 || children[0].RunID != "z-first" || children[1].RunID != "a-second" {
+		t.Fatalf("children: %+v %v", children, err)
+	}
+}
+
 func TestFinishedChildRelationExpiresWithMarker(t *testing.T) {
 	defer func(n int) { markerRetireEvery = n }(markerRetireEvery)
 	markerRetireEvery = 1

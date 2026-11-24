@@ -27,28 +27,31 @@ const (
 var errBadRecord = errors.New("engine: bad log record")
 
 type startMeta struct {
-	RunID    string
-	Parent   string
-	Plan     string
-	PlanHash string
-	Tenant   string
-	Workflow string
-	Meta     []byte
-	Created  int64
-	Updated  int64
-	Tier     Tier
+	RunID         string
+	Parent        string
+	Plan          string
+	PlanHash      string
+	Tenant        string
+	Workflow      string
+	Meta          []byte
+	CreationOrder int64
+	Created       int64
+	Updated       int64
+	Tier          Tier
 	// Keep: the run's output is kept after it finishes, for IdempotencyTTL
 	// (SubmitRequest.KeepOutput, ADR 0050). Stored in the tier byte's high
 	// bit: records written before it read as false.
 	Keep bool
 }
 
-// keepBit, parentBit and infoBit extend the tier byte (tiers are small
-// numbers). infoBit carries the code-workflow listing metadata (ADR 0068).
+// These bits extend the tier byte (tiers are small numbers). infoBit carries
+// code-workflow listing metadata (ADR 0068); orderBit carries ADR 0083's
+// store-local creation ordinal.
 const (
 	keepBit   = 0x80
 	parentBit = 0x40
 	infoBit   = 0x20
+	orderBit  = 0x10
 )
 
 func tierByte(m *startMeta) byte {
@@ -62,6 +65,9 @@ func tierByte(m *startMeta) byte {
 	if m.Workflow != "" {
 		b |= infoBit
 	}
+	if m.CreationOrder > 0 {
+		b |= orderBit
+	}
 	return b
 }
 
@@ -74,6 +80,9 @@ func appendMeta(b []byte, m *startMeta) []byte {
 		b = appendStr(b, string(m.Meta))
 		b = binary.AppendVarint(b, m.Created)
 		b = binary.AppendVarint(b, m.Updated)
+	}
+	if m.CreationOrder > 0 {
+		b = binary.AppendVarint(b, m.CreationOrder)
 	}
 	return b
 }
@@ -246,7 +255,7 @@ func decodeMeta(r *rdr) *startMeta {
 	m.PlanHash = r.str()
 	m.Tenant = r.str()
 	t := r.byte1()
-	m.Tier, m.Keep = Tier(t&^(keepBit|parentBit|infoBit)), t&keepBit != 0
+	m.Tier, m.Keep = Tier(t&^(keepBit|parentBit|infoBit|orderBit)), t&keepBit != 0
 	if t&parentBit != 0 {
 		m.Parent = r.str()
 	}
@@ -255,6 +264,12 @@ func decodeMeta(r *rdr) *startMeta {
 		m.Meta = r.bytes()
 		m.Created = r.i()
 		m.Updated = r.i()
+	}
+	if t&orderBit != 0 {
+		m.CreationOrder = r.i()
+		if m.CreationOrder <= 0 || m.CreationOrder > maxCreationOrder {
+			r.err = errBadRecord
+		}
 	}
 	return m
 }

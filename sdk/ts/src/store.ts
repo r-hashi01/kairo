@@ -51,6 +51,8 @@ export interface RunRow {
 	error: string | null;
 	/** Events recorded so far (the next one gets this number). */
 	seq: number;
+	/** Store-local ordinal for Children and List; zero identifies a legacy row (ADR 0083). */
+	createdOrder?: number;
 	createdAt: number;
 	updatedAt: number;
 	/** The run that made this one (a workflow, of its calls): removed with it (ADR 0054). */
@@ -214,7 +216,9 @@ export function retryingStore(store: Store): Store {
 
 const DDL = (p: string, blob: string, big: string) => [
 	`CREATE TABLE IF NOT EXISTS ${p}run (id TEXT PRIMARY KEY, plan TEXT NOT NULL, hash TEXT NOT NULL, state ${blob} NOT NULL,
-	  input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq ${big} NOT NULL, created_at ${big} NOT NULL, updated_at ${big} NOT NULL)`,
+	  input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq ${big} NOT NULL, created_order ${big} NOT NULL DEFAULT 0,
+	  created_at ${big} NOT NULL, updated_at ${big} NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS ${p}counter (name TEXT PRIMARY KEY, value ${big} NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS ${p}event (run TEXT NOT NULL, seq ${big} NOT NULL, body TEXT NOT NULL, PRIMARY KEY (run, seq))`,
 	`CREATE TABLE IF NOT EXISTS ${p}timer (run TEXT NOT NULL, timer ${big} NOT NULL, act ${big} NOT NULL, at ${big} NOT NULL, PRIMARY KEY (run, timer))`,
 	`CREATE INDEX IF NOT EXISTS ${p}timer_at ON ${p}timer (at)`,
@@ -276,13 +280,16 @@ const DDL_REMOVAL = (p: string) => [
 	`CREATE INDEX IF NOT EXISTS ${p}run_parent ON ${p}run (parent)`,
 	`CREATE INDEX IF NOT EXISTS ${p}run_done ON ${p}run (updated_at) WHERE status IN ${DONE_SQL}`,
 	`CREATE INDEX IF NOT EXISTS ${p}run_roots ON ${p}run (created_at, id) WHERE parent IS NULL`,
+	`CREATE INDEX IF NOT EXISTS ${p}run_roots_order ON ${p}run (created_order, created_at, id) WHERE parent IS NULL`,
 ];
 
-const RUN_COLS = 'id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta';
+const RUN_COLS = 'id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta, created_order';
+const RUN_ORDER = 'created_order, created_at, id';
+const MAX_CREATION_ORDER = Number.MAX_SAFE_INTEGER;
 
 /** A new run's row, or the changes to it: workflow and meta are set once (ADR 0059). */
 const PUT = (p: string, ph: (i: number) => string) =>
-	`INSERT INTO ${p}run (${RUN_COLS}) VALUES (${Array.from({ length: 14 }, (_, i) => ph(i + 1)).join(', ')})
+	`INSERT INTO ${p}run (${RUN_COLS}) VALUES (${Array.from({ length: 15 }, (_, i) => ph(i + 1)).join(', ')})
 	 ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error,
 	 seq = excluded.seq, updated_at = excluded.updated_at`;
 
@@ -295,7 +302,7 @@ const CLAIM = (p: string, ph: (i: number) => string) =>
 const DRIVE_WHERE = (ph: (i: number) => string, from: number) => `WHERE run = ${ph(from)} AND act = 0 AND owner = ${ph(from + 1)} AND attempt = ${ph(from + 2)}`;
 
 /** The query of list, and its parameters. */
-function listQuery(p: string, f: ListFilter, ph: (i: number) => string): [string, unknown[]] {
+function listQuery(p: string, f: ListFilter, ph: (i: number) => string, after?: RunRow): [string, unknown[]] {
 	let q = `SELECT ${RUN_COLS} FROM ${p}run WHERE parent IS NULL`;
 	const args: unknown[] = [];
 	const add = (cond: (x: string) => string, v: unknown) => {
@@ -306,8 +313,14 @@ function listQuery(p: string, f: ListFilter, ph: (i: number) => string): [string
 	if (f.status) add((x) => `status = ${x}`, f.status);
 	if (f.since) add((x) => `created_at >= ${x}`, f.since);
 	if (f.until) add((x) => `created_at < ${x}`, f.until);
-	if (f.after) add((x) => `(created_at, id) > (SELECT created_at, id FROM ${p}run WHERE id = ${x})`, f.after);
-	q += ' ORDER BY created_at, id';
+	if (after) {
+		if ((after.createdOrder ?? 0) === 0) {
+			args.push(after.createdAt, after.createdAt, after.id);
+			const n = args.length;
+			q += ` AND (created_order > 0 OR (created_order = 0 AND (created_at > ${ph(n - 2)} OR (created_at = ${ph(n - 1)} AND id > ${ph(n)}))))`;
+		} else add((x) => `created_order > ${x}`, after.createdOrder);
+	}
+	q += ` ORDER BY ${RUN_ORDER}`;
 	if (f.limit && f.limit > 0) {
 		args.push(f.limit);
 		q += ` LIMIT ${ph(args.length)}`;
@@ -322,7 +335,7 @@ const dollar = (i: number) => `$${i}`;
 function runRow(r: any): RunRow | undefined {
 	if (!r) return undefined;
 	return { id: r.id, plan: r.plan, hash: r.hash, state: new Uint8Array(r.state), input: r.input ?? null, status: r.status, output: r.output, error: r.error,
-		seq: Number(r.seq), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null,
+		seq: Number(r.seq), createdOrder: Number(r.created_order), createdAt: Number(r.created_at), updatedAt: Number(r.updated_at), parent: r.parent ?? null,
 		workflow: r.workflow ?? null, meta: r.meta ?? null };
 }
 
@@ -396,11 +409,13 @@ export class SQLiteStore implements Store {
 		for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
 		const cols = this.db.prepare(`PRAGMA table_info(${this.p}run)`).all() as { name: string }[];
 		for (const col of ADDED) if (!cols.some((c) => c.name === col)) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN ${col} TEXT`);
+		if (!cols.some((c) => c.name === 'created_order')) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0`);
+		this.db.exec(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
 		for (const q of DDL_REMOVAL(this.p)) this.db.exec(q);
 		const p = this.p;
 		this.q = {
 			get: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = ?`),
-			children: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE parent = ? ORDER BY created_at, id`),
+			children: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE parent = ? ORDER BY ${RUN_ORDER}`),
 			recoverableTimers: this.db.prepare(`SELECT run, timer, act, at FROM ${p}timer WHERE run = ? AND at <= ? ORDER BY at`),
 			recoverableLeases: this.db.prepare(`SELECT run, act, attempt, owner, until FROM ${p}lease WHERE run = ? AND act <> 0 AND until < ? ORDER BY until`),
 			put: this.db.prepare(PUT(p, qmark)),
@@ -468,7 +483,13 @@ export class SQLiteStore implements Store {
 			for (const ev of c.events) this.q.event.run(id, seq++, JSON.stringify(ev));
 			if (c.row) {
 				const r = c.row;
-				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta);
+				if (before) r.createdOrder = before.createdOrder;
+				else if (r.parent || r.workflow) {
+					const next = this.db.prepare(`UPDATE ${this.p}counter SET value = value + 1 WHERE name = 'run_order' AND value < ? RETURNING value`).get(MAX_CREATION_ORDER);
+					if (!next) throw new Error('kairo: creation order exhausted');
+					r.createdOrder = Number(next.value);
+				}
+				this.q.put.run(r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta, r.createdOrder ?? 0);
 			}
 			if (c.clearTimers) {
 				this.q.clearTimers.run(id);
@@ -596,7 +617,9 @@ export class SQLiteStore implements Store {
 	}
 
 	async list(f: ListFilter): Promise<RunRow[]> {
-		const [q, args] = listQuery(this.p, f, qmark);
+		const after = f.after ? await this.get(f.after) : undefined;
+		if (f.after && !after) return [];
+		const [q, args] = listQuery(this.p, f, qmark, after);
 		return this.db.prepare(q).all(...args).map((r: any) => runRow(r)!);
 	}
 
@@ -709,6 +732,8 @@ export class PostgresStore implements Store {
 	async init(): Promise<void> {
 		for (const q of DDL(this.p, 'BYTEA', 'BIGINT')) await this.pool.query(q);
 		for (const col of ADDED) await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS ${col} TEXT`);
+		await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0`);
+		await this.pool.query(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
 		for (const q of DDL_REMOVAL(this.p)) await this.pool.query(q);
 	}
 
@@ -766,10 +791,16 @@ export class PostgresStore implements Store {
 			for (const ev of ch.events) await c.query(`INSERT INTO ${p}event (run, seq, body) VALUES ($1, $2, $3)`, [id, seq++, JSON.stringify(ev)]);
 			if (ch.row) {
 				const r = ch.row;
+				if (before) r.createdOrder = before.createdOrder;
+				else if (r.parent || r.workflow) {
+					const next = (await c.query(`UPDATE ${p}counter SET value = value + 1 WHERE name = 'run_order' AND value < $1 RETURNING value`, [MAX_CREATION_ORDER])).rows[0];
+					if (!next) throw new Error('kairo: creation order exhausted');
+					r.createdOrder = Number(next.value);
+				}
 				// A new run's row: two submissions racing for one id insert it
 				// once; the loser's insert fails and its transaction rolls back.
 				await c.query(PUT(p, dollar),
-					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta]);
+					[r.id, r.plan, r.hash, Buffer.from(r.state), r.input, r.status, r.output, r.error, seq, r.createdAt, r.updatedAt, r.parent, r.workflow, r.meta, r.createdOrder ?? 0]);
 			}
 			if (ch.clearTimers) {
 				await c.query(`DELETE FROM ${p}timer WHERE run = $1`, [id]);
@@ -863,7 +894,7 @@ export class PostgresStore implements Store {
 	}
 
 	async children(parent: string): Promise<RunRow[]> {
-		return (await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE parent = $1 ORDER BY created_at, id`, [parent])).rows.map((r: any) => runRow(r)!);
+		return (await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE parent = $1 ORDER BY ${RUN_ORDER}`, [parent])).rows.map((r: any) => runRow(r)!);
 	}
 
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {
@@ -907,7 +938,9 @@ export class PostgresStore implements Store {
 	}
 
 	async list(f: ListFilter): Promise<RunRow[]> {
-		const [q, args] = listQuery(this.p, f, dollar);
+		const after = f.after ? await this.get(f.after) : undefined;
+		if (f.after && !after) return [];
+		const [q, args] = listQuery(this.p, f, dollar, after);
 		return (await this.pool.query(q, args)).rows.map((r: any) => runRow(r)!);
 	}
 

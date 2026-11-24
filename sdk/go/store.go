@@ -16,17 +16,20 @@ import (
 
 // RunRow is a run as stored.
 type RunRow struct {
-	ID        string
-	Plan      string
-	Hash      string
-	State     []byte
-	Input     json.RawMessage // nil: NULL
-	Status    string
-	Output    json.RawMessage // nil: NULL
-	Error     string
-	Seq       int64 // events recorded so far
-	CreatedAt int64
-	UpdatedAt int64
+	ID     string
+	Plan   string
+	Hash   string
+	State  []byte
+	Input  json.RawMessage // nil: NULL
+	Status string
+	Output json.RawMessage // nil: NULL
+	Error  string
+	Seq    int64 // events recorded so far
+	// CreationOrder is the store-local ordinal used by Children and List
+	// (ADR 0083). Zero identifies a legacy row.
+	CreationOrder int64
+	CreatedAt     int64
+	UpdatedAt     int64
 	// Parent is the run that made this one (a workflow, of its calls):
 	// kept and removed with it (ADR 0054). Empty: none.
 	Parent string
@@ -35,6 +38,10 @@ type RunRow struct {
 	Workflow string
 	Meta     json.RawMessage // nil: NULL
 }
+
+const maxCreationOrder int64 = 1<<53 - 1
+
+var errCreationOrderExhausted = errors.New("kairo: creation order exhausted")
 
 // ListFilter selects root runs for List (ADR 0059): those of Workflow, in
 // Status, created in [Since, Until) (unix ms; 0: unbounded), after the run

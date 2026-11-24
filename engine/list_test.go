@@ -56,22 +56,22 @@ func TestListCodeWorkflows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := listIDs(rows); got != "a,b,c" {
+	if got := listIDs(rows); got != "b,a,c" {
 		t.Fatalf("all: %s (%+v)", got, rows)
 	}
-	if rows[0].CreatedAt != at.UnixMilli() || rows[0].UpdatedAt != at.UnixMilli() || string(rows[0].Meta) != `{"user":"a"}` {
+	if rows[0].CreatedAt != at.UnixMilli() || rows[0].UpdatedAt != at.UnixMilli() || string(rows[0].Meta) != `{"user":"b"}` {
 		t.Fatalf("metadata: %+v", rows[0])
 	}
 	rows, err = e.List(context.Background(), ListFilter{Workflow: "orders"})
-	if err != nil || listIDs(rows) != "a,b" {
+	if err != nil || listIDs(rows) != "b,a" {
 		t.Fatalf("workflow: %s %v", listIDs(rows), err)
 	}
 	rows, err = e.List(context.Background(), ListFilter{Status: "completed"})
 	if err != nil || listIDs(rows) != "a" {
 		t.Fatalf("status: %s %v", listIDs(rows), err)
 	}
-	rows, err = e.List(context.Background(), ListFilter{Since: at, Until: at.Add(time.Millisecond), After: "a", Limit: 1})
-	if err != nil || listIDs(rows) != "b" {
+	rows, err = e.List(context.Background(), ListFilter{Since: at, Until: at.Add(time.Millisecond), After: "b", Limit: 1})
+	if err != nil || listIDs(rows) != "a" {
 		t.Fatalf("page: %s %v", listIDs(rows), err)
 	}
 	if rows, err = e.List(context.Background(), ListFilter{After: "missing"}); err != nil || len(rows) != 0 {
@@ -109,11 +109,14 @@ func TestListSurvivesRestart(t *testing.T) {
 
 	e2 := startEngine()
 	defer e2.Close()
+	if _, err := submit(e2, SubmitRequest{Plan: "kairo.workflow", Tenant: "t", Tier: &ft, RunID: "later", Workflow: "orders"}); err != nil {
+		t.Fatal(err)
+	}
 	rows, err := e2.List(context.Background(), ListFilter{Workflow: "orders"})
-	if err != nil || listIDs(rows) != "active,finished" {
+	if err != nil || listIDs(rows) != "active,finished,later" {
 		t.Fatalf("after restart: %s %+v %v", listIDs(rows), rows, err)
 	}
-	for _, row := range rows {
+	for _, row := range rows[:2] {
 		if row.CreatedAt != at.UnixMilli() || row.UpdatedAt != at.UnixMilli() || string(row.Meta) != `{"kept":true}` {
 			t.Fatalf("after restart metadata: %+v", row)
 		}

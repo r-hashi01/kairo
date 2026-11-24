@@ -87,7 +87,9 @@ func (s *SQLStore) Init(ctx context.Context) error {
 	p := s.p
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS ` + p + `run (id TEXT PRIMARY KEY, plan TEXT NOT NULL, hash TEXT NOT NULL, state ` + blob + ` NOT NULL,
-		  input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq ` + big + ` NOT NULL, created_at ` + big + ` NOT NULL, updated_at ` + big + ` NOT NULL)`,
+		  input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq ` + big + ` NOT NULL, created_order ` + big + ` NOT NULL DEFAULT 0,
+		  created_at ` + big + ` NOT NULL, updated_at ` + big + ` NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS ` + p + `counter (name TEXT PRIMARY KEY, value ` + big + ` NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + p + `event (run TEXT NOT NULL, seq ` + big + ` NOT NULL, body TEXT NOT NULL, PRIMARY KEY (run, seq))`,
 		`CREATE TABLE IF NOT EXISTS ` + p + `timer (run TEXT NOT NULL, timer ` + big + ` NOT NULL, act ` + big + ` NOT NULL, at ` + big + ` NOT NULL, PRIMARY KEY (run, timer))`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `timer_at ON ` + p + `timer (at)`,
@@ -126,10 +128,29 @@ func (s *SQLStore) Init(ctx context.Context) error {
 			}
 		}
 	}
+	if s.dialect == Postgres {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	} else {
+		has, err := s.hasColumn(ctx, p+"run", "created_order")
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO `+p+`counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`); err != nil {
+		return err
+	}
 	for _, q := range []string{
 		`CREATE INDEX IF NOT EXISTS ` + p + `run_parent ON ` + p + `run (parent)`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `run_done ON ` + p + `run (updated_at) WHERE status IN ` + doneSQL,
 		`CREATE INDEX IF NOT EXISTS ` + p + `run_roots ON ` + p + `run (created_at, id) WHERE parent IS NULL`,
+		`CREATE INDEX IF NOT EXISTS ` + p + `run_roots_order ON ` + p + `run (created_order, created_at, id) WHERE parent IS NULL`,
 	} {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
 			return err
@@ -184,14 +205,16 @@ func asString(v any) string {
 	}
 }
 
-const runCols = `id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta`
+const runCols = `id, plan, hash, state, input, status, output, error, seq, created_order, created_at, updated_at, parent, workflow, meta`
+
+const runOrderSQL = `created_order, created_at, id`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanRun(sc scanner) (*RunRow, error) {
 	var r RunRow
 	var input, output, errMsg, parent, workflow, meta sql.NullString
-	if err := sc.Scan(&r.ID, &r.Plan, &r.Hash, &r.State, &input, &r.Status, &output, &errMsg, &r.Seq, &r.CreatedAt, &r.UpdatedAt, &parent, &workflow, &meta); err != nil {
+	if err := sc.Scan(&r.ID, &r.Plan, &r.Hash, &r.State, &input, &r.Status, &output, &errMsg, &r.Seq, &r.CreationOrder, &r.CreatedAt, &r.UpdatedAt, &parent, &workflow, &meta); err != nil {
 		return nil, err
 	}
 	r.Workflow = workflow.String
@@ -334,12 +357,30 @@ func (s *SQLStore) WithRun(ctx context.Context, id string, fn func(*RunRow) (*Ch
 			seq++
 		}
 		if r := ch.Row; r != nil {
+			if before != nil {
+				r.CreationOrder = before.CreationOrder
+			} else if r.Parent != "" || r.Workflow != "" {
+				res, err := ex.ExecContext(ctx, s.q(`UPDATE `+p+`counter SET value = value + 1 WHERE name = 'run_order' AND value < ?`), maxCreationOrder)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errCreationOrderExhausted
+				}
+				if err := ex.QueryRowContext(ctx, `SELECT value FROM `+p+`counter WHERE name = 'run_order'`).Scan(&r.CreationOrder); err != nil {
+					return err
+				}
+			}
 			// A new run's row: two submissions racing for one id insert it
 			// once; the loser's transaction fails and rolls back.
-			if _, err := ex.ExecContext(ctx, s.q(`INSERT INTO `+p+`run (`+runCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			if _, err := ex.ExecContext(ctx, s.q(`INSERT INTO `+p+`run (`+runCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				ON CONFLICT (id) DO UPDATE SET state = excluded.state, status = excluded.status, output = excluded.output,
 				error = excluded.error, seq = excluded.seq, updated_at = excluded.updated_at`),
-				r.ID, r.Plan, r.Hash, r.State, nullable(r.Input), r.Status, nullable(r.Output), nullStr(r.Error), seq, r.CreatedAt, r.UpdatedAt, nullStr(r.Parent),
+				r.ID, r.Plan, r.Hash, r.State, nullable(r.Input), r.Status, nullable(r.Output), nullStr(r.Error), seq, r.CreationOrder, r.CreatedAt, r.UpdatedAt, nullStr(r.Parent),
 				nullStr(r.Workflow), nullable(r.Meta)); err != nil {
 				return err
 			}
@@ -567,7 +608,7 @@ func (s *SQLStore) Get(ctx context.Context, id string) (*RunRow, error) {
 }
 
 func (s *SQLStore) Children(ctx context.Context, parent string) ([]RunRow, error) {
-	rows, err := s.db.QueryContext(ctx, s.q(`SELECT `+runCols+` FROM `+s.p+`run WHERE parent = ? ORDER BY created_at, id`), parent)
+	rows, err := s.db.QueryContext(ctx, s.q(`SELECT `+runCols+` FROM `+s.p+`run WHERE parent = ? ORDER BY `+runOrderSQL), parent)
 	if err != nil {
 		return nil, err
 	}
@@ -772,6 +813,17 @@ func (s *SQLStore) EndDrive(ctx context.Context, run, owner string, token int32,
 }
 
 func (s *SQLStore) List(ctx context.Context, f ListFilter) ([]RunRow, error) {
+	var after *RunRow
+	if f.After != "" {
+		var err error
+		after, err = s.Get(ctx, f.After)
+		if err != nil {
+			return nil, err
+		}
+		if after == nil {
+			return []RunRow{}, nil
+		}
+	}
 	q := `SELECT ` + runCols + ` FROM ` + s.p + `run WHERE parent IS NULL`
 	var args []any
 	if f.Workflow != "" {
@@ -790,11 +842,16 @@ func (s *SQLStore) List(ctx context.Context, f ListFilter) ([]RunRow, error) {
 		q += ` AND created_at < ?`
 		args = append(args, f.Until)
 	}
-	if f.After != "" {
-		q += ` AND (created_at, id) > (SELECT created_at, id FROM ` + s.p + `run WHERE id = ?)`
-		args = append(args, f.After)
+	if after != nil {
+		if after.CreationOrder == 0 {
+			q += ` AND (created_order > 0 OR (created_order = 0 AND (created_at > ? OR (created_at = ? AND id > ?))))`
+			args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
+		} else {
+			q += ` AND created_order > ?`
+			args = append(args, after.CreationOrder)
+		}
 	}
-	q += ` ORDER BY created_at, id`
+	q += ` ORDER BY ` + runOrderSQL
 	if f.Limit > 0 {
 		q += ` LIMIT ?`
 		args = append(args, f.Limit)

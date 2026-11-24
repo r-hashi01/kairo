@@ -257,6 +257,9 @@ type RunInfo struct {
 	// NextAt is the earliest timer deadline while the run is quiescent.
 	// It is populated by WaitQuiescent (ADR 0069).
 	NextAt int64 `json:"next_at,omitempty"`
+	// creationOrder is store-local durable metadata used by Children and
+	// List (ADR 0083). It is deliberately not part of the public JSON API.
+	creationOrder int64
 	// Input is the run's input, as it was submitted: given by GetInput
 	// only (for a run not finished), not by Get.
 	Input json.RawMessage `json:"input,omitempty"`
@@ -308,6 +311,10 @@ type Engine struct {
 	doneMax int      // markers per shard (ADR 0027)
 	feed    *feedHub // nil without Config.Feeds (ADR 0034)
 
+	orderMu       sync.Mutex
+	orderNext     int64 // last value handed out, or the reserved high-water after restart
+	orderReserved int64 // high-water durably reserved in DataDir
+
 	execMu    sync.Mutex
 	pollers   []*sched.Poller
 	budgets   map[string]chan struct{} // in-process tasks at once, by resource (ADR 0039)
@@ -321,6 +328,10 @@ type Engine struct {
 	quietID      atomic.Uint64
 	randomMu     sync.Mutex
 }
+
+const maxCreationOrder int64 = 1<<53 - 1
+
+var errCreationOrderExhausted = errors.New("engine: creation order exhausted")
 
 // Open creates an engine and recovers the runs found in its logs. Plans
 // that recovered runs refer to must be registered in advance with
@@ -434,6 +445,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	if cfg.DataDir != "" {
 		if err := checkShardCount(cfg.DataDir, cfg.Shards); err != nil {
+			return nil, err
+		}
+		if err := e.loadCreationOrder(); err != nil {
 			return nil, err
 		}
 	}
@@ -845,6 +859,16 @@ func (e *Engine) submitID(ctx context.Context, req SubmitRequest, p *ir.Plan, ti
 	}
 	sr := &startReq{runID: id, generated: generated, parent: req.Parent, workflow: req.Workflow, meta: req.Meta, tenant: req.Tenant, plan: p, tier: tier, input: req.Input, entry: req.Entry, limits: lim, depth: req.Depth, vars: req.Vars, drive: req.Drive, initialSignal: req.InitialSignal,
 		keep: req.KeepOutput && tier >= TierFile, reply: reply}
+	if req.Parent != "" || req.Workflow != "" {
+		order, err := e.nextCreationOrder()
+		if err != nil {
+			if attached {
+				e.detach(req.Parent, id)
+			}
+			return SubmitResult{}, err
+		}
+		sr.creationOrder = order
+	}
 	sh := e.shardFor(id)
 	active := make(chan struct{}, 1)
 	ticket, err := e.adm.Admit(req.Tenant, func() { active <- struct{}{} })
@@ -952,7 +976,7 @@ func (e *Engine) addRecoveredChild(parent, child string, done bool) {
 	cs[child] = done
 }
 
-// Children returns the direct children of parent, in RunID byte order.
+// Children returns the direct children of parent, in creation order.
 func (e *Engine) Children(ctx context.Context, parent string) ([]RunInfo, error) {
 	reply := make(chan []string, 1)
 	e.shardFor(parent).inbox.Push(msg{kind: mQueryChildren, runID: parent, childrenReply: reply})
@@ -973,7 +997,23 @@ func (e *Engine) Children(ctx context.Context, parent string) ([]RunInfo, error)
 		}
 		out = append(out, ri)
 	}
+	sort.Slice(out, func(i, j int) bool { return runCreatedBefore(out[i], out[j]) })
 	return out, nil
+}
+
+// runCreatedBefore implements ADR 0083's total order. Records from before
+// the ordinal existed form a legacy group ordered as they were before.
+func runCreatedBefore(a, b RunInfo) bool {
+	if a.creationOrder == 0 || b.creationOrder == 0 {
+		if a.creationOrder != b.creationOrder {
+			return a.creationOrder == 0
+		}
+		if a.CreatedAt != b.CreatedAt {
+			return a.CreatedAt < b.CreatedAt
+		}
+		return a.RunID < b.RunID
+	}
+	return a.creationOrder < b.creationOrder
 }
 
 // ListFilter selects root code workflows in creation order (ADR 0068).
@@ -1010,13 +1050,14 @@ func (e *Engine) retainedListCursor(ri RunInfo) bool {
 	return !ri.FinishedAt.Before(e.cfg.Now().Add(-e.cfg.IdempotencyTTL))
 }
 
-// List returns retained root code workflows ordered by (created_at, RunID).
+// List returns retained root code workflows ordered by creation ordinal.
 // Each shard contributes an independently consistent snapshot; listing does
 // not stop unrelated shard loops.
 func (e *Engine) List(ctx context.Context, f ListFilter) ([]RunInfo, error) {
-	var afterAt int64
+	var cursor RunInfo
 	if f.After != "" {
-		cursor, err := e.Get(ctx, f.After)
+		var err error
+		cursor, err = e.Get(ctx, f.After)
 		if errors.Is(err, ErrUnknownRun) {
 			return []RunInfo{}, nil
 		}
@@ -1026,7 +1067,6 @@ func (e *Engine) List(ctx context.Context, f ListFilter) ([]RunInfo, error) {
 		if !e.retainedListCursor(cursor) {
 			return []RunInfo{}, nil
 		}
-		afterAt = cursor.CreatedAt
 	}
 
 	replies := make([]chan []listItem, len(e.shards))
@@ -1073,20 +1113,13 @@ func (e *Engine) List(ctx context.Context, f ListFilter) ([]RunInfo, error) {
 			continue
 		}
 		if f.After != "" {
-			created := ri.CreatedAt
-			if created < afterAt || (created == afterAt && ri.RunID <= f.After) {
+			if !runCreatedBefore(cursor, ri) {
 				continue
 			}
 		}
 		out = append(out, ri)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		a, b := out[i].CreatedAt, out[j].CreatedAt
-		if a != b {
-			return a < b
-		}
-		return out[i].RunID < out[j].RunID
-	})
+	sort.Slice(out, func(i, j int) bool { return runCreatedBefore(out[i], out[j]) })
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}
@@ -1269,7 +1302,7 @@ func (e *Engine) trimmed(runID string) (RunInfo, bool) {
 		return RunInfo{}, false
 	}
 	ri := RunInfo{RunID: runID, Parent: en.parent, Workflow: en.workflow, Meta: en.meta, Status: en.status, Trimmed: true,
-		FinishedAt: time.UnixMilli(en.at)}
+		FinishedAt: time.UnixMilli(en.at), creationOrder: en.creationOrder}
 	if en.workflow != "" {
 		ri.Plan = "kairo.workflow"
 	}
@@ -1514,4 +1547,83 @@ func checkShardCount(dir string, n int) error {
 		return fmt.Errorf("engine: %s was created with %d shards, configured %d", dir, got, n)
 	}
 	return nil
+}
+
+const creationOrderReserve = 1024
+
+func (e *Engine) loadCreationOrder() error {
+	b, err := os.ReadFile(filepath.Join(e.cfg.DataDir, "CREATION_ORDER"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || n < 0 || n > maxCreationOrder {
+		return fmt.Errorf("engine: invalid CREATION_ORDER: %q", strings.TrimSpace(string(b)))
+	}
+	e.orderNext, e.orderReserved = n, n
+	return nil
+}
+
+// observeCreationOrder runs during recovery, before submissions are accepted.
+func (e *Engine) observeCreationOrder(n int64) {
+	if n > e.orderNext {
+		e.orderNext = n
+	}
+}
+
+// nextCreationOrder reserves values durably in blocks. A crash may leave a
+// gap, which ADR 0083 permits, but can never make a value reusable after log
+// retirement. This I/O runs in the submitting goroutine, never a shard loop.
+func (e *Engine) nextCreationOrder() (int64, error) {
+	e.orderMu.Lock()
+	defer e.orderMu.Unlock()
+	if e.orderNext >= maxCreationOrder {
+		return 0, errCreationOrderExhausted
+	}
+	if e.orderNext >= e.orderReserved && e.cfg.DataDir != "" {
+		reserved := min(max(e.orderNext, e.orderReserved)+creationOrderReserve, maxCreationOrder)
+		if err := writeCreationOrder(filepath.Join(e.cfg.DataDir, "CREATION_ORDER"), reserved, e.cfg.NoSync); err != nil {
+			return 0, err
+		}
+		e.orderReserved = reserved
+	}
+	e.orderNext++
+	return e.orderNext, nil
+}
+
+func writeCreationOrder(path string, n int64, noSync bool) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".creation-order-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.WriteString(strconv.FormatInt(n, 10)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if !noSync {
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	if noSync {
+		return nil
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	return errors.Join(err, d.Close())
 }

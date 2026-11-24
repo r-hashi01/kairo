@@ -19,18 +19,20 @@ import (
 // durable.
 
 // Marker version 2 adds kept (ADR 0050), version 3 adds parent (ADR 0067),
-// and version 4 adds code-workflow listing metadata (ADR 0068).
-const markerVersion = 4
+// version 4 adds code-workflow listing metadata (ADR 0068), and version 5
+// adds the store-local creation ordinal (ADR 0083).
+const markerVersion = 5
 
 type marker struct {
-	runID    string
-	at       int64 // unix ms
-	status   string
-	parent   string
-	workflow string
-	meta     []byte
-	created  int64
-	updated  int64
+	runID         string
+	at            int64 // unix ms
+	status        string
+	parent        string
+	workflow      string
+	meta          []byte
+	creationOrder int64
+	created       int64
+	updated       int64
 	// kept: the run's output is in the blob store under keptKey(runID,
 	// gen), written before this marker (ADR 0050).
 	kept bool
@@ -49,6 +51,9 @@ var errBadMarker = errors.New("engine: malformed done-log record")
 func encodeMarker(b []byte, m marker) []byte {
 	version := byte(3)
 	if m.workflow != "" {
+		version = 4
+	}
+	if m.creationOrder > 0 {
 		version = markerVersion
 	}
 	b = append(b, version)
@@ -69,6 +74,9 @@ func encodeMarker(b []byte, m marker) []byte {
 		b = appendStr(b, string(m.meta))
 		b = binary.AppendVarint(b, m.created)
 		b = binary.AppendVarint(b, m.updated)
+	}
+	if version >= 5 {
+		b = binary.AppendVarint(b, m.creationOrder)
 	}
 	return b
 }
@@ -131,6 +139,13 @@ func decodeMarker(rec []byte) (marker, error) {
 			m.updated, rec = updated, rec[n:]
 		}
 	}
+	if version >= 5 && ok1 && ok2 {
+		order, n := binary.Varint(rec)
+		if n <= 0 || order <= 0 || order > maxCreationOrder {
+			return m, errBadMarker
+		}
+		m.creationOrder, rec = order, rec[n:]
+	}
 	if !ok1 || !ok2 || len(rec) != 0 {
 		return m, errBadMarker
 	}
@@ -138,16 +153,17 @@ func decodeMarker(rec []byte) (marker, error) {
 }
 
 type doneEntry struct {
-	at       int64
-	lsn      uint64
-	status   string
-	parent   string
-	workflow string
-	meta     []byte
-	created  int64
-	updated  int64
-	kept     bool   // the output is kept (ADR 0050)
-	gen      uint64 // its keptKey generation
+	at            int64
+	lsn           uint64
+	status        string
+	parent        string
+	workflow      string
+	meta          []byte
+	creationOrder int64
+	created       int64
+	updated       int64
+	kept          bool   // the output is kept (ADR 0050)
+	gen           uint64 // its keptKey generation
 }
 
 // doneIndex is written by the shard loop and read by Submit, Get and Wait.
@@ -238,14 +254,14 @@ func (e *Engine) marker(id string) (doneEntry, bool) {
 
 func doneFromMarker(m marker, lsn uint64) doneEntry {
 	return doneEntry{at: m.at, lsn: lsn, status: m.status, parent: m.parent, workflow: m.workflow, meta: m.meta,
-		created: m.created, updated: m.updated, kept: m.kept, gen: m.gen}
+		creationOrder: m.creationOrder, created: m.created, updated: m.updated, kept: m.kept, gen: m.gen}
 }
 
 // addMarker logs a marker for a finished run; after runs once it is
 // durable. kept: its output was durably put under keptKey(id, gen) first.
 func (s *shard) addMarker(r *run, status string, kept bool, gen uint64, after func()) {
 	d := s.doneLog
-	m := marker{runID: r.id, parent: r.parent, workflow: r.workflow, meta: r.meta, created: r.created, updated: r.updated,
+	m := marker{runID: r.id, parent: r.parent, workflow: r.workflow, meta: r.meta, creationOrder: r.creationOrder, created: r.created, updated: r.updated,
 		at: s.now, status: status, kept: kept, gen: gen}
 	d.buf = wal.Frame(d.buf, encodeMarker(nil, m))
 	d.lsn++
@@ -405,6 +421,7 @@ func (s *shard) recoverMarkers() error {
 		if err != nil {
 			return err
 		}
+		s.e.observeCreationOrder(m.creationOrder)
 		d.expired++
 		if m.at < cut {
 			if m.kept {

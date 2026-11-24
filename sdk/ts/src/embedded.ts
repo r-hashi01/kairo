@@ -584,6 +584,7 @@ export class Embedded {
 				output: res.output === undefined ? null : JSON.stringify(res.output),
 				error: res.error || null,
 				seq: 0, // set by the store
+				createdOrder: row?.createdOrder ?? 0, // assigned by the store on first creation
 				createdAt: row?.createdAt ?? at,
 				updatedAt: at,
 				parent: row ? row.parent : (start?.parent ?? null),

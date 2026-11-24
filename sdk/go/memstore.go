@@ -16,6 +16,7 @@ type MemStore struct {
 	events map[string][]json.RawMessage
 	timers map[string]map[uint32]TimerRow
 	leases map[string]map[uint32]LeaseRow
+	order  int64
 }
 
 // NewMemStore returns an empty in-memory store.
@@ -71,7 +72,13 @@ func (m *MemStore) WithRun(_ context.Context, id string, fn func(*RunRow) (*Chan
 		r := copyRow(ch.Row)
 		r.Seq = int64(len(m.events[id]))
 		if before != nil {
-			r.CreatedAt, r.Input, r.Parent, r.Workflow, r.Meta = before.CreatedAt, before.Input, before.Parent, before.Workflow, before.Meta
+			r.CreationOrder, r.CreatedAt, r.Input, r.Parent, r.Workflow, r.Meta = before.CreationOrder, before.CreatedAt, before.Input, before.Parent, before.Workflow, before.Meta
+		} else if r.Parent != "" || r.Workflow != "" {
+			if m.order >= maxCreationOrder {
+				return errCreationOrderExhausted
+			}
+			m.order++
+			r.CreationOrder = m.order
 		}
 		m.runs[id] = r
 	}
@@ -115,12 +122,7 @@ func (m *MemStore) Children(_ context.Context, parent string) ([]RunRow, error) 
 			out = append(out, *copyRow(r))
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAt != out[j].CreatedAt {
-			return out[i].CreatedAt < out[j].CreatedAt
-		}
-		return out[i].ID < out[j].ID
-	})
+	sort.Slice(out, func(i, j int) bool { return runRowBefore(&out[i], &out[j]) })
 	return out, nil
 }
 
@@ -313,23 +315,32 @@ func (m *MemStore) List(_ context.Context, f ListFilter) ([]RunRow, error) {
 		}
 		out = append(out, *copyRow(r))
 	}
-	before := func(a, b *RunRow) bool {
-		if a.CreatedAt != b.CreatedAt {
-			return a.CreatedAt < b.CreatedAt
-		}
-		return a.ID < b.ID
-	}
-	sort.Slice(out, func(i, j int) bool { return before(&out[i], &out[j]) })
+	sort.Slice(out, func(i, j int) bool { return runRowBefore(&out[i], &out[j]) })
 	if f.After != "" {
-		if a := m.runs[f.After]; a != nil {
-			i := sort.Search(len(out), func(i int) bool { return before(a, &out[i]) })
-			out = out[i:]
+		a := m.runs[f.After]
+		if a == nil {
+			return []RunRow{}, nil
 		}
+		i := sort.Search(len(out), func(i int) bool { return runRowBefore(a, &out[i]) })
+		out = out[i:]
 	}
 	if f.Limit > 0 && len(out) > f.Limit {
 		out = out[:f.Limit]
 	}
 	return out, nil
+}
+
+func runRowBefore(a, b *RunRow) bool {
+	if a.CreationOrder == 0 || b.CreationOrder == 0 {
+		if a.CreationOrder != b.CreationOrder {
+			return a.CreationOrder == 0
+		}
+		if a.CreatedAt != b.CreatedAt {
+			return a.CreatedAt < b.CreatedAt
+		}
+		return a.ID < b.ID
+	}
+	return a.CreationOrder < b.CreationOrder
 }
 
 // Events returns a run's recorded events (tests).

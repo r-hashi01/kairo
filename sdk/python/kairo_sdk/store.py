@@ -65,6 +65,7 @@ class RunRow:
     parent: str | None = None  # the run that made this one: removed with it (ADR 0054)
     workflow: str | None = None  # a workflow run's workflow (None for a call; ADR 0059)
     meta: str | None = None  # JSON: what the application started it with (ADR 0059)
+    created_order: int = 0  # store-local ordinal; zero identifies a legacy row (ADR 0083)
 
 
 @dataclass
@@ -223,7 +224,9 @@ def _prefix(p: str) -> str:
 def _ddl(p: str, blob: str, big: str) -> list[str]:
     return [
         f"""CREATE TABLE IF NOT EXISTS {p}run (id TEXT PRIMARY KEY, plan TEXT NOT NULL, hash TEXT NOT NULL, state {blob} NOT NULL,
-          input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq {big} NOT NULL, created_at {big} NOT NULL, updated_at {big} NOT NULL)""",
+          input TEXT, status TEXT NOT NULL, output TEXT, error TEXT, seq {big} NOT NULL, created_order {big} NOT NULL DEFAULT 0,
+          created_at {big} NOT NULL, updated_at {big} NOT NULL)""",
+        f"CREATE TABLE IF NOT EXISTS {p}counter (name TEXT PRIMARY KEY, value {big} NOT NULL)",
         f"CREATE TABLE IF NOT EXISTS {p}event (run TEXT NOT NULL, seq {big} NOT NULL, body TEXT NOT NULL, PRIMARY KEY (run, seq))",
         f"CREATE TABLE IF NOT EXISTS {p}timer (run TEXT NOT NULL, timer {big} NOT NULL, act {big} NOT NULL, at {big} NOT NULL, PRIMARY KEY (run, timer))",
         f"CREATE INDEX IF NOT EXISTS {p}timer_at ON {p}timer (at)",
@@ -305,6 +308,7 @@ def _ddl_removal(p: str) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS {p}run_parent ON {p}run (parent)",
         f"CREATE INDEX IF NOT EXISTS {p}run_done ON {p}run (updated_at) WHERE status IN {_DONE_SQL}",
         f"CREATE INDEX IF NOT EXISTS {p}run_roots ON {p}run (created_at, id) WHERE parent IS NULL",
+        f"CREATE INDEX IF NOT EXISTS {p}run_roots_order ON {p}run (created_order, created_at, id) WHERE parent IS NULL",
     ]
 
 
@@ -332,18 +336,20 @@ def _removals(p: str, ph: str) -> list[str]:
     ]
 
 
-_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta"
+_RUN_COLS = "id, plan, hash, state, input, status, output, error, seq, created_at, updated_at, parent, workflow, meta, created_order"
+_RUN_ORDER = "created_order, created_at, id"
+_MAX_CREATION_ORDER = (1 << 53) - 1
 
 
 def _put(p: str, ph: str) -> str:
     """A new run's row, or the changes to it: workflow and meta are set once (ADR 0059)."""
-    return (f"INSERT INTO {p}run ({_RUN_COLS}) VALUES ({', '.join([ph] * 14)}) ON CONFLICT (id) DO UPDATE SET "
+    return (f"INSERT INTO {p}run ({_RUN_COLS}) VALUES ({', '.join([ph] * 15)}) ON CONFLICT (id) DO UPDATE SET "
             "state = excluded.state, status = excluded.status, output = excluded.output, error = excluded.error, "
             "seq = excluded.seq, updated_at = excluded.updated_at")
 
 
 def _put_args(r: RunRow, seq: int) -> tuple[Any, ...]:
-    return (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent, r.workflow, r.meta)
+    return (r.id, r.plan, r.hash, r.state, r.input, r.status, r.output, r.error, seq, r.created_at, r.updated_at, r.parent, r.workflow, r.meta, r.created_order)
 
 
 def _claim(p: str, ph: str) -> str:
@@ -359,16 +365,22 @@ def _end_drive(p: str, ph: str, resume: bool) -> str:
 
 
 def _list_query(p: str, ph: str, workflow: str | None, status: str | None, since: int | None, until: int | None,
-                after: str | None, limit: int | None) -> tuple[str, tuple[Any, ...]]:
+                after: RunRow | None, limit: int | None) -> tuple[str, tuple[Any, ...]]:
     """The query of list, and its parameters."""
     q = f"SELECT {_RUN_COLS} FROM {p}run WHERE parent IS NULL"
     args: list[Any] = []
-    for cond, v in (("workflow = {}", workflow), ("status = {}", status), ("created_at >= {}", since), ("created_at < {}", until),
-                    (f"(created_at, id) > (SELECT created_at, id FROM {p}run WHERE id = {{}})", after)):
+    for cond, v in (("workflow = {}", workflow), ("status = {}", status), ("created_at >= {}", since), ("created_at < {}", until)):
         if v:
             q += " AND " + cond.format(ph)
             args.append(v)
-    q += " ORDER BY created_at, id"
+    if after is not None:
+        if after.created_order == 0:
+            q += f" AND (created_order > 0 OR (created_order = 0 AND (created_at > {ph} OR (created_at = {ph} AND id > {ph}))))"
+            args.extend((after.created_at, after.created_at, after.id))
+        else:
+            q += f" AND created_order > {ph}"
+            args.append(after.created_order)
+    q += " ORDER BY " + _RUN_ORDER
     if limit and limit > 0:
         q += f" LIMIT {ph}"
         args.append(limit)
@@ -378,7 +390,7 @@ def _list_query(p: str, ph: str, workflow: str | None, status: str | None, since
 def _row(r: Any) -> RunRow | None:
     if r is None:
         return None
-    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11], r[12], r[13])
+    return RunRow(r[0], r[1], r[2], bytes(r[3]), r[4], r[5], r[6], r[7], int(r[8]), int(r[9]), int(r[10]), r[11], r[12], r[13], int(r[14]))
 
 
 def _check_parent(parent: RunRow | None, parent_id: str, child_id: str) -> None:
@@ -434,6 +446,9 @@ class SQLiteStore:
         for col in _ADDED:
             if col not in cols:
                 self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN {col} TEXT")
+        if "created_order" not in cols:
+            self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0")
+        self.db.execute(f"INSERT INTO {self.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
         for q in _ddl_removal(self.p):
             self.db.execute(q)
 
@@ -473,6 +488,17 @@ class SQLiteStore:
                 seq += 1
             if c.row is not None:
                 r = c.row
+                if before is not None:
+                    r.created_order = before.created_order
+                elif r.parent is not None or r.workflow is not None:
+                    cur = db.execute(
+                        f"UPDATE {p}counter SET value = value + 1 WHERE name = 'run_order' AND value < ? RETURNING value",
+                        (_MAX_CREATION_ORDER,),
+                    )
+                    value = cur.fetchone()
+                    if value is None:
+                        raise RuntimeError("kairo: creation order exhausted")
+                    r.created_order = int(value[0])
                 db.execute(_put(p, "?"), _put_args(r, seq))
             if c.clear:
                 db.execute(f"DELETE FROM {p}timer WHERE run = ?", (id,))
@@ -576,7 +602,7 @@ class SQLiteStore:
 
     async def children(self, parent: str) -> list[RunRow]:
         assert self.db is not None
-        rows = self.db.execute(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = ? ORDER BY created_at, id", (parent,)).fetchall()
+        rows = self.db.execute(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = ? ORDER BY {_RUN_ORDER}", (parent,)).fetchall()
         return [row for r in rows if (row := _row(r)) is not None]
 
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
@@ -638,7 +664,10 @@ class SQLiteStore:
     async def list(self, *, workflow: str | None = None, status: str | None = None, since: int | None = None,
                    until: int | None = None, after: str | None = None, limit: int | None = None) -> list[RunRow]:
         assert self.db is not None
-        q, args = _list_query(self.p, "?", workflow, status, since, until, after, limit)
+        cursor = await self.get(after) if after else None
+        if after and cursor is None:
+            return []
+        q, args = _list_query(self.p, "?", workflow, status, since, until, cursor, limit)
         return [_row(r) for r in self.db.execute(q, args).fetchall()]  # type: ignore[misc]
 
     async def close(self) -> None:
@@ -741,6 +770,8 @@ class PostgresStore:
             await self._exec(q)
         for col in _ADDED:
             await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS {col} TEXT")
+        await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0")
+        await self._exec(f"INSERT INTO {self.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
         for q in _ddl_removal(self.p):
             await self._exec(q)
 
@@ -785,6 +816,17 @@ class PostgresStore:
                     seq += 1
                 if c.row is not None:
                     r = c.row
+                    if before is not None:
+                        r.created_order = before.created_order
+                    elif r.parent is not None or r.workflow is not None:
+                        cur = await conn.execute(
+                            f"UPDATE {p}counter SET value = value + 1 WHERE name = 'run_order' AND value < %s RETURNING value",
+                            (_MAX_CREATION_ORDER,),
+                        )
+                        value = await cur.fetchone()
+                        if value is None:
+                            raise RuntimeError("kairo: creation order exhausted")
+                        r.created_order = int(value[0])
                     await conn.execute(_put(p, "%s"), _put_args(r, seq))
                 if c.clear:
                     await conn.execute(f"DELETE FROM {p}timer WHERE run = %s", (id,))
@@ -879,7 +921,7 @@ class PostgresStore:
         return _row(rows[0]) if rows else None
 
     async def children(self, parent: str) -> list[RunRow]:
-        rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = %s ORDER BY created_at, id", (parent,))
+        rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = %s ORDER BY {_RUN_ORDER}", (parent,))
         return [row for r in rows if (row := _row(r)) is not None]
 
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
@@ -929,7 +971,10 @@ class PostgresStore:
 
     async def list(self, *, workflow: str | None = None, status: str | None = None, since: int | None = None,
                    until: int | None = None, after: str | None = None, limit: int | None = None) -> list[RunRow]:
-        q, args = _list_query(self.p, "%s", workflow, status, since, until, after, limit)
+        cursor = await self.get(after) if after else None
+        if after and cursor is None:
+            return []
+        q, args = _list_query(self.p, "%s", workflow, status, since, until, cursor, limit)
         return [_row(r) for r in await self._exec(q, args)]  # type: ignore[misc]
 
     async def listen(self, settled: Callable[[str], None]) -> Callable[[], Any]:
