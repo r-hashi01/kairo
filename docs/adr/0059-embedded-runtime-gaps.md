@@ -116,6 +116,7 @@ Go の SDK（ADR 0058）を作り終えてから、SDK として足りないも�
 - **API。** `k.run(name, input, { id, meta, signal })`、`k.submit(name, input, { id, meta })`、`k.result(id, { signal })`、`k.list({ workflow, status, since, until, after, limit })`、`ctx.waitFor(name, { timeout })`（ミリ秒）、アクションの `limit`・`rate`、`concurrency`。例外は `StoppedError`・`TimedOutError`。結果を待つ API は、Python の `await` が予約語なので、両言語で `result` にそろえた（Go は `Await`）。
 - **打ち切れない関数は置いていく。** TypeScript では関数を外から止められないので、中止されたら関数の Promise を待たずに戻る。そうしないと、永久に待つ関数があるとき `close` が終わらない。置いていった関数が後で失敗しても、未処理の reject にはしない。
 - **掃除のタイマーは `unref()` する。** `close` を呼ばないスクリプトでも、プロセスが終われるようにするため。
+  - ただし、`run` と `result` で結果を待つ呼び出し手がいる間は `ref` する（2026-11-25 追記）。止まったプロセスが借用を持つワークフローを待つとき、それを引き取るのはこの掃除だけで、`unref()` のままでは、ほかに何もしていないスクリプトが期限より先に終わってしまうため。待つ呼び出し手がいなくなれば `unref()` に戻すので、何も待たないスクリプトは今までどおり終われる。タイマーは増やさない。
 - **kairod（`HttpBackend`）では、借用・先取りのシグナル・一覧はない**（一覧はエラー）。待ちモードの `run` は、従来どおり呼び出したところで動かす。kairod の保持期間を過ぎたときの `ResultLostError` を、呼び出し側に届けるため。期限付きの待ちと `limit`・`rate` は kairod でも効く。
 - **待つのをやめると取り消していた不具合**は TypeScript にもあったので、直した。
 - **テスト。** `src/driving.test.ts` に、Go と同じ 9 件を SQLite で足した。Go と TypeScript の相互再開のテストも通る。
