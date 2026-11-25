@@ -87,6 +87,16 @@ async def serve(app: Any, tls: ssl.SSLContext | None = None) -> tuple[str, async
     return (f"https://localhost:{port}" if tls else f"http://127.0.0.1:{port}"), s
 
 
+async def blocked_call(k: Kairo, workflow: str) -> str:
+    """The call of workflow that stopped for review (blocked), once it has."""
+    for _ in range(400):
+        for c in await k.children(workflow):
+            if c["status"] == "blocked":
+                return c["run_id"]
+        await asyncio.sleep(0.025)
+    raise AssertionError(f"no call of {workflow} stopped for review")
+
+
 def plain(fn: Any) -> Any:
     """An ASGI app from fn(path, message) -> (status, body), for remote ends written by hand."""
 
@@ -382,26 +392,32 @@ class HttpActionTest(unittest.TestCase):
                 await k.run("w", None, id="expire-1")
             await k.close()
             # The scheduler's ticks, in new processes: leases expire, the
-            # unprotected step is retried (after its backoff), the real one stops.
-            out = None
+            # unprotected step is retried (after its backoff), the real one
+            # stops for review, and the workflow waits there (ADR 0058).
+            blocked = ""
             for _ in range(40):
                 await asyncio.sleep(0.1)
                 k = await invocation()
                 await k.tick()
-                try:
-                    out = await k.run("w", None, id="expire-1")
-                except Suspended:
-                    pass
+                with self.assertRaises(Suspended):
+                    await k.run("w", None, id="expire-1")
+                kids = await k.children("expire-1")
                 await k.close()
-                if out is not None:
+                blocked = next((c["run_id"] for c in kids if c["status"] == "blocked"), "")
+                if blocked:
                     break
-            self.assertIsNotNone(out, "the workflow ended")
+            self.assertNotEqual(blocked, "", "the real call stopped for review")
+            # Reviewed by hand: it did not take effect. The workflow goes on.
+            k = await invocation()
+            await k.resolve_failed(blocked, "not sent")
+            out = await k.run("w", None, id="expire-1")
+            await k.close()
             # Retried at least once; more if a process closed while a retry
             # it had started was still out (its outcome is dropped, as a
             # process that stops drops it, and the lease expires again).
             self.assertGreaterEqual(calls["idem"], 2)
             self.assertEqual(out["a"], f"attempt {calls['idem']}")
-            self.assertIn("blocked", out["real"])
+            self.assertIn("not sent", out["real"])
             self.assertEqual(calls["real"], 1, "the real action is not called again")
 
         run(main)
@@ -439,7 +455,10 @@ class HttpActionTest(unittest.TestCase):
             self.assertEqual(calls["bad"], 1, "a 4xx is not retried")
             self.assertEqual(await k.run("w", "flaky", id="st-flaky"), "ok")
             self.assertEqual(calls["flaky"], 2)
-            self.assertIn("blocked", await k.run("w", "down", id="st-down"))
+            down = asyncio.ensure_future(k.run("w", "down", id="st-down"))
+            call = await blocked_call(k, "st-down")  # stops for review; the workflow waits there
+            await k.resolve_failed(call, "not sent")
+            self.assertIn("not sent", await down)
             self.assertEqual(calls["down"], 1)
             await k.close()
 
@@ -466,7 +485,10 @@ class HttpActionTest(unittest.TestCase):
 
             await k.start()
             cb.current = k
-            self.assertIn("blocked", await k.run("w", None, id="large-response"))
+            out = asyncio.ensure_future(k.run("w", None, id="large-response"))
+            call = await blocked_call(k, "large-response")  # unknown: stops for review
+            await k.resolve(call, "taken by hand")
+            self.assertEqual(await out, "taken by hand")
             await k.close()
 
         run(main)

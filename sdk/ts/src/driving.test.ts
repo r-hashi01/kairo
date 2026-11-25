@@ -252,6 +252,63 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k1.close();
 	});
 
+	// A real call whose process stopped while it ran is not run again: it
+	// stops for review, and the workflow waits for it there instead of
+	// failing; resolving it goes on with the answer (ADR 0058, 0066; issue #80).
+	for (const how of ['resolve', 'resolveFailed'] as const) {
+		test(`a blocked call waits for review in the workflow (${how})`, async () => {
+			const path = join(dir, `review-${how}.db`);
+			let pays = 0;
+			let release!: () => void;
+			const stuck = new Promise<void>((r) => (release = r));
+			const start = async (store: Store, hang: boolean) => {
+				const k = await open(path, { store, leaseMs: 200 });
+				k.defineAction('pay', {
+					effect: 'real',
+					handler: async () => {
+						pays++;
+						if (hang) await stuck; // as a process that stops while paying
+						return 'paid';
+					},
+				});
+				k.workflow('w', async (ctx) => (await ctx.call<string>('pay')) + '!');
+				await k.start();
+				return k;
+			};
+			const [store, state] = dying(new SQLiteStore(path));
+			const k1 = await start(store, true);
+			await k1.submit('w', null, { id: `review-${how}` });
+			await waitUntil(() => pays === 1);
+			state.dead = true; // stops: its leases are not renewed
+
+			const k2 = await start(new SQLiteStore(path), false);
+			try {
+				const result = k2.result(`review-${how}`, { signal: AbortSignal.timeout(10_000) });
+				result.catch(() => {}); // awaited below; an early failure must not leave it unhandled
+				let call = '';
+				await waitUntil(async () => {
+					const blocked = (await k2.children(`review-${how}`)).find((c) => c.status === 'blocked');
+					call = blocked?.run_id ?? '';
+					return call !== '';
+				});
+				// The workflow waits on: nothing is failed or cancelled meanwhile.
+				assert.equal((await k2.backend.get(`review-${how}`)).status, 'running');
+				if (how === 'resolve') {
+					await k2.resolve(call, 'confirmed');
+					assert.equal(await result, 'confirmed!');
+				} else {
+					await k2.resolveFailed(call, 'not paid');
+					await assert.rejects(result, /not paid/);
+				}
+				assert.equal(pays, 1, 'the real call was not made again');
+			} finally {
+				await k2.close();
+				release(); // its outcome is not recorded: k1's store is gone
+				await k1.close();
+			}
+		});
+	}
+
 	// While a process drives a workflow, another one that runs it does not
 	// drive it too: it waits for the result.
 	test('a live driver is not doubled', async () => {

@@ -345,17 +345,23 @@ export class Embedded {
 		return info(row);
 	}
 
-	/** Waits until the run has finished or stopped for review (in this process's view). */
-	async wait(runId: string, signal?: AbortSignal): Promise<RunInfo> {
+	/**
+	 * Waits until the run has finished or stopped for review (in this
+	 * process's view); with until DONE, only until it has finished.
+	 */
+	async wait(runId: string, signal?: AbortSignal, until: ReadonlySet<string> = SETTLED): Promise<RunInfo> {
 		let resolve!: (r: RunInfo) => void;
 		const done = new Promise<RunInfo>((r) => (resolve = r));
+		const wake = (r: RunInfo) => {
+			if (until.has(r.status)) resolve(r);
+		};
 		let set = this.waiters.get(runId);
 		if (!set) this.waiters.set(runId, (set = new Set()));
-		set.add(resolve);
+		set.add(wake);
 		try {
 			// Registered first, then read: an end between the two still wakes us.
 			const now = await this.get(runId);
-			if (SETTLED.has(now.status)) return now;
+			if (until.has(now.status)) return now;
 			if (!signal) return await done;
 			return await new Promise<RunInfo>((res, rej) => {
 				const abort = () => rej(signal.reason ?? new Error('aborted'));
@@ -367,9 +373,14 @@ export class Embedded {
 				});
 			});
 		} finally {
-			set.delete(resolve);
+			set.delete(wake);
 			if (set.size === 0) this.waiters.delete(runId);
 		}
+	}
+
+	/** Waits until the run has finished: one stopped for review waits for its review (ADR 0058). */
+	waitDone(runId: string, signal?: AbortSignal): Promise<RunInfo> {
+		return this.wait(runId, signal, DONE);
 	}
 
 	async signal(runId: string, name: string, payload: unknown = null): Promise<void> {

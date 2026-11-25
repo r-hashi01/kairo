@@ -313,6 +313,71 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_a_blocked_call_waits_for_review(self) -> None:
+        """A real call whose process stopped while it ran is not run again: it
+        stops for review, and the workflow waits for it there instead of
+        failing; resolving it goes on with the answer (ADR 0058, 0066; issue #80)."""
+        for how in ("resolve", "resolve_failed"):
+            with self.subTest(how=how):
+                self._blocked_call_waits_for_review(how)
+
+    def _blocked_call_waits_for_review(self, how: str) -> None:
+        path = self.path(f"review-{how}.db")
+        pays = {"n": 0}
+
+        async def main() -> None:
+            async def start(store: Any, hang: bool) -> Kairo:
+                k = await self.open(path, store=store, lease_ms=200)
+
+                @k.action("pay")
+                def pay(req, ctx):
+                    pays["n"] += 1
+                    if hang:
+                        ctx.cancelled.wait(10)  # as a process that stops while paying; close ends it
+                    return "paid"
+
+                @k.workflow("w")
+                async def w(ctx, _):
+                    return (await ctx.call("pay")) + "!"
+
+                await k.start()
+                return k
+
+            store = Dying(SQLiteStore(path))
+            k1 = await start(store, True)
+            await k1.submit("w", None, id=f"review-{how}")
+            await wait_until(lambda: pays["n"] == 1)
+            store.dead = True  # stops: its leases are not renewed
+
+            k2 = await start(None, False)
+            try:
+                result = asyncio.ensure_future(asyncio.wait_for(k2.result(f"review-{how}"), 10))
+                call = ""
+                for _ in range(400):
+                    blocked = [c for c in await k2.children(f"review-{how}") if c["status"] == "blocked"]
+                    if blocked:
+                        call = blocked[0]["run_id"]
+                        break
+                    await asyncio.sleep(0.025)
+                self.assertNotEqual(call, "", "the call did not stop for review")
+                # The workflow waits on: nothing is failed or cancelled meanwhile.
+                self.assertEqual((await k2.backend.get(f"review-{how}"))["status"], "running")
+                if how == "resolve":
+                    await k2.resolve(call, "confirmed")
+                    self.assertEqual(await result, "confirmed!")
+                else:
+                    await k2.resolve_failed(call, "not paid")
+                    with self.assertRaisesRegex(WorkflowError, "not paid"):
+                        await result
+                self.assertEqual(pays["n"], 1, "the real call was not made again")
+            finally:
+                if not result.done():
+                    result.cancel()
+                await k2.close()
+                await k1.close()  # its outcome is not recorded: its store is gone
+
+        asyncio.run(main())
+
     def test_a_live_driver_is_not_doubled(self) -> None:
         """While a process drives a workflow, another one that runs it does not
         drive it too: it waits for the result."""
