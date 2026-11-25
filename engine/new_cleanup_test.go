@@ -13,13 +13,17 @@ import (
 
 type newCleanupSink struct {
 	*wal.MemSink
-	closes atomic.Int32
+	closes   atomic.Int32
+	closeErr error
 }
 
 func trackedNewSink() *newCleanupSink { return &newCleanupSink{MemSink: &wal.MemSink{}} }
 
 func (s *newCleanupSink) Close() error {
 	s.closes.Add(1)
+	if s.closeErr != nil {
+		return s.closeErr
+	}
 	return s.MemSink.Close()
 }
 
@@ -124,6 +128,27 @@ func TestNewRejectsPartialTierAcrossShards(t *testing.T) {
 	requireClosedOnce(t, memory)
 }
 
+func TestNewReportsPartialTierCloseErrors(t *testing.T) {
+	closeErr := errors.New("injected partial sink close failure")
+	partial := trackedNewSink()
+	partial.closeErr = closeErr
+	_, err := New(Config{Shards: 2, Sinks: func(tier Tier, shard int) (wal.Sink, error) {
+		if tier == TierMemory {
+			return trackedNewSink(), nil
+		}
+		if tier == TierFile && shard == 0 {
+			return partial, nil
+		}
+		return nil, nil
+	}})
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("New returned %v, want partial sink close error", err)
+	}
+	if got := partial.closes.Load(); got != 1 {
+		t.Fatalf("partial sink closed %d times, want 1", got)
+	}
+}
+
 func TestNewClosesOrdinaryAndDoneSinksAfterDoneOpenFailure(t *testing.T) {
 	var ordinary []*newCleanupSink
 	var done []*newCleanupSink
@@ -148,6 +173,48 @@ func TestNewClosesOrdinaryAndDoneSinksAfterDoneOpenFailure(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("New succeeded")
+	}
+	if len(ordinary) != 4 || len(done) != 1 {
+		t.Fatalf("opened ordinary=%d done=%d, want 4 and 1", len(ordinary), len(done))
+	}
+	requireClosedOnce(t, ordinary)
+	requireClosedOnce(t, done)
+}
+
+func TestNewClosesEncryptedSinksAndReportsCleanupErrors(t *testing.T) {
+	openErr := errors.New("injected done sink open failure")
+	ordinaryCloseErr := errors.New("injected ordinary sink close failure")
+	doneCloseErr := errors.New("injected done sink close failure")
+	var ordinary []*newCleanupSink
+	var done []*newCleanupSink
+	_, err := New(Config{
+		Shards: 2,
+		Keys:   testKeys(t, 17),
+		Sinks: func(tier Tier, _ int) (wal.Sink, error) {
+			if tier != TierMemory && tier != TierFile {
+				return nil, nil
+			}
+			sink := trackedNewSink()
+			if len(ordinary) == 0 {
+				sink.closeErr = ordinaryCloseErr
+			}
+			ordinary = append(ordinary, sink)
+			return sink, nil
+		},
+		DoneLogs: func(shard int) (wal.Sink, error) {
+			if shard == 1 {
+				return nil, openErr
+			}
+			sink := trackedNewSink()
+			sink.closeErr = doneCloseErr
+			done = append(done, sink)
+			return sink, nil
+		},
+	})
+	for _, want := range []error{openErr, ordinaryCloseErr, doneCloseErr} {
+		if !errors.Is(err, want) {
+			t.Errorf("New returned %v, want %v", err, want)
+		}
 	}
 	if len(ordinary) != 4 || len(done) != 1 {
 		t.Fatalf("opened ordinary=%d done=%d, want 4 and 1", len(ordinary), len(done))

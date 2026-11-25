@@ -337,7 +337,7 @@ var errCreationOrderExhausted = errors.New("engine: creation order exhausted")
 // Open creates an engine and recovers the runs found in its logs. Plans
 // that recovered runs refer to must be registered in advance with
 // RegisterPlan (use New + Recover for that), or passed via plans.
-func New(cfg Config) (*Engine, error) {
+func New(cfg Config) (_ *Engine, retErr error) {
 	if cfg.Shards <= 0 {
 		cfg.Shards = runtime.GOMAXPROCS(0)
 	}
@@ -446,7 +446,9 @@ func New(cfg Config) (*Engine, error) {
 	keepSinks := false
 	defer func() {
 		if !keepSinks {
-			closeSinks(openedSinks)
+			if err := closeSinks(openedSinks); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("engine: closing sinks after failed initialization: %w", err))
+			}
 		}
 	}()
 	for t := TierMemory; t < tierCount; t++ {
@@ -459,10 +461,13 @@ func New(cfg Config) (*Engine, error) {
 			}
 			if s == nil {
 				avail = false
-				closeSinks(openedSinks[tierStart:])
+				closeErr := closeSinks(openedSinks[tierStart:])
 				openedSinks = openedSinks[:tierStart]
 				for j := 0; j < i; j++ {
 					sinks[j][t] = nil
+				}
+				if closeErr != nil {
+					return nil, fmt.Errorf("engine: closing unavailable %s tier: %w", t, closeErr)
 				}
 				break
 			}
@@ -1364,17 +1369,22 @@ func (e *Engine) deleteKept(runID string, gen uint64) error {
 	return nil
 }
 
+// closeSinks closes sinks in reverse order and joins any errors.
+func closeSinks(sinks []wal.Sink) error {
+	var errs []error
+	for i := len(sinks) - 1; i >= 0; i-- {
+		if sinks[i] != nil {
+			if err := sinks[i].Close(); err != nil {
+				errs = append(errs, fmt.Errorf("sink %d: %w", i, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // doneSinks opens the per-shard logs of finished-run markers (ADR 0027).
 // None are needed if markers are disabled or no shard has a log tier that
 // survives a restart.
-func closeSinks(sinks []wal.Sink) {
-	for i := len(sinks) - 1; i >= 0; i-- {
-		if sinks[i] != nil {
-			_ = sinks[i].Close()
-		}
-	}
-}
-
 func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) (out []wal.Sink, retErr error) {
 	cfg := e.cfg
 	out = make([]wal.Sink, cfg.Shards)
@@ -1384,7 +1394,9 @@ func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) (out []wal.Sink, retErr 
 	var opened []wal.Sink
 	defer func() {
 		if retErr != nil {
-			closeSinks(opened)
+			if err := closeSinks(opened); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("engine: closing done sinks after failed initialization: %w", err))
+			}
 		}
 	}()
 	if cfg.DoneLogs == nil && cfg.DataDir == "" {
