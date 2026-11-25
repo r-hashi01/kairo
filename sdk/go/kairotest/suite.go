@@ -1074,9 +1074,22 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 // While a process drives a workflow, another one that runs it does not
 // drive it too: it waits for the result.
 func testLiveDriverIsNotDoubled(t *testing.T, open Opener) {
+	// The clock is the test's: the driver's lease outlives its first period
+	// only by its renewals, and the other process's sweeps see it alive
+	// whatever the machine's load (issue #86).
+	const lease = 200                    // ms
+	var now, renewed, swept atomic.Int64 // the clock; k1's latest renewed lease end; k2's latest sweep clock
+	now.Store(1_000_000_000)
 	runs := &counts{m: map[string]int{}}
 	start := func(name string) *kairo.Kairo {
-		k, err := kairo.Open(context.Background(), kairo.Options{Store: open(), Lease: 200 * time.Millisecond})
+		store := &watchedStore{Store: open()}
+		if name == "k1" {
+			store.renewed = &renewed
+		} else {
+			store.swept = &swept
+		}
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: store, Lease: lease * time.Millisecond,
+			Now: func() time.Time { return time.UnixMilli(now.Load()) }})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1104,7 +1117,15 @@ func testLiveDriverIsNotDoubled(t *testing.T, open Opener) {
 		}
 		res <- out
 	}()
-	time.Sleep(300 * time.Millisecond) // a lease period and more: k1 renews it
+	// Steps shorter than the lease, three of them: past its first period.
+	for range 3 {
+		at := now.Add(150)
+		waitUntil(t, func() bool { return renewed.Load() >= at+lease }) // k1 is alive: it renews
+		waitUntil(t, func() bool { return swept.Load() >= at })         // k2's sweep looks, and finds it alive
+		if n := runs.get("k2"); n != 0 {
+			t.Fatalf("k2 drove it %d times", n)
+		}
+	}
 	if err := k2.Signal(context.Background(), "one-1", "go", "went"); err != nil {
 		t.Fatal(err)
 	}
@@ -1114,6 +1135,29 @@ func testLiveDriverIsNotDoubled(t *testing.T, open Opener) {
 	if runs.get("k2") != 0 {
 		t.Fatalf("k2 drove it %d times", runs.get("k2"))
 	}
+}
+
+// watchedStore records the lease ends a process renews to and the clock
+// its sweeps look for expired leases at.
+type watchedStore struct {
+	kairo.Store
+	renewed, swept *atomic.Int64
+}
+
+func (s *watchedStore) RenewLeases(ctx context.Context, owner string, until int64) error {
+	if s.renewed != nil {
+		for v := s.renewed.Load(); until > v && !s.renewed.CompareAndSwap(v, until); v = s.renewed.Load() {
+		}
+	}
+	return s.Store.RenewLeases(ctx, owner, until)
+}
+
+func (s *watchedStore) ExpiredLeases(ctx context.Context, now int64, limit int) ([]kairo.LeaseRow, error) {
+	if s.swept != nil {
+		for v := s.swept.Load(); now > v && !s.swept.CompareAndSwap(v, now); v = s.swept.Load() {
+		}
+	}
+	return s.Store.ExpiredLeases(ctx, now, limit)
 }
 
 // Signals sent before the workflow reaches its waits are received there,
