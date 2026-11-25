@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,7 +139,9 @@ func TestStaleSnapshotRefusesToStart(t *testing.T) {
 				return f
 			}
 			waitFor(t, func() bool { ri, _ := e1.Get(context.Background(), id); return ri.Evicted && snapFile() != "" })
-			time.Sleep(50 * time.Millisecond) // checkpoint durable
+			// The snapshot's checkpoint is in the log (issue #89: not a fixed wait).
+			waitFor(t, func() bool { return checkpointed(t, dir, keys) > 0 })
+			first := checkpointed(t, dir, keys)
 			old, _ := os.ReadFile(snapFile())
 			e1.Signal(id, "a", nil)
 			waitFor(t, func() bool {
@@ -148,7 +152,9 @@ func TestStaleSnapshotRefusesToStart(t *testing.T) {
 				cur, _ := os.ReadFile(snapFile())
 				return !bytes.Equal(cur, old)
 			})
-			time.Sleep(50 * time.Millisecond)
+			// The newer snapshot's checkpoint is in the log before the engine
+			// stops: that is what refuses the old one put back.
+			waitFor(t, func() bool { return checkpointed(t, dir, keys) > first })
 			e1.Close()
 			os.WriteFile(snapFile(), old, 0o644)
 			if _, err := startSealed(t, dir, keys); !errors.Is(err, seal.ErrTampered) {
@@ -156,6 +162,73 @@ func TestStaleSnapshotRefusesToStart(t *testing.T) {
 			}
 		})
 	}
+}
+
+// checkpointed is the newest snapshot LSN that a checkpoint record in dir's
+// file-tier log (shard 0) points at, 0 if none. It reads the segments as
+// they are, while the engine writes: a record still being written is left
+// out. keys decrypt a sealed log.
+func checkpointed(t *testing.T, dir string, keys seal.Keys) uint64 {
+	t.Helper()
+	const prefix = "shard-000"
+	paths, _ := filepath.Glob(filepath.Join(dir, "wal", prefix+".L*.wal"))
+	sort.Strings(paths) // the 20-digit first LSN orders them
+	var src logRecords
+	for _, p := range paths {
+		first, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(filepath.Base(p), prefix+".L"), ".wal"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lsn := first
+		wal.Scan(data, func(rec []byte) error {
+			src = append(src, logRecord{lsn: lsn, rec: append([]byte(nil), rec...)})
+			lsn++
+			return nil
+		})
+	}
+	var log wal.Sink = src
+	if keys != nil {
+		log = wal.Encrypted(src, keys, prefix+"/"+TierFile.String())
+	}
+	var newest uint64
+	if err := log.ReadAll(func(_ uint64, rec []byte) error {
+		if r, err := decodeRecord(rec); err == nil && r.kind == recCheckpoint && r.snapLSN > newest {
+			newest = r.snapLSN
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return newest
+}
+
+type logRecord struct {
+	lsn uint64
+	rec []byte
+}
+
+// logRecords is a read-only wal.Sink over records already read.
+type logRecords []logRecord
+
+func (l logRecords) Append([]byte) error { return errors.New("read only") }
+func (l logRecords) Next() uint64 {
+	if len(l) == 0 {
+		return 1
+	}
+	return l[len(l)-1].lsn + 1
+}
+func (l logRecords) Close() error { return nil }
+func (l logRecords) ReadAll(fn func(uint64, []byte) error) error {
+	for _, r := range l {
+		if err := fn(r.lsn, r.rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func splitFrames(data []byte) [][]byte {
