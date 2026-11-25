@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/core"
 	"github.com/r-hashi01/kairo/ir"
 	opmetrics "github.com/r-hashi01/kairo/metrics"
@@ -958,7 +959,20 @@ func TestLogCompaction(t *testing.T) {
 func TestCompactionDoesNotWakeIdleEngine(t *testing.T) {
 	for _, evict := range []time.Duration{20 * time.Millisecond, -1} {
 		t.Run(fmt.Sprint("evict=", evict > 0), func(t *testing.T) {
-			e := newEngine(t, Config{Shards: 1, DataDir: t.TempDir(), NoSync: true, CompactEvery: 8, EvictAfter: evict})
+			dir := t.TempDir()
+			var io ioCount
+			e := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true, CompactEvery: 8, EvictAfter: evict,
+				Snapshots: countedStore{Store: mustDir(t, filepath.Join(dir, "snapshots")), io: &io},
+				Sinks: func(tier Tier, shard int) (wal.Sink, error) {
+					if tier != TierFile {
+						return nil, nil
+					}
+					fs, err := wal.OpenFile(filepath.Join(dir, "wal"), fmt.Sprintf("shard-%03d", shard), true)
+					if err != nil {
+						return nil, err
+					}
+					return countedSink{Sink: fs, io: &io}, nil
+				}})
 			defer e.Close()
 			mustPlan(t, e, `{"name":"w","root":{"kind":"wait","id":"w","signal":"never"}}`)
 			e.Start()
@@ -967,14 +981,22 @@ func TestCompactionDoesNotWakeIdleEngine(t *testing.T) {
 				submit(e, SubmitRequest{Plan: "w", Tenant: "t", Tier: &ft})
 			}
 			waitFor(t, func() bool { st := e.Stats(); return st.InMemory+st.Evicted == 40 })
-			wakes := func() uint64 { return e.shards[0].wakeups.Load() }
-			// Let in-flight snapshot writes and checkpoints settle.
+			s := e.shards[0]
+			wakes := func() uint64 { return s.wakeups.Load() }
+			// Settled: no snapshot write or log append is under way or
+			// queued, and nothing reached the shard, at both ends of a
+			// window. A write in flight, however slow the disk, keeps it
+			// unsettled (issue #89: not a quiet window alone).
+			idle := func() bool { return io.inFlight.Load() == 0 && e.ioq.Len() == 0 && s.inbox.Len() == 0 }
 			var w0 uint64
 			waitFor(t, func() bool {
-				a := wakes()
+				a, done := wakes(), io.done.Load()
+				if !idle() {
+					return false
+				}
 				time.Sleep(100 * time.Millisecond)
 				w0 = wakes()
-				return a == w0
+				return idle() && a == w0 && done == io.done.Load()
 			})
 			time.Sleep(300 * time.Millisecond)
 			if w1 := wakes(); w1 != w0 {
@@ -982,6 +1004,59 @@ func TestCompactionDoesNotWakeIdleEngine(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ioCount counts I/O the engine does: under way, and done.
+type ioCount struct{ inFlight, done atomic.Int64 }
+
+func (c *ioCount) do(f func() error) error {
+	c.inFlight.Add(1)
+	defer func() {
+		c.done.Add(1)
+		c.inFlight.Add(-1)
+	}()
+	return f()
+}
+
+// countedStore counts a blob store's writes and deletes.
+type countedStore struct {
+	blob.Store
+	io *ioCount
+}
+
+func (s countedStore) Put(key string, data []byte) error {
+	return s.io.do(func() error { return s.Store.Put(key, data) })
+}
+
+func (s countedStore) Delete(key string) error {
+	return s.io.do(func() error { return s.Store.Delete(key) })
+}
+
+// countedSink counts a log's appends and retirements.
+type countedSink struct {
+	wal.Sink
+	io *ioCount
+}
+
+func (s countedSink) Append(batch []byte) error {
+	return s.io.do(func() error { return s.Sink.Append(batch) })
+}
+
+func (s countedSink) Retire(lsn uint64) error {
+	r, ok := s.Sink.(wal.Retirer)
+	if !ok {
+		return nil
+	}
+	return s.io.do(func() error { return r.Retire(lsn) })
+}
+
+func mustDir(t *testing.T, dir string) blob.Store {
+	t.Helper()
+	s, err := blob.NewDir(dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
 
 // Reusing the id of a finished run: the new run must survive a restart
