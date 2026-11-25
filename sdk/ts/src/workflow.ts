@@ -1848,10 +1848,12 @@ export class Kairo {
 				await this.backend.idle!();
 				r = await this.backend.get(runId);
 			}
-			if (!finished(r) && r.status !== 'blocked') throw new Suspended(`call ${runId} waits`);
+			// Waiting, or stopped for review until it is resolved (ADR 0058).
+			if (!finished(r)) throw new Suspended(`call ${runId} waits`);
 		} else {
 			try {
-				r = await this.backend.wait(runId, ctx.signal);
+				// A call stopped for review waits for it (ADR 0058, 0066).
+				r = this.backend.waitDone ? await this.backend.waitDone(runId, ctx.signal) : await this.backend.wait(runId, ctx.signal);
 			} catch (e) {
 				if (ctx.signal.aborted) {
 					// The workflow was cancelled in kairo: so is the call. If not,

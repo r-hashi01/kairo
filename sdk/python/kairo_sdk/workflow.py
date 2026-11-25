@@ -2112,10 +2112,13 @@ class Kairo:
             else:
                 await self.backend.idle()
                 r = await self.backend.get(run_id)
-            if not finished(r) and r.get("status") != "blocked":
+            # Waiting, or stopped for review until it is resolved (ADR 0058).
+            if not finished(r):
                 raise Suspended(f"call {run_id} waits")
         else:
-            r = await self.backend.wait(run_id)
+            # A call stopped for review waits for it (ADR 0058, 0066).
+            wait_done = getattr(self.backend, "wait_done", None)
+            r = await (wait_done or self.backend.wait)(run_id)
         if r.get("trimmed"):
             raise ResultLostError(f"call {run_id} finished, but kairo no longer keeps its result")
         if r.get("status") != "completed":

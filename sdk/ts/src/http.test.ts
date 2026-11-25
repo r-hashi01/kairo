@@ -69,6 +69,16 @@ async function callbackServer(): Promise<{ url: string; to: (k: Kairo) => void }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** The call of workflow that stopped for review (blocked), once it has. */
+async function blockedCall(k: Kairo, workflow: string): Promise<string> {
+	for (let i = 0; i < 400; i++) {
+		const c = (await k.children(workflow)).find((r) => r.status === 'blocked');
+		if (c) return c.run_id;
+		await sleep(25);
+	}
+	throw new Error(`no call of ${workflow} stopped for review`);
+}
+
 function actionBody(size: number): string {
 	const prefix = '{"run_id":"r","act":1,"attempt":1,"action":"x","input":"';
 	const suffix = '"}';
@@ -289,25 +299,29 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 		await assert.rejects(k.run('w', null, { id: 'expire-1' }), Suspended);
 		await k.close();
 		// The scheduler's ticks, in new processes: leases expire, the
-		// unprotected step is retried (after its backoff), the real one stops.
-		let out: { a: string; real: string } | undefined;
-		for (let i = 0; i < 40 && !out; i++) {
+		// unprotected step is retried (after its backoff), the real one
+		// stops for review, and the workflow waits there (ADR 0058).
+		let blocked = '';
+		for (let i = 0; i < 40 && !blocked; i++) {
 			await sleep(100);
 			k = await invocation();
 			await k.tick();
-			out = (await k.run('w', null, { id: 'expire-1' }).catch((e) => {
-				if (e instanceof Suspended) return undefined;
-				throw e;
-			})) as typeof out;
+			await assert.rejects(k.run('w', null, { id: 'expire-1' }), Suspended);
+			blocked = (await k.children('expire-1')).find((c) => c.status === 'blocked')?.run_id ?? '';
 			await k.close();
 		}
-		assert.ok(out, 'the workflow ended');
+		assert.ok(blocked, 'the real call stopped for review');
+		// Reviewed by hand: it did not take effect. The workflow goes on.
+		k = await invocation();
+		await k.resolveFailed(blocked, 'not sent');
+		const out = (await k.run('w', null, { id: 'expire-1' })) as { a: string; real: string };
+		await k.close();
 		// Retried at least once; more if a process closed while a retry it
 		// had started was still out (its outcome is dropped, as a process
 		// that stops drops it, and the lease expires again).
 		assert.ok(calls.idem >= 2, `idem called ${calls.idem} times`);
 		assert.equal(out.a, `attempt ${calls.idem}`);
-		assert.match(out.real, /blocked/);
+		assert.match(out.real, /not sent/);
 		assert.equal(calls.real, 1, 'the real action is not called again');
 	});
 
@@ -355,7 +369,10 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 		assert.equal(calls.bad, 1, 'a 4xx is not retried');
 		assert.equal(await k.run('w', 'flaky', { id: 'st-flaky' }), 'ok');
 		assert.equal(calls.flaky, 2);
-		assert.match(String(await k.run('w', 'down', { id: 'st-down' })), /blocked/);
+		const down = k.run('w', 'down', { id: 'st-down' });
+		const call = await blockedCall(k, 'st-down'); // stops for review; the workflow waits there
+		await k.resolveFailed(call, 'not sent');
+		assert.match(String(await down), /not sent/);
 		assert.equal(calls.down, 1);
 		await k.close();
 	});
@@ -374,7 +391,10 @@ describe('actions over HTTP(S)', { skip: !hasGo }, () => {
 		});
 		await k.start();
 		cb.to(k);
-		assert.match(String(await k.run('w', null, { id: 'large-response' })), /blocked/);
+		const out = k.run('w', null, { id: 'large-response' });
+		const call = await blockedCall(k, 'large-response'); // unknown: stops for review
+		await k.resolve(call, 'taken by hand');
+		assert.equal(await out, 'taken by hand');
 		await k.close();
 	});
 

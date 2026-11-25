@@ -22,6 +22,8 @@ export interface Backend {
 	/** Throws KairoError 404 for a run that does not exist. With input: the run's input too (ADR 0060). */
 	get(runId: string, opts?: { input?: boolean }): Promise<RunInfo>;
 	wait(runId: string, signal?: AbortSignal): Promise<RunInfo>;
+	/** Like wait, but a run stopped for review (blocked) is waited past, until its review settles it (the embedded runtime; kairod's wait already does). */
+	waitDone?(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	waitQuiescent?(runId: string, signal?: AbortSignal): Promise<RunInfo>;
 	signal(runId: string, name: string, payload: unknown): Promise<void>;
 	applySignal?(runId: string, name: string, payload: unknown, signalId: string, onlyIfWaiting: boolean): Promise<{ applied: boolean; duplicate?: boolean; early?: boolean }>;
@@ -391,6 +393,10 @@ export class EmbeddedBackend implements Backend {
 
 	wait(runId: string, signal?: AbortSignal) {
 		return this.runtime.wait(runId, signal);
+	}
+
+	waitDone(runId: string, signal?: AbortSignal) {
+		return this.runtime.waitDone(runId, signal);
 	}
 
 	signal(runId: string, name: string, payload: unknown) {

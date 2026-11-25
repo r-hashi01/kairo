@@ -412,6 +412,11 @@ class EmbeddedBackend:
     async def wait(self, run_id: str) -> dict[str, Any]:
         return await self.runtime.wait(run_id)
 
+    async def wait_done(self, run_id: str) -> dict[str, Any]:
+        """Like wait, but a run stopped for review is waited past, until its
+        review settles it (kairod's wait already does)."""
+        return await self.runtime.wait_done(run_id)
+
     async def signal(self, run_id: str, name: str, payload: Any) -> None:
         await self.runtime.signal(run_id, name, payload)
 

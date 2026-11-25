@@ -414,23 +414,33 @@ class Embedded:
                     self.logger.warning("kairo: run %s: putting off a timer: %s", run_id, put_off_error)
                 raise
 
-    async def wait(self, run_id: str) -> dict[str, Any]:
+    async def wait(self, run_id: str, until: frozenset[str] | set[str] = SETTLED) -> dict[str, Any]:
         """Waits until the run has finished or stopped for review (in this
-        process's view, and other processes' with a store that listens)."""
-        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._waiters.setdefault(run_id, set()).add(fut)
-        try:
-            # Registered first, then read: an end between the two still wakes us.
-            now = await self.get(run_id)
-            if now["status"] in SETTLED:
-                return now
-            return await fut
-        finally:
-            ws = self._waiters.get(run_id)
-            if ws is not None:
-                ws.discard(fut)
-                if not ws:
-                    del self._waiters[run_id]
+        process's view, and other processes' with a store that listens);
+        with until DONE, only until it has finished."""
+        while True:
+            fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            self._waiters.setdefault(run_id, set()).add(fut)
+            try:
+                # Registered first, then read: an end between the two still wakes us.
+                now = await self.get(run_id)
+                if now["status"] in until:
+                    return now
+                r = await fut
+                if r["status"] in until:
+                    return r
+                # Woken as it stopped for review: wait on, from a new read.
+            finally:
+                ws = self._waiters.get(run_id)
+                if ws is not None:
+                    ws.discard(fut)
+                    if not ws:
+                        del self._waiters[run_id]
+
+    async def wait_done(self, run_id: str) -> dict[str, Any]:
+        """Waits until the run has finished: one stopped for review waits for
+        its review (ADR 0058)."""
+        return await self.wait(run_id, DONE)
 
     async def signal(self, run_id: str, name: str, payload: Any = None) -> None:
         await self.signal_applied(run_id, name, payload)
