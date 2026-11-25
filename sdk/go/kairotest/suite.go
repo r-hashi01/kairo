@@ -908,26 +908,41 @@ type deadStore struct {
 	dead atomic.Bool
 }
 
+// onceStore, once armed, fails one transition: the one that creates the
+// next call of workflow parent (a run under parent that does not exist
+// yet). Other writes, such as a call's recorded outcome, pass, so the
+// failure lands on the same boundary however the goroutines interleave
+// (issue #84).
 type onceStore struct {
 	kairo.Store
-	fail atomic.Bool
+	parent string
+	fail   atomic.Bool
 }
 
 var errStoreBusy = errors.New("store busy")
 
 func (s *onceStore) WithRun(ctx context.Context, id string, fn func(*kairo.RunRow) (*kairo.Changes, error)) error {
-	if s.fail.Swap(false) {
-		return errStoreBusy
+	if s.fail.Load() && strings.HasPrefix(id, s.parent+"/") {
+		if row, err := s.Store.Get(ctx, id); err == nil && row == nil && s.fail.CompareAndSwap(true, false) {
+			return errStoreBusy
+		}
 	}
 	return s.Store.WithRun(ctx, id, fn)
 }
 
 // A transient Store failure gives up only the current drive. The lease
 // expiry replays it, completed calls are reused, and no failure is recorded
-// (ADR 0063). The public marker has the same meaning.
+// (ADR 0063). The public marker has the same meaning. The clock is the
+// test's: a lease expires when the test moves it, not because a loaded
+// machine renewed it late (issue #84).
 func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
-	s := &onceStore{Store: open()}
-	k, err := kairo.Open(context.Background(), kairo.Options{Store: s, Lease: 50 * time.Millisecond})
+	const lease = 50 * time.Millisecond
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
+	expire := func() { now.Add(2 * lease.Milliseconds()) } // past every lease taken so far
+	s := &onceStore{Store: open(), parent: "store-retry-1"}
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: s, Lease: lease,
+		Now: func() time.Time { return time.UnixMilli(now.Load()) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,8 +979,24 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 	if err := k.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := kairo.Run[string](context.Background(), k, "store-retry", nil, kairo.WithID("store-retry-1")); err != nil || out != "onetwo" {
-		t.Fatalf("%q %v", out, err)
+	type result struct {
+		out string
+		err error
+	}
+	run := func(workflow, id string) chan result {
+		c := make(chan result, 1)
+		go func() {
+			out, err := kairo.Run[string](context.Background(), k, workflow, nil, kairo.WithID(id))
+			c <- result{out, err}
+		}()
+		return c
+	}
+	res := run("store-retry", "store-retry-1")
+	// The failure was injected and the drive gave it up: its lease expires.
+	waitUntil(t, func() bool { return armed.Load() && !s.fail.Load() })
+	expire()
+	if r := <-res; r.err != nil || r.out != "onetwo" {
+		t.Fatalf("%q %v", r.out, r.err)
 	}
 	if first.Load() != 1 || second.Load() != 1 || attempts.Load() < 2 {
 		t.Fatalf("first %d second %d attempts %d", first.Load(), second.Load(), attempts.Load())
@@ -973,8 +1004,11 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 	if info, err := k.Get(context.Background(), "store-retry-1"); err != nil || info.Status != "completed" {
 		t.Fatalf("run %+v: %v", info, err)
 	}
-	if out, err := kairo.Run[string](context.Background(), k, "explicit-retry", nil, kairo.WithID("explicit-retry-1")); err != nil || out != "ok" {
-		t.Fatalf("explicit: %q %v", out, err)
+	res = run("explicit-retry", "explicit-retry-1")
+	waitUntil(t, func() bool { return explicit.Load() == 1 })
+	expire()
+	if r := <-res; r.err != nil || r.out != "ok" {
+		t.Fatalf("explicit: %q %v", r.out, r.err)
 	}
 	if explicit.Load() != 2 {
 		t.Fatalf("explicit attempts %d", explicit.Load())
