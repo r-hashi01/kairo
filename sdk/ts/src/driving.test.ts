@@ -253,12 +253,32 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 	});
 
 	// While a process drives a workflow, another one that runs it does not
-	// drive it too: it waits for the result.
+	// drive it too: it waits for the result. The clock is the test's: the
+	// driver's lease outlives its first period only by its renewals, and
+	// the other process's sweeps see it alive whatever the machine's load
+	// (issue #86).
 	test('a live driver is not doubled', async () => {
 		const path = join(dir, 'one.db');
+		const lease = 200;
+		let now = 1_000_000_000;
+		let renewed = 0; // the latest lease end k1 renewed to
+		let swept = 0; // the latest clock k2's sweep looked for expired leases at
 		const runs: Record<string, number> = { k1: 0, k2: 0 };
+		const watched = (store: Store, name: string): Store =>
+			new Proxy(store, {
+				get(target, prop) {
+					const v = (target as any)[prop];
+					if (typeof v !== 'function') return v;
+					if (name === 'k1' && prop === 'renewLeases')
+						return (owner: string, until: number) => ((renewed = Math.max(renewed, until)), v.call(target, owner, until));
+					if (name === 'k2' && prop === 'expiredLeases')
+						return (at: number, limit: number) => ((swept = Math.max(swept, at)), v.call(target, at, limit));
+					return v.bind(target);
+				},
+			});
 		const start = async (name: string) => {
-			const k = await open(path, { leaseMs: 200 });
+			const backend = await EmbeddedBackend.open({ store: watched(new SQLiteStore(path), name), wasm, leaseMs: lease, now: () => now });
+			const k = new Kairo({ backend });
 			k.workflow('w', async (ctx) => {
 				runs[name]!++;
 				return ctx.waitFor<string>('go');
@@ -271,7 +291,13 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k1.submit('w', null, { id: 'one-1' });
 		await waitUntil(() => runs.k1 === 1);
 		const res = k2.run('w', null, { id: 'one-1' });
-		await sleep(300); // a lease period and more: k1 renews it
+		// Steps shorter than the lease, three of them: past its first period.
+		for (let step = 0; step < 3; step++) {
+			now += 150;
+			await waitUntil(() => renewed >= now + lease); // k1 is alive: it renews
+			await waitUntil(() => swept >= now); // k2's sweep looks, and finds it alive
+			assert.equal(runs.k2, 0, 'k2 drove it');
+		}
 		await k2.signal('one-1', 'go', 'went');
 		assert.equal(await res, 'went');
 		assert.equal(runs.k2, 0, 'k2 drove it');

@@ -315,12 +315,37 @@ class DrivingTest(unittest.TestCase):
 
     def test_a_live_driver_is_not_doubled(self) -> None:
         """While a process drives a workflow, another one that runs it does not
-        drive it too: it waits for the result."""
+        drive it too: it waits for the result. The clock is the test's: the
+        driver's lease outlives its first period only by its renewals, and the
+        other process's sweeps see it alive whatever the machine's load
+        (issue #86)."""
         path = self.path("one.db")
+        lease = 200
+        clock = {"now": 1_000_000_000}
+        seen = {"renewed": 0, "swept": 0}  # k1's latest renewed lease end; k2's latest sweep clock
         runs = {"k1": 0, "k2": 0}
 
+        class Watched:
+            def __init__(self, store: SQLiteStore, name: str) -> None:
+                self._store, self._name = store, name
+
+            def __getattr__(self, attr: str) -> Any:
+                v = getattr(self._store, attr)
+                if self._name == "k1" and attr == "renew_leases":
+                    async def renew(owner: str, until: int) -> None:
+                        seen["renewed"] = max(seen["renewed"], until)
+                        await v(owner, until)
+                    return renew
+                if self._name == "k2" and attr == "expired_leases":
+                    async def expired(now: int, limit: int) -> Any:
+                        seen["swept"] = max(seen["swept"], now)
+                        return await v(now, limit)
+                    return expired
+                return v
+
         async def start(name: str) -> Kairo:
-            k = await self.open(path, lease_ms=200)
+            b = await EmbeddedBackend.open(Watched(SQLiteStore(path), name), wasm=self.wasm, lease_ms=lease, now=lambda: clock["now"])
+            k = Kairo(backend=b)
 
             @k.workflow("w")
             async def w(ctx, _):
@@ -336,7 +361,12 @@ class DrivingTest(unittest.TestCase):
             await k1.submit("w", None, id="one-1")
             await wait_until(lambda: runs["k1"] == 1)
             res = asyncio.ensure_future(k2.run("w", None, id="one-1"))
-            await asyncio.sleep(0.3)  # a lease period and more: k1 renews it
+            # Steps shorter than the lease, three of them: past its first period.
+            for _ in range(3):
+                clock["now"] += 150
+                await wait_until(lambda: seen["renewed"] >= clock["now"] + lease)  # k1 is alive: it renews
+                await wait_until(lambda: seen["swept"] >= clock["now"])  # k2's sweep looks, and finds it alive
+                self.assertEqual(runs["k2"], 0, "k2 drove it")
             await k2.signal("one-1", "go", "went")
             self.assertEqual(await res, "went")
             self.assertEqual(runs["k2"], 0, "k2 drove it")
