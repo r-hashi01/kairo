@@ -39,6 +39,8 @@ type fixture struct {
 	frames []string
 	// What node-m's step read of the steps before it.
 	stepData string
+	// node-slow runs until this is closed (or the engine stops it).
+	slow chan struct{}
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -57,7 +59,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Exec(`DROP TABLE ` + prefix + `execution, ` + prefix + `step`) })
-	f := &fixture{t: t}
+	f := &fixture{t: t, slow: make(chan struct{})}
 
 	// The control plane: lifecycle events.
 	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +97,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(e.Close)
 	e.RegisterExecutor([]string{ActionNode, ActionPureNode}, 8, engine.ExecutorFunc(
-		func(_ context.Context, tk *task.Task, _ func([]byte)) task.Result {
+		func(ctx context.Context, tk *task.Task, _ func([]byte)) task.Result {
 			var node Node
 			json.Unmarshal(tk.Params, &node)
 			slots := inputSlots(tk.Input)
@@ -105,7 +107,10 @@ func newFixture(t *testing.T) *fixture {
 			case "node-fail":
 				return task.Result{Err: "boom"}
 			case "node-slow":
-				time.Sleep(600 * time.Millisecond)
+				select {
+				case <-f.slow:
+				case <-ctx.Done():
+				}
 			case "node-wait":
 				// As n8n's Wait node: wait, then emit its input (ADR 0045).
 				return task.Result{Wait: &task.Wait{Until: time.Now().Add(400 * time.Millisecond).UnixMilli(),
@@ -486,7 +491,8 @@ func TestDaemonRestoresWaitingSteps(t *testing.T) {
 	f.d.mu.Lock()
 	delete(f.d.runs, id)
 	f.d.mu.Unlock()
-	// The wait ends and Slow runs: the execution is running again.
+	// The wait ends and Slow runs: the execution is running again. Slow is
+	// held until this is seen, not given a fixed time (issue #89).
 	f.waitFor(func() bool {
 		get()
 		for _, s := range snap.Steps {
@@ -499,6 +505,7 @@ func TestDaemonRestoresWaitingSteps(t *testing.T) {
 	if snap.Status != "running" {
 		t.Fatalf("while Slow runs after the wait: %s", snap.Status)
 	}
+	close(f.slow)
 	f.waitFor(func() bool { get(); return snap.Status == "completed" })
 }
 
