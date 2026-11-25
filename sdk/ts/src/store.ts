@@ -404,6 +404,10 @@ export class SQLiteStore implements Store {
 		const sqlite = 'node:sqlite';
 		const { DatabaseSync } = (await import(sqlite)) as any;
 		this.db = new DatabaseSync(this.path);
+		// First, so every statement after it (WAL included) waits for another
+		// process's write lock instead of failing with "database is locked",
+		// as the Go (busy_timeout) and Python (sqlite3's timeout) stores do.
+		this.db.exec('PRAGMA busy_timeout=5000');
 		if (this.path !== ':memory:') this.db.exec('PRAGMA journal_mode=WAL');
 		this.db.exec(`PRAGMA synchronous=${this.sync}`);
 		for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
