@@ -61,6 +61,24 @@ class CancelBeforeDone:
         await self.backend.finish(run_id, payload)
 
 
+class CancelDuringLateReplay:
+    """Holds descendant cancellation while a late replay registers."""
+
+    def __init__(self, backend) -> None:
+        self.backend = backend
+        self._cancel = backend.cancel
+        backend.cancel = self.cancel
+        self.child_id = ""
+        self.child_entered = asyncio.Event()
+        self.release_child = asyncio.Event()
+
+    async def cancel(self, run_id: str) -> None:
+        if run_id == self.child_id:
+            self.child_entered.set()
+            await self.release_child.wait()
+        await self._cancel(run_id)
+
+
 class TickSerializationTest(unittest.TestCase):
     def test_remote_drain_uses_the_backend(self) -> None:
         class Backend:
@@ -515,6 +533,53 @@ class WorkflowTest(unittest.TestCase):
                 await done
             await asyncio.to_thread(self.slow_cancelled.wait, 10)
             self.assertTrue(self.slow_cancelled.is_set())
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_cancel_stops_replay_started_after_initial_driver_scan(self) -> None:
+        async def main() -> None:
+            backend = await self.raw_backend()
+            gate = CancelDuringLateReplay(backend)
+            k = Kairo(backend=backend, mode="suspend")
+            invocations = 0
+            replay_started = asyncio.Event()
+            replay_stopped = asyncio.Event()
+
+            @k.workflow("cancel-replay")
+            async def cancel_replay(ctx, input):
+                nonlocal invocations
+                invocations += 1
+                late = invocations == 2
+                if late:
+                    replay_started.set()
+                try:
+                    return await ctx.wait_for("go")
+                finally:
+                    if late:
+                        replay_stopped.set()
+
+            await k.start()
+            id = f"py-cancel-replay-{type(self).__name__}"
+            with self.assertRaises(Suspended):
+                await k.run("cancel-replay", None, id=id)
+            children = await k.children(id)
+            self.assertEqual(len(children), 1)
+            gate.child_id = children[0]["run_id"]
+            k.suspend = False
+
+            cancelling = asyncio.create_task(k.cancel(id))
+            await asyncio.wait_for(gate.child_entered.wait(), 10)
+            replay = asyncio.create_task(k.run("cancel-replay", None, id=id))
+            try:
+                await asyncio.wait_for(replay_started.wait(), 10)
+                await asyncio.wait_for(replay_stopped.wait(), 10)
+            finally:
+                gate.release_child.set()
+            await cancelling
+            with self.assertRaises(Cancelled):
+                await replay
+            self.assertEqual((await k.backend.get(id))["status"], "cancelled")
             await k.close()
 
         asyncio.run(main())

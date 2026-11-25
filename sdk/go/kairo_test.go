@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -309,5 +310,107 @@ func TestCancelAfterCompletionReportsSettled(t *testing.T) {
 	}
 	if err := k.Cancel(context.Background(), "already-complete"); !errors.Is(err, ErrRunSettled) {
 		t.Fatalf("cancel: %v", err)
+	}
+}
+
+type cancelReplayRuns struct {
+	runs
+	childID         string
+	childEntered    chan struct{}
+	releaseChild    chan struct{}
+	childEnteredOne sync.Once
+	childCalls      atomic.Int32
+}
+
+func (r *cancelReplayRuns) cancel(ctx context.Context, runID string) error {
+	if runID == r.childID && r.childCalls.Add(1) == 1 {
+		r.childEnteredOne.Do(func() { close(r.childEntered) })
+		<-r.releaseChild
+	}
+	return r.runs.cancel(ctx, runID)
+}
+
+func waitTestChannel(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func TestCancelStopsReplayStartedAfterInitialDriverScan(t *testing.T) {
+	k, err := Open(context.Background(), Options{Store: NewMemStore(), Mode: Suspend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+
+	replayStarted := make(chan struct{})
+	replayStopped := make(chan struct{})
+	invocations := 0
+	Workflow(k, "cancel-replay", func(ctx *Context, _ any) (string, error) {
+		invocations++
+		late := invocations == 2
+		if late {
+			close(replayStarted)
+		}
+		value, err := WaitFor[string](ctx, "go")
+		if late {
+			close(replayStopped)
+		}
+		return value, err
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	const id = "cancel-replay-parent"
+	if _, err := Run[string](context.Background(), k, "cancel-replay", nil, WithID(id)); !errors.Is(err, ErrSuspended) {
+		t.Fatalf("initial run: %v", err)
+	}
+	children, err := k.Children(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d, want 1", len(children))
+	}
+
+	gate := &cancelReplayRuns{
+		runs:         k.runs,
+		childID:      children[0].RunID,
+		childEntered: make(chan struct{}),
+		releaseChild: make(chan struct{}),
+	}
+	k.runs = gate
+	k.mode = Wait
+	var releaseChild sync.Once
+	defer releaseChild.Do(func() { close(gate.releaseChild) })
+
+	cancelResult := make(chan error, 1)
+	go func() { cancelResult <- k.Cancel(context.Background(), id) }()
+	waitTestChannel(t, gate.childEntered, "the cancellation's descendant scan")
+
+	replayResult := make(chan error, 1)
+	go func() {
+		_, err := Run[string](context.Background(), k, "cancel-replay", nil, WithID(id))
+		replayResult <- err
+	}()
+	waitTestChannel(t, replayStarted, "the late replay")
+	waitTestChannel(t, replayStopped, "the late replay to observe cancellation")
+	releaseChild.Do(func() { close(gate.releaseChild) })
+	if err := <-cancelResult; err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if err := <-replayResult; !errors.Is(err, ErrCancelled) {
+		t.Fatalf("late replay: %v", err)
+	}
+	info, err := k.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status != "cancelled" {
+		t.Fatalf("late replay overtook cancellation: status = %s", info.Status)
 	}
 }

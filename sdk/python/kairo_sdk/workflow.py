@@ -1772,7 +1772,8 @@ class Kairo:
         # make the function record a failure before the durable parent one.
         stop = self._stops_by_id.get(id)
         request = self._cancel_requests.get(id)
-        if request is None and stop is not None:
+        created = request is None
+        if request is None:
             request = asyncio.get_running_loop().create_future()
             self._cancel_requests[id] = request
         if stop is not None:
@@ -1792,8 +1793,10 @@ class Kairo:
             if info.get("status") != "cancelled":
                 raise RunSettledError(f"workflow {id} is {info.get('status')}")
         finally:
-            if request is not None and not request.done():
+            if created and not request.done():
                 request.set_result(settled)
+                if self._cancel_requests.get(id) is request:
+                    self._cancel_requests.pop(id, None)
 
     async def resolve(self, call_id: str, output: Any = None) -> None:
         """Settles call call_id, stopped for review (blocked: a real step whose
@@ -1884,6 +1887,8 @@ class Kairo:
         self._stops.add(stop)
         self._drives_idle.clear()
         self._stops_by_id[id] = stop
+        if id in self._cancel_requests or self._tree_cancellations.get(id, 0) > 0:
+            _set(stop)
         if self._closing:
             _set(stop)
         unlink: Callable[[], None] | None = None
@@ -2001,7 +2006,6 @@ class Kairo:
                 self._drives_idle.set()
             if self._stops_by_id.get(id) is stop:
                 del self._stops_by_id[id]
-            self._cancel_requests.pop(id, None)
             self._driving_ids.discard(id)
             if unlink is not None:
                 unlink()

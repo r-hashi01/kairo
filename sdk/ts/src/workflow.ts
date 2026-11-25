@@ -1545,7 +1545,8 @@ export class Kairo {
 		// Stop this process's replay first, so a child cancellation cannot make
 		// the function record a failure before the durable parent cancellation.
 		let request = this.cancelRequests.get(id);
-		if (!request && this.drivingById.has(id)) {
+		const created = !request;
+		if (!request) {
 			let finish!: (settled: boolean) => void;
 			const done = new Promise<boolean>((resolve) => (finish = resolve));
 			request = { done, finish };
@@ -1568,7 +1569,10 @@ export class Kairo {
 			settled = true;
 			if (info.status !== 'cancelled') throw new RunSettledError(`workflow ${id} is ${info.status}`);
 		} finally {
-			request?.finish(settled);
+			if (created) {
+				request.finish(settled);
+				if (this.cancelRequests.get(id) === request) this.cancelRequests.delete(id);
+			}
 		}
 	}
 
@@ -1658,6 +1662,7 @@ export class Kairo {
 		const abort = new AbortController();
 		this.driving.add(abort);
 		this.drivingById.set(id, abort);
+		if (this.cancelRequests.has(id) || (this.treeCancellations.get(id) ?? 0) > 0) abort.abort();
 		const stop = () => abort.abort();
 		parent?.signal?.addEventListener('abort', stop);
 		if (parent?.signal?.aborted) abort.abort();
@@ -1729,7 +1734,6 @@ export class Kairo {
 				this.driveIdleWaiters.clear();
 			}
 			if (this.drivingById.get(id) === abort) this.drivingById.delete(id);
-			this.cancelRequests.delete(id);
 			this.drivingIds.delete(id);
 			abort.abort();
 		}

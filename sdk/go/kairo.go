@@ -232,6 +232,7 @@ type Kairo struct {
 	planned      map[string]bool
 	driving      map[*drive]struct{}
 	drivingIDs   map[string]bool
+	cancelReqs   map[string]*cancelRequest
 	treeCancels  map[string]int
 	redriving    map[string]bool
 	again        map[string]bool
@@ -425,7 +426,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	}
 	rt.metrics = newMetricEmitter(opts.Metrics)
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
-		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
+		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, cancelReqs: map[string]*cancelRequest{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
 		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, limitFor: opts.DestinationLimits,
 		tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
 	if rates, ok := opts.Store.(SharedRateStore); ok {
@@ -1330,11 +1331,18 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 	defer cancel()
 	d := &drive{id: id, cancel: cancel}
 	k.mu.Lock()
+	if req := k.cancelReqs[id]; req != nil {
+		d.cancelReq = req
+	}
 	k.driving[d] = struct{}{}
 	k.drivingIDs[id] = true
+	cancelling := d.cancelReq != nil || k.treeCancels[id] > 0
 	close(k.driveChanged)
 	k.driveChanged = make(chan struct{})
 	k.mu.Unlock()
+	if cancelling {
+		cancel()
+	}
 	defer func() {
 		k.mu.Lock()
 		delete(k.driving, d)
@@ -1892,15 +1900,15 @@ func (k *Kairo) Cancel(ctx context.Context, id string) (retErr error) {
 	// Stop this process's replay first, so a child cancellation cannot make
 	// the function record a failure before the durable parent cancellation.
 	k.mu.Lock()
-	var req *cancelRequest
-	created := false
+	req := k.cancelReqs[id]
+	created := req == nil
+	if created {
+		req = &cancelRequest{done: make(chan struct{})}
+		k.cancelReqs[id] = req
+	}
 	for d := range k.driving {
 		if d.id == id {
-			if d.cancelReq == nil {
-				d.cancelReq = &cancelRequest{done: make(chan struct{})}
-				created = true
-			}
-			req = d.cancelReq
+			d.cancelReq = req
 			d.cancel()
 			break
 		}
@@ -1911,6 +1919,11 @@ func (k *Kairo) Cancel(ctx context.Context, id string) (retErr error) {
 		defer func() {
 			req.ok = settled
 			close(req.done)
+			k.mu.Lock()
+			if k.cancelReqs[id] == req {
+				delete(k.cancelReqs, id)
+			}
+			k.mu.Unlock()
 		}()
 	}
 	for {

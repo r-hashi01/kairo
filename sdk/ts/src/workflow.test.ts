@@ -192,6 +192,37 @@ function cancelBeforeDone(inner: Backend): Backend {
 	});
 }
 
+function cancelDuringLateReplay(inner: Backend) {
+	let childId = '';
+	let childEntered!: () => void;
+	let releaseChild!: () => void;
+	const childEnteredPromise = new Promise<void>((resolve) => (childEntered = resolve));
+	const releaseChildPromise = new Promise<void>((resolve) => (releaseChild = resolve));
+	const wrapped = new Proxy(inner, {
+		get(target, prop) {
+			if (prop === 'cancel') {
+				return async (runId: string) => {
+					if (runId === childId) {
+						childEntered();
+						await releaseChildPromise;
+					}
+					return target.cancel(runId);
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === 'function' ? value.bind(target) : value;
+		},
+	});
+	return {
+		backend: wrapped,
+		configure(child: string) {
+			childId = child;
+		},
+		childEntered: childEnteredPromise,
+		releaseChild,
+	};
+}
+
 /** The suite, against backends made by backend() (a new one = a new process). */
 function suite(name: string, backend: () => Promise<Backend>) {
 	describe(name, { skip: !hasGo }, () => {
@@ -367,6 +398,46 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			await k.cancel('wf-long-1');
 			await rejected;
 			await waitUntil(() => slowAborted);
+			await k.close();
+		});
+
+		test('cancel stops a replay that starts after its initial driver scan', async () => {
+			const gate = cancelDuringLateReplay(await backend());
+			const k = new Kairo({ backend: gate.backend, mode: 'suspend' });
+			let invocations = 0;
+			let replayStarted!: () => void;
+			let replayStopped = false;
+			const replayStartedPromise = new Promise<void>((resolve) => (replayStarted = resolve));
+			k.workflow('cancel-replay', async (ctx) => {
+				const late = ++invocations === 2;
+				if (late) replayStarted();
+				try {
+					return await ctx.waitFor('go');
+				} finally {
+					if (late) replayStopped = true;
+				}
+			});
+			await k.start();
+			const id = `ts-cancel-replay-${name.replace(/\W/g, '')}`;
+			await assert.rejects(k.run('cancel-replay', null, { id }), Suspended);
+			const children = await k.children(id);
+			assert.equal(children.length, 1);
+			gate.configure(children[0]!.run_id);
+			(k as unknown as { suspend: boolean }).suspend = false;
+
+			const cancelling = k.cancel(id);
+			await gate.childEntered;
+			const replay = k.run('cancel-replay', null, { id });
+			const replayCancelled = assert.rejects(replay, CancelledError);
+			try {
+				await replayStartedPromise;
+				await waitUntil(() => replayStopped);
+			} finally {
+				gate.releaseChild();
+			}
+			await cancelling;
+			await replayCancelled;
+			assert.equal((await k.backend.get(id)).status, 'cancelled');
 			await k.close();
 		});
 
