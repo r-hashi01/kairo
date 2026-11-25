@@ -130,6 +130,8 @@ make check | race | bench | quick
   - `PostToolUse`（Edit/Write）：gofmt を実行し、パッケージに go vet をかけます。`core/` を変えたら純粋性テストも走らせます。
   - `Stop`：`scripts/check.sh --quick` が通らないと終了させません。Go のソースが前回の成功時から変わっていなければ省略します。
 - スキル：`/verify`（全検証）、`/bench`（性能予算）、`/core-change`（コアを変えるときのチェックリスト）、`/adr`（ADR の起票）
+  - `/verify-kairo`：TS の SDK の埋め込み実行を、利用者のアプリと同じく別々のプロセスで動かし、SIGKILL をまたいで確かめる（再開、作用 1 回、別プロセスからのシグナル、結果不明の確認）
+  - `/verify-snapshot-retention`：不変条件 8（スナップショットとログの退役）を TLA+ でモデル検査する。対象のコードを変えたら `scripts/stale.sh` で確かめる
 - サブエージェント：`invariant-reviewer`（差分を、不変条件と ADR の観点でレビューする。読み取り専用）
 - `scripts/check.sh` は `scripts/adr-lint.sh` も実行します（ADR の番号の重複、必須セクション、索引漏れを検査する）。
 - CI：`.github/workflows/ci.yml`（check と race、SQL の保存先、脆弱性検査）。性能の計測は CI では行いません（ADR 0056）
