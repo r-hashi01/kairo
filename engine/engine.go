@@ -379,12 +379,9 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg:          cfg,
-		disp:         sched.NewDispatcher(cfg.Limits),
 		adm:          sched.NewAdmission(cfg.Admission),
 		starts:       sched.NewStartAdmission(cfg.Admission.MaxStarting, cfg.Now),
 		live:         live.NewHub(),
-		obs:          obs.NewStream(cfg.Observe, 1<<16, 512),
-		metrics:      metrics.NewStream(cfg.Metrics, 4096, 256),
 		plans:        map[string]*ir.Plan{},
 		waiters:      map[string][]chan RunInfo{},
 		finished:     map[string]RunInfo{},
@@ -393,9 +390,6 @@ func New(cfg Config) (*Engine, error) {
 		ioStop:       make(chan struct{}),
 		stopped:      make(chan struct{}),
 		driveChanged: make(chan struct{}),
-	}
-	if e.metrics != nil {
-		e.starts.SetObserver(e.observeStart)
 	}
 	var err error
 	if e.blobs = cfg.Blobs; e.blobs == nil {
@@ -416,12 +410,6 @@ func New(cfg Config) (*Engine, error) {
 			e.snaps = blob.NewMem()
 		}
 	}
-	for i := 0; i < 16; i++ {
-		e.ioWG.Add(1)
-		go e.ioWorker()
-	}
-	go e.ioFeeder()
-
 	sinkFor := cfg.Sinks
 	if sinkFor == nil {
 		sinkFor = func(t Tier, shard int) (wal.Sink, error) {
@@ -454,6 +442,13 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e.tiers[TierNone] = true
 	sinks := make([][tierCount]wal.Sink, cfg.Shards)
+	var openedSinks []wal.Sink
+	keepSinks := false
+	defer func() {
+		if !keepSinks {
+			closeSinks(openedSinks)
+		}
+	}()
 	for t := TierMemory; t < tierCount; t++ {
 		avail := true
 		for i := 0; i < cfg.Shards; i++ {
@@ -466,6 +461,7 @@ func New(cfg Config) (*Engine, error) {
 				break
 			}
 			sinks[i][t] = s
+			openedSinks = append(openedSinks, s)
 		}
 		e.tiers[t] = avail
 	}
@@ -491,6 +487,26 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, s := range dones {
+		if s != nil {
+			openedSinks = append(openedSinks, s)
+		}
+	}
+
+	// Everything below is infallible construction. Start process goroutines
+	// only after every durable resource has opened successfully.
+	e.disp = sched.NewDispatcher(cfg.Limits)
+	e.obs = obs.NewStream(cfg.Observe, 1<<16, 512)
+	e.metrics = metrics.NewStream(cfg.Metrics, 4096, 256)
+	if e.metrics != nil {
+		e.starts.SetObserver(e.observeStart)
+	}
+	for i := 0; i < 16; i++ {
+		e.ioWG.Add(1)
+		go e.ioWorker()
+	}
+	go e.ioFeeder()
+
 	e.doneMax = (cfg.IdempotencyMax + cfg.Shards - 1) / cfg.Shards
 	e.shards = make([]*shard, cfg.Shards)
 	for i := range e.shards {
@@ -500,6 +516,7 @@ func New(cfg Config) (*Engine, error) {
 		e.feed = newFeedHub(e)
 		go e.feed.run()
 	}
+	keepSinks = true
 	return e, nil
 }
 
@@ -1344,12 +1361,26 @@ func (e *Engine) deleteKept(runID string, gen uint64) error {
 // doneSinks opens the per-shard logs of finished-run markers (ADR 0027).
 // None are needed if markers are disabled or no shard has a log tier that
 // survives a restart.
-func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) ([]wal.Sink, error) {
+func closeSinks(sinks []wal.Sink) {
+	for i := len(sinks) - 1; i >= 0; i-- {
+		if sinks[i] != nil {
+			_ = sinks[i].Close()
+		}
+	}
+}
+
+func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) (out []wal.Sink, retErr error) {
 	cfg := e.cfg
-	out := make([]wal.Sink, cfg.Shards)
+	out = make([]wal.Sink, cfg.Shards)
 	if cfg.IdempotencyTTL < 0 || (!e.tiers[TierFile] && !e.tiers[TierReplicated]) {
 		return out, nil
 	}
+	var opened []wal.Sink
+	defer func() {
+		if retErr != nil {
+			closeSinks(opened)
+		}
+	}()
 	if cfg.DoneLogs == nil && cfg.DataDir == "" {
 		log.Printf("kairo: no DataDir and no DoneLogs: finished-run markers are kept in memory and lost on restart")
 	}
@@ -1377,6 +1408,7 @@ func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) ([]wal.Sink, error) {
 			s = wal.Encrypted(s, cfg.Keys, fmt.Sprintf("shard-%03d/done", i))
 		}
 		out[i] = s
+		opened = append(opened, s)
 	}
 	return out, nil
 }
