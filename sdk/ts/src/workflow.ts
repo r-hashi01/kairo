@@ -496,6 +496,8 @@ export class Kairo {
 	private readonly life = new AbortController();
 	/** Wait mode: the sweep, once a lease period, of what stopped processes left (ADR 0059). */
 	private sweepTimer?: ReturnType<typeof setInterval>;
+	/** Wait mode: callers waiting in result() (run() included); the sweep keeps the process alive while there are any. */
+	private awaiting = 0;
 	private sweeping?: Promise<void>;
 	/** Limits (ADR 0059): steps at once in this process (embedded), and by destination. */
 	private slots?: Slots;
@@ -1194,11 +1196,19 @@ export class Kairo {
 		}
 		const signal = opts.signal ? AbortSignal.any([opts.signal, this.life.signal]) : this.life.signal;
 		let info: RunInfo;
+		// The workflow may be driven by a process that stopped: the sweep
+		// takes it up once its lease expires. Until then the sweep's timer
+		// is all that is left to keep the process alive, so it does while
+		// someone waits here (and only then: a script that waits for
+		// nothing still ends without close).
+		if (this.awaiting++ === 0) this.sweepTimer?.ref?.();
 		try {
 			info = await this.backend.wait(id, signal);
 		} catch (e) {
 			if (signal.aborted) throw new StoppedError(`workflow ${id}: stopped waiting for it`);
 			throw e;
+		} finally {
+			if (--this.awaiting === 0) this.sweepTimer?.unref?.();
 		}
 		return done(id, info) as O;
 	}

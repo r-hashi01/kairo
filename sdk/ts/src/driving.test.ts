@@ -4,11 +4,12 @@
 // kairo.wasm from this repository).
 
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
@@ -250,6 +251,51 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		assert.equal(writes, 1, 'the real call was not made again');
 		await k2.close();
 		await k1.close();
+	});
+
+	// A script that runs a workflow again right after its process died
+	// waits for the dead process's lease to expire and resumes it: the
+	// process is kept alive while run() waits, though nothing else holds
+	// its event loop (issue #79).
+	test('a run waiting for a stopped driver keeps its process alive', async () => {
+		const path = join(dir, 'alive.db');
+		const marks = mkdtempSync(join(dir, 'alive-'));
+		const script = join(dir, 'alive.ts');
+		writeFileSync(
+			script,
+			`import { open } from 'node:fs/promises';
+import { join } from 'node:path';
+import { EmbeddedBackend, Kairo, SQLiteStore } from ${JSON.stringify(pathToFileURL(join(repo, 'sdk/ts/src/index.ts')).href)};
+const [hang, marks, db, wasm] = process.argv.slice(2);
+const k = new Kairo({ backend: await EmbeddedBackend.open({ store: new SQLiteStore(db), wasm, leaseMs: 2000 }) });
+k.defineAction('pay', { effect: 'real', handler: async () => {
+	await (await open(join(marks, 'paid'), 'wx')).close(); // a second payment fails
+	return 'paid';
+} });
+k.workflow('w', async (ctx) => {
+	const paid = await ctx.call('pay');
+	if (hang === 'hang') { console.log('paid'); await new Promise(() => {}); }
+	return paid + '!';
+});
+await k.start();
+console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
+`,
+		);
+		const node = (hang: string) =>
+			spawn(process.execPath, ['--no-warnings', script, hang, marks, path, wasm], { stdio: ['ignore', 'pipe', 'inherit'] });
+		const p1 = node('hang');
+		await new Promise<void>((ok, fail) => {
+			p1.stdout!.on('data', (b: Buffer) => b.toString().includes('paid') && ok());
+			p1.on('exit', () => fail(new Error('the first process ended before paying')));
+		});
+		p1.kill('SIGKILL'); // its drive lease (2 s, longer than a start) stays until it expires
+		const p2 = node('run');
+		let out = '';
+		p2.stdout!.on('data', (b: Buffer) => (out += b.toString()));
+		const code = await new Promise<number | null>((ok) => p2.on('exit', ok));
+		assert.equal(code, 0, 'run() settled before the process ended');
+		assert.equal(out.trim(), '"paid!"');
+		assert.deepEqual(readdirSync(marks), ['paid'], 'paid once');
 	});
 
 	// While a process drives a workflow, another one that runs it does not
