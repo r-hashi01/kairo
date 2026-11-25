@@ -52,8 +52,11 @@ describe('waking the runtime (ADR 0053)', { skip: !hasGo }, () => {
 	test('a scheduler ticks over HTTP with its token', async () => {
 		const path = join(dir, 'tick.db');
 		const wakes: number[] = [];
+		// The clock is the test's: the too-early tick comes before the timer
+		// is due however slow the requests before it are (issue #89).
+		let now = Date.now();
 		const k = new Kairo({
-			backend: await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm }),
+			backend: await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, now: () => now }),
 			mode: 'suspend',
 			tickSecret: 'cron-secret',
 			wake: async (at) => void wakes.push(at),
@@ -66,10 +69,10 @@ describe('waking the runtime (ADR 0053)', { skip: !hasGo }, () => {
 		await k.start();
 		const base = await listen(k.fetchHandler());
 
-		const t0 = Date.now();
+		const t0 = now;
 		await assert.rejects(k.run('w', 'hi', { id: 'tick-1' }), Suspended);
 		assert.equal(wakes.length, 1, 'told when to wake');
-		assert.ok(wakes[0]! >= t0 + 300 && wakes[0]! < t0 + 2000, `wake at ${wakes[0]! - t0}ms`);
+		assert.equal(wakes[0], t0 + 300, 'wake when the timer is due');
 
 		assert.equal((await fetch(base + '/kairo/tick')).status, 401, 'no token');
 		assert.equal((await fetch(base + '/kairo/tick', { headers: { authorization: 'Bearer nope' } })).status, 401, 'a wrong token');
@@ -77,7 +80,7 @@ describe('waking the runtime (ADR 0053)', { skip: !hasGo }, () => {
 		// Too early: nothing to do; the same time comes back.
 		assert.deepEqual(await (await fetch(base + '/kairo/tick', { headers: auth })).json(), { next: wakes[0] });
 
-		await sleep(Math.max(0, wakes[0]! - Date.now()) + 20);
+		now = wakes[0]! + 20; // the timer is due
 		const r = await fetch(base + '/kairo/tick', { method: 'POST', headers: auth });
 		assert.deepEqual(await r.json(), { next: null }, 'nothing left to do');
 		assert.equal(await k.run('w', 'hi', { id: 'tick-1' }), 'HI');

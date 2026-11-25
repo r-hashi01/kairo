@@ -80,8 +80,12 @@ test('steps of a process that stopped are taken up', { skip: !hasGo }, async () 
 	};
 	const specs = [{ action: 'think', effect: 'unprotected' as const }, { action: 'send', effect: 'real' as const }];
 
+	// The clock is the test's, for A and B: whether a lease has expired
+	// does not depend on how long B takes to open (issue #89).
+	let now = Date.now();
+	const clock = () => now;
 	// A: both steps start, and A stops before either ends.
-	const a = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 200 });
+	const a = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 200, now: clock });
 	let started = 0;
 	a.registerActions(specs, async (_task, ctx) => {
 		started++;
@@ -96,7 +100,7 @@ test('steps of a process that stopped are taken up', { skip: !hasGo }, async () 
 	await a.close();
 
 	// B, once the leases expired.
-	const b = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 200 });
+	const b = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 200, now: clock });
 	const ran: string[] = [];
 	b.registerActions(specs, async (task) => {
 		ran.push(task.action);
@@ -105,7 +109,7 @@ test('steps of a process that stopped are taken up', { skip: !hasGo }, async () 
 	plans(b);
 	await b.tick(); // not yet expired: nothing to take up
 	assert.deepEqual(ran, []);
-	await new Promise((r) => setTimeout(r, 250));
+	now += 250; // past the leases
 	await b.tick();
 	assert.equal((await b.wait('u1')).status, 'completed', 'the unprotected step ran again');
 	const r1 = await b.wait('r1');
@@ -136,18 +140,35 @@ test('steps of a process that stopped are taken up', { skip: !hasGo }, async () 
 });
 
 // A process that is alive renews its leases: a step longer than the lease
-// is not taken up by another process meanwhile.
+// is not taken up by another process meanwhile. The clock is the test's:
+// it moves in steps shorter than the lease, each after A has renewed, so
+// the outcome does not depend on the machine's load (issue #89).
 test('a running step is not taken up while its process lives', { skip: !hasGo }, async () => {
 	const path = join(dir, 'renew.db');
 	const specs = [{ action: 'think', effect: 'unprotected' as const }];
 	const plan = { name: 'u', root: { kind: 'step', id: 'think', action: 'think' } };
-	const a = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 300 });
+	const lease = 300;
+	let now = Date.now();
+	let renewed = 0; // the latest lease end A renewed to
+	const watched = new Proxy(new SQLiteStore(path), {
+		get(target, prop) {
+			const v = (target as any)[prop];
+			if (typeof v !== 'function') return v;
+			if (prop === 'renewLeases') return (owner: string, until: number) => ((renewed = Math.max(renewed, until)), v.call(target, owner, until));
+			return v.bind(target);
+		},
+	});
+	const a = await Embedded.open({ store: watched, wasm, leaseMs: lease, now: () => now });
+	let release!: () => void;
+	const held = new Promise<void>((r) => (release = r));
+	let running = false;
 	a.registerActions(specs, async () => {
-		await new Promise((r) => setTimeout(r, 900));
+		running = true;
+		await held; // runs as long as the test says
 		return { output: 'a' };
 	});
 	a.registerPlan(plan);
-	const b = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: 300 });
+	const b = await Embedded.open({ store: new SQLiteStore(path), wasm, leaseMs: lease, now: () => now });
 	const ranInB: string[] = [];
 	b.registerActions(specs, async (t) => {
 		ranInB.push(t.action);
@@ -155,10 +176,17 @@ test('a running step is not taken up while its process lives', { skip: !hasGo },
 	});
 	b.registerPlan(plan);
 	await a.run('u', null, { runId: 'long1' });
-	for (let i = 0; i < 6; i++) {
-		await new Promise((r) => setTimeout(r, 150));
+	for (let i = 0; i < 200 && !running; i++) await new Promise((r) => setTimeout(r, 10));
+	assert.ok(running, 'the step started in a');
+	// Three steps shorter than the lease: past its first period.
+	for (let i = 0; i < 3; i++) {
+		now += 200;
+		for (let j = 0; j < 400 && renewed < now + lease; j++) await new Promise((r) => setTimeout(r, 25));
+		assert.ok(renewed >= now + lease, 'a renewed its lease');
 		await b.tick();
+		assert.deepEqual(ranInB, [], 'b took up a step that a was running');
 	}
+	release();
 	const r = await a.wait('long1');
 	assert.equal(r.output, 'a');
 	assert.deepEqual(ranInB, [], 'b took up a step that a was running');

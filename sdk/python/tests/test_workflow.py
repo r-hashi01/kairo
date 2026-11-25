@@ -734,7 +734,9 @@ class WorkflowTest(unittest.TestCase):
             @k.workflow("suspend-job")
             async def job(ctx, value):
                 out = await ctx.call("suspend-upper", value)
-                await ctx.sleep(0.12)
+                # kairod has no injectable clock: the timer is long enough that the
+                # early-tick checks below come before it is due on a loaded machine (issue #89).
+                await ctx.sleep(1.5)
                 return out
 
             await k.start()

@@ -44,8 +44,8 @@ class ScheduleTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         shutil.rmtree(cls.dir, ignore_errors=True)
 
-    async def embedded(self, name: str) -> EmbeddedBackend:
-        return await EmbeddedBackend.open(SQLiteStore(os.path.join(self.dir, name)), wasm=self.wasm)
+    async def embedded(self, name: str, **kw: Any) -> EmbeddedBackend:
+        return await EmbeddedBackend.open(SQLiteStore(os.path.join(self.dir, name)), wasm=self.wasm, **kw)
 
     def test_tick_over_http(self) -> None:
         async def main() -> None:
@@ -54,7 +54,10 @@ class ScheduleTest(unittest.TestCase):
             async def wake(at: int) -> None:
                 wakes.append(at)
 
-            k = Kairo(backend=await self.embedded("tick.db"), mode="suspend", tick_secret="cron-secret", wake=wake)
+            # The clock is the test's: the too-early tick comes before the timer
+            # is due however slow the requests before it are (issue #89).
+            clock = {"now": int(time.time() * 1000)}
+            k = Kairo(backend=await self.embedded("tick.db", now=lambda: clock["now"]), mode="suspend", tick_secret="cron-secret", wake=wake)
             k.action("llm", effect="unprotected")(lambda q, ctx: q.upper())
 
             @k.workflow("w")
@@ -66,18 +69,18 @@ class ScheduleTest(unittest.TestCase):
             base, _ = await serve(k.asgi_app())
             tick = base + "/kairo/tick"
 
-            t0 = int(time.time() * 1000)
+            t0 = clock["now"]
             with self.assertRaises(Suspended):
                 await k.run("w", "hi", id="tick-1")
             self.assertEqual(len(wakes), 1, "told when to wake")
-            self.assertTrue(t0 + 300 <= wakes[0] < t0 + 2000, f"wake at {wakes[0] - t0}ms")
+            self.assertEqual(wakes[0], t0 + 300, "wake when the timer is due")
 
             self.assertEqual((await asyncio.to_thread(get, tick))[0], 401, "no token")
             self.assertEqual((await asyncio.to_thread(get, tick, "GET", "nope"))[0], 401, "a wrong token")
             # Too early: nothing to do; the same time comes back.
             self.assertEqual(await asyncio.to_thread(get, tick, "GET", "cron-secret"), (200, {"next": wakes[0]}))
 
-            await asyncio.sleep(max(0, wakes[0] - time.time() * 1000) / 1000 + 0.02)
+            clock["now"] = wakes[0] + 20  # the timer is due
             self.assertEqual(await asyncio.to_thread(get, tick, "POST", "cron-secret"), (200, {"next": None}), "nothing left")
             self.assertEqual(await k.run("w", "hi", id="tick-1"), "HI")
             await k.close()

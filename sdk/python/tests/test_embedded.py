@@ -10,7 +10,9 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
+from typing import Any
 
 from kairo_sdk.embedded import Embedded
 from kairo_sdk.protocol import Result
@@ -82,7 +84,10 @@ class EmbeddedTest(unittest.TestCase):
             rt.register_plan({"name": "r", "root": {"kind": "step", "id": "send", "action": "send"}})
 
         async def main() -> None:
-            a = await self.open("lease.db", lease_ms=200)
+            # The clock is the test's, for A and B: whether a lease has expired
+            # does not depend on how long B takes to open (issue #89).
+            clock = {"now": int(time.time() * 1000)}
+            a = await self.open("lease.db", lease_ms=200, now=lambda: clock["now"])
             started = threading.Semaphore(0)
 
             def hang(task, ctx):
@@ -98,7 +103,7 @@ class EmbeddedTest(unittest.TestCase):
                 await asyncio.to_thread(started.acquire, True, 5)
             await a.close()
 
-            b = await self.open("lease.db", lease_ms=200)
+            b = await self.open("lease.db", lease_ms=200, now=lambda: clock["now"])
             ran: list[str] = []
 
             def done(task, ctx):
@@ -109,7 +114,7 @@ class EmbeddedTest(unittest.TestCase):
             plans(b)
             await b.tick()
             self.assertEqual(ran, [], "not taken up before the lease expired")
-            await asyncio.sleep(0.25)
+            clock["now"] += 250  # past the leases
             await b.tick()
             self.assertEqual((await b.wait("u1"))["status"], "completed", "the unprotected step ran again")
             self.assertEqual((await b.wait("r1"))["status"], "blocked", "the real step stops for review")
@@ -141,14 +146,44 @@ class EmbeddedTest(unittest.TestCase):
         asyncio.run(main())
 
     def test_a_running_step_is_not_taken_up_while_its_process_lives(self) -> None:
+        """A process that is alive renews its leases: a step longer than the
+        lease is not taken up by another process meanwhile. The clock is the
+        test's: it moves in steps shorter than the lease, each after A has
+        renewed, so the outcome does not depend on the machine's load (issue #89)."""
         specs = [{"action": "think", "effect": "unprotected"}]
         plan = {"name": "u", "root": {"kind": "step", "id": "think", "action": "think"}}
+        lease = 300
+        clock = {"now": int(time.time() * 1000)}
+        seen = {"renewed": 0}  # the latest lease end A renewed to
+
+        class Watched:
+            def __init__(self, store: SQLiteStore) -> None:
+                self._store = store
+
+            def __getattr__(self, attr: str) -> Any:
+                v = getattr(self._store, attr)
+                if attr != "renew_leases":
+                    return v
+
+                async def renew(owner: str, until: int) -> None:
+                    seen["renewed"] = max(seen["renewed"], until)
+                    await v(owner, until)
+
+                return renew
 
         async def main() -> None:
-            a = await self.open("renew.db", lease_ms=300)
-            a.register_actions(specs, lambda task, ctx: (ctx.cancelled.wait(0.9), Result(output="a"))[1])
+            path = os.path.join(self.dir, "renew.db")
+            a = await Embedded(Watched(SQLiteStore(path)), wasm=self.wasm, lease_ms=lease, now=lambda: clock["now"]).open()
+            running, held = threading.Event(), threading.Event()
+
+            def think(task, ctx):
+                running.set()
+                held.wait(10)  # runs as long as the test says
+                return Result(output="a")
+
+            a.register_actions(specs, think)
             a.register_plan(plan)
-            b = await self.open("renew.db", lease_ms=300)
+            b = await self.open("renew.db", lease_ms=lease, now=lambda: clock["now"])
             ran_in_b: list[str] = []
 
             def other(task, ctx):
@@ -158,9 +193,19 @@ class EmbeddedTest(unittest.TestCase):
             b.register_actions(specs, other)
             b.register_plan(plan)
             await a.run("u", None, run_id="long1")
-            for _ in range(6):
-                await asyncio.sleep(0.15)
+            self.assertTrue(await asyncio.to_thread(running.wait, 10), "the step started in a")
+            # Three steps shorter than the lease: past its first period.
+            for _ in range(3):
+                clock["now"] += 200
+                for _ in range(400):
+                    if seen["renewed"] >= clock["now"] + lease:
+                        break
+                    await asyncio.sleep(0.025)
+                self.assertGreaterEqual(seen["renewed"], clock["now"] + lease, "a renewed its lease")
                 await b.tick()
+                await b.idle()  # what the tick started there, done
+                self.assertEqual(ran_in_b, [], "b took up a step that a was running")
+            held.set()
             self.assertEqual((await a.wait("long1"))["output"], "a")
             self.assertEqual(ran_in_b, [], "b took up a step that a was running")
             await a.close()

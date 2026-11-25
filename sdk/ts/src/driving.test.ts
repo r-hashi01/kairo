@@ -956,7 +956,9 @@ describe('driving workflows on PostgreSQL (ADR 0059)', { skip: !hasGo || !dsn ||
 		const k1 = await start(store, true);
 		await k1.submit('w', 'f', { id: 'taken-pg' });
 		await waitUntil(() => writes === 1);
-		await sleep(100); // the write's outcome recorded
+		// The write's outcome recorded: otherwise the real call would stop
+		// for review when its lease expires (issue #89).
+		await waitUntil(async () => (await k1.children('taken-pg')).some((c) => c.status === 'completed'));
 		state.dead = true;
 		const k2 = await start(pgStore(), false);
 		assert.equal(await k2.result('taken-pg', { signal: AbortSignal.timeout(10_000) }), 'wrote f!');
