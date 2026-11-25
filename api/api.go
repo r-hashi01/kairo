@@ -31,6 +31,14 @@ type API struct {
 	catalogOps *catalogFileOps
 }
 
+const (
+	jsonBodyLimit  = int64(32 << 20)
+	nodesBodyLimit = int64(1 << 20)
+	eventBodyLimit = int64(8 << 20)
+)
+
+var errRequestBodyTooLarge = errors.New("request body too large")
+
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/nodes", a.postNodes)
@@ -65,8 +73,30 @@ func fail(w http.ResponseWriter, code int, err error) {
 	reply(w, code, map[string]string{"error": err.Error()})
 }
 
+func failRequest(w http.ResponseWriter, err error) {
+	code := http.StatusBadRequest
+	if errors.Is(err, errRequestBodyTooLarge) {
+		code = http.StatusRequestEntityTooLarge
+	}
+	fail(w, code, err)
+}
+
+func readBody(r *http.Request, limit int64) ([]byte, error) {
+	if r.ContentLength > limit {
+		return nil, fmt.Errorf("%w: maximum is %d bytes", errRequestBodyTooLarge, limit)
+	}
+	b, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: maximum is %d bytes", errRequestBodyTooLarge, limit)
+	}
+	return b, nil
+}
+
 func readJSON(r *http.Request, v any) error {
-	b, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	b, err := readBody(r, jsonBodyLimit)
 	if err != nil {
 		return err
 	}
@@ -74,9 +104,9 @@ func readJSON(r *http.Request, v any) error {
 }
 
 func (a *API) postNodes(w http.ResponseWriter, r *http.Request) {
-	b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	b, err := readBody(r, nodesBodyLimit)
 	if err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	var specs []ir.NodeSpec
@@ -133,7 +163,7 @@ func (a *API) postNodes(w http.ResponseWriter, r *http.Request) {
 func (a *API) postPlan(w http.ResponseWriter, r *http.Request) {
 	var def ir.Definition
 	if err := readJSON(r, &def); err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	if def.Name == "" {
@@ -190,7 +220,7 @@ func (a *API) postRun(w http.ResponseWriter, r *http.Request) {
 	}
 	var req engine.SubmitRequest
 	if err := readJSON(r, &req); err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	if k := r.Header.Get("Idempotency-Key"); k != "" {
@@ -391,7 +421,7 @@ func driveMatch(req driveClaimRequest, ri engine.RunInfo) bool {
 func (a *API) claimWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req driveClaimRequest
 	if err := readJSON(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err)
+		failRequest(w, err)
 		return
 	}
 	if req.Owner == "" || req.LeaseMS <= 0 || req.LeaseMS > int64((24*time.Hour)/time.Millisecond) || req.TimeoutMS < 0 || req.Limit < 0 || req.Limit > 1 {
@@ -526,11 +556,12 @@ type driveLeaseRequest struct {
 
 func (a *API) renewWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req driveLeaseRequest
-	if err := readJSON(r, &req); err != nil || req.LeaseMS <= 0 {
-		if err == nil {
-			err = errors.New("positive lease_ms is required")
-		}
-		fail(w, http.StatusBadRequest, err)
+	if err := readJSON(r, &req); err != nil {
+		failRequest(w, err)
+		return
+	}
+	if req.LeaseMS <= 0 {
+		fail(w, http.StatusBadRequest, errors.New("positive lease_ms is required"))
 		return
 	}
 	until, ok, err := a.E.RenewWorkflow(r.Context(), r.PathValue("id"), req.Owner, req.Token, time.Duration(req.LeaseMS)*time.Millisecond)
@@ -548,7 +579,7 @@ func (a *API) renewWorkflow(w http.ResponseWriter, r *http.Request) {
 func (a *API) releaseWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req driveLeaseRequest
 	if err := readJSON(r, &req); err != nil {
-		fail(w, http.StatusBadRequest, err)
+		failRequest(w, err)
 		return
 	}
 	ok, err := a.E.ReleaseWorkflow(r.Context(), r.PathValue("id"), req.Owner, req.Token, req.Retry)
@@ -629,9 +660,9 @@ func writeEvent(w io.Writer, name string, v any) {
 }
 
 func (a *API) signal(w http.ResponseWriter, r *http.Request) {
-	b, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	b, err := readBody(r, eventBodyLimit)
 	if err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	if len(b) == 0 {
@@ -657,7 +688,7 @@ func (a *API) signal(w http.ResponseWriter, r *http.Request) {
 func (a *API) applySignal(w http.ResponseWriter, r *http.Request) {
 	var req engine.SignalRequest
 	if err := readJSON(r, &req); err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	req.Name = r.PathValue("name")
@@ -679,7 +710,7 @@ func (a *API) resolve(w http.ResponseWriter, r *http.Request) {
 		Error  string          `json:"error"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	a.E.Resolve(r.PathValue("id"), req.Act, req.Output, req.Error)
@@ -696,12 +727,12 @@ func (a *API) children(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) finish(w http.ResponseWriter, r *http.Request) {
-	b, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	b, err := readBody(r, eventBodyLimit)
 	if err != nil || !json.Valid(b) {
 		if err == nil {
 			err = errors.New("finish payload must be JSON")
 		}
-		fail(w, 400, err)
+		failRequest(w, err)
 		return
 	}
 	if err := a.E.FinishWorkflow(r.Context(), r.PathValue("id"), b); err != nil {
