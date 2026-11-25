@@ -306,6 +306,10 @@ type Engine struct {
 	waitMu   sync.Mutex
 	waiters  map[string][]chan RunInfo
 	finished map[string]RunInfo
+	// inlining: finished runs whose output, a reference to blobs, is being
+	// inlined before the blobs are deleted. Get sees them in finished; Wait
+	// waits for finish (issue #93).
+	inlining map[string]struct{}
 	finOrder []string
 	runEnd   atomic.Pointer[[]func(runID string)] // ADR 0044
 
@@ -385,6 +389,7 @@ func New(cfg Config) (*Engine, error) {
 		plans:        map[string]*ir.Plan{},
 		waiters:      map[string][]chan RunInfo{},
 		finished:     map[string]RunInfo{},
+		inlining:     map[string]struct{}{},
 		io:           make(chan func()),
 		ioq:          mpsc.New[func()](),
 		ioStop:       make(chan struct{}),
@@ -1272,10 +1277,13 @@ func (e *Engine) Wait(ctx context.Context, runID string) (RunInfo, error) {
 	ch := make(chan RunInfo, 1)
 	e.waitMu.Lock()
 	if ri, ok := e.finished[runID]; ok {
-		e.waitMu.Unlock()
-		return ri, nil
-	}
-	if ri, ok := e.trimmed(runID); ok {
+		// One whose output is being inlined is waited for: its blobs are
+		// deleted right after (issue #93).
+		if _, inlining := e.inlining[runID]; !inlining {
+			e.waitMu.Unlock()
+			return ri, nil
+		}
+	} else if ri, ok := e.trimmed(runID); ok {
 		e.waitMu.Unlock()
 		return ri, nil
 	}
@@ -1419,11 +1427,13 @@ func (e *Engine) doneSinks(sinks [][tierCount]wal.Sink) (out []wal.Sink, retErr 
 	return out, nil
 }
 
-// rememberFinished records a finished run for Get and Submit's
-// idempotency without waking waiters (they are woken by finish).
+// rememberFinished records a finished run whose output is still being
+// inlined, for Get and Submit's idempotency, without waking waiters: they,
+// and Wait meanwhile, are woken by finish with the inlined output.
 func (e *Engine) rememberFinished(ri RunInfo) {
 	e.waitMu.Lock()
 	e.finished[ri.RunID] = ri
+	e.inlining[ri.RunID] = struct{}{}
 	e.waitMu.Unlock()
 }
 
@@ -1432,6 +1442,7 @@ func (e *Engine) finish(ri RunInfo) {
 	ws := e.waiters[ri.RunID]
 	delete(e.waiters, ri.RunID)
 	e.finished[ri.RunID] = ri
+	delete(e.inlining, ri.RunID)
 	e.finOrder = append(e.finOrder, ri.RunID)
 	if keep := e.cfg.RecentRuns; len(e.finOrder) > keep {
 		old := e.finOrder[:len(e.finOrder)-keep]
