@@ -446,7 +446,9 @@ func TestSuspendOnKairodWaitsForQuiescenceAndTicks(t *testing.T) {
 		if err != nil {
 			return "", err
 		}
-		if err := ctx.Sleep(120 * time.Millisecond); err != nil {
+		// kairod has no injectable clock: the timer is long enough that the
+		// early-tick checks below come before it is due on a loaded machine (issue #89).
+		if err := ctx.Sleep(1500 * time.Millisecond); err != nil {
 			return "", err
 		}
 		by, err := kairo.WaitFor[string](ctx, "approve")

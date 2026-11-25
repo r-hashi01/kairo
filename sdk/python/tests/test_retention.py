@@ -145,8 +145,11 @@ class RetentionTest(unittest.TestCase):
         path = os.path.join(self.dir, "external-recovery.db")
         replays = {"n": 0}
 
-        async def start(owner: str, mode: str) -> Kairo:
-            backend = await EmbeddedBackend.open(SQLiteStore(path), wasm=self.wasm, owner=owner, lease_ms=50)
+        async def start(owner: str, mode: str, skew: int = 0) -> Kairo:
+            # skew: this process's clock ahead of the machine's (past the other's lease).
+            backend = await EmbeddedBackend.open(
+                SQLiteStore(path), wasm=self.wasm, owner=owner, lease_ms=50, now=lambda: int(time.time() * 1000) + skew
+            )
             k = Kairo(backend=backend, mode=mode)
 
             @k.workflow("hold")
@@ -165,15 +168,15 @@ class RetentionTest(unittest.TestCase):
             k = await start("external-recovery-1", "wait")
             await k.submit("hold", None, id="recovery-parent")
             await k.submit("external-replay", None, id="recovery-child", parent="recovery-parent")
-            for _ in range(100):
+            for _ in range(400):
                 if replays["n"] == 1:
                     break
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.025)
             self.assertEqual(replays["n"], 1)
             await k.close()
 
-            await asyncio.sleep(0.005)
-            k = await start("external-recovery-2", "suspend")
+            # A minute on: the first process's drive leases have expired (issue #89).
+            k = await start("external-recovery-2", "suspend", 60_000)
             await k.tick()
             await asyncio.sleep(0.02)
             self.assertEqual(replays["n"], 1, "the expired drive lease did not replay the external child")

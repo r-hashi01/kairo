@@ -1219,7 +1219,14 @@ class DrivingPostgresTest(unittest.TestCase):
             k1 = await start(store, True)
             await k1.submit("w", "f", id="taken-pg")
             await wait_until(lambda: writes["n"] == 1)
-            await asyncio.sleep(0.1)  # the write's outcome recorded
+            # The write's outcome recorded: otherwise the real call would stop
+            # for review when its lease expires (issue #89).
+            for _ in range(400):
+                if any(c["status"] == "completed" for c in await k1.children("taken-pg")):
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                self.fail("the write's outcome was not recorded")
             store.dead = True
             k2 = await start(pg_store(), False)
             self.assertEqual(await asyncio.wait_for(k2.result("taken-pg"), 10), "wrote f!")

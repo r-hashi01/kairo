@@ -52,8 +52,9 @@ describe('removing finished runs (ADR 0054)', { skip: !hasGo }, () => {
 	test('an external child is replayed by re-submission, not an expired drive lease (ADR 0065)', async () => {
 		const path = join(dir, 'external-recovery.db');
 		let replays = 0;
-		const start = async (owner: string, mode: 'wait' | 'suspend') => {
-			const backend = await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, owner, leaseMs: 50 });
+		// skew: this process's clock ahead of the machine's (past the other's lease).
+		const start = async (owner: string, mode: 'wait' | 'suspend', skew = 0) => {
+			const backend = await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, owner, leaseMs: 50, now: () => Date.now() + skew });
 			const k = new Kairo({ backend, mode });
 			k.workflow('hold', async (ctx) => ctx.waitFor<string>('parent-go'));
 			k.workflow('external-replay', async (ctx) => {
@@ -66,12 +67,12 @@ describe('removing finished runs (ADR 0054)', { skip: !hasGo }, () => {
 		let k = await start('external-recovery-1', 'wait');
 		await k.submit('hold', null, { id: 'recovery-parent' });
 		await k.submit('external-replay', null, { id: 'recovery-child', parent: 'recovery-parent' });
-		for (let i = 0; replays !== 1 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		for (let i = 0; replays !== 1 && i < 400; i++) await new Promise((resolve) => setTimeout(resolve, 25));
 		assert.equal(replays, 1);
 		await k.close();
 
-		await new Promise((resolve) => setTimeout(resolve, 5));
-		k = await start('external-recovery-2', 'suspend');
+		// A minute on: the first process's drive leases have expired (issue #89).
+		k = await start('external-recovery-2', 'suspend', 60_000);
 		await k.tick();
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.equal(replays, 1, 'the expired drive lease did not replay the external child');

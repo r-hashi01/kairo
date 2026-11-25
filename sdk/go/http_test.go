@@ -369,7 +369,12 @@ func TestPlainHTTPOnlyHere(t *testing.T) {
 // workflow goes on.
 func TestTickOverHTTP(t *testing.T) {
 	var wakes []time.Time
+	// The clock is the test's: the too-early tick comes before the timer is
+	// due however slow the requests before it are (issue #89).
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
 	k, err := kairo.Open(context.Background(), kairo.Options{Store: kairo.NewMemStore(), Mode: kairo.Suspend,
+		Now:  func() time.Time { return time.UnixMilli(now.Load()) },
 		HTTP: kairo.HTTPOptions{TickSecret: "cron"}, Wake: func(at time.Time) error { wakes = append(wakes, at); return nil }})
 	if err != nil {
 		t.Fatal(err)
@@ -414,7 +419,7 @@ func TestTickOverHTTP(t *testing.T) {
 	if code, m := tick("cron"); code != http.StatusOK || int64(m["next"].(float64)) != wakes[0].UnixMilli() {
 		t.Fatalf("too early: %d %v", code, m)
 	}
-	time.Sleep(time.Until(wakes[0]) + 20*time.Millisecond)
+	now.Store(wakes[0].UnixMilli() + 20) // the timer is due
 	if code, m := tick("cron"); code != http.StatusOK || m["next"] != nil {
 		t.Fatalf("after: %d %v", code, m)
 	}

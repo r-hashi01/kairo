@@ -599,7 +599,9 @@ describe('kairod suspend', { skip: !hasGo }, () => {
 		});
 		k.workflow('ts-suspend-job', async (ctx, value: string) => {
 			const out = await ctx.call<string, string>('ts-suspend-upper', value);
-			await ctx.sleep(120);
+			// kairod has no injectable clock: the timer is long enough that the
+			// early-tick checks below come before it is due on a loaded machine (issue #89).
+			await ctx.sleep(1500);
 			return out;
 		});
 		await k.start();
