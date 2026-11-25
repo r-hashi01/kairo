@@ -81,6 +81,49 @@ func TestNewClosesOrdinarySinksAfterLaterOpenFailure(t *testing.T) {
 	requireClosedOnce(t, opened)
 }
 
+func TestNewRejectsPartialTierAcrossShards(t *testing.T) {
+	var memory []*newCleanupSink
+	partial := trackedNewSink()
+	e, err := New(Config{Shards: 2, Sinks: func(tier Tier, shard int) (wal.Sink, error) {
+		switch tier {
+		case TierMemory:
+			sink := trackedNewSink()
+			memory = append(memory, sink)
+			return sink, nil
+		case TierFile:
+			if shard == 0 {
+				return partial, nil
+			}
+		}
+		return nil, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.tiers[TierFile] {
+		t.Fatal("partial file tier is available")
+	}
+	for i, shard := range e.shards {
+		if shard.logs[TierFile] != nil {
+			t.Errorf("shard %d retained the partial file tier", i)
+		}
+	}
+	if got := partial.closes.Load(); got != 1 {
+		t.Fatalf("partial sink closed %d times before Engine.Close, want 1", got)
+	}
+	for i, sink := range memory {
+		if got := sink.closes.Load(); got != 0 {
+			t.Fatalf("memory sink %d closed before Engine.Close: %d", i, got)
+		}
+	}
+
+	e.Close()
+	if got := partial.closes.Load(); got != 1 {
+		t.Fatalf("partial sink closed %d times after Engine.Close, want 1", got)
+	}
+	requireClosedOnce(t, memory)
+}
+
 func TestNewClosesOrdinaryAndDoneSinksAfterDoneOpenFailure(t *testing.T) {
 	var ordinary []*newCleanupSink
 	var done []*newCleanupSink

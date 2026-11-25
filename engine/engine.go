@@ -450,6 +450,7 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}()
 	for t := TierMemory; t < tierCount; t++ {
+		tierStart := len(openedSinks)
 		avail := true
 		for i := 0; i < cfg.Shards; i++ {
 			s, err := sinkFor(t, i)
@@ -458,6 +459,11 @@ func New(cfg Config) (*Engine, error) {
 			}
 			if s == nil {
 				avail = false
+				closeSinks(openedSinks[tierStart:])
+				openedSinks = openedSinks[:tierStart]
+				for j := 0; j < i; j++ {
+					sinks[j][t] = nil
+				}
 				break
 			}
 			sinks[i][t] = s
