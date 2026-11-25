@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,6 +51,29 @@ func (cs *callbackServer) to(k *kairo.Kairo) {
 	cs.mu.Lock()
 	cs.cur = k
 	cs.mu.Unlock()
+}
+
+func serveAsyncAction(t *testing.T, k *kairo.Kairo, action, callback string) int {
+	t.Helper()
+	body, err := json.Marshal(httpaction.Request{RunID: "remote-run", StepID: "step", Act: 1, Attempt: 1, Action: action,
+		Input: json.RawMessage("null"), IdempotencyKey: "remote-run/1", Callback: callback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/kairo/action", bytes.NewReader(body))
+	req.Header.Set("Kairo-Signature", httpaction.Sign(secret, body, time.Now()))
+	w := httptest.NewRecorder()
+	k.Handler().ServeHTTP(w, req)
+	return w.Code
+}
+
+func waitHTTPTest(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
 }
 
 func open(t *testing.T, store kairo.Store, mode kairo.Mode, h kairo.HTTPOptions) *kairo.Kairo {
@@ -136,6 +161,98 @@ func TestActionAnswersLaterToAnotherProcess(t *testing.T) {
 	}
 	if runs.Load() != 1 {
 		t.Fatalf("ran %d times", runs.Load())
+	}
+}
+
+func TestAsyncActionHandlerStopsAtItsTimeout(t *testing.T) {
+	var callbacks atomic.Int32
+	callback := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		callbacks.Add(1)
+	}))
+	defer callback.Close()
+
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	kairo.Action(k, "slow", kairo.Real, func(tc *kairo.TaskContext, _ any) (any, error) {
+		close(started)
+		<-tc.Done()
+		close(stopped)
+		return nil, tc.Err()
+	}, kairo.URL("http://unused", true), kairo.Timeout(50*time.Millisecond))
+	if code := serveAsyncAction(t, k, "slow", callback.URL); code != http.StatusAccepted {
+		t.Fatalf("status = %d", code)
+	}
+	waitHTTPTest(t, started, "the asynchronous handler to start")
+	waitHTTPTest(t, stopped, "the asynchronous handler timeout")
+	if err := k.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if callbacks.Load() != 0 {
+		t.Fatalf("sent %d callbacks after the handler timed out", callbacks.Load())
+	}
+}
+
+func TestAsyncActionCallbackStopsAtItsTimeout(t *testing.T) {
+	entered := make(chan struct{})
+	stopped := make(chan struct{})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(entered)
+		_, _ = io.Copy(io.Discard, conn)
+		close(stopped)
+	}()
+
+	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	kairo.Action(k, "quick", kairo.Real, func(*kairo.TaskContext, any) (string, error) {
+		return "done", nil
+	}, kairo.URL("http://unused", true), kairo.Timeout(50*time.Millisecond))
+	if code := serveAsyncAction(t, k, "quick", "http://"+listener.Addr().String()); code != http.StatusAccepted {
+		t.Fatalf("status = %d", code)
+	}
+	waitHTTPTest(t, entered, "callback delivery to start")
+	waitHTTPTest(t, stopped, "callback delivery timeout")
+	if err := k.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseCancelsAndWaitsForAsyncAction(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	k := open(t, kairo.NewMemStore(), kairo.Wait, kairo.HTTPOptions{Secret: secret})
+	kairo.Action(k, "closing", kairo.Real, func(tc *kairo.TaskContext, _ any) (any, error) {
+		close(started)
+		<-tc.Done()
+		close(stopped)
+		return nil, tc.Err()
+	}, kairo.URL("http://unused", true), kairo.Timeout(time.Hour))
+	if code := serveAsyncAction(t, k, "closing", "http://127.0.0.1:1/callback"); code != http.StatusAccepted {
+		t.Fatalf("status = %d", code)
+	}
+	waitHTTPTest(t, started, "the asynchronous handler to start")
+	closed := make(chan error, 1)
+	go func() { closed <- k.Close() }()
+	waitHTTPTest(t, stopped, "Close to cancel the asynchronous handler")
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not wait for asynchronous action cleanup")
+	}
+	if code := serveAsyncAction(t, k, "closing", "http://127.0.0.1:1/callback"); code != http.StatusServiceUnavailable {
+		t.Fatalf("action accepted after Close: %d", code)
 	}
 }
 

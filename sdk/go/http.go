@@ -82,6 +82,15 @@ func (k *Kairo) httpClient() *http.Client {
 	return &http.Client{Transport: tr}
 }
 
+func actionTimeout(a *actionDef) time.Duration {
+	if s, ok := a.spec["timeout"].(string); ok {
+		if d, err := time.ParseDuration(s); err == nil {
+			return d
+		}
+	}
+	return 15 * time.Minute
+}
+
 // callRemote calls an action over HTTP(S).
 func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.RawMessage) result {
 	callback := t.Callback
@@ -96,12 +105,7 @@ func (k *Kairo) callRemote(ctx context.Context, t task, a *actionDef, in json.Ra
 	if int64(len(body)) > k.http.MaxBodyBytes {
 		return result{Err: fmt.Sprintf("calling %s: request body exceeds %d bytes", a.url, k.http.MaxBodyBytes), ErrType: "http_body_too_large"}
 	}
-	lease := 15 * time.Minute
-	if s, ok := a.spec["timeout"].(string); ok {
-		if d, err := time.ParseDuration(s); err == nil {
-			lease = d
-		}
-	}
+	lease := actionTimeout(a)
 	rctx, cancel := context.WithTimeout(ctx, min(lease, time.Minute))
 	defer cancel()
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost, a.url, bytes.NewReader(body))
@@ -284,9 +288,20 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 		return
 	}
 	// Answer now; run after, and send the outcome to the callback.
+	k.mu.Lock()
+	if k.closing.Load() {
+		k.mu.Unlock()
+		answer(http.StatusServiceUnavailable, map[string]string{"error": "kairo is closing"})
+		return
+	}
+	k.bgWG.Add(1)
+	k.mu.Unlock()
 	go func() {
-		res, unknown := toWire(run(context.Background()))
-		if unknown {
+		defer k.bgWG.Done()
+		ctx, cancel := context.WithTimeout(k.bgCtx, actionTimeout(a))
+		defer cancel()
+		res, unknown := toWire(run(ctx))
+		if unknown || ctx.Err() != nil {
 			return // no callback: the caller's lease expires and the step is taken up
 		}
 		if err := checkURL(req.Callback, k.http.AllowInsecure); err != nil {
@@ -301,8 +316,11 @@ func (k *Kairo) serveAction(_ http.ResponseWriter, r *http.Request, body []byte,
 			k.rt.logger.Warn("kairo: an action's callback", "action", req.Action, "err", err)
 			return
 		}
-		hreq, err := http.NewRequest(http.MethodPost, req.Callback, bytes.NewReader(cb))
+		callbackCtx, stopCallback := context.WithTimeout(ctx, time.Minute)
+		defer stopCallback()
+		hreq, err := http.NewRequestWithContext(callbackCtx, http.MethodPost, req.Callback, bytes.NewReader(cb))
 		if err != nil {
+			k.rt.logger.Warn("kairo: an action's callback", "action", req.Action, "err", err)
 			return
 		}
 		hreq.Header.Set("Content-Type", "application/json")
