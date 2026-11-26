@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1090,6 +1091,12 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 		t.Fatal(err)
 	}
 	waitUntil(t, func() bool { return runs.get("write") == 1 })
+	// The write's outcome recorded: otherwise the real call would stop for
+	// review when its lease expires, rightly (invariant 5; issue #99).
+	waitUntil(t, func() bool {
+		cs, err := k1.Children(context.Background(), "taken-1")
+		return err == nil && slices.ContainsFunc(cs, func(c kairo.RunInfo) bool { return c.Status == "completed" })
+	})
 	a.dead.Store(true) // stops: its lease is not renewed
 
 	k2 := start(open(), false)
