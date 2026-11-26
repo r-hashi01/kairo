@@ -14,7 +14,7 @@ import { after, before, describe, test } from 'node:test';
 
 import { EmbeddedBackend } from './backend.ts';
 import { finished } from './client.ts';
-import { PostgresStore, SQLiteStore, WorkflowRetryError, type Store } from './store.ts';
+import { PostgresStore, SQLiteStore, WorkflowRetryError, type LeaseRow, type Store } from './store.ts';
 import { ObservationKind, type Observation } from './observe.ts';
 import { CallError, CancelledError, Kairo, NotWaitingError, RetryAfterError, RetryableError, StoppedError, Suspended, TimedOutError, WorkflowError, type KairoOptions, type SignalReceipt } from './workflow.ts';
 import { EFFECT_WEAKENED } from './embedded.ts';
@@ -94,8 +94,10 @@ function dying(store: Store): [Store, { dead: boolean }] {
  * writes pass, so the failure lands on the same boundary however the work
  * interleaves (issue #84).
  */
-function failingOnce(store: Store, parent: string): [Store, { fail: boolean }] {
-	const state = { fail: false };
+function failingOnce(store: Store, parent: string): [Store, { fail: boolean; handed: Set<string> }] {
+	// handed: workflows whose drive was given up (handed to nobody); from
+	// then on, their lease expires when the test moves the clock past it.
+	const state = { fail: false, handed: new Set<string>() };
 	return [new Proxy(store, {
 		get(target, prop) {
 			const v = (target as any)[prop];
@@ -107,6 +109,10 @@ function failingOnce(store: Store, parent: string): [Store, { fail: boolean }] {
 					throw new Error('store busy');
 				}
 				return v.apply(target, args);
+			};
+			if (prop === 'handOver') return async (l: LeaseRow) => {
+				await v.call(target, l);
+				if (l.act === 0 && l.owner === '') state.handed.add(l.run);
 			};
 			return v.bind(target);
 		},
@@ -804,14 +810,16 @@ console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
 		await k.start();
 		const retried = k.run('store-retry', null, { id: 'store-retry-1' });
 		// The failure was injected and the drive gave it up: its lease expires.
-		await waitUntil(() => armed && !state.fail);
+		// The clock moves only after the hand-over, whose expiry is read from
+		// the clock (issue #99).
+		await waitUntil(() => state.handed.has('store-retry-1'));
 		expire();
 		assert.equal(await retried, 'onetwo');
 		assert.deepEqual({ first: runs.first, second: runs.second }, { first: 1, second: 1 });
 		assert.ok(runs.workflow >= 2);
 		assert.equal((await k.backend.get('store-retry-1')).status, 'completed');
 		const explicit = k.run('explicit-retry', null, { id: 'explicit-retry-1' });
-		await waitUntil(() => runs.explicit === 1);
+		await waitUntil(() => state.handed.has('explicit-retry-1'));
 		expire();
 		assert.equal(await explicit, 'ok');
 		assert.equal(runs.explicit, 2);

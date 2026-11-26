@@ -85,9 +85,20 @@ class FailingOnce:
         self._store = store
         self._parent = parent
         self.fail = False
+        # Workflows whose drive was given up (handed to nobody): from then on,
+        # their lease expires when the test moves the clock past it.
+        self.handed: set[str] = set()
 
     def __getattr__(self, name: str) -> Any:
         v = getattr(self._store, name)
+        if name == "hand_over":
+
+            async def hand_over(lease: Any) -> None:
+                await v(lease)
+                if lease.act == 0 and lease.owner == "":
+                    self.handed.add(lease.run)
+
+            return hand_over
         if name != "with_run":
             return v
 
@@ -876,14 +887,16 @@ class DrivingTest(unittest.TestCase):
             await k.start()
             retried = asyncio.ensure_future(k.run("store-retry", None, id="store-retry-1"))
             # The failure was injected and the drive gave it up: its lease expires.
-            await wait_until(lambda: armed and not store.fail)
+            # The clock moves only after the hand-over, whose expiry is read
+            # from the clock (issue #99).
+            await wait_until(lambda: "store-retry-1" in store.handed)
             expire()
             self.assertEqual(await retried, "onetwo")
             self.assertEqual((runs["first"], runs["second"]), (1, 1))
             self.assertGreaterEqual(runs["workflow"], 2)
             self.assertEqual((await k.backend.get("store-retry-1"))["status"], "completed")
             explicit = asyncio.ensure_future(k.run("explicit-retry", None, id="explicit-retry-1"))
-            await wait_until(lambda: runs["explicit"] == 1)
+            await wait_until(lambda: "explicit-retry-1" in store.handed)
             expire()
             self.assertEqual(await explicit, "ok")
             self.assertEqual(runs["explicit"], 2)
