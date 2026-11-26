@@ -1796,8 +1796,20 @@ func (k *Kairo) applySignal(ctx context.Context, runID, name string, payload any
 		res, err := k.remote.applySignal(ctx, runID, name, payload, o.id, o.onlyIfWaiting)
 		return res.Applied, res.Early, err
 	}
-	applied, err := k.rt.signalApplied(ctx, runID, name, payload)
+	// The wait's outcome keeps the logical signal ID, so a retry finds it
+	// (ADR 0071; issue #102).
+	applied, err := k.rt.signalApplied(ctx, runID, name, payload, signalMeta(o.id, false, o.onlyIfWaiting))
 	return applied, false, err
+}
+
+// signalMeta is the "_kairo_signal" a wait's outcome keeps (ADR 0071).
+func signalMeta(id string, early, onlyIfWaiting bool) json.RawMessage {
+	b, _ := json.Marshal(struct {
+		ID            string `json:"id"`
+		Early         bool   `json:"early"`
+		OnlyIfWaiting bool   `json:"only_if_waiting"`
+	}{id, early, onlyIfWaiting})
+	return b
 }
 
 func matchRecordedSignal(output json.RawMessage, payload any, o signalOpts) (bool, bool, error) {
@@ -1844,7 +1856,7 @@ func (k *Kairo) signalAhead(ctx context.Context, id, name, runID string, payload
 	if k.remote != nil {
 		spec.initialSignal = &remoteSignalRequest{Name: name, Payload: data, ID: signalID}
 	} else {
-		spec.then = []wasmcore.Event{{Kind: "signal", At: k.rt.now(), Name: name, Data: data}}
+		spec.then = []wasmcore.Event{{Kind: "signal", At: k.rt.now(), Name: name, Data: data, Meta: signalMeta(signalID, true, false)}}
 	}
 	existing, err := k.runs.run(ctx, planWait+name, map[string]any{"in": nil}, runID, spec)
 	return !existing, err
