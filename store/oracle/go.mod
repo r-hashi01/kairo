@@ -2,11 +2,11 @@ module github.com/r-hashi01/kairo/store/oracle
 
 go 1.27.4
 
-require github.com/r-hashi01/kairo/store/sqlstore v0.5.0
+require github.com/r-hashi01/kairo/store/sqlstore v0.5.1
 
 require (
 	github.com/sijms/go-ora/v2 v2.9.0
-	github.com/r-hashi01/kairo v0.5.0 // indirect
+	github.com/r-hashi01/kairo v0.5.1 // indirect
 )
 
 replace (
