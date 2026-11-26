@@ -1316,9 +1316,9 @@ func (s *shard) finish(r *run) {
 			} else {
 				err = fmt.Errorf("inlining output: %w", resolveErr)
 			}
-			if err == nil {
-				s.e.finish(ri)
-			}
+			// Waiters are woken either way (issue #96). If inlining
+			// failed, they get the reference: its blobs are not deleted.
+			s.e.finish(ri)
 		}
 		if err == nil {
 			err = s.e.deleteBlobs(id)

@@ -358,6 +358,12 @@ def _canonical(v: Any) -> str:
     return "".join(out)
 
 
+def _signal_meta(signal_id: str, early: bool, only_if_waiting: bool) -> dict[str, Any]:
+    """The "_kairo_signal" a wait's outcome keeps, so a retry with the same
+    ID finds it (ADR 0071; issue #102)."""
+    return {"id": signal_id, "early": early, "only_if_waiting": only_if_waiting}
+
+
 def _recorded_signal(output: Any, payload: Any, signal_id: str, only_if_waiting: bool) -> bool | None:
     if not isinstance(output, dict) or not isinstance(output.get("_kairo_signal"), dict):
         return None
@@ -1691,7 +1697,7 @@ class Kairo:
                 # This no-op transaction is the linearization point for
                 # "not present now". A wait created first accepts it here.
                 applied = (
-                    {"applied": await rt.signal_applied(run_id, name, payload), "early": False}
+                    {"applied": await rt.signal_applied(run_id, name, payload, _signal_meta(signal_id, False, only_if_waiting)), "early": False}
                     if rt is not None
                     else await self.backend.apply_signal(
                         run_id, name, payload, signal_id=signal_id, only_if_waiting=only_if_waiting
@@ -1722,7 +1728,7 @@ class Kairo:
                 n += 1
                 continue
             applied = (
-                {"applied": await rt.signal_applied(run_id, name, payload), "early": False}
+                {"applied": await rt.signal_applied(run_id, name, payload, _signal_meta(signal_id, False, only_if_waiting)), "early": False}
                 if rt is not None
                 else await self.backend.apply_signal(
                     run_id, name, payload, signal_id=signal_id, only_if_waiting=only_if_waiting
@@ -1756,7 +1762,7 @@ class Kairo:
         if finished(wf):
             raise LookupError(f"workflow {id} has finished")
         kw = (
-            {"then": [{"kind": "signal", "name": name, "data": payload}]}
+            {"then": [{"kind": "signal", "name": name, "data": payload, "meta": _signal_meta(signal_id, True, False)}]}
             if self._rt is not None
             else {"initial_signal": {"name": name, "payload": payload, "signal_id": signal_id}}
         )

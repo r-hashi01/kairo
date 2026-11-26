@@ -481,6 +481,44 @@ console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
 		await k.close();
 	});
 
+	// A signal sent again with its logical ID returns the first receipt, both
+	// when a wait took it and when it was sent ahead of its wait: the wait's
+	// outcome keeps the ID (ADR 0071; issue #102).
+	test('a wait keeps the logical signal id', async () => {
+		const k = await open(join(dir, 'signal-id.db'));
+		let open_!: () => void;
+		const gate = new Promise<void>((r) => (open_ = r));
+		k.defineAction('gate', { effect: 'unprotected', handler: async () => (await gate, null) });
+		k.workflow('w', async (ctx, gated: boolean) => {
+			if (gated) await ctx.call('gate', null);
+			const got: string[] = [];
+			for (let i = 0; i < 2; i++) got.push(await ctx.waitFor<string>('s'));
+			return got;
+		});
+		await k.start();
+		const again = async (id: string, first: SignalReceipt) => {
+			assert.deepEqual(await k.sendSignal(id, 's', 'a', { signalId: 'x' }), first);
+			await assert.rejects(k.sendSignal(id, 's', 'other', { signalId: 'x' }), /conflicts/);
+		};
+
+		await k.submit('w', false, { id: 'sid-waiting' });
+		await waitUntil(async () => (await k.children('sid-waiting')).some((c) => !finished(c)));
+		const first = await k.sendSignal('sid-waiting', 's', 'a', { signalId: 'x' });
+		assert.deepEqual([first.index, first.early], [0, false]);
+		await again('sid-waiting', first);
+		assert.equal((await k.sendSignal('sid-waiting', 's', 'b', { signalId: 'y' })).index, 1);
+		assert.deepEqual(await k.result('sid-waiting'), ['a', 'b']);
+
+		await k.submit('w', true, { id: 'sid-ahead' });
+		const ahead = await k.sendSignal('sid-ahead', 's', 'a', { signalId: 'x' });
+		assert.deepEqual([ahead.index, ahead.early], [0, true]);
+		await again('sid-ahead', ahead);
+		assert.equal((await k.sendSignal('sid-ahead', 's', 'b', { signalId: 'y' })).index, 1);
+		open_();
+		assert.deepEqual(await k.result('sid-ahead'), ['a', 'b']);
+		await k.close();
+	});
+
 	test('signal receipts and only-if-waiting are atomic across processes', async () => {
 		const path = join(dir, 'signal-receipts.db');
 		const gates = new Map<string, () => void>();

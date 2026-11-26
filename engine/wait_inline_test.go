@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/r-hashi01/kairo/blob"
 )
@@ -59,5 +62,57 @@ func TestWaitDoesNotReturnOutputBeingInlined(t *testing.T) {
 	ri := <-got
 	if strings.Contains(string(ri.Output), `"$blob"`) || !strings.Contains(string(ri.Output), "xxxx") {
 		t.Fatalf("Wait returned %s", ri.Output)
+	}
+}
+
+// failingBlobs fails reads of one run's blobs: its output cannot be
+// inlined.
+type failingBlobs struct {
+	blob.Store
+	group string
+}
+
+func (f failingBlobs) Get(key string) ([]byte, error) {
+	if strings.HasPrefix(key, f.group) {
+		return nil, errors.New("blob store unavailable")
+	}
+	return f.Store.Get(key)
+}
+
+// A run whose output cannot be inlined still wakes its waiters (issue
+// #96). They get the reference, and its blobs are kept.
+func TestWaitReturnsWhenInliningFails(t *testing.T) {
+	mem := blob.NewMem()
+	group := blob.RunGroup("bad") + "/"
+	e := newEngine(t, Config{Shards: 1, BlobThreshold: 64, Blobs: failingBlobs{Store: mem, group: group}})
+	defer e.Close()
+	mustPlan(t, e, oneStep)
+	e.RegisterExecutor([]string{"llm"}, 1, keptBigExec())
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	mt := TierMemory
+	if _, err := submit(e, SubmitRequest{Plan: "one", Tenant: "t", Tier: &mt, RunID: "bad"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	ri, err := e.Wait(ctx, "bad")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ri.Status != "completed" || !strings.Contains(string(ri.Output), `"$blob"`) {
+		t.Fatalf("Wait returned %s %s", ri.Status, ri.Output)
+	}
+	m := regexp.MustCompile(`"\$blob":"([^"]+)"`).FindSubmatch(ri.Output)
+	if m == nil {
+		t.Fatalf("no blob key in %s", ri.Output)
+	}
+	if _, err := mem.Get(string(m[1])); err != nil {
+		t.Fatalf("the blob the reference points to: %v", err)
+	}
+	// Wait after the fact returns too.
+	if _, err := e.Wait(ctx, "bad"); err != nil {
+		t.Fatal(err)
 	}
 }

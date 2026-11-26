@@ -537,6 +537,57 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_a_wait_keeps_the_logical_signal_id(self) -> None:
+        """A signal sent again with its logical ID returns the first receipt,
+        both when a wait took it and when it was sent ahead of its wait: the
+        wait's outcome keeps the ID (ADR 0071; issue #102)."""
+
+        async def main() -> None:
+            k = await self.open(self.path("signal-id.db"))
+            gate = threading.Event()
+
+            @k.action("gate", effect="unprotected")
+            def gate_(_, ctx):
+                gate.wait(30)
+                return None
+
+            @k.workflow("w")
+            async def w(ctx, gated):
+                if gated:
+                    await ctx.call("gate")
+                return [await ctx.wait_for("s") for _ in range(2)]
+
+            await k.start()
+
+            async def again(id: str, first: SignalReceipt) -> None:
+                self.assertEqual(await k.send_signal(id, "s", "a", signal_id="x"), first)
+                with self.assertRaisesRegex(ValueError, "conflicts"):
+                    await k.send_signal(id, "s", "other", signal_id="x")
+
+            await k.submit("w", False, id="sid-waiting")
+            for _ in range(400):
+                if any(c["status"] not in ("completed", "failed", "cancelled") for c in await k.children("sid-waiting")):
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                raise AssertionError("the workflow did not wait")
+            first = await k.send_signal("sid-waiting", "s", "a", signal_id="x")
+            self.assertEqual((first.index, first.early), (0, False))
+            await again("sid-waiting", first)
+            self.assertEqual((await k.send_signal("sid-waiting", "s", "b", signal_id="y")).index, 1)
+            self.assertEqual(await k.result("sid-waiting"), ["a", "b"])
+
+            await k.submit("w", True, id="sid-ahead")
+            ahead = await k.send_signal("sid-ahead", "s", "a", signal_id="x")
+            self.assertEqual((ahead.index, ahead.early), (0, True))
+            await again("sid-ahead", ahead)
+            self.assertEqual((await k.send_signal("sid-ahead", "s", "b", signal_id="y")).index, 1)
+            gate.set()
+            self.assertEqual(await k.result("sid-ahead"), ["a", "b"])
+            await k.close()
+
+        asyncio.run(main())
+
     def test_signal_receipts_and_only_if_waiting_are_atomic_across_processes(self) -> None:
         async def main() -> None:
             path = self.path("signal-receipts.db")
