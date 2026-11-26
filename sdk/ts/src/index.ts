@@ -11,3 +11,4 @@ export * from './store.ts';
 export * from './http.ts';
 export * from './testing.ts';
 export * from './version.ts';
+export { DivergedError } from './divergence.ts';

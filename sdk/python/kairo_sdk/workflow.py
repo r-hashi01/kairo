@@ -39,6 +39,7 @@ from typing import Any
 
 from .backend import Backend, HttpBackend
 from .client import KairoError, finished
+from .divergence import DivergedError, Divergence
 from .embedded import EffectWeakenedError, Embedded, new_token
 from .http import SignatureError, check_url, normalize_max_body, post, sign, verify
 from .metrics import (
@@ -50,7 +51,7 @@ from .metrics import (
     MetricEmitter,
     MetricSink,
 )
-from .observe import LOGGER, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
+from .observe import LOGGER, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
 from .protocol import Result
 from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, SharedRateRequest, SharedRateSettlement, WorkflowRetryError, is_workflow_retry
 from .worker import Task, TaskContext
@@ -259,6 +260,9 @@ def _workflow_input(name: str, version: str, input: Any, external_parent: bool =
     if external_parent:
         w["external_parent"] = True
     return w
+
+
+_CALL_ID = re.compile(r"[0-9a-f]{24}\.")
 
 
 def _externally_attached(input: Any) -> bool:
@@ -1838,6 +1842,35 @@ class Kairo:
             if self._rt is not None and parent is not None:
                 self._rt.reach(id, False)
 
+    def _action_has_effect(self, action: str) -> bool:
+        """Whether action acts outside: not unprotected, or not declared here (ADR 0084)."""
+        if action in BUILTIN:
+            return False
+        a = self._actions.get(action)
+        return a is None or a.effect != "unprotected"
+
+    def _has_effect(self, workflow: str, r: dict[str, Any]) -> bool:
+        """Whether recorded child r of workflow is a call with an effect (ADR 0084, decision 4)."""
+        rid = r.get("run_id", "")
+        # Only runs the workflow's calls made: <workflow>/<24 hex>.…
+        if not rid.startswith(workflow + "/") or not _CALL_ID.match(rid[len(workflow) + 1 :]):
+            return False
+        plan = r.get("plan") or ""
+        if plan == PLAN_WORKFLOW:
+            return not _externally_attached(r.get("input"))
+        if not plan.startswith(PLAN_CALL):
+            return False
+        return self._action_has_effect(plan[len(PLAN_CALL) :])
+
+    def _report_stuck(self, run_id: str, error: Exception) -> None:
+        """Logs and observes a workflow that cannot go on now."""
+        if self._rt is not None:
+            self._rt._record_stuck(run_id, error)
+            return
+        self._logger.warning("kairo: run %s cannot go on: %s", run_id, error)
+        if self._observer is not None:
+            observe(self._observer, self._logger, self._now, Observation(RUN_STUCK, run_id=run_id, error=str(error)))
+
     async def _run_child_as(self, name: str, input: Any, id: str, parent: str, up: Context) -> Any:
         if not isinstance(self.backend, HttpBackend):
             return await self._run_as(name, input, id, parent, up)
@@ -1933,7 +1966,8 @@ class Kairo:
 
             watcher = asyncio.ensure_future(watch())
         self._driving_ids.add(id)
-        ctx = Context(self, id, stop, cancelled)
+        div = Divergence(id, lambda: self.backend.children(id), lambda r: self._has_effect(id, r))
+        ctx = Context(self, id, stop, cancelled, div=div)
         # A function that raises, at once or later, fails the workflow; one
         # that does not stop when the workflow is cancelled or the process
         # closes is left behind.
@@ -1961,6 +1995,14 @@ class Kairo:
                             pass
                     raise Cancelled(f"workflow {id} cancelled")
                 raise StoppedError(f"workflow {id}: not driven here any more")
+            if div.err is not None:
+                # Left its record (ADR 0084): nothing more was made, and no
+                # outcome is recorded, even if the workflow caught the error.
+                # The drive is given up for a lease period, as for a
+                # transient error (ADR 0063).
+                _set(stop)
+                self._report_stuck(id, div.err)
+                raise WorkflowRetryError(str(div.err)) from div.err
             failed = False
             cause: BaseException | None = None
             value: Any = None
@@ -2390,9 +2432,12 @@ class Context:
         stop: asyncio.Future[None] | None = None,
         cancelled: Callable[[], bool] | None = None,
         replay: _ReplayDrive | None = None,
+        div: Divergence | None = None,
     ) -> None:
         self.id = id
         self._k = k
+        # Checks that this drive's replay keeps to its record (ADR 0084); none in replay().
+        self._div = div
         self._seen: dict[str, int] = {}
         # Set when the workflow stops being driven here (cancelled, or the process closes).
         self._stop = stop if stop is not None else asyncio.get_running_loop().create_future()
@@ -2413,6 +2458,21 @@ class Context:
             return await self._replay.read(run_id, "call", plan[len(PLAN_CALL) :], input)
         if self._stop.done():
             raise StoppedError(f"call {run_id}: stopped before it started")
+        if self._div is None:
+            return await self._call(plan, root, input, run_id, destination)
+        if plan.startswith(PLAN_WAIT):
+            kind = "wait"
+        elif plan.startswith(PLAN_CALL) and self._k._action_has_effect(plan[len(PLAN_CALL) :]):
+            kind = "effect"
+        else:
+            kind = "call"
+        await self._div.enter(run_id, kind)
+        try:
+            return await self._call(plan, root, input, run_id, destination)
+        finally:
+            self._div.leave(run_id)
+
+    async def _call(self, plan: str, root: dict[str, Any] | None, input: Any, run_id: str, destination: str) -> Any:
         try:
             return await self._k._call_run(plan, root, input, run_id, self.id, destination)
         except asyncio.CancelledError:
@@ -2462,4 +2522,10 @@ class Context:
         run_id = self._next("kairo.workflow/" + name, input)
         if self._replay is not None:
             return await self._replay.read(run_id, "workflow", name, input)
-        return await self._k._run_child_as(name, input, run_id, self.id, self)
+        if self._div is None:
+            return await self._k._run_child_as(name, input, run_id, self.id, self)
+        await self._div.enter(run_id, "effect")
+        try:
+            return await self._k._run_child_as(name, input, run_id, self.id, self)
+        finally:
+            self._div.leave(run_id)
