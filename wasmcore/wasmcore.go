@@ -93,6 +93,9 @@ type Inspection struct {
 	// either (ADR 0060).
 	Review  []uint32 `json:"review,omitempty"`
 	Intents []uint32 `json:"intents,omitempty"`
+	// Dispatched: the activations with an attempt out, with or without its
+	// intent. One out without its intent never acted (ADR 0085).
+	Dispatched []uint32 `json:"dispatched,omitempty"`
 }
 
 // Inspect reads a run's state (the core's encoding).
@@ -113,9 +116,13 @@ func Inspect(state []byte) (Inspection, error) {
 		if a.NeedsReview() {
 			in.Review = append(in.Review, id)
 		}
+		if core.Dispatched(s, id, a.Attempt) {
+			in.Dispatched = append(in.Dispatched, id)
+		}
 	}
 	sort.Slice(in.Review, func(i, j int) bool { return in.Review[i] < in.Review[j] })
 	sort.Slice(in.Intents, func(i, j int) bool { return in.Intents[i] < in.Intents[j] })
+	sort.Slice(in.Dispatched, func(i, j int) bool { return in.Dispatched[i] < in.Dispatched[j] })
 	return in, nil
 }
 

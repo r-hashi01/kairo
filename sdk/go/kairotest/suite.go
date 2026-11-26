@@ -41,6 +41,7 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"CancelReachesChildren":              testCancelReachesChildren,
 		"PanicIsAFailure":                    testPanicIsAFailure,
 		"StoppedDriverIsTakenUp":             testStoppedDriverIsTakenUp,
+		"WaitingStepsAreNotLeftForReview":    testWaitingStepsAreNotLeftForReview,
 		"LiveDriverIsNotDoubled":             testLiveDriverIsNotDoubled,
 		"SignalBeforeTheWait":                testSignalBeforeTheWait,
 		"SignalIDKeptByTheWait":              testSignalIDKeptByTheWait,
@@ -1128,6 +1129,126 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 	}
 	if runs.get("write") != 1 {
 		t.Fatalf("wrote %d times", runs.get("write"))
+	}
+}
+
+// Real steps that wait for a slot have no intent yet: a process that stops
+// leaves for review only the steps it was running; the others go again
+// elsewhere, each once (ADR 0085, issue #114).
+func testWaitingStepsAreNotLeftForReview(t *testing.T, open Opener) {
+	var mu sync.Mutex
+	started := map[int]int{}
+	release := make(chan struct{})
+	defer close(release)
+	start := func(store kairo.Store, hang bool) *kairo.Kairo {
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: store, Lease: 200 * time.Millisecond, Concurrency: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kairo.Action(k, "write", kairo.Real, func(tc *kairo.TaskContext, n int) (int, error) {
+			mu.Lock()
+			started[n]++
+			mu.Unlock()
+			if hang {
+				select { // as a process that stops mid-call
+				case <-release:
+				case <-tc.Done():
+				}
+			}
+			return n, nil
+		})
+		kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) ([]int, error) {
+			out := make([]int, 10)
+			fns := make([]func(*kairo.Context) error, 10)
+			for i := range fns {
+				fns[i] = func(ctx *kairo.Context) error {
+					v, err := kairo.Call[int](ctx, "write", i)
+					out[i] = v
+					return err
+				}
+			}
+			return out, kairo.Parallel(ctx, fns...)
+		})
+		if err := k.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(started)
+	}
+	a := &deadStore{Store: open()}
+	k1 := start(a, true)
+	defer k1.Close()
+	if _, err := k1.Submit(context.Background(), "w", nil, kairo.WithID("slots-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return count() == 2 }) // two run; eight wait for a slot
+	a.dead.Store(true)                                // stops: its leases are not renewed
+	mu.Lock()
+	running := []int{}
+	for n := range started {
+		running = append(running, n)
+	}
+	mu.Unlock()
+
+	k2 := start(open(), false)
+	defer k2.Close()
+	ctx := context.Background()
+	calls := func() (blocked, completed []kairo.RunInfo) {
+		cs, err := k2.Children(ctx, "slots-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cs {
+			switch c.Status {
+			case "blocked":
+				blocked = append(blocked, c)
+			case "completed":
+				completed = append(completed, c)
+			}
+		}
+		return blocked, completed
+	}
+	waitUntil(t, func() bool { b, c := calls(); return len(b) == 2 && len(c) == 8 })
+	if count() != 10 {
+		t.Fatalf("started %v", started)
+	}
+	mu.Lock()
+	for n, times := range started {
+		if times != 1 {
+			t.Errorf("step %d ran %d times", n, times)
+		}
+	}
+	mu.Unlock()
+	// The two that were running are for review; told that they acted, the
+	// workflow ends.
+	blocked, _ := calls()
+	var review []int
+	for _, b := range blocked {
+		var in struct {
+			In int `json:"in"`
+		}
+		if err := json.Unmarshal(b.Input, &in); err != nil {
+			t.Fatal(err)
+		}
+		review = append(review, in.In)
+		if err := k2.Resolve(ctx, b.RunID, in.In); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sort.Ints(review)
+	sort.Ints(running)
+	if !equalJSON(review, running) {
+		t.Fatalf("for review %v, running when it stopped %v", review, running)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := kairo.Await[[]int](wctx, k2, "slots-1")
+	if err != nil || !equalJSON(out, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) {
+		t.Fatalf("%v %v", out, err)
 	}
 }
 

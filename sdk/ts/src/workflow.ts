@@ -13,7 +13,8 @@ import { EffectWeakenedError, Embedded, newToken } from './embedded.ts';
 import type { Result, Task } from './protocol.ts';
 import { consoleLogger, observe, stepStatus, type Logger, type Observer } from './observe.ts';
 import { MetricEmitter, MetricName, type MetricSink } from './metrics.ts';
-import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, type LeaseRow } from './store.ts';
+import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, WorkflowRetryError, type LeaseRow } from './store.ts';
+import type { CoreCommand } from './core.ts';
 import type { Address, TaskContext } from './worker.ts';
 
 /** An action: what a step of a workflow runs, on this process's worker. */
@@ -530,6 +531,10 @@ export class Kairo {
 			this.rt = rt;
 			if (opts.logger) rt.logger = opts.logger;
 			if (opts.observe) rt.observer = opts.observe;
+			// A real step's intent goes with its dispatch only if it passes its
+			// limits at once; one that waits records it once it passes (ADR 0085).
+			rt.admitNow = (runId, c) => this.admitNow(runId, c);
+			rt.unadmit = (runId, c) => this.unadmit(runId, c);
 		}
 		this.logger = opts.logger ?? this.rt?.logger ?? consoleLogger;
 		const rtNow = this.rt?.now;
@@ -879,6 +884,26 @@ export class Kairo {
 		return res;
 	}
 
+	/** Slots taken for real steps admitted as they were dispatched (ADR 0085), by run, act and attempt. */
+	private readonly admittedAtOnce = new Map<string, (result: Result) => void>();
+
+	/** Whether the real step c of runId passes its limits at once; if so, its slots are taken for it. */
+	private admitNow(runId: string, c: CoreCommand): boolean {
+		const def = this.actions.get(c.action ?? '');
+		if (!def) return true; // no limits here: serve answers that there is no such action
+		const finish = this.tryAdmit(c.destination || def.destination || c.action!, def);
+		if (!finish) return false;
+		this.admittedAtOnce.set(`${runId}\0${c.act}\0${c.attempt}`, finish);
+		return true;
+	}
+
+	private unadmit(runId: string, c: CoreCommand): void {
+		const key = `${runId}\0${c.act}\0${c.attempt}`;
+		const finish = this.admittedAtOnce.get(key);
+		this.admittedAtOnce.delete(key);
+		finish?.({});
+	}
+
 	private async serve(task: Task, ctx: TaskContext): Promise<Result> {
 		const input = (task.input as { in?: unknown } | null)?.in;
 		switch (task.action) {
@@ -891,14 +916,37 @@ export class Kairo {
 				return { wait: { until: this.clock() + Number((input as { ms: number }).ms), output: null } };
 		}
 		const def = this.actions.get(task.action);
-		if (!def) return { error: `no action ${task.action} here` };
-		// Over a limit, the step waits here for a slot, leased (ADR 0059).
-		let finish: (result: Result) => void;
-		try {
-			finish = await this.admit(task.destination || def.destination || task.action, def, ctx.signal);
-		} catch (e) {
-			if (isWorkflowRetry(e)) return { dispatchError: e };
-			return { error: `step of ${task.action} stopped waiting for a slot`, retryable: true, errorType: 'cancelled' };
+		const atOnce = `${task.run_id}\0${task.act}\0${task.attempt}`;
+		let finish = this.admittedAtOnce.get(atOnce);
+		this.admittedAtOnce.delete(atOnce);
+		if (!def) {
+			finish?.({});
+			return { error: `no action ${task.action} here` };
+		}
+		if (!finish) {
+			// Over a limit, the step waits here for a slot, leased (ADR 0059).
+			try {
+				finish = await this.admit(task.destination || def.destination || task.action, def, ctx.signal);
+			} catch (e) {
+				if (isWorkflowRetry(e)) return { dispatchError: e };
+				return { error: `step of ${task.action} stopped waiting for a slot`, retryable: true, errorType: 'cancelled' };
+			}
+			// A real step dispatched without its intent: recorded now that it
+			// passed, before it acts (ADR 0085, invariant 4).
+			if (this.rt && def.effect !== 'unprotected') {
+				let recorded: boolean;
+				try {
+					recorded = await this.rt.recordIntent(task.run_id, task.act, task.attempt);
+				} catch (e) {
+					finish({});
+					return { dispatchError: isWorkflowRetry(e) ? e : new WorkflowRetryError(`recording the intent of ${task.run_id}: ${(e as Error)?.message ?? e}`, { cause: e }) };
+				}
+				if (!recorded) {
+					// Cancelled meanwhile, or taken up elsewhere: not this attempt's to run.
+					finish({});
+					return { error: `step of ${task.action} is no longer dispatched here`, errorType: 'cancelled' };
+				}
+			}
 		}
 		let weight = 0;
 		const taskContext: TaskContext = { ...ctx, setWeight: (n) => {
@@ -988,6 +1036,42 @@ export class Kairo {
 			if (admitted) limiter.finish(0, 0);
 			throw e;
 		}
+	}
+
+	/**
+	 * admit, without waiting: the slots of a step that passes its limits at
+	 * once, or undefined. Limits shared through the store are read there,
+	 * so a step with them is never taken as passing at once.
+	 */
+	private tryAdmit(destination: string, def: ActionDef): ((result: Result) => void) | undefined {
+		let limits: DestinationLimits = { concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate, shared: def.sharedLimits };
+		if (this.opts.destinationLimits) {
+			const dynamic = this.opts.destinationLimits(destination);
+			limits = {
+				concurrency: stricter(limits.concurrency, dynamic.concurrency),
+				requestsPerMinute: stricter(limits.requestsPerMinute, dynamic.requestsPerMinute),
+				weightPerMinute: stricter(limits.weightPerMinute, dynamic.weightPerMinute),
+				shared: !!limits.shared || !!dynamic.shared,
+			};
+		}
+		let limiter = this.limits.get(destination);
+		if (!limiter) this.limits.set(destination, (limiter = new Limiter()));
+		limiter.declare({ concurrency: def.limit, requestsPerMinute: def.rate, weightPerMinute: def.weightRate, shared: def.sharedLimits });
+		limits = limiter.resolve(limits);
+		if (limits.shared) return undefined;
+		if (!limiter.tryAdmit(limits)) return undefined;
+		if (this.slots && !this.slots.tryTake()) {
+			limiter.finish(0, 0);
+			this.retireLimiter(destination, limiter);
+			return undefined;
+		}
+		const slots = this.slots;
+		const l = limiter;
+		return (result) => {
+			slots?.give();
+			l.finish(result.weight ?? result.tokens ?? 0, result.retryable && !result.unknown ? result.retryAfter ?? 0 : 0);
+			this.retireLimiter(destination, l);
+		};
 	}
 
 	private retireLimiter(destination: string, limiter: Limiter): void {
@@ -1949,6 +2033,15 @@ class Slots {
 		this.free = size;
 	}
 
+	/** Takes a slot if one is free and nobody waits for one. */
+	tryTake(): boolean {
+		if (this.free > 0 && this.queue.length === 0) {
+			this.free--;
+			return true;
+		}
+		return false;
+	}
+
 	/** Takes a slot, waiting for one; rejects when signal aborts first. */
 	take(signal: AbortSignal): Promise<void> {
 		if (this.free > 0 && this.queue.length === 0) {
@@ -2070,6 +2163,20 @@ class Limiter {
 			signal.addEventListener('abort', stopped, { once: true });
 			if (ms !== undefined) timer = setTimeout(changed, Math.max(0, ms));
 		});
+	}
+
+	/** admit, if the step may start now and nobody waits before it. */
+	tryAdmit(v: DestinationLimits): boolean {
+		if (this.changed.size > 0) return false;
+		this.configure(v);
+		const now = Date.now();
+		this.refill(now);
+		let at = Math.max(now, this.pauseUntil, this.next);
+		if (this.weightRate > 0 && this.weight < 0) at = Math.max(at, now + (-this.weight / this.weightRate));
+		if ((this.concurrency > 0 && this.active >= this.concurrency) || at > now) return false;
+		this.active++;
+		if (this.every > 0) this.next = now + this.every;
+		return true;
 	}
 
 	async admit(v: DestinationLimits, signal: AbortSignal): Promise<void> {

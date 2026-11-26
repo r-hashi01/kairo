@@ -488,8 +488,34 @@ export class Embedded {
 		this.observe({ kind: 'run.stuck', runId, error: String((e as Error)?.message ?? e) });
 	}
 
-	/** The process that ran l's step stopped: its outcome is unknown. */
-	private recover(l: LeaseRow): Promise<boolean> {
+	/**
+	 * The process that had l's step stopped. A real step whose intent was
+	 * recorded may have acted: its outcome is unknown. One without its
+	 * intent was still waiting to pass its limits and never acted (ADR
+	 * 0085): the core's recovery dispatches it again, once no step of its
+	 * run is still out elsewhere (it recovers the whole run).
+	 */
+	private async recover(l: LeaseRow): Promise<boolean> {
+		const row = await this.store.get(l.run);
+		if (row) {
+			const ins = this.core.inspect(row.state);
+			if (ins.dispatched?.includes(l.act) && !ins.intents?.includes(l.act)) {
+				const { leases } = await this.store.recoverable(l.run, this.now());
+				const lost = new Set(leases.filter((x) => x.act !== 0).map((x) => x.act));
+				if (!(ins.dispatched ?? []).every((a) => lost.has(a))) return false; // another step of the run is still out: later
+				// Steps of the run that may have acted are settled as unknown
+				// first (their leases end with it); then the rest go again.
+				for (const a of ins.intents ?? []) {
+					const x = leases.find((y) => y.act === a);
+					if (x) await this.unknownOutcome(x);
+				}
+				return this.advance(l.run, () => this.process(l.run, [{ kind: 'recover', at: this.now() }]));
+			}
+		}
+		return this.unknownOutcome(l);
+	}
+
+	private unknownOutcome(l: LeaseRow): Promise<boolean> {
 		return this.advance(l.run, () => this.process(l.run, [{ kind: 'step_err', at: this.now(), act: l.act, attempt: l.attempt, unknown: true, retryable: true,
 			error: 'the process running the step stopped', error_type: 'process_lost' }]));
 	}
@@ -555,13 +581,55 @@ export class Embedded {
 		return (await this.processReported(runId, events, start, sharedRates)).existing;
 	}
 
+	/**
+	 * Set by the runtime's host (the SDK's Kairo): whether a real step being
+	 * dispatched passes its limits at once, its slots then taken for it.
+	 * Its intent is recorded with its dispatch only then; one that is to
+	 * wait records it once it passes (recordIntent, ADR 0085). Without it,
+	 * every real step's intent goes with its dispatch.
+	 */
+	admitNow?: (runId: string, c: CoreCommand) => boolean;
+	/** Gives back what admitNow took for a step that is not carried out. */
+	unadmit?: (runId: string, c: CoreCommand) => void;
+
+	/**
+	 * Records the intent of a real step that passed its limits after it was
+	 * dispatched (ADR 0085): whether it was (not if the step is no longer
+	 * that attempt's, cancelled or taken up elsewhere).
+	 */
+	async recordIntent(runId: string, act: number, attempt: number): Promise<boolean> {
+		return (await this.processReported(runId, [{ kind: 'intent', at: this.now(), act, attempt }])).applied;
+	}
+
 	private async processReported(
 		runId: string,
 		events: CoreEvent[],
 		start?: RunStart & { plan: Compiled; at: number },
 		sharedRates: SharedRateSettlement[] = [],
 	): Promise<{ existing: boolean; applied: boolean }> {
-		const out = await this.store.withRun(runId, (row) => {
+		// Steps admitted at once, in any try of the transaction below: given
+		// back unless carried out.
+		const admitted = new Map<string, CoreCommand>();
+		let out: Awaited<ReturnType<Embedded["transact"]>>;
+		try {
+			out = await this.transact(runId, events, start, sharedRates, admitted);
+		} catch (e) {
+			for (const c of admitted.values()) this.unadmit?.(runId, c);
+			throw e;
+		}
+		const carried = new Set(this.closed ? [] : out.commands.filter((c) => c.intent).map((c) => `${c.act}\0${c.attempt}`));
+		for (const [k, c] of admitted) if (!carried.has(k)) this.unadmit?.(runId, c);
+		return this.afterTransaction(runId, out);
+	}
+
+	private transact(
+		runId: string,
+		events: CoreEvent[],
+		start: (RunStart & { plan: Compiled; at: number }) | undefined,
+		sharedRates: SharedRateSettlement[],
+		admitted: Map<string, CoreCommand>,
+	) {
+		return this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
 			if (row && start) return { events: [], result: { existing: true, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row } };
@@ -583,8 +651,16 @@ export class Embedded {
 				res = { status: r.status, output: r.output, error: r.error };
 				for (const c of r.commands) {
 					commands.push(c);
-					// A real step's intent, committed with what dispatched it.
-					if (c.kind === 'dispatch' && c.effect === 'real') apply({ kind: 'intent', at: ev.at, act: c.act, attempt: c.attempt });
+					// A real step's intent, committed with what dispatched it if
+					// it passes its limits at once; else once it does (ADR 0085).
+					if (c.kind === 'dispatch' && c.effect === 'real') {
+						const k = `${c.act}\0${c.attempt}`;
+						if (!this.admitNow || admitted.has(k) || this.admitNow(runId, c)) {
+							if (this.admitNow) admitted.set(k, c);
+							c.intent = true;
+							apply({ kind: 'intent', at: ev.at, act: c.act, attempt: c.attempt });
+						}
+					}
 				}
 			};
 			for (const ev of events) apply(ev);
@@ -641,6 +717,9 @@ export class Embedded {
 				result: { existing: false, applied: true, started: !row, settled, commands, row: next },
 			};
 		});
+	}
+
+	private afterTransaction(runId: string, out: Awaited<ReturnType<Embedded['transact']>>): { existing: boolean; applied: boolean } {
 		if (this.closed) return { existing: out.existing, applied: out.applied };
 		const row = out.row;
 		if (out.started && row) this.observe({ kind: 'run.started', runId, ...runAttrs(row) });

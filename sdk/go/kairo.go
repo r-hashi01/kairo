@@ -730,6 +730,9 @@ func (k *Kairo) Start(ctx context.Context) error {
 	}
 	k.rt.mu.Lock()
 	k.rt.lostDrive, k.rt.missingPlan, k.rt.wakeParent = k.lostDrive, k.missingPlan, k.redrive
+	// A real step's intent goes with its dispatch only if it passes its
+	// limits at once; one that waits records it once it passes (ADR 0085).
+	k.rt.admitNow = k.admitNow
 	k.rt.leaseParents = k.mode == Suspend
 	k.rt.mu.Unlock()
 	if k.remote != nil {
@@ -850,13 +853,31 @@ func (k *Kairo) serve(ctx context.Context, t task, emit func([]byte)) result {
 	if a == nil {
 		return result{Err: "no action " + t.Action + " here"}
 	}
-	// Over a limit, the step waits here for a slot, leased (ADR 0059, 0077).
-	finish, err := k.admit(ctx, t.Destination, a)
-	if err != nil {
-		if retryWorkflow(err) {
-			return result{dispatchErr: err}
+	// Over a limit, the step waits here for a slot, leased (ADR 0059, 0077);
+	// unless it passed at once, its intent recorded with its dispatch.
+	finish := k.rt.takeAdmitted(t)
+	if finish == nil {
+		var err error
+		if finish, err = k.admit(ctx, t.Destination, a); err != nil {
+			if retryWorkflow(err) {
+				return result{dispatchErr: err}
+			}
+			return result{Err: err.Error(), Retryable: true, ErrType: "cancelled"}
 		}
-		return result{Err: err.Error(), Retryable: true, ErrType: "cancelled"}
+		if k.remote == nil && k.rt.admitNow != nil && a.spec["effect"] == string(Real) {
+			// A real step dispatched without its intent: recorded now that it
+			// passed, before it acts (ADR 0085, invariant 4).
+			recorded, err := k.rt.recordIntent(ctx, t)
+			if err != nil {
+				finish(&result{})
+				return result{dispatchErr: RetryWorkflow(err)}
+			}
+			if !recorded {
+				// Cancelled meanwhile, or taken up elsewhere: not this attempt's to run.
+				finish(&result{})
+				return result{Err: "step of " + t.Action + " is no longer dispatched here", ErrType: "cancelled"}
+			}
+		}
 	}
 	var res result
 	if a.url != "" {
@@ -2388,6 +2409,39 @@ func (l *limiter) wake() {
 	l.changed = make(chan struct{})
 }
 
+// tryAdmit is admit, if the step may start now.
+func (l *limiter) tryAdmit(limits DestinationLimits) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	limits.Concurrency = stricter(l.declared.Concurrency, limits.Concurrency)
+	if !limits.Shared {
+		limits.RequestsPerMin = stricter(l.declared.RequestsPerMin, limits.RequestsPerMin)
+		limits.WeightPerMin = stricter(l.declared.WeightPerMin, limits.WeightPerMin)
+	}
+	l.configure(limits, now)
+	at := now
+	if l.pauseUntil.After(at) {
+		at = l.pauseUntil
+	}
+	if l.next.After(at) {
+		at = l.next
+	}
+	if l.wpm > 0 && l.weight < 0 {
+		if weightAt := now.Add(durationFromMillis((-l.weight) / l.wpm)); weightAt.After(at) {
+			at = weightAt
+		}
+	}
+	if (l.concurrency > 0 && l.active >= l.concurrency) || at.After(now) {
+		return false
+	}
+	l.active++
+	if l.every > 0 {
+		l.next = now.Add(l.every)
+	}
+	return true
+}
+
 func (l *limiter) admit(ctx context.Context, limits DestinationLimits) error {
 	for {
 		now := time.Now()
@@ -2503,6 +2557,53 @@ func stricter(a, b int) int {
 }
 
 // admit waits for a step's runtime destination and the process slot.
+// admitNow is admit, without waiting: what gives back the slots of the real
+// step c of runID if it passes its limits at once, or nil. Dynamic limits
+// (DestinationLimits) and limits shared through the store are read outside
+// the dispatch's transaction, so a step with them never passes at once.
+func (k *Kairo) admitNow(runID string, c wasmcore.Command) func(*result) {
+	k.mu.Lock()
+	a := k.actions[c.Action]
+	k.mu.Unlock()
+	if a == nil {
+		return func(*result) {} // no limits here: serve answers that there is no such action
+	}
+	if k.limitFor != nil {
+		return nil
+	}
+	dest := c.Destination
+	limits := DestinationLimits{Shared: a.shared, RequestsPerMin: a.rate, WeightPerMin: a.weight}
+	k.mu.Lock()
+	l := k.limits[dest]
+	if l == nil {
+		l = &limiter{}
+		k.limits[dest] = l
+	}
+	k.mu.Unlock()
+	l.declare(DestinationLimits{Concurrency: a.limit, RequestsPerMin: a.rate, WeightPerMin: a.weight, Shared: a.shared})
+	limits = l.resolve(limits)
+	if limits.Shared || !l.tryAdmit(limits) {
+		return nil
+	}
+	if k.slots != nil {
+		select {
+		case k.slots <- struct{}{}:
+		default:
+			l.finish(0, 0)
+			k.retireLimiter(dest, l)
+			return nil
+		}
+	}
+	slots := k.slots
+	return func(res *result) {
+		if slots != nil {
+			<-slots
+		}
+		l.finish(res.Weight, time.Duration(res.RetryAfter)*time.Millisecond)
+		k.retireLimiter(dest, l)
+	}
+}
+
 func (k *Kairo) admit(ctx context.Context, dest string, a *actionDef) (finish func(*result), err error) {
 	var held []chan struct{}
 	releaseSlots := func() {

@@ -41,6 +41,8 @@ export interface CoreCommand {
 	idempotency_key?: string;
 	input?: unknown;
 	destination?: string;
+	/** Set by the host: a real step's intent was recorded with its dispatch (ADR 0085). */
+	intent?: boolean;
 }
 
 /** What applying an event answers besides the new state (wasmcore.Result). */
@@ -72,6 +74,8 @@ export interface Inspection {
 	review?: number[];
 	/** The activations with a real attempt out and its intent durable, in order. A resolve event settles either. */
 	intents?: number[];
+	/** The activations with an attempt out, with or without its intent, in order. One without its intent never acted (ADR 0085). */
+	dispatched?: number[];
 }
 
 export class CoreError extends Error {}

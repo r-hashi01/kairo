@@ -203,6 +203,13 @@ class Embedded:
         self.wake_parent: Callable[[str], None] | None = None
         self.plan_for: Callable[[str], dict[str, Any] | None] | None = None
         self.admit: Admit | None = None
+        # admit_now lets a real step being dispatched pass its limits at
+        # once, if it can: what gives its slots back, or None. Its intent is
+        # recorded with its dispatch only then; one that is to wait records
+        # it once it passes (ADR 0085). Without it, every real step's intent
+        # goes with its dispatch.
+        self.admit_now: Callable[[str, dict[str, Any]], Callable[[Result], None] | None] | None = None
+        self._admitted_at_once: dict[str, Callable[[Result], None]] = {}
 
     async def open(self) -> Embedded:
         await self.store.init()
@@ -656,6 +663,31 @@ class Embedded:
         return _sdk_plan(plan["name"]) and not _strictly_real(plan) and bool(self.core.inspect(row.state).get("intent_durable"))
 
     async def _recover(self, lease: LeaseRow) -> bool:
+        """The process that had lease's step stopped. A real step whose intent
+        was recorded may have acted: its outcome is unknown. One without its
+        intent was still waiting to pass its limits and never acted (ADR
+        0085): the core's recovery dispatches it again, once no step of its
+        run is still out elsewhere (it recovers the whole run)."""
+        row = await self.store.get(lease.run)
+        if row is not None:
+            ins = self.core.inspect(row.state)
+            dispatched = ins.get("dispatched") or []
+            intents = ins.get("intents") or []
+            if lease.act in dispatched and lease.act not in intents:
+                leases, _ = await self.store.recoverable(lease.run, self.now())
+                lost = {x.act for x in leases if x.act != 0}
+                if not all(a in lost for a in dispatched):
+                    return False  # another step of the run is still out: later
+                # Steps of the run that may have acted are settled as unknown
+                # first (their leases end with it); then the rest go again.
+                for a in intents:
+                    x = next((y for y in leases if y.act == a), None)
+                    if x is not None:
+                        await self._unknown_outcome(x)
+                return await self._advance(lease.run, lambda: self._process(lease.run, [{"kind": "recover", "at": self.now()}]))
+        return await self._unknown_outcome(lease)
+
+    async def _unknown_outcome(self, lease: LeaseRow) -> bool:
         return await self._advance(
             lease.run,
             lambda: self._process(lease.run, [
@@ -705,6 +737,9 @@ class Embedded:
         commands. With begin, a new run of its plan (or the existing one: the
         answer says which)."""
         start = begin["plan"] if begin is not None else None
+        # Steps admitted at once, in any try of the transaction below: given
+        # back unless carried out.
+        admitted: dict[str, Callable[[Result], None]] = {}
 
         def change(row: RunRow | None) -> Changes[dict[str, Any]]:
             # A step's outcome ends its lease, applied or not (a stale one).
@@ -738,8 +773,16 @@ class Embedded:
                 res = {"status": r["status"], "output": r.get("output"), "error": r.get("error")}
                 for c in r["commands"]:
                     commands.append(c)
-                    # A real step's intent, committed with what dispatched it.
+                    # A real step's intent, committed with what dispatched it if
+                    # it passes its limits at once; else once it does (ADR 0085).
                     if c["kind"] == "dispatch" and c.get("effect") == "real":
+                        k = f"{c['act']}\0{c.get('attempt', 0)}"
+                        if self.admit_now is not None and k not in admitted:
+                            finish = self.admit_now(run_id, c)
+                            if finish is None:
+                                continue
+                            admitted[k] = finish
+                        c["intent"] = True
                         apply({"kind": "intent", "at": ev["at"], "act": c["act"], "attempt": c.get("attempt", 0)})
 
             for ev in events:
@@ -796,7 +839,18 @@ class Embedded:
                 ch.set_leases.append(LeaseRow(nxt.parent, 0, new_token(), self.owner, at + self.lease_ms))
             return ch
 
-        out = await self.store.with_run(run_id, change)
+        try:
+            out = await self.store.with_run(run_id, change)
+        except BaseException:
+            for finish in admitted.values():
+                finish(Result())
+            raise
+        carried = set() if self._closed else {f"{c['act']}\0{c.get('attempt', 0)}" for c in out["commands"] if c.get("intent")}
+        for k, finish in admitted.items():
+            if k in carried:
+                self._admitted_at_once[f"{run_id}\0{k}"] = finish
+            else:
+                finish(Result())
         if self._closed:
             return {"existing": bool(out["existing"]), "applied": bool(out["applied"])}
         row = out["row"]
@@ -879,10 +933,29 @@ class Embedded:
         release: Callable[[], None] | None = None
         began = 0.0
         try:
-            # Over a limit, the step waits here for a slot, leased (ADR 0059).
+            # Over a limit, the step waits here for a slot, leased (ADR 0059);
+            # unless it passed at once, its intent recorded with its dispatch.
+            at_once = self._admitted_at_once.pop(f"{run_id}\0{c['act']}\0{c.get('attempt', 0)}", None)
             while True:
+                if at_once is not None:
+                    got = at_once
+                    break
                 try:
                     got = await self.admit(task, ctx) if self.admit is not None else None
+                    if callable(got) and c.get("effect") == "real" and self.admit_now is not None:
+                        # A real step dispatched without its intent: recorded now
+                        # that it passed, before it acts (ADR 0085, invariant 4).
+                        try:
+                            recorded = (await self._process_report(run_id, [{"kind": "intent", "at": self.now(), "act": c["act"], "attempt": c.get("attempt", 0)}]))["applied"]
+                        except BaseException:
+                            got(Result())
+                            raise
+                        if not recorded:
+                            # Cancelled meanwhile, or taken up elsewhere: not this attempt's to run.
+                            got(Result())
+                            self._running.pop(key, None)
+                            self._renew()
+                            return
                     break
                 except Exception as e:
                     if not is_workflow_retry(e):
