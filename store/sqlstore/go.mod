@@ -2,6 +2,6 @@ module github.com/r-hashi01/kairo/store/sqlstore
 
 go 1.27.4
 
-require github.com/r-hashi01/kairo v0.5.0
+require github.com/r-hashi01/kairo v0.5.1
 
 replace github.com/r-hashi01/kairo => ../..

@@ -3,8 +3,8 @@ module github.com/r-hashi01/kairo/store/sqlite
 go 1.27.4
 
 require (
-	github.com/r-hashi01/kairo v0.5.0
-	github.com/r-hashi01/kairo/store/sqlstore v0.5.0
+	github.com/r-hashi01/kairo v0.5.1
+	github.com/r-hashi01/kairo/store/sqlstore v0.5.1
 	modernc.org/sqlite v1.60.1
 )
 
