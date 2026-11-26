@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"StoppedDriverIsTakenUp":             testStoppedDriverIsTakenUp,
 		"LiveDriverIsNotDoubled":             testLiveDriverIsNotDoubled,
 		"SignalBeforeTheWait":                testSignalBeforeTheWait,
+		"SignalIDKeptByTheWait":              testSignalIDKeptByTheWait,
 		"SignalReceiptsAndOnlyIfWaiting":     testSignalReceiptsAndOnlyIfWaiting,
 		"WaitTimesOut":                       testWaitTimesOut,
 		"Limits":                             testLimits,
@@ -917,6 +919,22 @@ type onceStore struct {
 	kairo.Store
 	parent string
 	fail   atomic.Bool
+	handed sync.Map // workflows whose drive was handed to nobody
+}
+
+// HandOver records a drive given up: from then on, its lease expires when
+// the test moves the clock past it.
+func (s *onceStore) HandOver(ctx context.Context, l kairo.LeaseRow) error {
+	err := s.Store.HandOver(ctx, l)
+	if err == nil && l.Act == 0 && l.Owner == "" {
+		s.handed.Store(l.Run, true)
+	}
+	return err
+}
+
+func (s *onceStore) handedOver(run string) bool {
+	_, ok := s.handed.Load(run)
+	return ok
 }
 
 var errStoreBusy = errors.New("store busy")
@@ -993,7 +1011,9 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 	}
 	res := run("store-retry", "store-retry-1")
 	// The failure was injected and the drive gave it up: its lease expires.
-	waitUntil(t, func() bool { return armed.Load() && !s.fail.Load() })
+	// The clock moves only after the hand-over, whose expiry is read from
+	// the clock (issue #99).
+	waitUntil(t, func() bool { return s.handedOver("store-retry-1") })
 	expire()
 	if r := <-res; r.err != nil || r.out != "onetwo" {
 		t.Fatalf("%q %v", r.out, r.err)
@@ -1005,7 +1025,7 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 		t.Fatalf("run %+v: %v", info, err)
 	}
 	res = run("explicit-retry", "explicit-retry-1")
-	waitUntil(t, func() bool { return explicit.Load() == 1 })
+	waitUntil(t, func() bool { return s.handedOver("explicit-retry-1") })
 	expire()
 	if r := <-res; r.err != nil || r.out != "ok" {
 		t.Fatalf("explicit: %q %v", r.out, r.err)
@@ -1090,6 +1110,12 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 		t.Fatal(err)
 	}
 	waitUntil(t, func() bool { return runs.get("write") == 1 })
+	// The write's outcome recorded: otherwise the real call would stop for
+	// review when its lease expires, rightly (invariant 5; issue #99).
+	waitUntil(t, func() bool {
+		cs, err := k1.Children(context.Background(), "taken-1")
+		return err == nil && slices.ContainsFunc(cs, func(c kairo.RunInfo) bool { return c.Status == "completed" })
+	})
 	a.dead.Store(true) // stops: its lease is not renewed
 
 	k2 := start(open(), false)
@@ -1233,6 +1259,96 @@ func testSignalBeforeTheWait(t *testing.T, open Opener) {
 	close(gate)
 	out, err := kairo.Await[[]string](context.Background(), k, "ahead-1")
 	if err != nil || !equalJSON(out, []string{"first", "second"}) {
+		t.Fatalf("%v %v", out, err)
+	}
+}
+
+// A signal sent again with its logical ID returns the first receipt, both
+// when a wait took it and when it was sent ahead of its wait: the wait's
+// outcome keeps the ID (ADR 0071; issue #102).
+func testSignalIDKeptByTheWait(t *testing.T, open Opener) {
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: open()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	gate := make(chan struct{})
+	kairo.Action(k, "gate", kairo.Unprotected, func(*kairo.TaskContext, any) (any, error) {
+		<-gate
+		return nil, nil
+	})
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, gated bool) ([]string, error) {
+		if gated {
+			if _, err := kairo.Call[any](ctx, "gate", nil); err != nil {
+				return nil, err
+			}
+		}
+		var got []string
+		for range 2 {
+			p, err := kairo.WaitFor[string](ctx, "s")
+			if err != nil {
+				return nil, err
+			}
+			got = append(got, p)
+		}
+		return got, nil
+	})
+	k.Start(context.Background())
+	ctx := context.Background()
+	send := func(id, p, sid string) kairo.SignalReceipt {
+		t.Helper()
+		r, err := k.SendSignal(ctx, id, "s", p, kairo.SignalID(sid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	again := func(id, p, sid string, want kairo.SignalReceipt) {
+		t.Helper()
+		if got := send(id, p, sid); got != want {
+			t.Fatalf("sent again: %+v, first: %+v", got, want)
+		}
+		if _, err := k.SendSignal(ctx, id, "s", "other", kairo.SignalID(sid)); err == nil {
+			t.Fatal("the same id with another payload was accepted")
+		}
+	}
+
+	// Taken by a wait that was there.
+	if _, err := k.Submit(ctx, "w", false, kairo.WithID("sid-waiting")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool {
+		cs, err := k.Children(ctx, "sid-waiting")
+		return err == nil && slices.ContainsFunc(cs, func(c kairo.RunInfo) bool { return !c.Finished() })
+	})
+	first := send("sid-waiting", "a", "x")
+	if first.Index != 0 || first.Early {
+		t.Fatalf("first: %+v", first)
+	}
+	again("sid-waiting", "a", "x", first)
+	if r := send("sid-waiting", "b", "y"); r.Index != 1 {
+		t.Fatalf("second: %+v", r)
+	}
+	out, err := kairo.Await[[]string](ctx, k, "sid-waiting")
+	if err != nil || !equalJSON(out, []string{"a", "b"}) {
+		t.Fatalf("%v %v", out, err)
+	}
+
+	// Sent ahead of its wait.
+	if _, err := k.Submit(ctx, "w", true, kairo.WithID("sid-ahead")); err != nil {
+		t.Fatal(err)
+	}
+	first = send("sid-ahead", "a", "x")
+	if first.Index != 0 || !first.Early {
+		t.Fatalf("first: %+v", first)
+	}
+	again("sid-ahead", "a", "x", first)
+	if r := send("sid-ahead", "b", "y"); r.Index != 1 {
+		t.Fatalf("second: %+v", r)
+	}
+	close(gate)
+	out, err = kairo.Await[[]string](ctx, k, "sid-ahead")
+	if err != nil || !equalJSON(out, []string{"a", "b"}) {
 		t.Fatalf("%v %v", out, err)
 	}
 }

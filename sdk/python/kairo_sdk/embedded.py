@@ -445,9 +445,13 @@ class Embedded:
     async def signal(self, run_id: str, name: str, payload: Any = None) -> None:
         await self.signal_applied(run_id, name, payload)
 
-    async def signal_applied(self, run_id: str, name: str, payload: Any = None) -> bool:
-        """Applies a signal and says whether its event was recorded (ADR 0064)."""
-        out = await self._process_report(run_id, [{"kind": "signal", "at": self.now(), "name": name, "data": payload}])
+    async def signal_applied(self, run_id: str, name: str, payload: Any = None, meta: Any = None) -> bool:
+        """Applies a signal and says whether its event was recorded (ADR 0064).
+        meta, if any, is kept in the wait's outcome as "_kairo_signal" (ADR 0071)."""
+        ev: dict[str, Any] = {"kind": "signal", "at": self.now(), "name": name, "data": payload}
+        if meta is not None:
+            ev["meta"] = meta
+        out = await self._process_report(run_id, [ev])
         return bool(out["applied"])
 
     async def cancel(self, run_id: str) -> None:

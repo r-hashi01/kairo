@@ -387,9 +387,14 @@ export class Embedded {
 		await this.signalApplied(runId, name, payload);
 	}
 
-	/** Applies a signal and says whether its event was recorded (ADR 0064). */
-	async signalApplied(runId: string, name: string, payload: unknown = null): Promise<boolean> {
-		return (await this.processReported(runId, [{ kind: 'signal', at: this.now(), name, data: payload }])).applied;
+	/**
+	 * Applies a signal and says whether its event was recorded (ADR 0064).
+	 * meta, if any, is kept in the wait's outcome as "_kairo_signal" (ADR 0071).
+	 */
+	async signalApplied(runId: string, name: string, payload: unknown = null, meta?: unknown): Promise<boolean> {
+		const ev: CoreEvent = { kind: 'signal', at: this.now(), name, data: payload };
+		if (meta !== undefined) ev.meta = meta;
+		return (await this.processReported(runId, [ev])).applied;
 	}
 
 	async cancel(runId: string): Promise<void> {
