@@ -465,16 +465,18 @@ func (r *runtime) settledElsewhere(runID string) {
 }
 
 func (r *runtime) signal(ctx context.Context, runID, name string, payload any) error {
-	_, err := r.signalApplied(ctx, runID, name, payload)
+	_, err := r.signalApplied(ctx, runID, name, payload, nil)
 	return err
 }
 
-func (r *runtime) signalApplied(ctx context.Context, runID, name string, payload any) (bool, error) {
+// signalApplied applies signal name to wait runID. meta, if any, is kept in
+// the wait's outcome as "_kairo_signal" (ADR 0071).
+func (r *runtime) signalApplied(ctx context.Context, runID, name string, payload any, meta json.RawMessage) (bool, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return false, err
 	}
-	report, err := r.processReported(ctx, runID, []wasmcore.Event{{Kind: "signal", At: r.now(), Name: name, Data: data}}, nil)
+	report, err := r.processReported(ctx, runID, []wasmcore.Event{{Kind: "signal", At: r.now(), Name: name, Data: data, Meta: meta}}, nil)
 	return report.applied, err
 }
 

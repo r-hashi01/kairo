@@ -454,6 +454,11 @@ function canonical(v: unknown): string {
 	return JSON.stringify(v ?? null);
 }
 
+/** The "_kairo_signal" a wait's outcome keeps, so a retry with the same ID finds it (ADR 0071; issue #102). */
+function signalMeta(id: string, early: boolean, onlyIfWaiting: boolean): { id: string; early: boolean; only_if_waiting: boolean } {
+	return { id, early, only_if_waiting: onlyIfWaiting };
+}
+
 function recordedSignal(output: unknown, payload: unknown, signalId: string, onlyIfWaiting: boolean): boolean | undefined {
 	if (!output || typeof output !== 'object') return undefined;
 	const row = output as { payload?: unknown; _kairo_signal?: { id?: unknown; early?: unknown; only_if_waiting?: unknown } };
@@ -1472,7 +1477,7 @@ export class Kairo {
 				// The no-op transaction is the linearization point for "not
 				// present now". A wait created first accepts the signal here.
 				const applied = rt
-					? { applied: await rt.signalApplied(runId, name, payload), early: false }
+					? { applied: await rt.signalApplied(runId, name, payload, signalMeta(signalId, false, !!opts.onlyIfWaiting)), early: false }
 					: await this.backend.applySignal!(runId, name, payload, signalId, !!opts.onlyIfWaiting);
 				if (applied.applied) {
 					receipt = { runId, index: n, early: !!applied.early };
@@ -1505,7 +1510,7 @@ export class Kairo {
 				continue;
 			}
 			const applied = rt
-				? { applied: await rt.signalApplied(runId, name, payload), early: false }
+				? { applied: await rt.signalApplied(runId, name, payload, signalMeta(signalId, false, !!opts.onlyIfWaiting)), early: false }
 				: await this.backend.applySignal!(runId, name, payload, signalId, !!opts.onlyIfWaiting);
 			if (applied.applied) {
 				receipt = { runId, index: n, early: !!applied.early };
@@ -1540,7 +1545,7 @@ export class Kairo {
 			runId,
 			parent: id,
 			...(this.rt
-				? { then: [{ kind: 'signal', name, data: payload ?? null }] }
+				? { then: [{ kind: 'signal', name, data: payload ?? null, meta: signalMeta(signalId, true, false) }] }
 				: { initialSignal: { name, payload: payload ?? null, signal_id: signalId } }),
 		});
 		return !r.existing;
