@@ -88,16 +88,23 @@ function dying(store: Store): [Store, { dead: boolean }] {
 	return [proxy, state];
 }
 
-function failingOnce(store: Store): [Store, { fail: boolean }] {
+/**
+ * Once armed, fails one transition: the one that creates the next call of
+ * workflow parent (a run under parent that does not exist yet). Other
+ * writes pass, so the failure lands on the same boundary however the work
+ * interleaves (issue #84).
+ */
+function failingOnce(store: Store, parent: string): [Store, { fail: boolean }] {
 	const state = { fail: false };
 	return [new Proxy(store, {
 		get(target, prop) {
 			const v = (target as any)[prop];
 			if (typeof v !== 'function') return v;
-			if (prop === 'withRun') return (...args: unknown[]) => {
-				if (state.fail) {
+			if (prop === 'withRun') return async (...args: unknown[]) => {
+				const id = args[0] as string;
+				if (state.fail && id.startsWith(parent + '/') && (await target.get(id)) === undefined && state.fail) {
 					state.fail = false;
-					return Promise.reject(new Error('store busy'));
+					throw new Error('store busy');
 				}
 				return v.apply(target, args);
 			};
@@ -771,8 +778,12 @@ console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
 
 	test('a transient store error retries the workflow without recording failure', async () => {
 		const path = join(dir, 'store-retry.db');
-		const [store, state] = failingOnce(new SQLiteStore(path));
-		const k = await open(path, { store, leaseMs: 50 });
+		const [store, state] = failingOnce(new SQLiteStore(path), 'store-retry-1');
+		// The clock is the test's: a lease expires when the test moves it,
+		// not because a loaded machine renewed it late (issue #84).
+		let now = Date.now();
+		const expire = () => (now += 100); // past every lease (50 ms) taken so far
+		const k = new Kairo({ backend: await EmbeddedBackend.open({ store, wasm, leaseMs: 50, now: () => now }) });
 		const runs = { first: 0, second: 0, workflow: 0, explicit: 0 };
 		let armed = false;
 		k.defineAction('first', { effect: 'real', handler: async () => (runs.first++, 'one') });
@@ -791,11 +802,18 @@ console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
 			return 'ok';
 		});
 		await k.start();
-		assert.equal(await k.run('store-retry', null, { id: 'store-retry-1' }), 'onetwo');
+		const retried = k.run('store-retry', null, { id: 'store-retry-1' });
+		// The failure was injected and the drive gave it up: its lease expires.
+		await waitUntil(() => armed && !state.fail);
+		expire();
+		assert.equal(await retried, 'onetwo');
 		assert.deepEqual({ first: runs.first, second: runs.second }, { first: 1, second: 1 });
 		assert.ok(runs.workflow >= 2);
 		assert.equal((await k.backend.get('store-retry-1')).status, 'completed');
-		assert.equal(await k.run('explicit-retry', null, { id: 'explicit-retry-1' }), 'ok');
+		const explicit = k.run('explicit-retry', null, { id: 'explicit-retry-1' });
+		await waitUntil(() => runs.explicit === 1);
+		expire();
+		assert.equal(await explicit, 'ok');
 		assert.equal(runs.explicit, 2);
 		await k.close();
 	});

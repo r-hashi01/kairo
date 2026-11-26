@@ -76,8 +76,14 @@ class Dying:
 
 
 class FailingOnce:
-    def __init__(self, store: SQLiteStore) -> None:
+    """Once armed, fails one transition: the one that creates the next call of
+    workflow parent (a run under parent that does not exist yet). Other writes
+    pass, so the failure lands on the same boundary however the work
+    interleaves (issue #84)."""
+
+    def __init__(self, store: SQLiteStore, parent: str) -> None:
         self._store = store
+        self._parent = parent
         self.fail = False
 
     def __getattr__(self, name: str) -> Any:
@@ -85,11 +91,11 @@ class FailingOnce:
         if name != "with_run":
             return v
 
-        async def once(*args: Any, **kw: Any) -> Any:
-            if self.fail:
+        async def once(id: str, *args: Any, **kw: Any) -> Any:
+            if self.fail and id.startswith(self._parent + "/") and await self._store.get(id) is None and self.fail:
                 self.fail = False
                 raise sqlite3.OperationalError("store busy")
-            return await v(*args, **kw)
+            return await v(id, *args, **kw)
 
         return once
 
@@ -827,8 +833,16 @@ class DrivingTest(unittest.TestCase):
     def test_a_transient_store_error_retries_the_workflow_without_recording_failure(self) -> None:
         async def main() -> None:
             path = self.path("store-retry.db")
-            store = FailingOnce(SQLiteStore(path))
-            k = await self.open(path, store=store, lease_ms=50)
+            store = FailingOnce(SQLiteStore(path), "store-retry-1")
+            # The clock is the test's: a lease expires when the test moves it,
+            # not because a loaded machine renewed it late (issue #84).
+            clock = {"now": int(time.time() * 1000)}
+
+            def expire() -> None:
+                clock["now"] += 100  # past every lease (50 ms) taken so far
+
+            b = await EmbeddedBackend.open(store, wasm=self.wasm, lease_ms=50, now=lambda: clock["now"])
+            k = Kairo(backend=b)
             runs = {"first": 0, "second": 0, "workflow": 0, "explicit": 0}
             armed = False
 
@@ -860,11 +874,18 @@ class DrivingTest(unittest.TestCase):
                 return "ok"
 
             await k.start()
-            self.assertEqual(await k.run("store-retry", None, id="store-retry-1"), "onetwo")
+            retried = asyncio.ensure_future(k.run("store-retry", None, id="store-retry-1"))
+            # The failure was injected and the drive gave it up: its lease expires.
+            await wait_until(lambda: armed and not store.fail)
+            expire()
+            self.assertEqual(await retried, "onetwo")
             self.assertEqual((runs["first"], runs["second"]), (1, 1))
             self.assertGreaterEqual(runs["workflow"], 2)
             self.assertEqual((await k.backend.get("store-retry-1"))["status"], "completed")
-            self.assertEqual(await k.run("explicit-retry", None, id="explicit-retry-1"), "ok")
+            explicit = asyncio.ensure_future(k.run("explicit-retry", None, id="explicit-retry-1"))
+            await wait_until(lambda: runs["explicit"] == 1)
+            expire()
+            self.assertEqual(await explicit, "ok")
             self.assertEqual(runs["explicit"], 2)
             await k.close()
 
