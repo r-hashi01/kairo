@@ -170,4 +170,4 @@ Lambda などから直接呼ぶときは、`tick_handler(make)` を使います�
 
 ## 対応していない環境
 
-- **Cloudflare Workers:** 今の埋め込みのランタイムは `node:wasi` と `node:sqlite` を使うので、動きません。
+- **Cloudflare Workers:** 今の埋め込みのランタイムは `node:sqlite` を使うので、動きません。WASM のコアは `node:wasi` を使わず、SDK の中の最小限の WASI で動きます（#108）。
