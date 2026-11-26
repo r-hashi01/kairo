@@ -919,6 +919,22 @@ type onceStore struct {
 	kairo.Store
 	parent string
 	fail   atomic.Bool
+	handed sync.Map // workflows whose drive was handed to nobody
+}
+
+// HandOver records a drive given up: from then on, its lease expires when
+// the test moves the clock past it.
+func (s *onceStore) HandOver(ctx context.Context, l kairo.LeaseRow) error {
+	err := s.Store.HandOver(ctx, l)
+	if err == nil && l.Act == 0 && l.Owner == "" {
+		s.handed.Store(l.Run, true)
+	}
+	return err
+}
+
+func (s *onceStore) handedOver(run string) bool {
+	_, ok := s.handed.Load(run)
+	return ok
 }
 
 var errStoreBusy = errors.New("store busy")
@@ -995,7 +1011,9 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 	}
 	res := run("store-retry", "store-retry-1")
 	// The failure was injected and the drive gave it up: its lease expires.
-	waitUntil(t, func() bool { return armed.Load() && !s.fail.Load() })
+	// The clock moves only after the hand-over, whose expiry is read from
+	// the clock (issue #99).
+	waitUntil(t, func() bool { return s.handedOver("store-retry-1") })
 	expire()
 	if r := <-res; r.err != nil || r.out != "onetwo" {
 		t.Fatalf("%q %v", r.out, r.err)
@@ -1007,7 +1025,7 @@ func testTransientStoreErrorRetriesWorkflow(t *testing.T, open Opener) {
 		t.Fatalf("run %+v: %v", info, err)
 	}
 	res = run("explicit-retry", "explicit-retry-1")
-	waitUntil(t, func() bool { return explicit.Load() == 1 })
+	waitUntil(t, func() bool { return s.handedOver("explicit-retry-1") })
 	expire()
 	if r := <-res; r.err != nil || r.out != "ok" {
 		t.Fatalf("explicit: %q %v", r.out, r.err)
@@ -1092,6 +1110,12 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 		t.Fatal(err)
 	}
 	waitUntil(t, func() bool { return runs.get("write") == 1 })
+	// The write's outcome recorded: otherwise the real call would stop for
+	// review when its lease expires, rightly (invariant 5; issue #99).
+	waitUntil(t, func() bool {
+		cs, err := k1.Children(context.Background(), "taken-1")
+		return err == nil && slices.ContainsFunc(cs, func(c kairo.RunInfo) bool { return c.Status == "completed" })
+	})
 	a.dead.Store(true) // stops: its lease is not renewed
 
 	k2 := start(open(), false)
