@@ -912,17 +912,23 @@ func TestLogCompaction(t *testing.T) {
 	}
 	// Compaction is checked only as the log grows (no timer), so keep a
 	// trickle of work going while checkpoints and snapshot deletes finish.
+	// Retirement removes segments one after another off the shard loop:
+	// the oldest one gone does not mean the rest are. Wait for both, with
+	// the same bound (not a count taken mid-retirement).
 	var segs []string
-	waitFor(t, func() bool {
+	for deadline := time.Now().Add(10 * time.Second); ; {
 		id, _ := submit(e1, SubmitRequest{Plan: "five", Input: json.RawMessage(`{"q":"y"}`), Tenant: "t", Tier: &ft})
 		wait(t, e1, id)
 		segs = walSegments(t, dir)
-		return !strings.HasSuffix(filepath.Base(segs[0]), ".L00000000000000000001.wal")
-	})
-	t.Logf("%d segments left after ~%d records", len(segs), 450*13)
-	if len(segs) > 30 {
-		t.Fatalf("log not compacted: %d segments", len(segs))
+		if !strings.HasSuffix(filepath.Base(segs[0]), ".L00000000000000000001.wal") && len(segs) <= 30 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log not compacted: %d segments, the oldest %s", len(segs), filepath.Base(segs[0]))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	t.Logf("%d segments left after ~%d records", len(segs), 450*13)
 	// Crash without draining the blocked task.
 	for _, s := range e1.shards {
 		s.inbox.Push(msg{kind: mStop})
