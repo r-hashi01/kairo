@@ -1070,6 +1070,13 @@ func (d *deadStore) Recoverable(ctx context.Context, run string, now int64) ([]k
 	return d.Store.Recoverable(ctx, run, now)
 }
 
+func (d *deadStore) HandOver(ctx context.Context, l kairo.LeaseRow) error {
+	if d.dead.Load() {
+		return errDead
+	}
+	return d.Store.HandOver(ctx, l)
+}
+
 func (d *deadStore) EndDrive(ctx context.Context, run, owner string, token int32, now int64, resume bool) error {
 	if d.dead.Load() {
 		return errDead
