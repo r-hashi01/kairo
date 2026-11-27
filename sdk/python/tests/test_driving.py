@@ -405,6 +405,79 @@ class DrivingTest(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_a_gone_process_is_taken_up_before_its_lease_expires(self) -> None:
+        """A process that is gone (its liveness mark taken away, as the OS does
+        when a process ends) has its workflow taken up long before its lease
+        expires, and the real call it made is not made again (ADR 0086)."""
+        path = self.path("gone.db")
+        writes = {"n": 0}
+
+        async def start(store: Any, hang: bool, owner_check_ms: int | None = None) -> Kairo:
+            kw = {"owner_check_ms": owner_check_ms} if owner_check_ms else {}
+            b = await EmbeddedBackend.open(store if store is not None else SQLiteStore(path), wasm=self.wasm, lease_ms=30_000, **kw)
+            k = Kairo(backend=b)
+
+            @k.action("write")
+            def write(p, ctx):
+                writes["n"] += 1
+                return f"wrote {p}"
+
+            @k.workflow("w")
+            async def w(ctx, p):
+                out = await ctx.call("write", p)
+                if hang:
+                    await asyncio.Event().wait()  # as a process that stops here
+                return out + "!"
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            store = Dying(SQLiteStore(path))
+            k1 = await start(store, True)
+            await k1.submit("w", "f", id="gone-1")
+            await wait_until(lambda: bool(query(path, "SELECT 1 FROM kairo_run WHERE parent = 'gone-1' AND status = 'completed'")))
+            store.dead = True  # stops: its leases are not renewed
+            k1.backend.runtime._live._held.close()  # and its lock goes, as the OS takes it from a process that ends
+
+            k2 = await start(None, False, owner_check_ms=100)
+            # Well within the 30 s lease.
+            self.assertEqual(await asyncio.wait_for(k2.result("gone-1"), 10), "wrote f!")
+            self.assertEqual(writes["n"], 1, "the real call was not made again")
+            await k2.close()
+            await k1.close()
+
+        asyncio.run(main())
+
+    def test_a_live_process_is_not_taken_for_gone(self) -> None:
+        """A live process (its mark held) is not taken for gone (ADR 0086)."""
+        path = self.path("live.db")
+
+        async def main() -> None:
+            k1 = await self.open(path, lease_ms=30_000)
+            release = asyncio.Event()
+
+            @k1.action("hold", effect="unprotected")
+            def hold(_, ctx):
+                return "ok"
+
+            @k1.workflow("w")
+            async def w(ctx, _):
+                await release.wait()
+                return await ctx.call("hold")
+
+            await k1.start()
+            await k1.submit("w", None, id="live-1")
+            await wait_until(lambda: bool(query(path, "SELECT 1 FROM kairo_lease WHERE run = 'live-1'")))
+            b2 = await EmbeddedBackend.open(SQLiteStore(path), wasm=self.wasm, lease_ms=30_000, owner_check_ms=100)
+            self.assertFalse(await b2.runtime.check_owners(), "its owner lives")
+            release.set()
+            self.assertEqual(await k1.result("live-1"), "ok")
+            await b2.close()
+            await k1.close()
+
+        asyncio.run(main())
+
     def test_a_blocked_call_waits_for_review(self) -> None:
         """A real call whose process stopped while it ran is not run again: it
         stops for review, and the workflow waits for it there instead of
@@ -1532,6 +1605,54 @@ class DrivingPostgresTest(unittest.TestCase):
                 await pool.close()
 
         asyncio.run(main())
+
+    def test_a_gone_process_is_taken_up_before_its_lease_expires(self) -> None:
+        """A process whose session ended (its advisory lock gone with it) has its
+        workflow taken up long before its lease expires (ADR 0086)."""
+        writes = {"n": 0}
+
+        async def body(open_, pg_store) -> None:
+            async def start(store: Any, hang: bool, owner_check_ms: int | None = None) -> Kairo:
+                kw = {"owner_check_ms": owner_check_ms} if owner_check_ms else {}
+                b = await EmbeddedBackend.open(store, wasm=self.wasm, lease_ms=30_000, **kw)
+                k = Kairo(backend=b)
+
+                @k.action("write")
+                def write(p, ctx):
+                    writes["n"] += 1
+                    return f"wrote {p}"
+
+                @k.workflow("w")
+                async def w(ctx, p):
+                    out = await ctx.call("write", p)
+                    if hang:
+                        await asyncio.Event().wait()
+                    return out + "!"
+
+                await k.start()
+                return k
+
+            store = Dying(pg_store())
+            k1 = await start(store, True)
+            await k1.submit("w", "f", id="gone-pg")
+
+            async def wrote() -> bool:
+                return any(c["status"] == "completed" for c in await k1.children("gone-pg"))
+
+            for _ in range(400):
+                if await wrote():
+                    break
+                await asyncio.sleep(0.025)
+            store.dead = True
+            live = k1.backend.runtime._live
+            await live._conn.close()  # its session ends, as with its process
+            k2 = await start(pg_store(), False, owner_check_ms=100)
+            self.assertEqual(await asyncio.wait_for(k2.result("gone-pg"), 10), "wrote f!")
+            self.assertEqual(writes["n"], 1)
+            await k2.close()
+            await k1.close()
+
+        self.run_pg(body)
 
     def test_a_stopped_driver_is_taken_up(self) -> None:
         writes = {"n": 0}

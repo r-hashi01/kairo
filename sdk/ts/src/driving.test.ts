@@ -314,6 +314,62 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k1.close();
 	});
 
+	// A process that is gone (its liveness mark taken away, as the OS does
+	// when a process ends) has its workflow taken up long before its lease
+	// expires, and the real call it made is not made again (ADR 0086).
+	test('a gone process is taken up before its lease expires', async () => {
+		const path = join(dir, 'gone.db');
+		let writes = 0;
+		const start = async (store: Store, hang: boolean) => {
+			const k = await open(path, { store, leaseMs: 30_000 });
+			k.defineAction('write', { effect: 'real', handler: async (p: string) => (writes++, `wrote ${p}`) });
+			k.workflow('w', async (ctx, p: string) => {
+				const w = await ctx.call<string>('write', p);
+				if (hang) await new Promise(() => {}); // as a process that stops here
+				return w + '!';
+			});
+			await k.start();
+			return k;
+		};
+		const [store, state] = dying(new SQLiteStore(path));
+		const k1 = await start(store, true);
+		await k1.submit('w', 'f', { id: 'gone-1' });
+		await waitUntil(async () => (await query(path, "SELECT 1 FROM kairo_run WHERE parent = 'gone-1' AND status = 'completed'")).length > 0);
+		state.dead = true; // stops: its leases are not renewed
+		(k1.backend as any).runtime.live.held.close(); // and its lock goes, as the OS takes it from a process that ends
+
+		const k2 = new Kairo({ backend: await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, leaseMs: 30_000, ownerCheckMs: 100 }) });
+		k2.defineAction('write', { effect: 'real', handler: async (p: string) => (writes++, `wrote ${p}`) });
+		k2.workflow('w', async (ctx, p: string) => (await ctx.call<string>('write', p)) + '!');
+		await k2.start();
+		// Well within the 30 s lease.
+		assert.equal(await k2.result('gone-1', { signal: AbortSignal.timeout(10_000) }), 'wrote f!');
+		assert.equal(writes, 1, 'the real call was not made again');
+		await k2.close();
+		await k1.close();
+	});
+
+	// A live process (its mark held) is not taken for gone: its work stays
+	// with it until its lease expires (ADR 0086).
+	test('a live process is not taken for gone', async () => {
+		const path = join(dir, 'live.db');
+		const s1 = new SQLiteStore(path);
+		const k1 = new Kairo({ backend: await EmbeddedBackend.open({ store: s1, wasm, leaseMs: 30_000 }) });
+		let release!: () => void;
+		const held = new Promise<void>((r) => (release = r));
+		k1.defineAction('hold', { effect: 'unprotected', handler: async () => (await held, 'ok') });
+		k1.workflow('w', async (ctx) => ctx.call<string>('hold'));
+		await k1.start();
+		await k1.submit('w', null, { id: 'live-1' });
+		await waitUntil(async () => (await query(path, "SELECT 1 FROM kairo_lease WHERE run LIKE 'live-1/%'")).length > 0);
+		const rt2 = (await EmbeddedBackend.open({ store: new SQLiteStore(path), wasm, leaseMs: 30_000, ownerCheckMs: 100 })).runtime as any;
+		assert.equal(await rt2.checkOwners(), false, 'its owner lives');
+		release();
+		assert.equal(await k1.result('live-1'), 'ok');
+		await rt2.close();
+		await k1.close();
+	});
+
 	// A resident process that stops without closing: another one takes its
 	// workflow up when its drive lease expires, and the real call it made
 	// is not made again.
@@ -1312,6 +1368,35 @@ describe('driving workflows on PostgreSQL (ADR 0059)', { skip: !hasGo || !dsn ||
 		await pool.end();
 	});
 	const pgStore = () => new PostgresStore(pool, { prefix });
+
+	// A process whose session ended (its advisory lock gone with it) has its
+	// workflow taken up long before its lease expires; the real call it
+	// made is not made again (ADR 0086).
+	test('a gone process is taken up before its lease expires', async () => {
+		let writes = 0;
+		const start = async (store: Store, hang: boolean, ownerCheckMs?: number) => {
+			const k = new Kairo({ backend: await EmbeddedBackend.open({ store, wasm, leaseMs: 30_000, ...(ownerCheckMs ? { ownerCheckMs } : {}) }) });
+			k.defineAction('write', { effect: 'real', handler: async (p: string) => (writes++, `wrote ${p}`) });
+			k.workflow('w', async (ctx, p: string) => {
+				const w = await ctx.call<string>('write', p);
+				if (hang) await new Promise(() => {});
+				return w + '!';
+			});
+			await k.start();
+			return k;
+		};
+		const [store, state] = dying(pgStore());
+		const k1 = await start(store, true);
+		await k1.submit('w', 'f', { id: 'gone-pg' });
+		await waitUntil(async () => (await k1.children('gone-pg')).some((c) => c.status === 'completed'));
+		state.dead = true;
+		(k1.backend as any).runtime.live.client.release(true); // its session ends, as with its process
+		const k2 = await start(pgStore(), false, 100);
+		assert.equal(await k2.result('gone-pg', { signal: AbortSignal.timeout(10_000) }), 'wrote f!');
+		assert.equal(writes, 1);
+		await k2.close();
+		await k1.close();
+	});
 
 	test('a stopped driver is taken up', async () => {
 		let writes = 0;

@@ -503,6 +503,7 @@ export class Kairo {
 	private readonly life = new AbortController();
 	/** Wait mode: the sweep, once a lease period, of what stopped processes left (ADR 0059). */
 	private sweepTimer?: ReturnType<typeof setInterval>;
+	private ownerTimer?: ReturnType<typeof setInterval>;
 	/** Wait mode: callers waiting in result() (run() included); the sweep keeps the process alive while there are any. */
 	private awaiting = 0;
 	private sweeping?: Promise<void>;
@@ -532,6 +533,13 @@ export class Kairo {
 			this.rt = rt;
 			if (opts.logger) rt.logger = opts.logger;
 			if (opts.observe) rt.observer = opts.observe;
+			// A process that lost its liveness mark may have had its work taken
+			// up already: it stops, as a process that stops (ADR 0086).
+			rt.onLost = () => {
+				if (this.closing) return;
+				this.logger.warn('kairo: this process lost its liveness mark; it stops', {});
+				void this.close();
+			};
 			// A real step's intent goes with its dispatch only if it passes its
 			// limits at once; one that waits records it once it passes (ADR 0085).
 			rt.admitNow = (runId, c) => this.admitNow(runId, c);
@@ -660,6 +668,13 @@ export class Kairo {
 			sweep();
 			this.sweepTimer = setInterval(sweep, rt.lease);
 			this.sweepTimer.unref?.();
+			// Between sweeps: owners whose mark is gone have their work taken
+			// up at once, without waiting for their leases (ADR 0086).
+			this.ownerTimer = setInterval(() => {
+				if (this.closing || this.draining) return;
+				rt.checkOwners().then((took) => took && sweep(), (e) => this.logger.warn('kairo: checking owners', { err: e }));
+			}, rt.ownerCheckMs);
+			this.ownerTimer.unref?.();
 		}
 	}
 
@@ -671,6 +686,7 @@ export class Kairo {
 		this.closing = true;
 		this.stopHook?.();
 		clearInterval(this.sweepTimer);
+		clearInterval(this.ownerTimer);
 		this.life.abort();
 		for (const a of this.driving) a.abort();
 		// The drives here end; their leases are left expired, for another

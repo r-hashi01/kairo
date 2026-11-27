@@ -608,6 +608,9 @@ class Kairo:
                 self._rt.logger = logger
             if observe is not None:
                 self._rt.observer = observe
+            # A process that lost its liveness mark may have had its work taken
+            # up already: it stops, as a process that stops (ADR 0086).
+            self._rt.on_lost = self._lost_mark
         self._logger = logger or (self._rt.logger if self._rt is not None else LOGGER)
         # The clock (unix ms): the embedded runtime's (its now), or the system's.
         self._now: Callable[[], int] = self._rt.now if self._rt is not None else _now_ms
@@ -623,6 +626,7 @@ class Kairo:
         self._life: asyncio.Future[None] | None = None
         # Wait mode: the sweep, once a lease period, of what stopped processes left (ADR 0059).
         self._sweeper: asyncio.Future[None] | None = None
+        self._owner_watch: asyncio.Future[None] | None = None
         # Limits (ADR 0059): steps at once in this process (embedded), and by destination.
         self._slots: _Slots | None = None
         self._limits: dict[str, _Limiter] = {}
@@ -792,6 +796,30 @@ class Kairo:
             # processes that stopped left (ADR 0059): their workflows, steps and
             # timers. One task for the process, not one for each run.
             self._sweeper = asyncio.ensure_future(self._sweep(rt))
+            # Between sweeps: owners whose mark is gone have their work taken
+            # up at once, without waiting for their leases (ADR 0086).
+            self._owner_watch = asyncio.ensure_future(self._watch_owners(rt))
+
+    def _lost_mark(self) -> None:
+        if self._closing:
+            return
+        self._logger.warning("kairo: this process lost its liveness mark; it stops")
+        fut = asyncio.ensure_future(self.close())
+        self._background.add(fut)
+        fut.add_done_callback(self._background.discard)
+
+    async def _watch_owners(self, rt: Embedded) -> None:
+        life = self._life_future()
+        while not self._closing:
+            try:
+                if not self._draining and await rt.check_owners():
+                    await rt.tick()
+            except Exception as e:
+                if not self._closing:
+                    self._logger.warning("kairo: checking owners: %s", e)
+            if self._closing:
+                return
+            await asyncio.wait({life}, timeout=rt.owner_check_ms / 1000)
 
     async def _sweep(self, rt: Embedded) -> None:
         life = self._life_future()
@@ -883,7 +911,7 @@ class Kairo:
             _set(stop)
         # The drives here end; their leases are left expired, for another
         # process to take up (ADR 0059).
-        waits = [*self._drives, *self._redrives] + ([self._sweeper] if self._sweeper is not None else [])
+        waits = [*self._drives, *self._redrives] + [f for f in (self._sweeper, self._owner_watch) if f is not None]
         await asyncio.gather(*waits, return_exceptions=True)
         await self.backend.close()
         if self._metrics is not None:

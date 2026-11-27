@@ -4,6 +4,7 @@
 // the events, replace the state and arm or disarm timers.
 
 import type { CoreEvent } from './core.ts';
+import { PgLiveness, SQLiteLiveness, type Liveness } from './liveness.ts';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, readdir, realpath, rm, rmdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -159,6 +160,14 @@ export interface Store {
 	/** Ends owner's leases now (a process that knows its earlier self stopped). */
 	expireLeases(owner: string, now: number): Promise<void>;
 	/**
+	 * What tells owners' liveness (ADR 0086), if this store can: a process
+	 * holds its mark while it lives, and a gone owner's leases are taken up
+	 * without waiting for them to expire. Absent: by time only.
+	 */
+	liveness?(): Liveness | undefined;
+	/** Owners of leases not expired at now (ADR 0086). */
+	leaseOwners?(now: number): Promise<string[]>;
+	/**
 	 * Calls settled with the id of each run that settles in any process
 	 * (Changes.notify), until the returned function is called. Absent:
 	 * runs settled in other processes are not heard of.
@@ -189,6 +198,8 @@ export function retryingStore(store: Store): Store {
 		get(target, prop) {
 			const value = Reflect.get(target, prop, target) as unknown;
 			if (typeof value !== 'function') return value;
+			// Not a store operation: what tells liveness (ADR 0086), as it is.
+			if (prop === 'liveness') return value.bind(target);
 			return async (...given: unknown[]) => {
 				const args = [...given];
 				let callbackError: unknown;
@@ -438,6 +449,7 @@ export class SQLiteStore implements Store {
 			expired: this.db.prepare(`SELECT run, act, attempt, owner, until FROM ${p}lease WHERE until < ? ORDER BY until LIMIT ?`),
 			renew: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
 			expire: this.db.prepare(`UPDATE ${p}lease SET until = ? WHERE owner = ?`),
+			leaseOwners: this.db.prepare(`SELECT DISTINCT owner FROM ${p}lease WHERE until >= ? AND owner <> ''`),
 			nextTimer: this.db.prepare(`SELECT MIN(at) AS t FROM ${p}timer`),
 			nextLease: this.db.prepare(`SELECT MIN(until) AS t FROM ${p}lease`),
 			handOver: this.db.prepare(`UPDATE ${p}lease SET owner = ?, until = ? WHERE run = ? AND act = ? AND attempt = ?`),
@@ -609,6 +621,14 @@ export class SQLiteStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		this.q.expire.run(now - 1, owner);
+	}
+
+	liveness(): Liveness | undefined {
+		return this.path === ':memory:' ? undefined : new SQLiteLiveness(this.path);
+	}
+
+	async leaseOwners(now: number): Promise<string[]> {
+		return this.q.leaseOwners.all(now).map((r: any) => String(r.owner));
 	}
 
 	async claimDrive(l: LeaseRow, now: number): Promise<boolean> {
@@ -929,6 +949,15 @@ export class PostgresStore implements Store {
 
 	async expireLeases(owner: string, now: number): Promise<void> {
 		await this.pool.query(`UPDATE ${this.p}lease SET until = $1 WHERE owner = $2`, [now - 1, owner]);
+	}
+
+	liveness(): Liveness {
+		return new PgLiveness(this.pool);
+	}
+
+	async leaseOwners(now: number): Promise<string[]> {
+		const r = await this.pool.query(`SELECT DISTINCT owner FROM ${this.p}lease WHERE until >= $1 AND owner <> ''`, [now]);
+		return r.rows.map((x: any) => String(x.owner));
 	}
 
 	async claimDrive(l: LeaseRow, now: number): Promise<boolean> {
