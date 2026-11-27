@@ -3,7 +3,7 @@
 // I/O happens here; the embedded runtime reads and writes the state.
 
 import { readFileSync } from 'node:fs';
-import { WASI } from 'node:wasi';
+import { wasiImports } from './wasi.ts';
 
 /** The ABI version this SDK speaks (wasmcore.ABIVersion). */
 export const ABI_VERSION = 1;
@@ -90,9 +90,9 @@ export class Core {
 	/** Loads the WASM module from path (or its bytes). */
 	static async load(wasm: string | Uint8Array): Promise<Core> {
 		const bytes = typeof wasm === 'string' ? readFileSync(wasm) : wasm;
-		const wasi = new WASI({ version: 'preview1' });
-		const instance = await WebAssembly.instantiate(await WebAssembly.compile(new Uint8Array(bytes)), wasi.getImportObject() as WebAssembly.Imports);
-		wasi.initialize(instance);
+		const wasi = wasiImports(); // not node:wasi, which warns (issue #108)
+		const instance = await WebAssembly.instantiate(await WebAssembly.compile(new Uint8Array(bytes)), wasi.imports);
+		wasi.start(instance);
 		return new Core(instance);
 	}
 

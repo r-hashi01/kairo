@@ -25,4 +25,4 @@ Preconditions:
 ## Gotchas
 
 - ワークフローの保存状態は、関数が例外を投げて失敗しても `status: "completed"` になります。成否は `output.payload.ok` で見ます。`status` だけで成功と判断しないでください。
-- Node は WASI に `ExperimentalWarning` を出します。`kv.sh` は `--no-warnings` で消しています。
+- SDK は `node:wasi` を使わないので、WASI の `ExperimentalWarning` は出ません（#108）。`kv.sh` の `--no-warnings` は、ほかの実験的な機能の警告を消すために残しています。
