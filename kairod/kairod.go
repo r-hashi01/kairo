@@ -1,0 +1,317 @@
+// Package kairod runs the engine as a daemon: an HTTP control API, a
+// socket for pulling workers, and the built-in HTTP executor for LLM calls.
+// cmd/kairod is it with files only; store/kairod, the kairod released, can
+// keep the durable tiers in a SQL database too (ADR 0087).
+package kairod
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/r-hashi01/kairo/api"
+	"github.com/r-hashi01/kairo/engine"
+	"github.com/r-hashi01/kairo/executor/httpexec"
+	"github.com/r-hashi01/kairo/httpaction"
+	"github.com/r-hashi01/kairo/ir"
+	"github.com/r-hashi01/kairo/metrics"
+	"github.com/r-hashi01/kairo/obs"
+	"github.com/r-hashi01/kairo/protocol"
+	"github.com/r-hashi01/kairo/sched"
+	"github.com/r-hashi01/kairo/task"
+)
+
+// Main runs kairod with the flags of the command line, until it is
+// stopped. storage opens the SQL store named by KAIRO_STORE (ADR 0087);
+// nil: this kairod keeps its data in files only.
+func Main(storage Storage) {
+	var (
+		dataDir      = flag.String("data", "./kairo-data", "data directory (logs, snapshots, blobs, plans)")
+		shards       = flag.Int("shards", 0, "number of shards (default: GOMAXPROCS; fixed per data directory)")
+		httpAddr     = flag.String("http", "127.0.0.1:8420", "control API listen address")
+		callbackURL  = flag.String("callback-url", "", "public HTTPS base for daemon-owned action callbacks (enables callbacks; keys come from KAIRO_CALLBACK_KEYS)")
+		callbackAddr = flag.String("callback-http", "127.0.0.1:8421", "callback-only listen address, normally behind the callback URL's TLS proxy")
+		callbackMax  = flag.Int64("callback-max-body-bytes", httpaction.DefaultMaxBody, "maximum daemon-owned action callback body (1..512 MiB)")
+		sockPath     = flag.String("socket", "", "UNIX socket for workers (default: <data>/worker.sock)")
+		tcpAddr      = flag.String("worker-tcp", "", "optional TCP address for workers (requires KAIRO_WORKER_TOKEN)")
+		insecureTCP  = flag.Bool("allow-insecure-worker-tcp", false, "allow worker TCP without authentication (development only)")
+		nodesFile    = flag.String("nodes", "", "JSON file with an array of node specs")
+		limitFile    = flag.String("limits", "", `JSON file: {"<destination>": {"RPM":..,"TPM":..,"TenantConcurrency":..}}`)
+		obsFile      = flag.String("obs", "", "write the observability stream as JSON lines to this file (- for stdout)")
+		metricsFile  = flag.String("metrics", "", "write bounded operational measurements as JSON lines to this file (- for stdout)")
+		tierName     = flag.String("tier", "none", "default durability tier: none|memory|file")
+		noSync       = flag.Bool("nosync", false, "skip fsync (only for tmpfs or testing)")
+		maxActive    = flag.Int("max-active", 0, "admission: max concurrently active runs (0 = unlimited)")
+		maxQueued    = flag.Int("max-queued", 100000, "admission: max runs waiting for admission")
+		perTenant    = flag.Int("tenant-max-active", 0, "admission: max active runs per tenant (0 = unlimited)")
+		maxStarting  = flag.Int("max-starting", 0, "admission: safety ceiling per shard/tier for starts awaiting durable acknowledgement (0 = adaptive)")
+		httpConc     = flag.Int("http-concurrency", 0, "concurrent requests of the built-in HTTP executor (0: from the open file limit, ADR 0039)")
+		httpMaxBody  = flag.Int64("http-max-response-bytes", httpexec.DefaultMaxResponseBytes, "maximum successful response or retained SSE output of the built-in HTTP executor (1..512 MiB)")
+		idemTTL      = flag.Duration("idempotency-ttl", 24*time.Hour, "how long finished run ids stay idempotency keys across restarts (negative disables)")
+		storeNS      = flag.String("store-namespace", "kairod", "with KAIRO_STORE: the namespace of this kairod's data in the database")
+		storeInsec   = flag.Bool("store-allow-insecure", false, "with KAIRO_STORE: allow a connection without verified TLS (tests and trusted local setups only)")
+	)
+	flag.Parse()
+	maxCallbackBody, err := httpaction.NormalizeMaxBody(*callbackMax)
+	if err != nil {
+		log.Fatal(err)
+	}
+	maxHTTPResponse, err := httpexec.NormalizeMaxResponseBytes(*httpMaxBody)
+	if err != nil {
+		log.Fatal(err)
+	}
+	workerToken := os.Getenv("KAIRO_WORKER_TOKEN")
+	if err := validateWorkerListener(*tcpAddr, workerToken, *insecureTCP); err != nil {
+		log.Fatal(err)
+	}
+
+	var callbacks *httpaction.CallbackCapabilities
+	if *callbackURL != "" {
+		keys, err := callbackKeys(os.Getenv("KAIRO_CALLBACK_KEYS"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		callbacks, err = httpaction.NewCallbackCapabilities(*callbackURL, keys, time.Now)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	var tier engine.Tier
+	if err := tier.UnmarshalText([]byte(*tierName)); err != nil {
+		log.Fatal(err)
+	}
+	reg := ir.NewRegistry()
+	// Built-in HTTP actions: an LLM call is unprotected (safe to re-run);
+	// a generic request is left undeclared, so it is treated as real.
+	reg.Register(ir.NodeSpec{Action: "http.llm", Effect: ir.EffectUnprotected, MaxAttempts: 4, Timeout: ir.Duration(10 * time.Minute)})
+	if *nodesFile != "" {
+		b, err := os.ReadFile(*nodesFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := reg.LoadJSON(b); err != nil {
+			log.Fatalf("%s: %v", *nodesFile, err)
+		}
+	}
+	limits := map[string]sched.DestLimits{}
+	if *limitFile != "" {
+		b, err := os.ReadFile(*limitFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &limits); err != nil {
+			log.Fatalf("%s: %v", *limitFile, err)
+		}
+	}
+	var sink obs.Sink = obs.Discard
+	switch *obsFile {
+	case "":
+	case "-":
+		sink = obs.NewJSONLines(os.Stdout)
+	default:
+		f, err := os.OpenFile(*obsFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		sink = obs.NewJSONLines(f)
+	}
+	var metricSink metrics.Sink
+	switch *metricsFile {
+	case "":
+	case "-":
+		metricSink = metrics.NewJSONLines(os.Stdout)
+	default:
+		f, err := os.OpenFile(*metricsFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		metricSink = metrics.NewJSONLines(f)
+	}
+
+	cfg := engine.Config{
+		Shards:         *shards,
+		Registry:       reg,
+		DataDir:        *dataDir,
+		NoSync:         *noSync,
+		DefaultTier:    tier,
+		IdempotencyTTL: *idemTTL,
+		Admission: sched.AdmissionConfig{
+			MaxActive: *maxActive, MaxQueued: *maxQueued,
+			MaxActivePerTenant: func(string) int { return *perTenant }, MaxStarting: *maxStarting,
+		},
+		Limits:  func(dest string) sched.DestLimits { return limits[dest] },
+		Observe: sink,
+		Metrics: metricSink,
+	}
+	// KAIRO_STORE: the durable tiers in a SQL database, which replicates
+	// them (ADR 0087). An environment variable, not a flag: a DSN may hold
+	// credentials, and the command line is visible to other users.
+	if dsn := os.Getenv("KAIRO_STORE"); dsn != "" {
+		if storage == nil {
+			log.Fatal("kairod: KAIRO_STORE is set, but this kairod keeps its data in files only (build store/kairod)")
+		}
+		st, err := storage(dsn, StoreOptions{Namespace: *storeNS, AllowInsecureTransport: *storeInsec})
+		if err != nil {
+			log.Fatal(err) // errors never contain the DSN
+		}
+		defer st.Close()
+		n := *shards
+		if n <= 0 {
+			n = runtime.GOMAXPROCS(0)
+		}
+		if cfg.Shards, err = st.Shards(n, *shards > 0); err != nil {
+			log.Fatal(err)
+		}
+		st.Configure(&cfg)
+	}
+	e, err := engine.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := api.Load(e, *dataDir); err != nil {
+		log.Fatal(err)
+	}
+	// The built-in HTTP executor serves every action named "http.*".
+	hx := httpexec.New()
+	hx.MaxResponseBytes = maxHTTPResponse
+	var hmu sync.Mutex
+	served := map[string]bool{}
+	serveHTTP := func(action string) {
+		hmu.Lock()
+		defer hmu.Unlock()
+		if strings.HasPrefix(action, "http.") && !served[action] {
+			served[action] = true
+			e.RegisterExecutor([]string{action}, *httpConc, hx)
+		}
+	}
+	serveHTTP("http.llm")
+	serveHTTP("http.request")
+	for _, s := range reg.Specs() {
+		serveHTTP(s.Action)
+	}
+	if err := e.Start(); err != nil {
+		log.Fatal(err)
+	}
+
+	ws := &protocol.Server{E: e, Token: workerToken}
+	if callbacks != nil {
+		ws.Callback = func(t *task.Task) *task.Callback {
+			until := t.Deadline
+			if until == 0 {
+				until = time.Now().Add(15 * time.Minute).UnixMilli()
+			}
+			return callbacks.Issue(t, until)
+		}
+	}
+	if *sockPath == "" {
+		*sockPath = filepath.Join(*dataDir, "worker.sock")
+	}
+	ul, err := listenUnixWorker(*sockPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go ws.Serve(ul)
+	if *tcpAddr != "" {
+		tl, err := net.Listen("tcp", *tcpAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go ws.Serve(tl)
+	}
+
+	srv := &http.Server{Addr: *httpAddr, Handler: (&api.API{E: e, Dir: *dataDir, OnNode: func(s ir.NodeSpec) { serveHTTP(s.Action) }}).Handler()}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	var callbackSrv *http.Server
+	if callbacks != nil {
+		callbackSrv = &http.Server{Addr: *callbackAddr, Handler: (&api.ActionCallbacks{E: e, Capabilities: callbacks, MaxBodyBytes: maxCallbackBody}).Handler()}
+		go func() {
+			if err := callbackSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal(err)
+			}
+		}()
+		log.Printf("kairod: callback-only API on http://%s", *callbackAddr)
+	}
+	log.Printf("kairod: api on http://%s, workers on unix:%s, data in %s", *httpAddr, *sockPath, *dataDir)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Printf("kairod: shutting down")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	if callbackSrv != nil {
+		callbackSrv.Shutdown(ctx)
+	}
+	if err := ws.Shutdown(ctx); err != nil {
+		log.Printf("kairod: worker shutdown: %v", err)
+		return
+	}
+	e.Close()
+}
+
+func validateWorkerListener(tcpAddr, token string, allowInsecure bool) error {
+	if tcpAddr != "" && token == "" && !allowInsecure {
+		return errors.New("-worker-tcp requires KAIRO_WORKER_TOKEN (or -allow-insecure-worker-tcp for development)")
+	}
+	return nil
+}
+
+func listenUnixWorker(path string) (net.Listener, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("worker socket path exists and is not a socket: %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale worker socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect worker socket: %w", err)
+	}
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = l.Close()
+		return nil, fmt.Errorf("set worker socket permissions: %w", err)
+	}
+	return l, nil
+}
+
+func callbackKeys(raw string) ([][]byte, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("KAIRO_CALLBACK_KEYS is required with -callback-url")
+	}
+	parts := strings.Split(raw, ",")
+	keys := make([][]byte, 0, len(parts))
+	for i, part := range parts {
+		key, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("KAIRO_CALLBACK_KEYS key %d is not unpadded base64url: %w", i, err)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
