@@ -19,6 +19,7 @@ from typing import Any
 
 from kairo_sdk.backend import EmbeddedBackend
 from kairo_sdk.embedded import EFFECT_WEAKENED
+from kairo_sdk.client import finished
 from kairo_sdk.observe import RUN_SETTLED, RUN_STARTED, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation
 from kairo_sdk.store import SQLiteStore, WorkflowRetryError
 from kairo_sdk.workflow import CallError, Cancelled, DestinationLimits, Kairo, NotWaitingError, RetryAfterError, RetryableError, SignalReceipt, StoppedError, Suspended, TimedOutError, WorkflowError
@@ -109,6 +110,25 @@ class FailingOnce:
             return await v(id, *args, **kw)
 
         return once
+
+
+class Slow:
+    """A store whose reads and writes each take a turn of the event loop, as
+    over a network (SQLite here answers at once)."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        v = getattr(self._store, name)
+        if name not in ("get", "with_run"):
+            return v
+
+        async def slow(*args: Any, **kw: Any) -> Any:
+            await asyncio.sleep(0.002)
+            return await v(*args, **kw)
+
+        return slow
 
 
 @unittest.skipUnless(HAS_GO and HAS_WASMTIME, "go or wasmtime not found")
@@ -951,6 +971,121 @@ class DrivingTest(unittest.TestCase):
             expire()
             self.assertEqual(await explicit, "ok")
             self.assertEqual(runs["explicit"], 2)
+            await k.close()
+
+        asyncio.run(main())
+
+    async def replayed(self, name: str, observe: Any = None, slow: bool = False):
+        """A runtime whose workflows give up their drive with
+        WorkflowRetryError to be replayed (ADR 0063), on a clock of the
+        test's: expire(id, then) waits until id's drive was handed over,
+        calls then, and moves the clock past the lease. slow: each read and
+        write takes a turn of the event loop, as over a network."""
+        base: Any = SQLiteStore(self.path(name))
+        if slow:
+            base = Slow(base)
+        store = FailingOnce(base, "none")
+        clock = {"now": int(time.time() * 1000)}
+        b = await EmbeddedBackend.open(store, wasm=self.wasm, lease_ms=50, now=lambda: clock["now"])
+        k = Kairo(backend=b, observe=observe)
+
+        async def expire(id: str, then: Any = None) -> None:
+            await wait_until(lambda: id in store.handed)
+            store.handed.discard(id)
+            if then is not None:
+                then()
+            clock["now"] += 100
+
+        return k, expire
+
+    def test_a_replay_that_leaves_its_record_stops_before_a_real_call(self) -> None:
+        """A replay that makes a real call it did not make before, while the
+        call it made then is not reached, stops before the new call runs:
+        nothing is made, no outcome is recorded even if the workflow catches
+        the error, and it goes on once code that replays as it first ran
+        drives it (ADR 0084)."""
+
+        async def main() -> None:
+            stuck: list[str] = []
+            k, expire = await self.replayed("diverged.db", lambda o: stuck.append(o.error or "") if o.kind == RUN_STUCK else None)
+            paid: list[int] = []
+            state = {"amount": 1, "drives": 0}
+
+            @k.action("pay")
+            def pay(n, ctx):
+                paid.append(n)
+                return "paid"
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                try:
+                    await ctx.call("pay", state["amount"])  # from outside the record
+                except Exception:
+                    pass  # even caught, it stops
+                state["drives"] += 1
+                if state["drives"] == 1:
+                    raise WorkflowRetryError("replay me")
+                return "done"
+
+            await k.start()
+            result = asyncio.ensure_future(k.run("w", None, id="diverged-1"))
+            await expire("diverged-1", lambda: state.update(amount=2))
+            await wait_until(lambda: any("left its record" in e for e in stuck))
+            self.assertEqual(paid, [1])
+            self.assertFalse(finished(await k.backend.get("diverged-1")))
+            await expire("diverged-1", lambda: state.update(amount=1))
+            self.assertEqual(await result, "done")
+            self.assertEqual(paid, [1])
+            await k.close()
+
+        asyncio.run(main())
+
+    def test_calls_made_at_once_are_not_taken_for_a_divergence(self) -> None:
+        """Calls made at once are not judged before the function can go no
+        further: a new real call waits while another recorded one is still
+        to be reached (ADR 0084, decision 2)."""
+
+        async def main() -> None:
+            k, expire = await self.replayed("at-once.db", slow=True)
+            calls: list[str] = []
+            state = {"drives": 0}
+
+            @k.action("act")
+            def act(what, ctx):
+                calls.append(what)
+                return what
+
+            @k.action("look", effect="unprotected")
+            def look(what, ctx):
+                return what
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                state["drives"] += 1
+                first = state["drives"] == 1
+                b_done = asyncio.Event()
+
+                async def a() -> None:
+                    await ctx.call("act", "a1")
+                    if first:
+                        await b_done.wait()  # the record has b1 when the drive is given up
+                        raise WorkflowRetryError("replay me")
+                    await ctx.call("act", "a2")  # new, while b1 may not be reached yet
+
+                async def b() -> None:
+                    for step in ("b0", "b0.1", "b0.2"):
+                        await ctx.call("look", step)
+                    await ctx.call("act", "b1")
+                    b_done.set()
+
+                await asyncio.gather(a(), b())
+                return "done"
+
+            await k.start()
+            result = asyncio.ensure_future(k.run("w", None, id="at-once-1"))
+            await expire("at-once-1")
+            self.assertEqual(await result, "done")
+            self.assertEqual(sorted(calls), ["a1", "a2", "b1"])
             await k.close()
 
         asyncio.run(main())

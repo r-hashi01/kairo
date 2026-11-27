@@ -38,6 +38,26 @@ type Context struct {
 	// cancelled reports whether the workflow (or one above it) was
 	// cancelled in kairo.
 	cancelled func() bool
+	// div checks that this drive's replay keeps to its record before a
+	// call with an effect is made (ADR 0084); nil in Replay.
+	div *divergence
+}
+
+// keepsToRecord notes that the drive makes call id, and, for a call with
+// an effect, checks first that the replay has not left its record (ADR
+// 0084). Once it has, every call reports it.
+func (c *Context) keepsToRecord(id string, effect bool) error {
+	if c.div == nil {
+		return nil
+	}
+	if err := c.div.diverged(); err != nil {
+		return err
+	}
+	c.div.reach(id)
+	if !effect {
+		return nil
+	}
+	return c.div.check(c, c, id)
 }
 
 // ID is the workflow's execution id.
@@ -183,7 +203,7 @@ func Child[O any](ctx *Context, name string, in any) (O, error) {
 	var out json.RawMessage
 	if ctx.replay != nil {
 		out, err = ctx.replay.call(ctx, id, "workflow", name, raw)
-	} else {
+	} else if err = ctx.keepsToRecord(id, true); err == nil {
 		out, err = ctx.k.runChildAs(ctx, name, raw, id, ctx.id, ctx.cancelled)
 	}
 	if err != nil {
@@ -216,7 +236,7 @@ func Parallel(ctx *Context, fns ...func(ctx *Context) error) error {
 		if ctx.lane != "" {
 			lane = ctx.lane + "." + lane
 		}
-		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, replay: ctx.replay, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled, root: root}
+		branch := &Context{Context: ctx.Context, k: ctx.k, id: ctx.id, replay: ctx.replay, lane: lane, seen: map[string]int{}, cancelled: ctx.cancelled, root: root, div: ctx.div}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

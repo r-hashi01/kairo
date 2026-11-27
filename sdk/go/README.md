@@ -119,6 +119,8 @@ kairo.Workflow(k, "name", func(ctx *kairo.Context, in In) (Out, error) { ... })
 
 A workflow must be deterministic between its calls: read the clock and randomness through `ctx.Now()` and `ctx.Random()`, do I/O in actions, and run calls at once only through `Parallel`. Each branch of each `Parallel` numbers its calls apart from the others'; waits are numbered across the workflow, in the order it reaches them, so that a signal finds a wait in a branch (two branches that wait for the same signal at once receive them in the order they reach their waits). A panic fails the workflow; it does not crash the process.
 
+If a replay leaves its record — it is about to make a call with an effect (an action that is not unprotected, or a child workflow) while a recorded call with an effect it would have reached first was never reached — nothing is made: the call fails with `ErrDiverged` (a `*DivergedError`), the drive records no outcome even if the workflow catches it, the run is logged and observed as `run.stuck`, and it is replayed again a lease period later. Deploy code that replays as the workflow first ran, start new runs on a new version, or cancel it (ADR 0084). Each branch of `Parallel` is judged by its own record.
+
 To change a workflow's function while runs of it are under way, give it a version. A run keeps the version it started with to its end, and a process drives only the runs whose version it has. New runs start with the current version; keep the old one, `Draining`, until no run of it is left (`RunInfo.Version`, `k.List`).
 
 ```go
