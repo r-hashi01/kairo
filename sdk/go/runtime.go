@@ -738,7 +738,16 @@ func (r *runtime) recover(ctx context.Context, l LeaseRow) error {
 					}
 				}
 			}
-			_, err = r.process(ctx, l.Run, []wasmcore.Event{{Kind: "recover", At: r.now()}}, nil)
+			// Still never acted: another recovery (this process's replay, or
+			// another process) may have dispatched it again meanwhile, its
+			// intent recorded; that one is not recovered twice.
+			_, err = r.processIf(ctx, l.Run, []wasmcore.Event{{Kind: "recover", At: r.now()}}, nil, nil, func(row *RunRow) bool {
+				if row == nil {
+					return false
+				}
+				in, err := wasmcore.Inspect(row.State)
+				return err == nil && slices.Contains(in.Dispatched, l.Act) && !slices.Contains(in.Intents, l.Act)
+			})
 			return err
 		}
 	}
@@ -964,6 +973,12 @@ func (r *runtime) processWithRates(ctx context.Context, runID string, events []w
 }
 
 func (r *runtime) processReportedWithRates(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo, rates []SharedRateSettlement) (processReport, error) {
+	return r.processIf(ctx, runID, events, start, rates, nil)
+}
+
+// processIf is processReportedWithRates, applying events only if when
+// (read in the same transaction) says the run is still as it was seen.
+func (r *runtime) processIf(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo, rates []SharedRateSettlement, when func(*RunRow) bool) (processReport, error) {
 	var (
 		existing, settled, applied bool
 		commands                   []wasmcore.Command
@@ -985,6 +1000,9 @@ func (r *runtime) processReportedWithRates(ctx context.Context, runID string, ev
 		}
 		if row != nil && start != nil {
 			existing = true
+			return nil, nil
+		}
+		if when != nil && !when(row) {
 			return nil, nil
 		}
 		if row == nil && start == nil {

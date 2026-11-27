@@ -684,7 +684,19 @@ class Embedded:
                     x = next((y for y in leases if y.act == a), None)
                     if x is not None:
                         await self._unknown_outcome(x)
-                return await self._advance(lease.run, lambda: self._process(lease.run, [{"kind": "recover", "at": self.now()}]))
+                # Still never acted: another recovery (this process's replay, or
+                # another process) may have dispatched it again meanwhile, its
+                # intent recorded; that one is not recovered twice.
+                def still(r: RunRow | None) -> bool:
+                    if r is None:
+                        return False
+                    now = self.core.inspect(r.state)
+                    return lease.act in (now.get("dispatched") or []) and lease.act not in (now.get("intents") or [])
+
+                async def again() -> bool:
+                    return bool((await self._process_report(lease.run, [{"kind": "recover", "at": self.now()}], when=still))["existing"])
+
+                return await self._advance(lease.run, again)
         return await self._unknown_outcome(lease)
 
     async def _unknown_outcome(self, lease: LeaseRow) -> bool:
@@ -732,6 +744,7 @@ class Embedded:
     async def _process_report(
         self, run_id: str, events: list[dict[str, Any]], begin: dict[str, Any] | None = None,
         shared_rates: list[SharedRateSettlement] | None = None,
+        when: Callable[[RunRow | None], bool] | None = None,
     ) -> dict[str, bool]:
         """Applies events to run_id in one transaction, then carries out the
         commands. With begin, a new run of its plan (or the existing one: the
@@ -746,6 +759,9 @@ class Embedded:
             end_leases = [e["act"] for e in events if e["kind"] in OUTCOMES and e.get("act") is not None]
             if row is not None and start is not None:
                 return Changes({"existing": True, "applied": False, "started": False, "settled": False, "commands": [], "row": row})
+            # Applied only if the run is still as it was seen.
+            if when is not None and not when(row):
+                return Changes({"existing": row is not None, "applied": False, "started": False, "settled": False, "commands": [], "row": row})
             if row is None and start is None:
                 return Changes({"existing": False, "applied": False, "started": False, "settled": False, "commands": [], "row": None}, end_leases=end_leases)
             plan = start if start is not None else self._plan(row.plan)  # type: ignore[union-attr]

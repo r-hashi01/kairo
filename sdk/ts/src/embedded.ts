@@ -509,7 +509,14 @@ export class Embedded {
 					const x = leases.find((y) => y.act === a);
 					if (x) await this.unknownOutcome(x);
 				}
-				return this.advance(l.run, () => this.process(l.run, [{ kind: 'recover', at: this.now() }]));
+				// Still never acted: another recovery (this process's replay, or
+				// another process) may have dispatched it again meanwhile, its
+				// intent recorded; that one is not recovered twice.
+				return this.advance(l.run, async () => (await this.processReported(l.run, [{ kind: 'recover', at: this.now() }], undefined, [], (r) => {
+					if (!r) return false;
+					const now = this.core.inspect(r.state);
+					return !!now.dispatched?.includes(l.act) && !now.intents?.includes(l.act);
+				})).existing);
 			}
 		}
 		return this.unknownOutcome(l);
@@ -606,13 +613,14 @@ export class Embedded {
 		events: CoreEvent[],
 		start?: RunStart & { plan: Compiled; at: number },
 		sharedRates: SharedRateSettlement[] = [],
+		when?: (row: RunRow | undefined) => boolean,
 	): Promise<{ existing: boolean; applied: boolean }> {
 		// Steps admitted at once, in any try of the transaction below: given
 		// back unless carried out.
 		const admitted = new Map<string, CoreCommand>();
 		let out: Awaited<ReturnType<Embedded["transact"]>>;
 		try {
-			out = await this.transact(runId, events, start, sharedRates, admitted);
+			out = await this.transact(runId, events, start, sharedRates, admitted, when);
 		} catch (e) {
 			for (const c of admitted.values()) this.unadmit?.(runId, c);
 			throw e;
@@ -628,11 +636,14 @@ export class Embedded {
 		start: (RunStart & { plan: Compiled; at: number }) | undefined,
 		sharedRates: SharedRateSettlement[],
 		admitted: Map<string, CoreCommand>,
+		when?: (row: RunRow | undefined) => boolean,
 	) {
 		return this.store.withRun(runId, (row) => {
 			// A step's outcome ends its lease, applied or not (a stale one).
 			const endLeases = events.filter((e) => OUTCOMES.has(e.kind) && e.act !== undefined).map((e) => e.act!);
 			if (row && start) return { events: [], result: { existing: true, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row } };
+			// Applied only if the run is still as it was seen.
+			if (when && !when(row)) return { events: [], result: { existing: !!row, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row } };
 			if (!row && !start)
 				return { events: [], endLeases, result: { existing: false, applied: false, started: false, settled: false, commands: [] as CoreCommand[], row: undefined } };
 			const plan = start ? start.plan : this.plan(row!.plan);

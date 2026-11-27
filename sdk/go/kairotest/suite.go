@@ -1134,14 +1134,20 @@ func testStoppedDriverIsTakenUp(t *testing.T, open Opener) {
 
 // Real steps that wait for a slot have no intent yet: a process that stops
 // leaves for review only the steps it was running; the others go again
-// elsewhere, each once (ADR 0085, issue #114).
+// elsewhere, each once (ADR 0085, issue #114). The clock is the test's: the
+// leases expire once, when the test moves it, not because a loaded machine
+// renewed one late.
 func testWaitingStepsAreNotLeftForReview(t *testing.T, open Opener) {
+	const lease = 200 * time.Millisecond
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
 	var mu sync.Mutex
 	started := map[int]int{}
 	release := make(chan struct{})
 	defer close(release)
 	start := func(store kairo.Store, hang bool) *kairo.Kairo {
-		k, err := kairo.Open(context.Background(), kairo.Options{Store: store, Lease: 200 * time.Millisecond, Concurrency: 2})
+		k, err := kairo.Open(context.Background(), kairo.Options{Store: store, Lease: lease, Concurrency: 2,
+			Now: func() time.Time { return time.UnixMilli(now.Load()) }})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1187,6 +1193,7 @@ func testWaitingStepsAreNotLeftForReview(t *testing.T, open Opener) {
 	}
 	waitUntil(t, func() bool { return count() == 2 }) // two run; eight wait for a slot
 	a.dead.Store(true)                                // stops: its leases are not renewed
+	now.Add(2 * lease.Milliseconds())                 // and they expire
 	mu.Lock()
 	running := []int{}
 	for n := range started {
