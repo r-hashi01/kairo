@@ -3,12 +3,12 @@ module github.com/r-hashi01/kairo/store/kairod
 go 1.27.4
 
 require (
-	github.com/r-hashi01/kairo v0.5.1
-	github.com/r-hashi01/kairo/store/mysql v0.5.1
-	github.com/r-hashi01/kairo/store/oracle v0.5.1
-	github.com/r-hashi01/kairo/store/postgres v0.5.1
-	github.com/r-hashi01/kairo/store/sqlite v0.5.1
-	github.com/r-hashi01/kairo/store/sqlstore v0.5.1
+	github.com/r-hashi01/kairo v0.5.2
+	github.com/r-hashi01/kairo/store/mysql v0.5.2
+	github.com/r-hashi01/kairo/store/oracle v0.5.2
+	github.com/r-hashi01/kairo/store/postgres v0.5.2
+	github.com/r-hashi01/kairo/store/sqlite v0.5.2
+	github.com/r-hashi01/kairo/store/sqlstore v0.5.2
 )
 
 require (
