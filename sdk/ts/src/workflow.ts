@@ -830,6 +830,8 @@ export class Kairo {
 
 	/** Suspend mode: drives workflow id on (again, if it is being driven now). */
 	private redrive(id: string): void {
+		// Closing: nothing more is driven here (it would not be stopped).
+		if (this.closing) return;
 		if (this.redriving.has(id)) {
 			this.again.add(id);
 			return;
@@ -854,7 +856,7 @@ export class Kairo {
 						// Suspended again, failed (recorded), cancelled, driven
 						// elsewhere, or of a version not here.
 					}
-				} while (this.again.has(id));
+				} while (this.again.has(id) && !this.closing);
 			} finally {
 				this.redriving.delete(id);
 			}
@@ -1759,6 +1761,9 @@ export class Kairo {
 				throw new ResultLostError(`workflow ${id} started more than ${ttl}ms ago: its calls' records may be gone`);
 			}
 		}
+		// Closing: close has stopped the drives already, and would not stop
+		// this one (issue #116). The workflow goes on where it is driven next.
+		if (this.closing) throw new StoppedError(`workflow ${id}: not driven here any more`);
 		const abort = new AbortController();
 		this.driving.add(abort);
 		this.drivingById.set(id, abort);

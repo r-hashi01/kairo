@@ -2166,6 +2166,9 @@ func (k *Kairo) settle() {
 // redrive, in suspend mode, drives workflow id on (again, if it is being
 // driven now).
 func (k *Kairo) redrive(id string) {
+	if k.closing.Load() {
+		return // nothing more is driven here (issue #116)
+	}
 	k.mu.Lock()
 	if k.redriving[id] {
 		k.again[id] = true
@@ -2211,7 +2214,7 @@ func (k *Kairo) redrive(id string) {
 			k.mu.Lock()
 			more := k.again[id]
 			k.mu.Unlock()
-			if !more {
+			if !more || k.closing.Load() {
 				return
 			}
 		}
