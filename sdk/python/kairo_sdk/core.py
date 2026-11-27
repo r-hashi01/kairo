@@ -7,8 +7,13 @@ Needs wasmtime (``pip install "kairo-sdk[embedded]"``).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import platform
 import struct
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +27,121 @@ class CoreError(Exception):
     pass
 
 
+# Compiling kairo.wasm is most of what opening a Core costs (about 360 ms
+# with wasmtime, against a few ms to instantiate it): a serverless function
+# that opens one for each call pays it each time (issue #107). A module is
+# compiled once a process, and its machine code kept in a cache directory
+# that later processes read instead (Module.deserialize_file).
+_lock = threading.Lock()
+_engine: Any = None
+_modules: dict[bytes, Any] = {}
+
+
+def _compiled(data: bytes) -> tuple[Any, Any]:
+    """The engine, and kairo.wasm (data) compiled for it."""
+    global _engine
+    from wasmtime import Engine
+
+    key = hashlib.sha256(data).digest()
+    with _lock:
+        if _engine is None:
+            _engine = Engine()
+        module = _modules.get(key)
+        if module is None:
+            module = _modules[key] = _load(_engine, data, key)
+        return _engine, module
+
+
+def _compile(engine: Any, data: bytes) -> Any:
+    from wasmtime import Module
+
+    return Module(engine, data)
+
+
+def cache_dir() -> Path | None:
+    """Where compiled kairo.wasm is kept: KAIRO_WASM_CACHE, or the user's
+    cache directory (XDG_CACHE_HOME, else ~/.cache) under kairo-sdk;
+    None when KAIRO_WASM_CACHE is "off". A serverless function points it at
+    a directory shipped with its code, compiled there when it is built."""
+    env = os.environ.get("KAIRO_WASM_CACHE")
+    if env == "off":
+        return None
+    if env:
+        return Path(env)
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "kairo-sdk"
+
+
+def _trusted(d: Path) -> bool:
+    # Machine code is run as it is read: only from a directory nobody else
+    # can write to.
+    if not hasattr(os, "getuid"):
+        return True
+    st = d.stat()
+    return st.st_uid == os.getuid() and st.st_mode & 0o022 == 0
+
+
+#: How many compiled cores a cache directory keeps (the latest written):
+#: one for each kairo-sdk and wasmtime in use, not one for every build.
+CACHE_KEEP = 8
+
+
+def _prune(d: Path) -> None:
+    kept = sorted(d.glob("*.cwasm"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in kept[CACHE_KEEP:]:
+        old.unlink(missing_ok=True)
+
+
+def _load(engine: Any, data: bytes, key: bytes) -> Any:
+    """kairo.wasm compiled for engine: from the cache directory if it is
+    there for this wasmtime and machine, else compiled and kept there. A
+    cache that cannot be read or written is passed over."""
+    from importlib.metadata import version
+
+    from wasmtime import Module
+
+    try:
+        d = cache_dir()
+    except Exception:  # no home directory
+        d = None
+    if d is None:
+        return _compile(engine, data)
+    try:
+        name = f"{key.hex()[:32]}-wasmtime{version('wasmtime')}-{platform.system()}-{platform.machine()}.cwasm".lower()
+    except Exception:  # pragma: no cover - wasmtime installed without metadata
+        return _compile(engine, data)
+    path = d / name
+    try:
+        if path.is_file() and _trusted(d):
+            return Module.deserialize_file(engine, str(path))
+    except Exception:
+        pass  # not this wasmtime's after all: compiled again below
+    module = _compile(engine, data)
+    try:
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _trusted(d):
+            fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(module.serialize())
+                os.replace(tmp, path)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+            _prune(d)
+    except Exception:
+        pass  # a read-only place (a serverless function's code): not kept
+    return module
+
+
 class Core:
     def __init__(self, wasm: str | Path | bytes | None = None) -> None:
         try:
             from wasmtime import Engine, Linker, Module, Store, WasiConfig
         except ImportError as e:  # pragma: no cover - depends on the install
             raise CoreError("the embedded runtime needs wasmtime: pip install 'kairo-sdk[embedded]'") from e
-        engine = Engine()
         data = wasm if isinstance(wasm, bytes) else Path(wasm or DEFAULT_WASM).read_bytes()
-        module = Module(engine, data)
+        engine, module = _compiled(data)
         self._store = Store(engine)
         self._store.set_wasi(WasiConfig())
         linker = Linker(engine)

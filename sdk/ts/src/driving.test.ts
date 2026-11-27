@@ -910,6 +910,109 @@ console.log(JSON.stringify(await k.run('w', null, { id: 'alive-1' })));
 		await k.close();
 	});
 
+	// A drive whose workflow gives up with WorkflowRetryError is replayed
+	// once the test moves its clock past the lease (ADR 0063).
+	const replayed = async (name: string, observe?: (o: Observation) => void, slow = false) => {
+		const sqlite = new SQLiteStore(join(dir, name));
+		// slow: each read and write takes a turn of the event loop, as over
+		// a network (SQLite here answers at once).
+		const base: Store = slow
+			? new Proxy(sqlite, {
+					get(target, prop) {
+						const v = (target as any)[prop];
+						if (typeof v !== 'function') return v;
+						if (prop !== 'get' && prop !== 'withRun') return v.bind(target);
+						return async (...args: unknown[]) => {
+							await new Promise((r) => setTimeout(r, 2));
+							return v.apply(target, args);
+						};
+					},
+				})
+			: sqlite;
+		const [store, state] = failingOnce(base, 'none');
+		let now = Date.now();
+		const k = new Kairo({ backend: await EmbeddedBackend.open({ store, wasm, leaseMs: 50, now: () => now }), ...(observe ? { observe } : {}) });
+		// Waits until id's drive was handed over, calls then, and moves the clock.
+		const expire = async (id: string, then?: () => void) => {
+			await waitUntil(() => state.handed.has(id));
+			state.handed.delete(id);
+			then?.();
+			now += 100;
+		};
+		return { k, expire };
+	};
+
+	// A replay that makes a real call it did not make before, while the
+	// call it made then is not reached, stops before the new call runs:
+	// nothing is made, no outcome is recorded even if the workflow catches
+	// the error, and it goes on once code that replays as it first ran
+	// drives it (ADR 0084).
+	test('a replay that leaves its record stops before a real call', async () => {
+		const stuck: string[] = [];
+		const { k, expire } = await replayed('diverged.db', (o) => {
+			if (o.kind === 'run.stuck') stuck.push(o.error ?? '');
+		});
+		const paid: number[] = [];
+		let amount = 1;
+		let drives = 0;
+		k.defineAction('pay', { effect: 'real', handler: async (n: number) => (paid.push(n), 'paid') });
+		k.workflow('w', async (ctx) => {
+			try {
+				await ctx.call('pay', amount); // from outside the record
+			} catch {} // even caught, it stops
+			if (++drives === 1) throw new WorkflowRetryError('replay me');
+			return 'done';
+		});
+		await k.start();
+		const result = k.run('w', null, { id: 'diverged-1' });
+		await expire('diverged-1', () => (amount = 2));
+		await waitUntil(() => stuck.some((e) => e.includes('left its record')));
+		assert.deepEqual(paid, [1]);
+		assert.ok(!finished(await k.backend.get('diverged-1')));
+		await expire('diverged-1', () => (amount = 1));
+		assert.equal(await result, 'done');
+		assert.deepEqual(paid, [1]);
+		await k.close();
+	});
+
+	// Calls made at once are not judged before the function can go no
+	// further: a new real call waits while another recorded one is still
+	// to be reached (ADR 0084, decision 2).
+	test('calls made at once are not taken for a divergence', async () => {
+		const { k, expire } = await replayed('at-once.db', undefined, true);
+		const calls: string[] = [];
+		let drives = 0;
+		k.defineAction('act', { effect: 'real', handler: async (what: string) => (calls.push(what), what) });
+		k.defineAction('look', { effect: 'unprotected', handler: async (what: string) => what });
+		k.workflow('w', async (ctx) => {
+			const first = ++drives === 1;
+			let bDone!: () => void;
+			const b = new Promise<void>((r) => (bDone = r));
+			await Promise.all([
+				(async () => {
+					await ctx.call('act', 'a1');
+					if (first) {
+						await b; // the record has b1 when the drive is given up
+						throw new WorkflowRetryError('replay me');
+					}
+					await ctx.call('act', 'a2'); // new, while b1 may not be reached yet
+				})(),
+				(async () => {
+					for (const step of ['b0', 'b0.1', 'b0.2']) await ctx.call('look', step);
+					await ctx.call('act', 'b1');
+					bDone();
+				})(),
+			]);
+			return 'done';
+		});
+		await k.start();
+		const result = k.run('w', null, { id: 'at-once-1' });
+		await expire('at-once-1');
+		assert.equal(await result, 'done');
+		assert.deepEqual(calls.sort(), ['a1', 'a2', 'b1']);
+		await k.close();
+	});
+
 	// observe is told of runs that start and settle and of steps' attempts;
 	// an observer that throws does not stop the runtime.
 	test('observe', async () => {

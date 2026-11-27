@@ -9,6 +9,7 @@ API); ``Kairo`` declares actions and workflows written as code.
 
 from .backend import Backend, EmbeddedBackend, HttpBackend
 from .client import Client, KairoError
+from .divergence import DivergedError
 from .embedded import EFFECT_WEAKENED, EffectWeakenedError
 from .http import SignatureError
 from .observe import (
@@ -117,6 +118,7 @@ __all__ = [
     "UnknownOutcomeError",
     "WorkflowError",
     "WorkflowRetryError",
+    "DivergedError",
     "Chunk",
     "Credit",
     "Hello",
