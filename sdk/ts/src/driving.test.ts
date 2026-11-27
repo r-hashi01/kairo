@@ -1390,7 +1390,10 @@ describe('driving workflows on PostgreSQL (ADR 0059)', { skip: !hasGo || !dsn ||
 		await k1.submit('w', 'f', { id: 'gone-pg' });
 		await waitUntil(async () => (await k1.children('gone-pg')).some((c) => c.status === 'completed'));
 		state.dead = true;
-		(k1.backend as any).runtime.live.client.release(true); // its session ends, as with its process
+		// Its session ends, as with its process.
+		const live = (k1.backend as any).runtime.live;
+		const pid = (await live.client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+		await pool.query('SELECT pg_terminate_backend($1)', [pid]);
 		const k2 = await start(pgStore(), false, 100);
 		assert.equal(await k2.result('gone-pg', { signal: AbortSignal.timeout(10_000) }), 'wrote f!');
 		assert.equal(writes, 1);

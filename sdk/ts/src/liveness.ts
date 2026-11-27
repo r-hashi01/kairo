@@ -146,7 +146,10 @@ export class PgLiveness implements Liveness {
 		if (!c) return;
 		try {
 			if (!this.broken) await c.query("SELECT pg_advisory_unlock(hashtextextended('kairo.owner:' || $1, 0))", [this.owner]);
-		} catch {}
-		c.release();
+		} catch {
+			this.broken = true;
+		}
+		// A broken connection is not given back to be used again.
+		(c.release as (destroy?: boolean) => void)(this.broken || undefined);
 	}
 }

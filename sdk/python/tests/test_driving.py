@@ -1644,8 +1644,12 @@ class DrivingPostgresTest(unittest.TestCase):
                     break
                 await asyncio.sleep(0.025)
             store.dead = True
+            # Its session ends, as with its process.
             live = k1.backend.runtime._live
-            await live._conn.close()  # its session ends, as with its process
+            cur = await live._conn.execute("SELECT pg_backend_pid()")
+            (pid,) = await cur.fetchone()
+            async with store._store.pool.connection() as c:
+                await c.execute("SELECT pg_terminate_backend(%s)", (pid,))
             k2 = await start(pg_store(), False, owner_check_ms=100)
             self.assertEqual(await asyncio.wait_for(k2.result("gone-pg"), 10), "wrote f!")
             self.assertEqual(writes["n"], 1)
