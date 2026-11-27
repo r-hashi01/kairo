@@ -607,6 +607,109 @@ func (s *SQLStore) Get(ctx context.Context, id string) (*RunRow, error) {
 	return r, err
 }
 
+// Tree returns run id and every run under it, each with its events (ADR
+// 0088), from one read-only transaction: SQLite's deferred BEGIN (one
+// snapshot of the file from the first read on), PostgreSQL's REPEATABLE
+// READ READ ONLY. The root first, then the others in creation order.
+func (s *SQLStore) Tree(ctx context.Context, id string) ([]TreeRun, error) {
+	p := s.p
+	tree := `WITH RECURSIVE tree(id) AS (SELECT CAST(? AS TEXT) UNION SELECT r.id FROM ` + p + `run r JOIN tree t ON r.parent = t.id) SELECT id FROM tree`
+	var out []TreeRun
+	err := s.readTx(ctx, func(q querier) error {
+		rows, err := q.QueryContext(ctx, s.q(`SELECT `+runCols+` FROM `+p+`run WHERE id IN (`+tree+`) ORDER BY `+runOrderSQL), id)
+		if err != nil {
+			return err
+		}
+		var runs []TreeRun
+		at := map[string]int{}
+		for rows.Next() {
+			r, err := scanRun(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			at[r.ID] = len(runs)
+			runs = append(runs, TreeRun{Run: *r})
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		i, ok := at[id]
+		if !ok {
+			return nil // no such run
+		}
+		rows, err = q.QueryContext(ctx, s.q(`SELECT run, body FROM `+p+`event WHERE run IN (`+tree+`) ORDER BY run, seq`), id)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var run, body string
+			if err := rows.Scan(&run, &body); err != nil {
+				return err
+			}
+			if j, ok := at[run]; ok {
+				runs[j].Events = append(runs[j].Events, json.RawMessage(body))
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		out = make([]TreeRun, 0, len(runs))
+		out = append(out, runs[i])
+		out = append(out, runs[:i]...)
+		out = append(out, runs[i+1:]...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// readTx runs fn in a read-only transaction.
+func (s *SQLStore) readTx(ctx context.Context, fn func(q querier) error) error {
+	if s.dialect == SQLite {
+		conn, err := s.db.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		// Ended however ctx does, as tx: a connection back in the pool with
+		// a transaction open would pin the file's snapshot.
+		end := context.Background()
+		if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+			_, _ = conn.ExecContext(end, `ROLLBACK`) // if it began after all
+			return err
+		}
+		if err := fn(conn); err != nil {
+			_, _ = conn.ExecContext(end, `ROLLBACK`)
+			return err
+		}
+		if _, err := conn.ExecContext(end, `COMMIT`); err != nil {
+			_, _ = conn.ExecContext(end, `ROLLBACK`)
+			return err
+		}
+		return nil
+	}
+	t, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	if err := fn(t); err != nil {
+		_ = t.Rollback()
+		return err
+	}
+	return t.Commit()
+}
+
 func (s *SQLStore) Children(ctx context.Context, parent string) ([]RunRow, error) {
 	rows, err := s.db.QueryContext(ctx, s.q(`SELECT `+runCols+` FROM `+s.p+`run WHERE parent = ? ORDER BY `+runOrderSQL), parent)
 	if err != nil {

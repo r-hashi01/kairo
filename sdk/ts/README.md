@@ -108,6 +108,28 @@ With either backend, calls and child workflows belong to their parent's tree. A 
 | `k.children(id)` | The runs made directly by `id`, over kairod or embedded |
 | `k.list({ workflow?, status?, since?, until?, after?, limit? })` | Workflows (not child workflows or calls), oldest first, with `meta`, `createdAt` and `updatedAt` |
 | `k.replay(id, { signal? })` | Evaluates an embedded code workflow from its saved call records without running or changing anything |
+| `k.progress(id)` | The workflow's tree (its calls, waits and child workflows; the root first, then in creation order), each run with its recorded events: `started`, `dispatched`, `succeeded`, `failed`, `waiting`, `timer`, `signal`, `recovered`, `resolved`, `cancelled` |
+
+`progress` reads the tree and its recorded events in one read-only transaction and changes nothing (ADR 0088). It returns only what was recorded: the attempt of each outcome, a failure's message, type (`process_lost`: the process running the attempt stopped), whether it was retryable or unknown, a signal's name, a wait's deadline. An attempt's start is recorded only for real steps (`dispatched`), and each event's `at` is the clock of the process that applied it. It needs the embedded runtime, on a store with `tree` (`SQLiteStore`, `PostgresStore`); a run that is not there, or was removed with its finished tree, throws a 404 `KairoError`.
+
+### The run viewer
+
+`kairo-view` shows the workflows in a database in the browser: each workflow's calls on a time line, with attempts that failed, were interrupted because their process stopped, or wait; their inputs and outputs; and it updates while the page is open. It reads only through `list` and `progress`, and it can send a signal to a wait, resolve a call stopped for review, and cancel a workflow, through `signal`, `resolve`/`resolveFailed` and `cancel`. It does not drive workflows: the processes that run them take up what it sends.
+
+```sh
+npx kairo-view .kairo/app.db                       # SQLite
+npx kairo-view --postgres "$DATABASE_URL"          # PostgreSQL, with pg installed where it runs
+```
+
+or in the process that runs the workflows, which also lets it cancel and resolve their calls:
+
+```ts
+import { serveViewer } from 'kairo-sdk';
+const viewer = await serveViewer(k); // after k.start()
+console.log(viewer.url);
+```
+
+It listens on loopback only (127.0.0.1, or `::1`), and every request needs the key in the URL it prints: anyone with that URL can read the runs' inputs and outputs and act on them, so do not share it or expose the port. Started on its own, it has the plans of workflows and waits but not your actions': it refuses to cancel a workflow while one of its calls is unfinished, or to resolve a call, rather than do it in part (409). Open it with `serveViewer` in a process that defines the actions for those.
 
 `replay` is a record-only diagnostic. It evaluates the function registered for the run's saved workflow version, and returns the durable `run`, only the `calls` the function reached, and the local `outcome`, `output` or `error`. A missing, unfinished, blocked or trimmed call produces `outcome: 'boundary'` and `boundary`; even if the workflow catches that call's error, the replay remains at the boundary. Actions and child workflow functions do not run, waits do not advance, and no run, lease, timer or signal is changed. A child is one recorded call; replay its `runId` explicitly to inspect its internals. The durable root remains authoritative if its result differs from the local evaluation. This API is available while an embedded store still retains the tree, not with kairod.
 

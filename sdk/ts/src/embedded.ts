@@ -118,6 +118,8 @@ export class Embedded {
 	private readonly waiters = new Map<string, Set<(r: RunInfo) => void>>();
 	/** Called with each run that settles in this process. */
 	private readonly settledHooks = new Set<(r: RunInfo) => void>();
+	/** Called with each run heard of settling in another process. */
+	private readonly heardHooks = new Set<(runId: string) => void>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly running = new Map<string, AbortController>();
 	private readonly reached = new Map<string, number>();
@@ -196,11 +198,22 @@ export class Embedded {
 	}
 
 	private settledElsewhere(runId: string): void {
+		for (const h of this.heardHooks) h(runId);
 		const ws = this.waiters.get(runId);
 		if (!ws || ws.size === 0) return;
 		this.track(this.get(runId).then((r) => {
 			if (SETTLED.has(r.status)) for (const w of this.waiters.get(runId) ?? []) w(r);
 		}));
+	}
+
+	/**
+	 * Calls hook with the id of each run heard of settling in another
+	 * process (the store's notifications, when it has them: a hint only);
+	 * returns how to stop.
+	 */
+	onSettledElsewhere(hook: (runId: string) => void): () => void {
+		this.heardHooks.add(hook);
+		return () => this.heardHooks.delete(hook);
 	}
 
 	/** Calls hook with each run that settles in this process; returns how to stop. */
@@ -255,6 +268,15 @@ export class Embedded {
 		return def ? this.registerPlan(def) : undefined;
 	}
 
+	/**
+	 * Whether runs of plan name can be applied events here: its plan is
+	 * registered, or made from planFor (ADR 0088: the run viewer checks it
+	 * before an operation, so as not to apply one in part).
+	 */
+	knowsPlan(name: string): boolean {
+		return this.plan(name) !== undefined;
+	}
+
 	/** The lease period (ms). */
 	get lease(): number {
 		return this.leaseMs;
@@ -307,6 +329,16 @@ export class Embedded {
 	/** Root runs in creation order (ADR 0059). */
 	async list(f: ListFilter): Promise<RunInfo[]> {
 		return (await this.store.list(f)).map(info);
+	}
+
+	/**
+	 * Run runId and every run under it, each with its recorded events, read
+	 * in one transaction (ADR 0088); undefined if there is no such run.
+	 * Reads only.
+	 */
+	async tree(runId: string): Promise<{ info: RunInfo; events: CoreEvent[] }[] | undefined> {
+		if (!this.store.tree) throw new Error("this store cannot read runs' events");
+		return (await this.store.tree(runId))?.map((t) => ({ info: info(t.run), events: t.events }));
 	}
 
 	/** Direct children of runId (ADR 0054, 0062). */

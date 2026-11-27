@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -63,6 +64,8 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"WaitInAParallelBranch":              testWaitInAParallelBranch,
 		"DrainKeepsTheOutcome":               testDrainKeepsTheOutcome,
 		"UnreachedChildIsCancelled":          testUnreachedChildIsCancelled,
+		"Progress":                           testProgress,
+		"StoreTree":                          testStoreTree,
 	} {
 		t.Run(name, func(t *testing.T) { test(t, fresh(t)) })
 	}
@@ -1984,6 +1987,226 @@ func testSubmitAwaitAndList(t *testing.T, open Opener) {
 	}
 	if roots, err := k.List(context.Background(), kairo.Filter{}); err != nil || len(roots) != 5 {
 		t.Fatalf("%d %v", len(roots), err)
+	}
+}
+
+// Progress gives the tree and its recorded attempts, and reading it changes
+// nothing (ADR 0088).
+func testProgress(t *testing.T, open Opener) {
+	ctx := context.Background()
+	store := open()
+	k, err := kairo.Open(ctx, kairo.Options{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	kairo.Action(k, "llm", kairo.Unprotected, func(_ *kairo.TaskContext, q map[string]string) (string, error) { return q["q"], nil })
+	kairo.Action(k, "flaky", kairo.Unprotected, func(tc *kairo.TaskContext, _ any) (string, error) {
+		if tc.Attempt == 1 {
+			return "", kairo.Retryable(errors.New("not yet"))
+		}
+		return "ok", nil
+	}, kairo.MaxAttempts(3), kairo.Backoff(time.Millisecond))
+	kairo.Action(k, "write", kairo.Real, func(_ *kairo.TaskContext, _ map[string]string) (string, error) { return "written", nil })
+	kairo.Workflow(k, "progress", func(ctx *kairo.Context, _ any) (string, error) {
+		if _, err := kairo.Call[string](ctx, "llm", map[string]string{"q": "a"}); err != nil {
+			return "", err
+		}
+		if _, err := kairo.Call[string](ctx, "flaky", nil); err != nil {
+			return "", err
+		}
+		if _, err := kairo.Call[string](ctx, "write", map[string]string{"path": "p"}); err != nil {
+			return "", err
+		}
+		return kairo.WaitFor[string](ctx, "approve")
+	})
+	if err := k.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const id = "progress-1"
+	out := make(chan string, 1)
+	go func() {
+		got, err := kairo.Run[string](ctx, k, "progress", nil, kairo.WithID(id))
+		if err != nil {
+			t.Error(err)
+		}
+		out <- got
+	}()
+	waitUntil(t, func() bool {
+		kids, _ := k.Children(ctx, id)
+		return slices.ContainsFunc(kids, func(c kairo.RunInfo) bool { return c.Plan == "kairo.wait/approve" })
+	})
+
+	rows := func() []*kairo.RunRow {
+		t.Helper()
+		kids, err := store.Children(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := store.Get(ctx, id)
+		if err != nil || root == nil {
+			t.Fatalf("%v %v", root, err)
+		}
+		out := []*kairo.RunRow{root}
+		for i := range kids {
+			out = append(out, &kids[i])
+		}
+		return out
+	}
+	before := rows()
+	p, err := k.Progress(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Root != id || p.Runs[0].RunID != id || p.Runs[0].Kind != "workflow" || p.Runs[0].Name != "progress" {
+		t.Fatalf("root: %q %+v", p.Root, p.Runs[0])
+	}
+	var shape []string
+	for _, r := range p.Runs[1:] {
+		shape = append(shape, r.Kind+" "+r.Name)
+	}
+	if want := []string{"call llm", "call flaky", "call write", "wait approve"}; !slices.Equal(shape, want) {
+		t.Fatalf("runs %q, want %q", shape, want)
+	}
+	run := func(p kairo.RunProgress, name string) kairo.ProgressRun {
+		for _, r := range p.Runs {
+			if r.Name == name {
+				return r
+			}
+		}
+		t.Fatalf("no run %s", name)
+		return kairo.ProgressRun{}
+	}
+	kinds := func(name string) string {
+		var s []string
+		for _, e := range run(p, name).Events {
+			s = append(s, fmt.Sprintf("%s/%d", e.Kind, e.Attempt))
+		}
+		return strings.Join(s, " ")
+	}
+	for name, want := range map[string]string{
+		"llm":     "started/0 succeeded/1",
+		"flaky":   "started/0 failed/1 timer/0 succeeded/2",
+		"write":   "started/0 dispatched/1 succeeded/1",
+		"approve": "started/0",
+	} {
+		if got := kinds(name); got != want {
+			t.Fatalf("%s: %s, want %s", name, got, want)
+		}
+	}
+	if failed := run(p, "flaky").Events[1]; !failed.Retryable || failed.Error != "not yet" || failed.Unknown {
+		t.Fatalf("the failed attempt: %+v", failed)
+	}
+	for _, r := range p.Runs {
+		for _, e := range r.Events {
+			if e.At.UnixMilli() <= 0 || e.Signal != "" || !e.Deadline.IsZero() {
+				t.Fatalf("%s: %+v", r.RunID, e)
+			}
+		}
+	}
+
+	// Reading changed nothing.
+	if after := rows(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("the rows changed:\n%+v\n%+v", before, after)
+	}
+	if again, err := k.Progress(ctx, id); err != nil || !reflect.DeepEqual(again, p) {
+		t.Fatalf("read again: %v\n%+v\n%+v", err, p, again)
+	}
+
+	if err := k.Signal(ctx, id, "approve", "yes"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-out; got != "yes" {
+		t.Fatalf("%q", got)
+	}
+	done, err := k.Progress(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var approve []string
+	for _, e := range run(done, "approve").Events {
+		approve = append(approve, string(e.Kind)+" "+e.Signal)
+	}
+	if want := []string{"started ", "signal approve"}; !slices.Equal(approve, want) {
+		t.Fatalf("approve: %q, want %q", approve, want)
+	}
+	if done.Runs[0].Status != "completed" {
+		t.Fatalf("root: %+v", done.Runs[0])
+	}
+	if _, err := k.Progress(ctx, id+"-absent"); !errors.Is(err, kairo.ErrUnknownRun) {
+		t.Fatalf("absent: %v", err)
+	}
+}
+
+// A store's Tree is the run and every run under it, the root first and the
+// others in creation order, each with its own events in the order recorded;
+// nothing of another tree; nil for a run that is not there (ADR 0088).
+func testStoreTree(t *testing.T, open Opener) {
+	ctx := context.Background()
+	store := open()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	trees, ok := store.(kairo.TreeStore)
+	if !ok {
+		t.Skip("the store cannot read runs' events")
+	}
+	put := func(id, parent, workflow string, events ...string) {
+		t.Helper()
+		err := store.WithRun(ctx, id, func(*kairo.RunRow) (*kairo.Changes, error) {
+			ch := &kairo.Changes{Row: &kairo.RunRow{ID: id, Plan: "p", Hash: "h", State: []byte{1}, Status: "running",
+				CreatedAt: 42, UpdatedAt: 42, Parent: parent, Workflow: workflow}}
+			for _, e := range events {
+				ch.Events = append(ch.Events, json.RawMessage(e))
+			}
+			return ch, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ev := func(n int) string { return fmt.Sprintf(`{"kind":"timer","at":%d}`, n) }
+	put("tree-c0", "tree-r", "", ev(1)) // made before its parent's row
+	put("tree-r", "", "w", ev(2))
+	put("tree-other", "", "w", ev(3))
+	put("tree-c1", "tree-r", "", ev(4), ev(5))
+	put("tree-x", "tree-other", "", ev(6))
+	put("tree-g1", "tree-c1", "", ev(7))
+	put("tree-c2", "tree-r", "")
+	put("tree-c1", "tree-r", "", ev(8)) // appended to its earlier events
+
+	got := func(id string) string {
+		t.Helper()
+		tree, err := trees.Tree(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tree == nil {
+			return "nil"
+		}
+		var s []string
+		for _, r := range tree {
+			var evs []string
+			for _, e := range r.Events {
+				var at struct{ At int }
+				if err := json.Unmarshal(e, &at); err != nil {
+					t.Fatal(err)
+				}
+				evs = append(evs, strconv.Itoa(at.At))
+			}
+			s = append(s, r.Run.ID+"["+strings.Join(evs, ",")+"]")
+		}
+		return strings.Join(s, " ")
+	}
+	for id, want := range map[string]string{
+		"tree-r":      "tree-r[2] tree-c0[1] tree-c1[4,5,8] tree-g1[7] tree-c2[]",
+		"tree-c1":     "tree-c1[4,5,8] tree-g1[7]",
+		"tree-other":  "tree-other[3] tree-x[6]",
+		"tree-absent": "nil",
+	} {
+		if g := got(id); g != want {
+			t.Fatalf("%s: %s, want %s", id, g, want)
+		}
 	}
 }
 

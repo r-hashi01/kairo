@@ -52,6 +52,7 @@ from .metrics import (
     MetricSink,
 )
 from .observe import LOGGER, RUN_STUCK, STEP_FINISHED, STEP_STARTED, Observation, Observer, observe, step_status
+from .progress import RunProgress, progress_run
 from .protocol import Result
 from .store import ChildrenUnsettledError, LeaseRow, ParentUnavailableError, SharedRateRequest, SharedRateSettlement, WorkflowRetryError, is_workflow_retry
 from .worker import Task, TaskContext
@@ -1533,6 +1534,19 @@ class Kairo:
     async def children(self, id: str) -> list[dict[str, Any]]:
         """Runs made directly by id: calls, waits and child workflows."""
         return await self.backend.children(id)
+
+    async def progress(self, id: str) -> RunProgress:
+        """Workflow id's tree (it and every run under it: its calls, waits and
+        child workflows), each run with its recorded events (ADR 0088): the
+        attempts, their outcomes, steps whose process stopped. Only what was
+        recorded; it changes nothing. The embedded runtime only; KairoError
+        404 if there is no such run."""
+        if self._rt is None:
+            raise RuntimeError("reading progress needs the embedded runtime")
+        tree = await self._rt.tree(id)
+        if tree is None:
+            raise KairoError(404, f"no run {id}")
+        return RunProgress(id, [progress_run(info, events) for info, events in tree])
 
     async def replay(self, id: str) -> ReplayResult:
         """Evaluates an existing embedded code workflow using saved terminal

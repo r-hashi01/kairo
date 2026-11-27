@@ -121,6 +121,24 @@ type SharedRateStore interface {
 	PruneDestinationRates(ctx context.Context, limit int) (int, error)
 }
 
+// TreeRun is a run of a tree and its events, as stored (TreeStore.Tree).
+type TreeRun struct {
+	Run RunRow
+	// Events are the run's events in the order recorded (the core's
+	// encoding).
+	Events []json.RawMessage
+}
+
+// TreeStore is the optional Store capability Kairo.Progress reads with
+// (ADR 0088). A store without it cannot give a run's progress.
+type TreeStore interface {
+	// Tree returns run id and every run under it (by Parent), each with its
+	// events, read in one read-only transaction: the root first, then the
+	// others in creation order (as Children orders them). nil, nil: no run
+	// id. It writes nothing.
+	Tree(ctx context.Context, id string) ([]TreeRun, error)
+}
+
 // ErrParentUnavailable means a run cannot safely be added to the requested
 // parent's tree (ADR 0065).
 var ErrParentUnavailable = errors.New("kairo: parent workflow is unavailable")

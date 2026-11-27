@@ -71,6 +71,14 @@ class RunRow:
 
 
 @dataclass
+class TreeRun:
+    """A run of a tree and its events (Store.tree, ADR 0088)."""
+
+    run: RunRow
+    events: list[dict[str, Any]]  # the core's events, in the order recorded
+
+
+@dataclass
 class TimerRow:
     run: str
     timer: int
@@ -163,6 +171,10 @@ class Store(Protocol):
         """Root runs (no parent) in creation order (ADR 0059): of workflow, in
         status, created in [since, until), after the run after, at most limit."""
         ...
+    # Optional (ADR 0088): tree(id) -> list[TreeRun] | None. Run id and every
+    # run under it, each with its events in the order recorded, read in one
+    # read-only transaction: the root first, then the others in creation
+    # order; None if id is absent. A store without it cannot read runs' events.
     async def close(self) -> None: ...
 
 
@@ -390,6 +402,28 @@ def _list_query(p: str, ph: str, workflow: str | None, status: str | None, since
     return q, tuple(args)
 
 
+def _tree_runs(p: str, ph: str) -> str:
+    """Store.tree's runs: the tree's rows."""
+    return f"SELECT {_RUN_COLS} FROM {p}run WHERE id IN ({_tree(p, ph)}) ORDER BY {_RUN_ORDER}"
+
+
+def _tree_events(p: str, ph: str) -> str:
+    """Store.tree's events: the tree's, each run's in the order recorded."""
+    return f"SELECT run, seq, body FROM {p}event WHERE run IN ({_tree(p, ph)}) ORDER BY run, seq"
+
+
+def _tree_result(id: str, runs: list[Any], events: list[Any]) -> list[TreeRun] | None:
+    """Store.tree's result from the rows read: the root first."""
+    by_run: dict[str, list[dict[str, Any]]] = {}
+    for run, _seq, body in events:
+        by_run.setdefault(run, []).append(json.loads(body))
+    out = [TreeRun(row, by_run.get(row.id, [])) for r in runs if (row := _row(r)) is not None]
+    i = next((i for i, t in enumerate(out) if t.run.id == id), -1)
+    if i < 0:
+        return None
+    return [out[i], *out[:i], *out[i + 1:]]
+
+
 def _row(r: Any) -> RunRow | None:
     if r is None:
         return None
@@ -607,6 +641,20 @@ class SQLiteStore:
         assert self.db is not None
         rows = self.db.execute(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = ? ORDER BY {_RUN_ORDER}", (parent,)).fetchall()
         return [row for r in rows if (row := _row(r)) is not None]
+
+    async def tree(self, id: str) -> list[TreeRun] | None:
+        db, p = self.db, self.p
+        assert db is not None
+        # Without awaiting from BEGIN to COMMIT, and one snapshot of the file
+        # (deferred: it takes no write lock) for both reads: a run and its
+        # events agree.
+        db.execute("BEGIN")
+        try:
+            runs = db.execute(_tree_runs(p, "?"), (id,)).fetchall()
+            events = db.execute(_tree_events(p, "?"), (id,)).fetchall()
+        finally:
+            db.execute("COMMIT")
+        return _tree_result(id, runs, events)
 
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
         assert self.db is not None
@@ -935,6 +983,17 @@ class PostgresStore:
     async def children(self, parent: str) -> list[RunRow]:
         rows = await self._exec(f"SELECT {_RUN_COLS} FROM {self.p}run WHERE parent = %s ORDER BY {_RUN_ORDER}", (parent,))
         return [row for r in rows if (row := _row(r)) is not None]
+
+    async def tree(self, id: str) -> list[TreeRun] | None:
+        p = self.p
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                # One snapshot for both reads, writing nothing: a run and its
+                # events agree.
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                runs = await (await conn.execute(_tree_runs(p, "%s::text"), (id,))).fetchall()
+                events = await (await conn.execute(_tree_events(p, "%s::text"), (id,))).fetchall()
+        return _tree_result(id, runs, events)
 
     async def due_timers(self, now: int, limit: int) -> list[TimerRow]:
         rows = await self._exec(f"SELECT run, timer, act, at FROM {self.p}timer WHERE at <= %s ORDER BY at LIMIT %s", (now, limit))
