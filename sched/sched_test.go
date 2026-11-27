@@ -488,3 +488,43 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A task held for its intent goes to its worker only on Deliver (ADR 0085).
+func TestHeldTaskGoesOnDeliver(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	admitted := make(chan *task.Task, 1)
+	d.OnAdmitted(func(t *task.Task) { admitted <- t })
+	p := d.NewPoller([]string{"a"}, 1)
+	d.Submit(&task.Task{RunID: "r1", Act: 1, Action: "a", Tenant: "x", HoldForIntent: true})
+	held := <-admitted
+	select {
+	case dl := <-p.C:
+		t.Fatalf("handed over before Deliver: %+v", dl.Task)
+	default:
+	}
+	d.Deliver(held)
+	if dl := <-p.C; dl.Task != held {
+		t.Fatalf("delivered %+v", dl.Task)
+	}
+}
+
+// A held task the engine gives up on (Finish without Deliver: aborted
+// before its intent was durable) gives its poller's credit back.
+func TestHeldTaskFinishedGivesCreditBack(t *testing.T) {
+	d := NewDispatcher(nil)
+	defer d.Close()
+	admitted := make(chan *task.Task, 8)
+	d.OnAdmitted(func(t *task.Task) { admitted <- t })
+	p := d.NewPoller([]string{"a"}, 1)
+	d.Submit(&task.Task{RunID: "r1", Act: 1, Action: "a", Tenant: "x", HoldForIntent: true})
+	d.Submit(&task.Task{RunID: "r2", Act: 1, Action: "a", Tenant: "x", HoldForIntent: true})
+	d.Finish(<-admitted, Outcome{})
+	select {
+	case t2 := <-admitted:
+		d.Deliver(t2)
+		<-p.C
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the second task was never admitted: credit lost (queued %d, tracked %d)", d.Queued(), d.Tracked())
+	}
+}

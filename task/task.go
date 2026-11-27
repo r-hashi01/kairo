@@ -29,6 +29,11 @@ type Task struct {
 	// is zero, schedulers fall back to EstTokens for compatibility.
 	EstWeight int `json:"est_weight,omitempty"`
 
+	// HoldForIntent: a real step whose intent is recorded once it is
+	// admitted, not before (ADR 0085). The dispatcher holds it, its credit
+	// taken, until the engine says the intent is durable (Deliver).
+	HoldForIntent bool `json:"-"`
+
 	// Seq is assigned by the dispatcher for tracking outstanding tasks.
 	Seq uint64 `json:"seq"`
 	// Depth is the nesting depth of the run (ADR 0030). A worker that

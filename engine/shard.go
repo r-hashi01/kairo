@@ -87,12 +87,12 @@ type shardLog struct {
 type heldKind uint8
 
 const (
-	hDispatch heldKind = iota
-	hDone
+	hDone heldKind = iota
 	hEvict
 	hCheckpoint // a checkpoint record became durable: advance the run's base
 	hStarted    // the start is durable: answer Submit
 	hCallback   // a callback decision is durable: answer its HTTP request
+	hAdmitted   // an admitted real step's intent is durable: hand it over (ADR 0085)
 )
 
 type held struct {
@@ -236,6 +236,7 @@ const (
 	mDriveRelease
 	mCallback
 	mApplySignal
+	mAdmitted // the dispatcher admitted a real step held for its intent (ADR 0085)
 )
 
 type listItem struct {
@@ -273,6 +274,8 @@ type msg struct {
 	feedReply chan [tierCount]uint64
 	// mKept: the marker to add once the output is kept (ADR 0050)
 	after func()
+	// mAdmitted
+	task *task.Task
 }
 
 type queryReply struct {
@@ -640,6 +643,8 @@ func (s *shard) handle(m *msg) {
 		}
 		// Evicted again with newer state while the write was in progress.
 		s.writeSnapshot(r)
+	case mAdmitted:
+		s.admitted(m.task)
 	case mSnapDeleted:
 		r := m.run
 		if m.err != nil {
@@ -1048,14 +1053,43 @@ func (s *shard) dispatch(r *run, c *core.Command) {
 		s.e.disp.Submit(t)
 		return
 	}
-	// Real: record the intent, and release the command only once the log is
-	// durable up to the intent, which also covers every transition before it.
-	ev := core.Event{Kind: core.EvIntent, At: s.now, Act: c.Act, Attempt: c.Attempt}
+	// Real: its intent is recorded once the dispatcher admits it, not while
+	// it waits there (ADR 0085): a step that waited and never ran is then no
+	// outcome unknown after a crash. It goes to its worker only once the log
+	// is durable up to the intent, which covers every transition before it
+	// (admitted).
+	t.HoldForIntent = true
+	s.e.disp.Submit(t)
+}
+
+// admitted records the intent of real step t, which the dispatcher admitted
+// and holds, its credit taken; t goes to its worker once the intent is
+// durable (ADR 0085). One aborted meanwhile gives its credit back.
+func (s *shard) admitted(t *task.Task) {
+	r := s.runs[t.RunID]
+	if r == nil || r.done || r.st == nil || !core.Dispatched(r.st, t.Act, t.Attempt) {
+		s.e.disp.Finish(t, sched.Outcome{})
+		return
+	}
+	l := s.logFor(r)
+	if l == nil {
+		s.e.disp.Deliver(t)
+		return
+	}
+	if l.failed != nil {
+		// The log can no longer be made durable: the step cannot go on, and
+		// waiting here would hold its credit from other shards' work. It
+		// stays dispatched; a restart recovers it (it has no intent).
+		s.e.disp.Finish(t, sched.Outcome{})
+		return
+	}
+	ev := core.Event{Kind: core.EvIntent, At: s.now, Act: t.Act, Attempt: t.Attempt}
 	if _, err := core.Apply(r.plan, r.st, &ev, nil); err != nil {
+		s.e.disp.Finish(t, sched.Outcome{})
 		return
 	}
 	s.record(r, &ev)
-	s.hold(l, r, hDispatch, t)
+	s.hold(l, r, hAdmitted, t)
 }
 
 func (s *shard) hold(l *shardLog, r *run, k heldKind, t *task.Task) {
@@ -1118,11 +1152,13 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 
 func (s *shard) release(h held) {
 	switch h.kind {
-	case hDispatch:
+	case hAdmitted:
 		// Not if the step was aborted while its intent was becoming durable
 		// (a failed map element, a timeout, ADR 0032).
 		if r := h.run; !r.done && r.st != nil && core.Dispatched(r.st, h.task.Act, h.task.Attempt) {
-			s.e.disp.Submit(h.task)
+			s.e.disp.Deliver(h.task)
+		} else {
+			s.e.disp.Finish(h.task, sched.Outcome{})
 		}
 	case hDone:
 		s.finish(h.run)
