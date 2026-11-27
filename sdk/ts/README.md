@@ -77,6 +77,8 @@ k.workflow('name', async (ctx, input) => { ... });
 
 A workflow must be deterministic between its calls: read the clock and randomness through `ctx.now()` and `ctx.random()`, and do I/O in actions.
 
+If a replay leaves its record — it is about to make a call with an effect (an action that is not unprotected, or a child workflow) while a recorded call with an effect it would have reached first was never reached — nothing is made: the call fails with `DivergedError`, the drive records no outcome even if the workflow catches it, the run is logged and observed as `run.stuck`, and it is replayed again a lease period later. Deploy code that replays as the workflow first ran, start new runs on a new version, or cancel it (ADR 0084). Calls made at once (`ctx.parallel`, `Promise.all`) are judged once the function can go no further without the new call: until then it waits.
+
 To change a workflow's function while runs of it are under way, give it a version. A run keeps the version it started with to its end, and a process drives only the runs whose version it has. New runs start with the current version; keep the old one, `draining`, until no run of it is left (`version` in `get` and `list`).
 
 ```ts

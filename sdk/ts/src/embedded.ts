@@ -483,7 +483,8 @@ export class Embedded {
 		}
 	}
 
-	private recordStuck(runId: string, e: unknown): void {
+	/** Logs and observes a run that could not go on now. */
+	recordStuck(runId: string, e: unknown): void {
 		this.logger.warn('kairo: a run cannot go on', { run: runId, err: e });
 		this.observe({ kind: 'run.stuck', runId, error: String((e as Error)?.message ?? e) });
 	}

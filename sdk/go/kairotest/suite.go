@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,8 @@ func Run(t *testing.T, fresh func(t *testing.T) Opener) {
 		"LiveDriverIsNotDoubled":             testLiveDriverIsNotDoubled,
 		"SignalBeforeTheWait":                testSignalBeforeTheWait,
 		"SignalIDKeptByTheWait":              testSignalIDKeptByTheWait,
+		"DivergedReplayStopsBeforeEffects":   testDivergedReplayStopsBeforeEffects,
+		"BranchesAreJudgedApart":             testBranchesAreJudgedApart,
 		"SignalReceiptsAndOnlyIfWaiting":     testSignalReceiptsAndOnlyIfWaiting,
 		"WaitTimesOut":                       testWaitTimesOut,
 		"Limits":                             testLimits,
@@ -1395,6 +1398,144 @@ func testSignalBeforeTheWait(t *testing.T, open Opener) {
 	out, err := kairo.Await[[]string](context.Background(), k, "ahead-1")
 	if err != nil || !equalJSON(out, []string{"first", "second"}) {
 		t.Fatalf("%v %v", out, err)
+	}
+}
+
+// replayed opens a runtime on open() with a clock of the test's, whose
+// workflows give up their drive with RetryWorkflow to be replayed: the
+// returned func waits until the drive of id was handed over, calls then,
+// and moves the clock past the lease (ADR 0063).
+func replayed(t *testing.T, open Opener, observe func(kairo.Observation)) (*kairo.Kairo, func(id string, then func())) {
+	t.Helper()
+	const lease = 50 * time.Millisecond
+	var now atomic.Int64
+	now.Store(time.Now().UnixMilli())
+	s := &onceStore{Store: open()}
+	k, err := kairo.Open(context.Background(), kairo.Options{Store: s, Lease: lease, Observe: observe,
+		Now: func() time.Time { return time.UnixMilli(now.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { k.Close() })
+	return k, func(id string, then func()) {
+		t.Helper()
+		waitUntil(t, func() bool { return s.handedOver(id) })
+		s.handed.Delete(id)
+		if then != nil {
+			then()
+		}
+		now.Add(2 * lease.Milliseconds())
+	}
+}
+
+// A workflow whose replay makes a real call it did not make before, while
+// the call it made then is not reached, is stopped before the new call
+// runs: nothing is made, no outcome is recorded even if the workflow
+// catches the error, and it goes on once code that replays as it first ran
+// drives it (ADR 0084).
+func testDivergedReplayStopsBeforeEffects(t *testing.T, open Opener) {
+	var stuck atomic.Value
+	k, expire := replayed(t, open, func(o kairo.Observation) {
+		if o.Kind == kairo.ObsRunStuck {
+			stuck.Store(o.Error)
+		}
+	})
+	paid := &counts{m: map[string]int{}}
+	kairo.Action(k, "pay", kairo.Real, func(_ *kairo.TaskContext, amount int) (string, error) {
+		paid.add(strconv.Itoa(amount))
+		return "paid", nil
+	})
+	var amount, drives atomic.Int32
+	amount.Store(1)
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+		// The amount comes from outside the record: not deterministic.
+		_, _ = kairo.Call[string](ctx, "pay", int(amount.Load())) // even caught, it stops
+		if drives.Add(1) == 1 {
+			return "", kairo.RetryWorkflow(errors.New("replay me"))
+		}
+		return "done", nil
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	res := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := kairo.Run[string](ctx, k, "w", nil, kairo.WithID("diverged-1"))
+		res <- err
+	}()
+	expire("diverged-1", func() { amount.Store(2) }) // the replay pays another amount
+	waitUntil(t, func() bool { e, _ := stuck.Load().(string); return strings.Contains(e, "left its record") })
+	if paid.get("2") != 0 || paid.get("1") != 1 {
+		t.Fatalf("paid %v", paid.m)
+	}
+	if info, err := k.Get(context.Background(), "diverged-1"); err != nil || info.Finished() {
+		t.Fatalf("the diverged workflow: %+v %v", info, err)
+	}
+	// Code that replays as the workflow first ran: it goes on.
+	expire("diverged-1", func() { amount.Store(1) })
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+	if paid.get("1") != 1 || paid.get("2") != 0 {
+		t.Fatalf("paid %v", paid.m)
+	}
+}
+
+// A branch of Parallel that makes a new real call is judged by its own
+// record only: another branch's recorded call, not reached yet, is not a
+// divergence (ADR 0084, decision 2).
+func testBranchesAreJudgedApart(t *testing.T, open Opener) {
+	k, expire := replayed(t, open, nil)
+	calls := &counts{m: map[string]int{}}
+	kairo.Action(k, "act", kairo.Real, func(_ *kairo.TaskContext, what string) (string, error) {
+		calls.add(what)
+		return what, nil
+	})
+	var drives atomic.Int32
+	gate := make(chan struct{})
+	kairo.Workflow(k, "w", func(ctx *kairo.Context, _ any) (string, error) {
+		second := drives.Add(1) > 1
+		err := kairo.Parallel(ctx, func(ctx *kairo.Context) error {
+			if _, err := kairo.Call[string](ctx, "act", "a1"); err != nil {
+				return err
+			}
+			if second {
+				// New, after this branch's record; b1 is not reached yet.
+				_, err := kairo.Call[string](ctx, "act", "a2")
+				close(gate)
+				return err
+			}
+			return nil
+		}, func(ctx *kairo.Context) error {
+			if second {
+				<-gate
+			}
+			_, err := kairo.Call[string](ctx, "act", "b1")
+			return err
+		})
+		if err == nil && !second {
+			return "", kairo.RetryWorkflow(errors.New("replay me"))
+		}
+		return "done", err
+	})
+	if err := k.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	res := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := kairo.Run[string](ctx, k, "w", nil, kairo.WithID("branches-1"))
+		res <- err
+	}()
+	expire("branches-1", nil)
+	if err := <-res; err != nil {
+		t.Fatal(err)
+	}
+	if calls.get("a1") != 1 || calls.get("b1") != 1 || calls.get("a2") != 1 {
+		t.Fatalf("calls %v", calls.m)
 	}
 }
 

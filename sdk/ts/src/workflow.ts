@@ -15,6 +15,7 @@ import { consoleLogger, observe, stepStatus, type Logger, type Observer } from '
 import { MetricEmitter, MetricName, type MetricSink } from './metrics.ts';
 import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, WorkflowRetryError, type LeaseRow } from './store.ts';
 import type { CoreCommand } from './core.ts';
+import { DivergedError, Divergence } from './divergence.ts';
 import type { Address, TaskContext } from './worker.ts';
 
 /** An action: what a step of a workflow runs, on this process's worker. */
@@ -1781,7 +1782,20 @@ export class Kairo {
 			}, () => {});
 		}
 		this.drivingIds.add(id);
-		const ctx = new Context(this, id, abort.signal, cancelled);
+		const div = new Divergence(id, () => this.backend.children(id), (r) => this.hasEffect(id, r));
+		const ctx = new Context(this, id, abort.signal, cancelled, div);
+		// Left its record (ADR 0084): nothing more was made, and no outcome
+		// is recorded, even if the workflow caught the error. The drive is
+		// given up for a lease period, as for a transient error (ADR 0063).
+		const leftRecord = (): void => {
+			try {
+				div.check();
+			} catch (e) {
+				abort.abort();
+				this.reportStuck(id, e as Error);
+				throw new WorkflowRetryError((e as Error).message, { cause: e });
+			}
+		};
 		try {
 			let value: unknown;
 			let failed = false;
@@ -1793,7 +1807,10 @@ export class Kairo {
 				const running = Promise.resolve().then(() => fn(ctx, input));
 				running.catch(() => {});
 				value = await Promise.race([running, aborted(abort.signal)]);
+				leftRecord();
 			} catch (e) {
+				if (isWorkflowRetry(e) && (e as Error).cause instanceof DivergedError) throw e;
+				leftRecord();
 				if (e instanceof Suspended) throw e; // goes on later
 				// A child workflow whose version is not here: this one is left
 				// to another process, not failed (ADR 0060).
@@ -1904,12 +1921,40 @@ export class Kairo {
 			if (plan.startsWith(PLAN_WAIT)) return replay.read(runId, 'wait', plan.slice(PLAN_WAIT.length).split('@', 1)[0], input);
 			return replay.read(runId, 'call', calledAction(plan), input);
 		}
+		const kind = plan.startsWith(PLAN_WAIT) ? 'wait' : plan.startsWith(PLAN_CALL) && this.actionHasEffect(calledAction(plan)) ? 'effect' : 'call';
+		await ctx.div?.enter(runId, kind);
 		this.rt?.reach(runId, true);
 		try {
 			return await this.callRunReached(plan, root, input, runId, ctx, destination);
 		} finally {
 			this.rt?.reach(runId, false);
+			ctx.div?.leave(runId);
 		}
+	}
+
+	/** Whether action acts outside: not unprotected, or not declared here (ADR 0084). */
+	private actionHasEffect(action: string): boolean {
+		if ((Object.values(BUILTIN) as string[]).includes(action)) return false;
+		return this.actions.get(action)?.effect !== 'unprotected';
+	}
+
+	/** Whether recorded child r of workflow is a call with an effect (ADR 0084, decision 4). */
+	private hasEffect(workflow: string, r: RunInfo): boolean {
+		// Only runs the workflow's calls made: <workflow>/<24 hex>.…
+		if (!/^[0-9a-f]{24}\./.test(r.run_id.startsWith(workflow + '/') ? r.run_id.slice(workflow.length + 1) : '')) return false;
+		if (r.plan === PLAN_WORKFLOW) return !workflowOf(r.input)?.externalParent;
+		if (!r.plan?.startsWith(PLAN_CALL)) return false;
+		return this.actionHasEffect(r.plan.slice(PLAN_CALL.length));
+	}
+
+	/** Logs and observes a workflow that cannot go on now. */
+	private reportStuck(runId: string, e: Error): void {
+		if (this.rt) {
+			this.rt.recordStuck(runId, e);
+			return;
+		}
+		this.logger.warn('kairo: a run cannot go on', { run: runId, err: e });
+		if (this.opts.observe) observe(this.opts.observe, this.logger, this.clock, { kind: 'run.stuck', runId, error: e.message });
 	}
 
 	private async callRunReached(plan: string, root: unknown | null, input: unknown, runId: string, ctx: Context, destination: string): Promise<unknown> {
@@ -1965,6 +2010,15 @@ export class Kairo {
 	async childWorkflow(name: string, input: unknown, id: string, ctx: Context): Promise<unknown> {
 		const replay = this.replayDrives.get(ctx);
 		if (replay) return replay.read(id, 'workflow', name, input);
+		await ctx.div?.enter(id, 'effect');
+		try {
+			return await this.childWorkflowReached(name, input, id, ctx);
+		} finally {
+			ctx.div?.leave(id);
+		}
+	}
+
+	private async childWorkflowReached(name: string, input: unknown, id: string, ctx: Context): Promise<unknown> {
 		if (this.backend instanceof HttpBackend) {
 			const version = this.currentVersion(name);
 			if (version === undefined) throw new Error(`no workflow ${name}`);
@@ -2245,12 +2299,15 @@ export class Context {
 	readonly cancelled: () => boolean;
 	private readonly k: Kairo;
 	private readonly seen = new Map<string, number>();
+	/** Checks that this drive's replay keeps to its record (ADR 0084); none in replay(). */
+	readonly div: Divergence | undefined;
 
-	constructor(k: Kairo, id: string, signal: AbortSignal, cancelled: () => boolean = () => false) {
+	constructor(k: Kairo, id: string, signal: AbortSignal, cancelled: () => boolean = () => false, div?: Divergence) {
 		this.k = k;
 		this.id = id;
 		this.signal = signal;
 		this.cancelled = cancelled;
+		this.div = div;
 	}
 
 	private next(kind: string, input: unknown): string {

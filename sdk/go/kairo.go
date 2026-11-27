@@ -1390,8 +1390,16 @@ func (k *Kairo) runAs(ctx context.Context, name string, in json.RawMessage, id, 
 			}
 		}()
 	}
-	c := &Context{Context: cctx, k: k, id: id, seen: map[string]int{}, cancelled: cancelled}
+	c := &Context{Context: cctx, k: k, id: id, seen: map[string]int{}, cancelled: cancelled, div: newDivergence()}
 	value, err := callWorkflow(fn, c, in)
+	if derr := c.div.diverged(); derr != nil {
+		// Left its record (ADR 0084): nothing more was made, and no outcome
+		// is recorded, even if the workflow caught the error. The drive is
+		// given up for a lease period, as for a transient error (ADR 0063).
+		cancel()
+		k.rt.stuck(id, derr)
+		return nil, RetryWorkflow(derr)
+	}
 	if err != nil {
 		k.mu.Lock()
 		cancelReq := d.cancelReq
@@ -1598,6 +1606,10 @@ func (k *Kairo) callRunTo(c *Context, plan string, root map[string]any, in any, 
 	if c.replay != nil {
 		kind, name := replayCallKind(plan)
 		return c.replay.call(c, runID, kind, name, in)
+	}
+	action, isCall := strings.CutPrefix(plan, planCall)
+	if err := c.keepsToRecord(runID, isCall && k.actionHasEffect(action)); err != nil {
+		return nil, err
 	}
 	if k.remote == nil {
 		k.rt.reach(runID, true)
