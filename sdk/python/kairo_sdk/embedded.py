@@ -397,6 +397,16 @@ class Embedded:
     async def children(self, run_id: str) -> list[dict[str, Any]]:
         return [info(row) for row in await self.store.children(run_id)]
 
+    async def tree(self, run_id: str) -> list[tuple[dict[str, Any], list[dict[str, Any]]]] | None:
+        """Run run_id and every run under it, each with its recorded events,
+        read in one transaction (ADR 0088); None if there is no such run.
+        Reads only."""
+        read = getattr(self.store, "tree", None)
+        if read is None:
+            raise NotImplementedError("this store cannot read runs' events")
+        tree = await read(run_id)
+        return None if tree is None else [(info(t.run), t.events) for t in tree]
+
     def reach(self, run_id: str, on: bool) -> None:
         n = self._reached.get(run_id, 0)
         if on:

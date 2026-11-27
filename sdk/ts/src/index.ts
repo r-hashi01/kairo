@@ -6,6 +6,8 @@ export * from './backend.ts';
 export * from './core.ts';
 export * from './embedded.ts';
 export * from './observe.ts';
+export * from './progress.ts';
+export { serveViewer, type Viewer, type ViewerOptions } from './viewer.ts';
 export * from './metrics.ts';
 export * from './store.ts';
 export * from './http.ts';

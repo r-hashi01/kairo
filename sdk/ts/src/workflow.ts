@@ -15,6 +15,8 @@ import { consoleLogger, observe, stepStatus, type Logger, type Observer } from '
 import { MetricEmitter, MetricName, type MetricSink } from './metrics.ts';
 import { ChildrenUnsettledError, isWorkflowRetry, ParentUnavailableError, WorkflowRetryError, type LeaseRow } from './store.ts';
 import type { CoreCommand } from './core.ts';
+import { progressKind, runEvent, type RunProgress } from './progress.ts';
+import { WORKFLOW_PLAN, waitPlan, waitRoot } from './plans.ts';
 import { DivergedError, Divergence } from './divergence.ts';
 import type { Address, TaskContext } from './worker.ts';
 
@@ -631,7 +633,7 @@ export class Kairo {
 		await this.backend.start(specs, observer ? (task, ctx) => this.serveObserved(observer, task, ctx) : (task, ctx) => this.serve(task, ctx));
 		for (const { action } of specs) await this.plan(PLAN_CALL + action, { kind: 'step', id: 'call', action,
 			input: { in: '$input.in', $kairo_destination: '$input.destination' } });
-		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		await this.plan(WORKFLOW_PLAN.name, WORKFLOW_PLAN.root, WORKFLOW_PLAN.vars);
 		const rt = this.rt;
 		if (rt) {
 			rt.lostDrive = (l) => this.lostDrive(l);
@@ -1336,6 +1338,19 @@ export class Kairo {
 	}
 
 	/**
+	 * Workflow id's tree (it and every run under it: its calls, waits and
+	 * child workflows), each run with its recorded events (ADR 0088): the
+	 * attempts, their outcomes, steps whose process stopped. Only what was
+	 * recorded; it changes nothing. The embedded runtime only.
+	 */
+	async progress(id: string): Promise<RunProgress> {
+		if (!this.rt) throw new Error('reading progress needs the embedded runtime');
+		const tree = await this.rt.tree(id);
+		if (!tree) throw new KairoError(404, `no run ${id}`);
+		return { root: id, runs: tree.map(({ info, events }) => ({ ...info, ...progressKind(info), events: events.map(runEvent) })) };
+	}
+
+	/**
 	 * Evaluates an existing embedded code workflow using saved terminal call
 	 * records only. It does not run actions or child workflows, advance waits,
 	 * acquire a drive, or change any run.
@@ -1394,7 +1409,7 @@ export class Kairo {
 	): Promise<{ token: number; parent?: string }> {
 		const version = this.currentVersion(name);
 		if (version === undefined) throw new Error(`no workflow ${name}`);
-		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		await this.plan(WORKFLOW_PLAN.name, WORKFLOW_PLAN.root, WORKFLOW_PLAN.vars);
 		const token = this.rt || this.backend instanceof HttpBackend ? newToken() : 0;
 		const started = await this.backend.run(
 			PLAN_WORKFLOW,
@@ -1748,7 +1763,7 @@ export class Kairo {
 	): Promise<unknown> {
 		const current = this.currentVersion(name);
 		if (current === undefined) throw new Error(`no workflow ${name}`);
-		await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+		await this.plan(WORKFLOW_PLAN.name, WORKFLOW_PLAN.root, WORKFLOW_PLAN.vars);
 		// A new run starts with the current version; one that exists goes on
 		// with the version it started with (ADR 0060).
 		const started = await this.backend.run(
@@ -2043,7 +2058,7 @@ export class Kairo {
 		if (this.backend instanceof HttpBackend) {
 			const version = this.currentVersion(name);
 			if (version === undefined) throw new Error(`no workflow ${name}`);
-			await this.plan(PLAN_WORKFLOW, { kind: 'wait', id: 'done', signal: 'done' }, { started_at: { type: 'integer', value: 0 } });
+			await this.plan(WORKFLOW_PLAN.name, WORKFLOW_PLAN.root, WORKFLOW_PLAN.vars);
 			await this.backend.run(PLAN_WORKFLOW, workflowInput(name, version, input), {
 				runId: id,
 				parent: ctx.id,
@@ -2055,22 +2070,6 @@ export class Kairo {
 		}
 		return this.runAs(name, input, id, { id: ctx.id, signal: ctx.signal, cancelled: ctx.cancelled });
 	}
-}
-
-/** The plan of a wait for signal name, with a timeout (ms; 0: none). */
-function waitRoot(name: string, timeoutMs = 0) {
-	return { kind: 'wait', id: 'w', signal: name, ...(timeoutMs > 0 ? { timeout: `${timeoutMs}ms` } : {}) };
-}
-
-/** A wait's plan from its name (kairo.wait/<signal>[@<ms>]): one made by another process (ADR 0059). */
-function waitPlan(name: string): { name: string; root: unknown } | undefined {
-	if (!name.startsWith(PLAN_WAIT)) return undefined;
-	const rest = name.slice(PLAN_WAIT.length);
-	const i = rest.lastIndexOf('@');
-	if (i >= 0 && /^\d+$/.test(rest.slice(i + 1)) && Number(rest.slice(i + 1)) > 0) {
-		return { name, root: waitRoot(rest.slice(0, i), Number(rest.slice(i + 1))) };
-	}
-	return { name, root: waitRoot(rest) };
 }
 
 /** Rejects when signal aborts. */

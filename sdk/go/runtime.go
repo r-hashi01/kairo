@@ -124,6 +124,7 @@ type runtime struct {
 	coreMu  sync.RWMutex // Compile appends plans; Apply reads them
 	store   Store
 	rates   SharedRateStore
+	trees   TreeStore // nil: the store cannot read runs' events (ADR 0088)
 	now     func() int64
 	owner   string
 	leaseMs int64
@@ -197,6 +198,11 @@ func newRuntime(store Store, now func() int64, owner string, leaseMs, keepMs int
 	r.busyCond = sync.NewCond(&r.busyMu)
 	if rates, ok := store.(SharedRateStore); ok {
 		r.rates = rates
+	}
+	// From the store itself, as rates: the retrying wrapper is for a
+	// workflow's drive, and reading a tree is not one.
+	if trees, ok := store.(TreeStore); ok {
+		r.trees = trees
 	}
 	r.logger = slog.Default()
 	return r

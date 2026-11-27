@@ -115,6 +115,12 @@ export interface Changes<T> {
 	result: T;
 }
 
+/** A run of a tree and its events (Store.tree, ADR 0088). */
+export interface TreeRun {
+	run: RunRow;
+	events: CoreEvent[];
+}
+
 export interface SharedRateRequest {
 	destination: string;
 	requestsPerMinute?: number;
@@ -182,6 +188,13 @@ export interface Store {
 	endDrive(run: string, owner: string, token: number, now: number, resume: boolean): Promise<void>;
 	/** Root runs (no parent) in creation order (ADR 0059). */
 	list(f: ListFilter): Promise<RunRow[]>;
+	/**
+	 * Run id and every run under it, each with its events in the order
+	 * recorded, read in one read-only transaction (ADR 0088): the root
+	 * first, then the others in creation order. Undefined if id is absent.
+	 * Absent: this store cannot read runs' events.
+	 */
+	tree?(id: string): Promise<TreeRun[] | undefined>;
 	/** Optional capability for ADR 0078 shared destination limits. */
 	admitDestination?(request: SharedRateRequest): Promise<number>;
 	pruneDestinationRates?(limit: number): Promise<number>;
@@ -384,6 +397,24 @@ const IS_ROOT = (p: string, id: string, at: string) =>
 const TREE = (p: string, root: string) =>
 	`WITH RECURSIVE tree(id) AS (SELECT ${root} UNION SELECT r.id FROM ${p}run r JOIN tree t ON r.parent = t.id) SELECT id FROM tree`;
 
+/** The queries of Store.tree: the tree's runs, and their events in order. */
+const TREE_RUNS = (p: string, ph: string) => `SELECT ${RUN_COLS} FROM ${p}run WHERE id IN (${TREE(p, ph)}) ORDER BY ${RUN_ORDER}`;
+const TREE_EVENTS = (p: string, ph: string) => `SELECT run, seq, body FROM ${p}event WHERE run IN (${TREE(p, ph)}) ORDER BY run, seq`;
+
+/** Store.tree's result from the rows read: the root first. */
+function treeRuns(id: string, runs: any[], events: any[]): TreeRun[] | undefined {
+	const byRun = new Map<string, CoreEvent[]>();
+	for (const e of events) {
+		let list = byRun.get(e.run);
+		if (!list) byRun.set(e.run, (list = []));
+		list.push(JSON.parse(e.body) as CoreEvent);
+	}
+	const out = runs.map((r) => ({ run: runRow(r)!, events: byRun.get(r.id) ?? [] }));
+	const i = out.findIndex((t) => t.run.id === id);
+	if (i < 0) return undefined;
+	return [out[i]!, ...out.slice(0, i), ...out.slice(i + 1)];
+}
+
 function checkPrefix(p: string): string {
 	if (!/^[a-z][a-z0-9_]{0,30}$/.test(p)) throw new Error(`table prefix ${p}: letters, digits and _ only`);
 	return p;
@@ -459,6 +490,8 @@ export class SQLiteStore implements Store {
 			rmTimers: this.db.prepare(`DELETE FROM ${p}timer WHERE run IN (${TREE(p, '?')})`),
 			rmLeases: this.db.prepare(`DELETE FROM ${p}lease WHERE run IN (${TREE(p, '?')})`),
 			rmRuns: this.db.prepare(`DELETE FROM ${p}run WHERE id IN (${TREE(p, '?')})`),
+			treeRuns: this.db.prepare(TREE_RUNS(p, '?')),
+			treeEvents: this.db.prepare(TREE_EVENTS(p, '?')),
 		};
 	}
 
@@ -590,6 +623,19 @@ export class SQLiteStore implements Store {
 
 	async children(parent: string): Promise<RunRow[]> {
 		return this.q.children.all(parent).map((r: any) => runRow(r)!);
+	}
+
+	async tree(id: string): Promise<TreeRun[] | undefined> {
+		// Synchronous from BEGIN to COMMIT, and one snapshot of the file (WAL)
+		// for both reads: a run and its events agree.
+		this.db.exec('BEGIN');
+		try {
+			const runs = this.q.treeRuns.all(id);
+			const events = this.q.treeEvents.all(id);
+			return treeRuns(id, runs, events);
+		} finally {
+			this.db.exec('COMMIT');
+		}
 	}
 
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {
@@ -919,6 +965,23 @@ export class PostgresStore implements Store {
 
 	async children(parent: string): Promise<RunRow[]> {
 		return (await this.pool.query(`SELECT ${RUN_COLS} FROM ${this.p}run WHERE parent = $1 ORDER BY ${RUN_ORDER}`, [parent])).rows.map((r: any) => runRow(r)!);
+	}
+
+	async tree(id: string): Promise<TreeRun[] | undefined> {
+		const c = await this.pool.connect();
+		try {
+			// One snapshot for both reads: a run and its events agree.
+			await c.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+			try {
+				const runs = (await c.query(TREE_RUNS(this.p, '$1::text'), [id])).rows;
+				const events = (await c.query(TREE_EVENTS(this.p, '$1::text'), [id])).rows;
+				return treeRuns(id, runs, events);
+			} finally {
+				await c.query('COMMIT');
+			}
+		} finally {
+			c.release();
+		}
 	}
 
 	async dueTimers(now: number, limit: number): Promise<TimerRow[]> {

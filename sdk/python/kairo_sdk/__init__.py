@@ -28,6 +28,7 @@ from .observe import (
     Observer,
 )
 from .metrics import Metric, MetricSink
+from .progress import ProgressRunKind, RunEvent, RunEventKind, RunProgress
 from .protocol import (
     CAPABILITY_ASYNC_ACTION_CALLBACK,
     CAPABILITY_GRACEFUL_DRAIN,
@@ -110,6 +111,10 @@ __all__ = [
     "ReplayCall",
     "ReplayResult",
     "ParentUnavailableError",
+    "ProgressRunKind",
+    "RunEvent",
+    "RunEventKind",
+    "RunProgress",
     "SignalReceipt",
     "RetryableError",
     "RetryAfterError",

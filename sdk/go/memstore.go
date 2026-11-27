@@ -330,6 +330,45 @@ func (m *MemStore) List(_ context.Context, f ListFilter) ([]RunRow, error) {
 	return out, nil
 }
 
+// Tree returns run id and every run under it, each with its events (ADR
+// 0088): the root first, then the others in creation order. Under the
+// store's lock, so the runs and their events agree.
+func (m *MemStore) Tree(_ context.Context, id string) ([]TreeRun, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	root := m.runs[id]
+	if root == nil {
+		return nil, nil
+	}
+	kids := map[string][]string{}
+	for rid, r := range m.runs {
+		if r.Parent != "" {
+			kids[r.Parent] = append(kids[r.Parent], rid)
+		}
+	}
+	seen := map[string]bool{id: true}
+	var under []RunRow
+	for queue := []string{id}; len(queue) > 0; queue = queue[1:] {
+		for _, k := range kids[queue[0]] {
+			if !seen[k] {
+				seen[k] = true
+				under = append(under, *copyRow(m.runs[k]))
+				queue = append(queue, k)
+			}
+		}
+	}
+	sort.Slice(under, func(i, j int) bool { return runRowBefore(&under[i], &under[j]) })
+	out := make([]TreeRun, 0, 1+len(under))
+	out = append(out, TreeRun{Run: *copyRow(root)})
+	for _, r := range under {
+		out = append(out, TreeRun{Run: r})
+	}
+	for i := range out {
+		out[i].Events = append([]json.RawMessage(nil), m.events[out[i].Run.ID]...)
+	}
+	return out, nil
+}
+
 func runRowBefore(a, b *RunRow) bool {
 	if a.CreationOrder == 0 || b.CreationOrder == 0 {
 		if a.CreationOrder != b.CreationOrder {

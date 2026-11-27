@@ -16,7 +16,7 @@ import { ObservationKind, StepStatus } from './observe.ts';
 import { MetricName, type Metric } from './metrics.ts';
 import { PostgresStore, SQLiteStore } from './store.ts';
 import { ParentUnavailableError } from './store.ts';
-import { CallError, CancelledError, Kairo, RunSettledError, Suspended, UnknownOutcomeError } from './workflow.ts';
+import { CallError, CancelledError, Kairo, RetryableError, RunSettledError, Suspended, UnknownOutcomeError } from './workflow.ts';
 
 const repo = resolve(import.meta.dirname, '../../..');
 const dir = mkdtempSync(join(tmpdir(), 'kairo-sdk-'));
@@ -230,6 +230,7 @@ function suite(name: string, backend: () => Promise<Backend>) {
 		const unknownCalls: string[] = [];
 		let hang = true;
 		let slowAborted = false;
+		let flaky = 0;
 		let signalGateEntered: (() => void) | undefined;
 		let signalGateRelease: Promise<void> | undefined;
 
@@ -307,6 +308,15 @@ function suite(name: string, backend: () => Promise<Backend>) {
 			});
 			k.workflow('tree-hold', async (_ctx) => new Promise(() => {}));
 			k.workflow('listed', async (_ctx, input) => input);
+			k.defineAction('flaky', {
+				effect: 'unprotected',
+				maxAttempts: 3,
+				backoff: '1ms',
+				handler: async () => {
+					if (++flaky === 1) throw new RetryableError('not yet');
+					return 'ok';
+				},
+			});
 			await k.start();
 			return k;
 		}
@@ -531,6 +541,60 @@ function suite(name: string, backend: () => Promise<Backend>) {
 				assert.deepEqual(seen, ['1'], 'version 2 did not run it, and its call ran once');
 			} finally {
 				await k2.close();
+			}
+		});
+
+		test('progress gives the tree and its recorded attempts, and changes nothing (ADR 0088)', { skip: name === 'kairod' }, async () => {
+			const k = await kairo();
+			const id = `ts-progress-${name.replace(/\W/g, '')}`;
+			flaky = 0;
+			try {
+				k.workflow('progress', async (ctx) => {
+					await ctx.call('llm', { q: 'a' });
+					await ctx.call('flaky', null);
+					await ctx.call('write', { path: 'p' });
+					return ctx.waitFor<string>('approve');
+				});
+				const out = k.run('progress', null, { id });
+				await waitUntil(async () => (await k.children(id)).some((c) => c.plan === 'kairo.wait/approve'));
+
+				const before = await Promise.all([id, ...(await k.children(id)).map((c) => c.run_id)].map((r) => k.backend.get(r)));
+				const p = await k.progress(id);
+				assert.equal(p.root, id);
+				assert.equal(p.runs[0]!.run_id, id);
+				assert.equal(p.runs[0]!.kind, 'workflow');
+				assert.equal(p.runs[0]!.name, 'progress');
+				const kinds = (n: string) => p.runs.find((r) => r.name === n)!.events.map((e) => [e.kind, e.attempt ?? null]);
+				assert.deepEqual(p.runs.slice(1).map((r) => [r.kind, r.name]), [
+					['call', 'llm'],
+					['call', 'flaky'],
+					['call', 'write'],
+					['wait', 'approve'],
+				]);
+				assert.deepEqual(kinds('llm'), [['started', null], ['succeeded', 1]]);
+				assert.deepEqual(kinds('flaky'), [['started', null], ['failed', 1], ['timer', null], ['succeeded', 2]]);
+				const failed = p.runs.find((r) => r.name === 'flaky')!.events[1]!;
+				assert.equal(failed.retryable, true);
+				assert.equal(failed.error, 'not yet');
+				assert.deepEqual(kinds('write'), [['started', null], ['dispatched', 1], ['succeeded', 1]]);
+				assert.deepEqual(kinds('approve'), [['started', null]]);
+				for (const r of p.runs) for (const e of r.events) assert.ok(e.at > 0);
+
+				// Reading changed nothing.
+				const after = await Promise.all(before.map((r) => k.backend.get(r.run_id)));
+				assert.deepEqual(after, before);
+				assert.deepEqual(await k.progress(id), p);
+
+				await k.signal(id, 'approve', 'yes');
+				assert.equal(await out, 'yes');
+				const done = await k.progress(id);
+				assert.deepEqual(done.runs.find((r) => r.name === 'approve')!.events.map((e) => [e.kind, e.signal ?? null]), [
+					['started', null],
+					['signal', 'approve'],
+				]);
+				await assert.rejects(k.progress(`${id}-absent`), (e: unknown) => e instanceof KairoError && e.status === 404);
+			} finally {
+				await k.close();
 			}
 		});
 
