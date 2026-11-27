@@ -104,7 +104,9 @@ echo "python: $got"
 step "kairod and kairo-jev"
 for os in linux darwin; do
   for arch in amd64 arm64; do
-    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' -o "$out/bin/kairod-$version-$os-$arch" ./cmd/kairod
+    # The kairod released can keep its data in a SQL database (ADR 0087).
+    (cd store/kairod && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' \
+      -o "$out/bin/kairod-$version-$os-$arch" .)
     (cd executor/jev && CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' \
       -o "$out/bin/kairo-jev-$version-$os-$arch" ./cmd/kairo-jev)
   done

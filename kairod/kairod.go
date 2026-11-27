@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/r-hashi01/kairo/api"
+	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/executor/httpexec"
 	"github.com/r-hashi01/kairo/httpaction"
@@ -163,6 +164,7 @@ func Main(storage Storage) {
 	// KAIRO_STORE: the durable tiers in a SQL database, which replicates
 	// them (ADR 0087). An environment variable, not a flag: a DSN may hold
 	// credentials, and the command line is visible to other users.
+	var catalog blob.Store // with KAIRO_STORE: the plans kept in the database too
 	if dsn := os.Getenv("KAIRO_STORE"); dsn != "" {
 		if storage == nil {
 			log.Fatal("kairod: KAIRO_STORE is set, but this kairod keeps its data in files only (build store/kairod)")
@@ -180,12 +182,13 @@ func Main(storage Storage) {
 			log.Fatal(err)
 		}
 		st.Configure(&cfg)
+		catalog = st.Catalog
 	}
 	e, err := engine.New(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := api.Load(e, *dataDir); err != nil {
+	if err := api.LoadWith(e, *dataDir, catalog); err != nil {
 		log.Fatal(err)
 	}
 	// The built-in HTTP executor serves every action named "http.*".
@@ -236,7 +239,7 @@ func Main(storage Storage) {
 		go ws.Serve(tl)
 	}
 
-	srv := &http.Server{Addr: *httpAddr, Handler: (&api.API{E: e, Dir: *dataDir, OnNode: func(s ir.NodeSpec) { serveHTTP(s.Action) }}).Handler()}
+	srv := &http.Server{Addr: *httpAddr, Handler: (&api.API{E: e, Dir: *dataDir, Catalog: catalog, OnNode: func(s ir.NodeSpec) { serveHTTP(s.Action) }}).Handler()}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)

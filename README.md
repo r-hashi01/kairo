@@ -189,7 +189,7 @@ The embedded runtime needs nothing but a database. If you can run a resident pro
 - per-destination RPM/TPM limits and fair scheduling across tenants and processes
 - workers in any language pulling tasks over a credit-based protocol
 - graphs defined in JSON over an HTTP API, with live token streaming over SSE
-- storage in files, or SQLite, PostgreSQL, MySQL, TiDB or Oracle, with optional encryption at rest
+- storage in files, or SQLite, PostgreSQL, MySQL, TiDB or Oracle, with optional encryption at rest; with `KAIRO_STORE`, the released kairod keeps its runs and plans in that database, so a replicated database survives a lost disk ([docs/kairod-store.md](docs/kairod-store.md), ADR 0087)
 
 For URL-backed actions that may answer `202`, kairod owns the result callback. Configure a public HTTPS base and one or more 256-bit, unpadded base64url MAC keys (the first signs; all verify during rotation):
 
@@ -273,7 +273,7 @@ GOOS=wasip1 GOARCH=wasm go build -trimpath -buildmode=c-shared \
   -o sdk/python/kairo_sdk/wasm/kairo.wasm ./cmd/kairo-wasm
 pip install "./sdk/python[embedded]"
 
-# kairod
+# kairod (files only; store/kairod also takes KAIRO_STORE)
 go build -o kairod ./cmd/kairod && ./kairod -data ./data
 ```
 

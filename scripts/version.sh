@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 # The Go modules others import, tagged <dir>/vX.Y.Z beside vX.Y.Z (Go's
 # rule for nested modules). Not tagged: compat/* (evaluation) and
 # sdk/go/storetest (tests).
-tagged="store/sqlstore store/sqlite store/postgres store/mysql store/oracle executor/jev sdk/go/pgnotify"
+tagged="store/sqlstore store/sqlite store/postgres store/mysql store/oracle store/kairod executor/jev sdk/go/pgnotify"
 
 version=$(tr -d ' \n' < VERSION)
 semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'

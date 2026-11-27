@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/ir"
 	"github.com/r-hashi01/kairo/live"
@@ -26,6 +27,10 @@ type API struct {
 	Dir string
 	// OnNode is called for every node spec registered through the API.
 	OnNode func(ir.NodeSpec)
+	// Catalog, if set, keeps the plans and node specs too, before Dir: the
+	// SQL store a kairod keeps its runs in, so that another machine
+	// recovers them with their plans (ADR 0087). Load it with LoadWith.
+	Catalog blob.Store
 
 	registry   registryState
 	catalogOps *catalogFileOps
@@ -145,7 +150,7 @@ func (a *API) postNodes(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, err)
 			return
 		}
-		if err := writeRegistryCatalog(a.Dir, &catalog, a.fileOps()); err != nil {
+		if err := a.writeCatalog(&catalog); err != nil {
 			a.markRegistryWriteError(err)
 			fail(w, 500, err)
 			return
@@ -196,7 +201,7 @@ func (a *API) postPlan(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, err)
 			return
 		}
-		if err := writeRegistryCatalog(a.Dir, &catalog, a.fileOps()); err != nil {
+		if err := a.writeCatalog(&catalog); err != nil {
 			a.markRegistryWriteError(err)
 			fail(w, 500, err)
 			return

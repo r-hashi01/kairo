@@ -44,6 +44,7 @@ func open(dsn string, o kairod.StoreOptions) (*kairod.Store, error) {
 	}
 	return &kairod.Store{
 		Configure: b.Configure,
+		Catalog:   b.Store,
 		Shards:    func(n int, explicit bool) (int, error) { return pinShards(b.Store, n, explicit) },
 		Close:     db.Close,
 	}, nil
