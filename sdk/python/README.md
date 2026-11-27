@@ -10,6 +10,8 @@ Write a workflow as an ordinary `async` function. Every call it makes is recorde
 pip install "kairo-sdk[embedded]"     # Python 3.12+; the extra adds wasmtime
 ```
 
+The embedded runtime compiles its WASM core once per process and keeps the machine code in `KAIRO_WASM_CACHE` (default `$XDG_CACHE_HOME/kairo-sdk`, else `~/.cache/kairo-sdk`; `off` to disable). A new process reads that instead of compiling again. For a serverless function, point `KAIRO_WASM_CACHE` at a directory shipped with the code, and fill it in the build with the production wasmtime, OS and CPU (`python -c "from kairo_sdk.core import Core; Core()"`). A directory others can write to is never used.
+
 ## Quick start
 
 ```python
