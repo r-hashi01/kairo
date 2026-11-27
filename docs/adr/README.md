@@ -90,6 +90,6 @@
 | [0083](0083-store-assigned-run-creation-order.md) | 列挙する実行は保存先が割り当てる作成序数で並べる | 承認 |
 | [0084](0084-stop-diverged-replay-before-effects.md) | コードで書くワークフローのリプレイが記録から外れたら、作用のある新しい呼び出しを起こす前に止める | 承認 |
 | [0085](0085-record-intent-when-a-step-is-admitted.md) | 実の作用のステップの意図は、上限や受け入れを通って実行器へ渡す直前に記録する | 承認 |
-| [0087](0087-replicate-through-the-database.md) | kairod の複製は、自前で作らず、SQL の保存先のデータベースの複製に任せる | 提案 |
+| [0087](0087-replicate-through-the-database.md) | kairod の複製は、自前で作らず、SQL の保存先のデータベースの複製に任せる | 承認 |
 
 0001〜0015 は v0 の実装時に下した判断を後からまとめて起票したもので、2026-10-01 に承認されました。
