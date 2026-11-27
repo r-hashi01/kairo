@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -162,8 +164,16 @@ type runtime struct {
 	manualTimers bool
 	// draining (Kairo.Drain): no timer is armed here and no sweep runs; the
 	// steps already dispatched run to their end.
-	draining    atomic.Bool
-	lostDrive   func(ctx context.Context, l LeaseRow) error
+	draining  atomic.Bool
+	lostDrive func(ctx context.Context, l LeaseRow) error
+	// admitNow, set by Kairo, lets a real step being dispatched pass its
+	// limits at once, if it can: what gives its slots back, or nil. Its
+	// intent is recorded with its dispatch only then; one that is to wait
+	// records it once it passes (ADR 0085). Without it, every real step's
+	// intent goes with its dispatch.
+	admitNow    func(runID string, c wasmcore.Command) func(*result)
+	atOnceMu    sync.Mutex
+	atOnce      map[string]func(*result) // admitted at once, by run, act and attempt
 	missingPlan func(name string) bool
 	wakeParent  func(id string)
 }
@@ -691,7 +701,61 @@ func (r *runtime) recover(ctx context.Context, l LeaseRow) error {
 	if err != nil || !ok {
 		return err
 	}
-	_, err = r.process(ctx, l.Run, []wasmcore.Event{{Kind: "step_err", At: r.now(), Act: l.Act, Attempt: l.Attempt, Unknown: true,
+	// A real step whose intent was recorded may have acted: its outcome is
+	// unknown. One without its intent was still waiting to pass its limits
+	// and never acted (ADR 0085): the core's recovery dispatches it again,
+	// once no step of its run is still out elsewhere (it recovers the whole
+	// run).
+	row, err := r.store.Get(ctx, l.Run)
+	if err != nil {
+		return err
+	}
+	if row != nil {
+		in, err := wasmcore.Inspect(row.State)
+		if err != nil {
+			return err
+		}
+		if slices.Contains(in.Dispatched, l.Act) && !slices.Contains(in.Intents, l.Act) {
+			leases, _, err := r.store.Recoverable(ctx, l.Run, r.now())
+			if err != nil {
+				return err
+			}
+			lost := map[uint32]bool{}
+			for _, x := range leases {
+				lost[x.Act] = true
+			}
+			for _, a := range in.Dispatched {
+				if !lost[a] {
+					return nil // another step of the run is still out: later
+				}
+			}
+			// Steps of the run that may have acted are settled as unknown
+			// first (their leases end with it); then the rest go again.
+			for _, x := range leases {
+				if slices.Contains(in.Intents, x.Act) {
+					if err := r.unknownOutcome(ctx, x); err != nil {
+						return err
+					}
+				}
+			}
+			// Still never acted: another recovery (this process's replay, or
+			// another process) may have dispatched it again meanwhile, its
+			// intent recorded; that one is not recovered twice.
+			_, err = r.processIf(ctx, l.Run, []wasmcore.Event{{Kind: "recover", At: r.now()}}, nil, nil, func(row *RunRow) bool {
+				if row == nil {
+					return false
+				}
+				in, err := wasmcore.Inspect(row.State)
+				return err == nil && slices.Contains(in.Dispatched, l.Act) && !slices.Contains(in.Intents, l.Act)
+			})
+			return err
+		}
+	}
+	return r.unknownOutcome(ctx, l)
+}
+
+func (r *runtime) unknownOutcome(ctx context.Context, l LeaseRow) error {
+	_, err := r.process(ctx, l.Run, []wasmcore.Event{{Kind: "step_err", At: r.now(), Act: l.Act, Attempt: l.Attempt, Unknown: true,
 		Retryable: true, Err: "the process running the step stopped", ErrType: "process_lost"}}, nil)
 	return err
 }
@@ -852,6 +916,40 @@ func (r *runtime) renew() {
 	}
 }
 
+// stepKey names an attempt of an activation.
+func stepKey(act uint32, attempt int32) string {
+	return strconv.FormatUint(uint64(act), 10) + "\x00" + strconv.FormatInt(int64(attempt), 10)
+}
+
+// dispatches says whether commands dispatch the attempt named k.
+func dispatches(commands []wasmcore.Command, k string) bool {
+	for _, c := range commands {
+		if c.Kind == "dispatch" && stepKey(c.Act, c.Attempt) == k {
+			return true
+		}
+	}
+	return false
+}
+
+// takeAdmitted is what gives back the slots of step t if it passed its
+// limits as it was dispatched (its intent recorded with it), or nil.
+func (r *runtime) takeAdmitted(t task) func(*result) {
+	r.atOnceMu.Lock()
+	defer r.atOnceMu.Unlock()
+	k := t.RunID + "\x00" + stepKey(t.Act, t.Attempt)
+	finish := r.atOnce[k]
+	delete(r.atOnce, k)
+	return finish
+}
+
+// recordIntent records the intent of a real step that passed its limits
+// after it was dispatched (ADR 0085): whether it was (not if the step is no
+// longer that attempt's: cancelled, or taken up elsewhere).
+func (r *runtime) recordIntent(ctx context.Context, t task) (bool, error) {
+	report, err := r.processReported(ctx, t.RunID, []wasmcore.Event{{Kind: "intent", At: r.now(), Act: t.Act, Attempt: t.Attempt}}, nil)
+	return report.applied, err
+}
+
 // process applies events to run runID in one transaction, then carries out
 // the commands. With start, a new run of that plan (or the existing one:
 // existing says which).
@@ -875,13 +973,24 @@ func (r *runtime) processWithRates(ctx context.Context, runID string, events []w
 }
 
 func (r *runtime) processReportedWithRates(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo, rates []SharedRateSettlement) (processReport, error) {
+	return r.processIf(ctx, runID, events, start, rates, nil)
+}
+
+// processIf is processReportedWithRates, applying events only if when
+// (read in the same transaction) says the run is still as it was seen.
+func (r *runtime) processIf(ctx context.Context, runID string, events []wasmcore.Event, start *startInfo, rates []SharedRateSettlement, when func(*RunRow) bool) (processReport, error) {
 	var (
 		existing, settled, applied bool
 		commands                   []wasmcore.Command
 		newRow                     *RunRow
+		withIntent                 map[string]bool
 	)
+	// Steps admitted at once, in any try of the transaction below: given
+	// back unless carried out.
+	admitted := map[string]func(*result){}
 	err := r.store.WithRun(ctx, runID, func(row *RunRow) (*Changes, error) {
 		existing, settled, commands, newRow = false, false, nil, nil
+		withIntent = map[string]bool{}
 		// A step's outcome ends its lease, applied or not (a stale one).
 		var endLeases []uint32
 		for _, e := range events {
@@ -891,6 +1000,9 @@ func (r *runtime) processReportedWithRates(ctx context.Context, runID string, ev
 		}
 		if row != nil && start != nil {
 			existing = true
+			return nil, nil
+		}
+		if when != nil && !when(row) {
 			return nil, nil
 		}
 		if row == nil && start == nil {
@@ -944,8 +1056,18 @@ func (r *runtime) processReportedWithRates(ctx context.Context, runID string, ev
 			status, output, errMsg = res.Status, res.Output, res.Error
 			for _, c := range res.Commands {
 				commands = append(commands, c)
-				// A real step's intent, committed with what dispatched it.
+				// A real step's intent, committed with what dispatched it if
+				// it passes its limits at once; else once it does (ADR 0085).
 				if c.Kind == "dispatch" && c.Effect == "real" {
+					k := stepKey(c.Act, c.Attempt)
+					if _, ok := admitted[k]; !ok && r.admitNow != nil {
+						finish := r.admitNow(runID, c)
+						if finish == nil {
+							continue
+						}
+						admitted[k] = finish
+					}
+					withIntent[k] = true
 					apply(wasmcore.Event{Kind: "intent", At: ev.At, Act: c.Act, Attempt: c.Attempt})
 				}
 			}
@@ -1019,10 +1141,23 @@ func (r *runtime) processReportedWithRates(ctx context.Context, runID string, ev
 		newRow = next
 		return ch, nil
 	})
+	closed := r.isClosed()
+	for k, finish := range admitted {
+		if err == nil && !closed && withIntent[k] && dispatches(commands, k) {
+			r.atOnceMu.Lock()
+			if r.atOnce == nil {
+				r.atOnce = map[string]func(*result){}
+			}
+			r.atOnce[runID+"\x00"+k] = finish
+			r.atOnceMu.Unlock()
+			continue
+		}
+		finish(&result{})
+	}
 	if err != nil {
 		return processReport{}, err
 	}
-	if r.isClosed() {
+	if closed {
 		return processReport{existing: existing, applied: applied}, nil
 	}
 	if start != nil && !existing && newRow != nil {

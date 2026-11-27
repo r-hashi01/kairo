@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -345,6 +346,60 @@ class DrivingTest(unittest.TestCase):
             k2 = await start(None, False)
             self.assertEqual(await asyncio.wait_for(k2.result("taken-1"), 10), "wrote f!")
             self.assertEqual(writes["n"], 1, "the real call was not made again")
+            await k2.close()
+            await k1.close()
+
+        asyncio.run(main())
+
+    def test_steps_waiting_for_a_slot_are_not_left_for_review_when_the_process_stops(self) -> None:
+        """Real steps that wait for a slot have no intent yet: a process that
+        stops leaves for review only the steps it was running; the others go
+        again elsewhere (ADR 0085, issue #114)."""
+        path = self.path("waiting-slots.db")
+        started: set[int] = set()
+        release = threading.Event()
+
+        async def start(store: Any, hang: bool) -> Kairo:
+            k = await self.open(path, store=store, lease_ms=200, concurrency=2)
+
+            @k.action("write")
+            def write(n, ctx):
+                started.add(n)
+                if hang:
+                    release.wait(30)  # as a process that stops mid-call
+                return n
+
+            @k.workflow("w")
+            async def w(ctx, _):
+                return await asyncio.gather(*(ctx.call("write", i) for i in range(10)))
+
+            await k.start()
+            return k
+
+        async def main() -> None:
+            store = Dying(SQLiteStore(path))
+            k1 = await start(store, True)
+            await k1.submit("w", None, id="slots-1")
+            await wait_until(lambda: len(started) == 2)  # two run; eight wait for a slot
+            store.dead = True  # stops: its leases are not renewed
+            running = set(started)
+
+            k2 = await start(None, False)
+            calls = lambda: [r[0] for r in query(path, "SELECT status FROM kairo_run WHERE parent = 'slots-1'")]
+            await wait_until(lambda: calls().count("completed") == 8)
+            self.assertEqual(sorted(calls()), sorted(["blocked"] * 2 + ["completed"] * 8))
+            self.assertEqual(len(started), 10, "the eight that waited ran once, elsewhere")
+            # Each that ran had its intent recorded before its outcome (invariant 4).
+            for (rid,) in query(path, "SELECT id FROM kairo_run WHERE parent = 'slots-1' AND status = 'completed'"):
+                kinds = [json.loads(b)["kind"] for (b,) in query(path, "SELECT body FROM kairo_event WHERE run = ? ORDER BY seq", rid)]
+                self.assertTrue(0 <= max(i for i, k in enumerate(kinds) if k == "intent") < max(i for i, k in enumerate(kinds) if k == "step_ok"), f"{rid}: {kinds}")
+            # The two that were running are for review; told that they acted, the workflow ends.
+            review = query(path, "SELECT id, input FROM kairo_run WHERE parent = 'slots-1' AND status = 'blocked'")
+            self.assertEqual(sorted(json.loads(i)["in"] for _, i in review), sorted(running))
+            for rid, i in review:
+                await k2.resolve(rid, json.loads(i)["in"])
+            self.assertEqual(await asyncio.wait_for(k2.result("slots-1"), 10), list(range(10)))
+            release.set()
             await k2.close()
             await k1.close()
 

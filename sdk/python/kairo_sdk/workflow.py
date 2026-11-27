@@ -764,6 +764,9 @@ class Kairo:
         if rt is not None and (self._slots or self._limits or self._destination_limits or any(a.shared_limits for a in self._actions.values())):
             # Steps wait for their slots on the event loop, before their thread.
             rt.admit = self._admit_step
+            # A real step's intent goes with its dispatch only if it passes its
+            # limits at once; one that waits records it once it passes (ADR 0085).
+            rt.admit_now = self._admit_now
         await self.backend.start(specs, self._serve_observed if self._observer is not None else self._serve)
         for s in specs:
             await self._plan(PLAN_CALL + s["action"], {"kind": "step", "id": "call", "action": s["action"],
@@ -1107,6 +1110,44 @@ class Kairo:
                 self._limits.pop(destination, None)
             return
         asyncio.get_running_loop().call_later(after + 0.001, self._retire_limiter, destination, limiter)
+
+    def _admit_now(self, run_id: str, c: dict[str, Any]) -> Callable[[Result], None] | None:
+        """_admit, without waiting: what gives back the slots of a real step
+        that passes its limits at once, or None. Limits shared through the
+        store are read there, so a step with them never passes at once."""
+        action = c.get("action", "")
+        destination = c.get("destination") or action
+        a = self._actions.get(action)
+        if a is None or action in BUILTIN:
+            return lambda _result: None
+        limits = DestinationLimits(a.limit, a.rate, a.weight_rate, a.shared_limits)
+        if self._destination_limits is not None:
+            dynamic = self._destination_limits(destination)
+            limits = DestinationLimits(
+                _stricter(limits.concurrency, dynamic.concurrency),
+                _stricter(limits.requests_per_minute, dynamic.requests_per_minute),
+                _stricter(limits.weight_per_minute, dynamic.weight_per_minute),
+                a.shared_limits or dynamic.shared,
+            )
+        lim = self._limits.setdefault(destination, _Limiter())
+        lim.declare(DestinationLimits(a.limit, a.rate, a.weight_rate, a.shared_limits))
+        limits = lim.resolve(limits)
+        if limits.shared or not lim.try_admit(limits):
+            return None
+        slots = self._slots
+        if slots is not None and not slots.try_take():
+            lim.finish(0, 0)
+            self._retire_limiter(destination, lim)
+            return None
+
+        def finish(result: Result) -> None:
+            if slots is not None:
+                slots.give()
+            retry_after = result.retry_after_ms if result.retryable and not result.unknown else 0
+            lim.finish(result.weight or result.tokens, retry_after)
+            self._retire_limiter(destination, lim)
+
+        return finish
 
     async def _admit_step(self, task: Task, ctx: TaskContext) -> Callable[[], None] | Result:
         """The embedded runtime's admission of a dispatched step (ADR 0059)."""
@@ -2266,6 +2307,13 @@ class _Slots:
         self._free = size
         self._queue: collections.deque[asyncio.Future[None]] = collections.deque()
 
+    def try_take(self) -> bool:
+        """Takes a slot if one is free and nobody waits for one."""
+        if self._free > 0 and not self._queue:
+            self._free -= 1
+            return True
+        return False
+
     async def take(self, stop: asyncio.Future[None]) -> None:
         """Takes a slot, waiting for one; raises _StepStopped when stop is set first."""
         if self._free > 0 and not self._queue:
@@ -2377,6 +2425,23 @@ class _Limiter:
         if self.changed is not None and not self.changed.done():
             self.changed.set_result(None)
         self.changed = None
+
+    def try_admit(self, limits: DestinationLimits) -> bool:
+        """admit, if the step may start now and nobody waits before it."""
+        if self.changed is not None and not self.changed.done():
+            return False
+        self.configure(limits)
+        now = time.time()
+        self._refill(now)
+        at = max(now, self.pause_until, self.next)
+        if self.weight_rate > 0 and self.weight < 0:
+            at = max(at, now + (-self.weight / self.weight_rate))
+        if (self.concurrency > 0 and self.active >= self.concurrency) or at > now:
+            return False
+        self.active += 1
+        if self.every > 0:
+            self.next = now + self.every
+        return True
 
     async def admit(self, limits: DestinationLimits, stop: asyncio.Future[None]) -> None:
         while True:

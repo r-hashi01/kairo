@@ -236,6 +236,52 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k.close();
 	});
 
+	// Real steps that wait for a slot have no intent yet: a process that
+	// stops leaves for review only the steps it was running; the others go
+	// again elsewhere (ADR 0085, issue #114).
+	test('steps waiting for a slot are not left for review when the process stops', async () => {
+		const path = join(dir, 'waiting-slots.db');
+		const started = new Set<number>();
+		const start = async (store: Store, hang: boolean) => {
+			const k = await open(path, { store, leaseMs: 200, concurrency: 2 });
+			k.defineAction('write', { effect: 'real', handler: async (n: number, ctx) => {
+				started.add(n);
+				// As a process that stops mid-call (until it is closed).
+				if (hang) await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+				return n;
+			} });
+			k.workflow('w', async (ctx) => Promise.all(Array.from({ length: 10 }, (_, i) => ctx.call<number>('write', i))));
+			await k.start();
+			return k;
+		};
+		const [store, state] = dying(new SQLiteStore(path));
+		const k1 = await start(store, true);
+		await k1.submit('w', null, { id: 'slots-1' });
+		await waitUntil(() => started.size === 2); // two run; eight wait for a slot
+		state.dead = true; // stops: its leases are not renewed
+		const running = new Set(started);
+
+		const k2 = await start(new SQLiteStore(path), false);
+		const calls = async () => query(path, "SELECT status FROM kairo_run WHERE parent = 'slots-1'");
+		await waitUntil(async () => (await calls()).filter((r) => r.status === 'completed').length === 8);
+		const statuses = (await calls()).map((r) => r.status).sort();
+		assert.deepEqual(statuses, [...Array(2).fill('blocked'), ...Array(8).fill('completed')].sort());
+		assert.equal(started.size, 10, 'the eight that waited ran once, elsewhere');
+		// Each that ran had its intent recorded before its outcome (invariant 4),
+		// also those that waited for a slot.
+		for (const r of await query(path, "SELECT id FROM kairo_run WHERE parent = 'slots-1' AND status = 'completed'")) {
+			const kinds = (await query(path, 'SELECT body FROM kairo_event WHERE run = ? ORDER BY seq', r.id)).map((e) => JSON.parse(e.body).kind);
+			assert.ok(kinds.lastIndexOf('intent') >= 0 && kinds.lastIndexOf('intent') < kinds.lastIndexOf('step_ok'), `${r.id}: ${kinds}`);
+		}
+		// The two that were running are for review; told that they acted, the workflow ends.
+		const review = await query(path, "SELECT id, input FROM kairo_run WHERE parent = 'slots-1' AND status = 'blocked'");
+		for (const r of review) await k2.resolve(r.id, JSON.parse(r.input).in);
+		assert.deepEqual(await k2.result('slots-1', { signal: AbortSignal.timeout(10_000) }), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+		assert.deepEqual([...running].sort(), review.map((r) => JSON.parse(r.input).in).sort());
+		await k2.close();
+		await k1.close();
+	});
+
 	// A resident process that stops without closing: another one takes its
 	// workflow up when its drive lease expires, and the real call it made
 	// is not made again.
