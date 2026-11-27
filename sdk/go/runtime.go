@@ -166,6 +166,11 @@ type runtime struct {
 	// steps already dispatched run to their end.
 	draining  atomic.Bool
 	lostDrive func(ctx context.Context, l LeaseRow) error
+	// live is this process's liveness mark (ADR 0086), if the store has
+	// one; onLost, set by Kairo, is told when it is lost (it must stop).
+	live        Liveness
+	leaseOwners LivenessStore
+	onLost      func()
 	// admitNow, set by Kairo, lets a real step being dispatched pass its
 	// limits at once, if it can: what gives its slots back, or nil. Its
 	// intent is recorded with its dispatch only then; one that is to wait
@@ -206,6 +211,13 @@ func (r *runtime) open(ctx context.Context, named bool) error {
 		if err := r.store.ExpireLeases(ctx, r.owner, r.now()); err != nil {
 			return err
 		}
+	}
+	// Its mark, held while it lives (ADR 0086).
+	if l, ls := liveness(r.store); l != nil {
+		if err := l.Hold(ctx, r.owner); err != nil {
+			return err
+		}
+		r.live, r.leaseOwners = l, ls
 	}
 	if n, ok := r.store.(Notifier); ok {
 		stop, err := n.Listen(context.Background(), r.settledElsewhere)
@@ -536,6 +548,10 @@ func (r *runtime) resolve(ctx context.Context, runID string, output any, errMsg 
 // that are due, and finished trees past the time they are kept.
 func (r *runtime) tick(ctx context.Context) error {
 	r.lastSweep.Store(r.now())
+	// Owners whose mark is gone first: their leases expire now (ADR 0086).
+	if _, err := r.checkOwners(ctx); err != nil {
+		r.logger.Warn("kairo: checking owners", "err", err)
+	}
 	leases, err := r.store.ExpiredLeases(ctx, r.now(), 1000)
 	if err != nil {
 		return err
@@ -874,7 +890,47 @@ func (r *runtime) close() error {
 		delete(r.subs, id)
 	}
 	r.mu.Unlock()
+	if r.live != nil {
+		_ = r.live.Close()
+	}
 	return r.store.Close()
+}
+
+// checkOwners takes up the leases of owners whose mark is provably gone,
+// without waiting for them to expire (ADR 0086): whether there were any. A
+// process that lost its own mark is told to stop (onLost).
+func (r *runtime) checkOwners(ctx context.Context) (bool, error) {
+	if r.live == nil || r.isClosed() {
+		return false, nil
+	}
+	if r.live.Lost() {
+		r.lostMark()
+		return false, nil
+	}
+	owners, err := r.leaseOwners.LeaseOwners(ctx, r.now())
+	if err != nil {
+		return false, err
+	}
+	took := false
+	for _, o := range owners {
+		if o == r.owner || !r.live.Gone(ctx, o) {
+			continue
+		}
+		if err := r.store.ExpireLeases(ctx, o, r.now()); err != nil {
+			return took, err
+		}
+		took = true
+	}
+	if r.live.Lost() {
+		r.lostMark()
+	}
+	return took, nil
+}
+
+func (r *runtime) lostMark() {
+	if r.onLost != nil {
+		r.onLost()
+	}
 }
 
 func (r *runtime) isClosed() bool {

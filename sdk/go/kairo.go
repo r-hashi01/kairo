@@ -174,6 +174,11 @@ type Options struct {
 	// Lease: how long a step is leased to this process without renewal
 	// (default 30s).
 	Lease time.Duration
+	// OwnerCheck: how often a resident process checks whether the owners
+	// of other leases are gone (default: a sixth of Lease, at least 1s), to
+	// take their work up before their leases expire (ADR 0086), where the
+	// store can tell (SQLite files, PostgreSQL).
+	OwnerCheck time.Duration
 	// KeepFinished: how long a finished tree of runs is kept (ADR 0054).
 	// Default: KAIRO_KEEP_FINISHED ("30m", "24h", "7d", "forever"), or 24h.
 	KeepFinished time.Duration
@@ -255,6 +260,7 @@ type Kairo struct {
 	sweepStop chan struct{}
 
 	concurrency int
+	ownerCheck  time.Duration       // Options.OwnerCheck (ADR 0086)
 	slots       chan struct{}       // Concurrency (nil: no limit)
 	limits      map[string]*limiter // by destination
 	limitFor    func(string) (DestinationLimits, error)
@@ -427,7 +433,7 @@ func Open(ctx context.Context, opts Options) (*Kairo, error) {
 	rt.metrics = newMetricEmitter(opts.Metrics)
 	k := &Kairo{rt: rt, mode: opts.Mode, wake: opts.Wake, nowFn: nowFn, http: opts.HTTP, actions: map[string]*actionDef{}, workflows: map[string]*workflowDef{},
 		planned: map[string]bool{}, driving: map[*drive]struct{}{}, drivingIDs: map[string]bool{}, cancelReqs: map[string]*cancelRequest{}, treeCancels: map[string]int{}, redriving: map[string]bool{}, again: map[string]bool{},
-		owned: map[string]bool{}, concurrency: opts.Concurrency, limits: map[string]*limiter{}, limitFor: opts.DestinationLimits,
+		owned: map[string]bool{}, concurrency: opts.Concurrency, ownerCheck: opts.OwnerCheck, limits: map[string]*limiter{}, limitFor: opts.DestinationLimits,
 		tickSlot: make(chan struct{}, 1), driveChanged: make(chan struct{})}
 	if rates, ok := opts.Store.(SharedRateStore); ok {
 		k.rates = rates
@@ -730,6 +736,15 @@ func (k *Kairo) Start(ctx context.Context) error {
 	}
 	k.rt.mu.Lock()
 	k.rt.lostDrive, k.rt.missingPlan, k.rt.wakeParent = k.lostDrive, k.missingPlan, k.redrive
+	// A process that lost its liveness mark may have had its work taken up
+	// already: it stops, as a process that stops (ADR 0086).
+	k.rt.onLost = func() {
+		if k.closing.Load() {
+			return
+		}
+		k.rt.logger.Warn("kairo: this process lost its liveness mark; it stops")
+		go k.Close()
+	}
 	// A real step's intent goes with its dispatch only if it passes its
 	// limits at once; one that waits records it once it passes (ADR 0085).
 	k.rt.admitNow = k.admitNow
@@ -757,6 +772,14 @@ func (k *Kairo) Start(ctx context.Context) error {
 		defer k.bgWG.Done()
 		t := time.NewTicker(time.Duration(k.rt.leaseMs) * time.Millisecond)
 		defer t.Stop()
+		// Between sweeps: owners whose mark is gone have their work taken up
+		// at once, without waiting for their leases (ADR 0086).
+		check := k.ownerCheck
+		if check <= 0 {
+			check = max(time.Second, time.Duration(k.rt.leaseMs)*time.Millisecond/6)
+		}
+		owners := time.NewTicker(check)
+		defer owners.Stop()
 		for {
 			if !k.draining.Load() { // draining: left to other processes
 				if err := k.rt.tick(k.bgCtx); err != nil && k.bgCtx.Err() == nil {
@@ -764,10 +787,22 @@ func (k *Kairo) Start(ctx context.Context) error {
 				}
 			}
 			k.rt.recheck(k.bgCtx)
+		wait:
 			select {
 			case <-stop:
 				return
 			case <-t.C:
+			case <-owners.C:
+				if k.draining.Load() || k.rt.live == nil {
+					goto wait
+				}
+				took, err := k.rt.checkOwners(k.bgCtx)
+				if err != nil && k.bgCtx.Err() == nil {
+					k.rt.logger.Warn("kairo: checking owners", "err", err)
+				}
+				if !took {
+					goto wait
+				}
 			}
 		}
 	}(k.sweepStop)

@@ -147,13 +147,19 @@ class Embedded:
         wasm: Any = None,
         now: Callable[[], int] = _ms,
         lease_ms: int = 30_000,
+        owner_check_ms: int | None = None,
         owner: str | None = None,
         keep_finished: float | None | str = "env",
         logger: logging.Logger | None = None,
         observe: Observer | None = None,
         manual_timers: bool = False,
     ) -> None:
-        """keep_finished: how long a finished tree of runs is kept before tick
+        """owner_check_ms: how often a resident process checks whether the
+        owners of other leases are gone (default: a sixth of lease_ms, at
+        least 1 s), to take their work up before their leases expire (ADR
+        0086), where the store can tell (SQLite files, PostgreSQL).
+
+        keep_finished: how long a finished tree of runs is kept before tick
         removes it (ms; ADR 0054); None keeps it. Default: KAIRO_KEEP_FINISHED
         ("30m", "24h", "7d", "forever"), or 24 hours.
 
@@ -172,6 +178,11 @@ class Embedded:
         self.now = now
         self._manual_timers = manual_timers
         self.lease_ms = lease_ms
+        self.owner_check_ms = owner_check_ms if owner_check_ms is not None else max(1000, lease_ms // 6)
+        # This process's liveness mark (ADR 0086), if the store has one; and
+        # what is told when it is lost (the process must stop).
+        self._live: Any = None
+        self.on_lost: Callable[[], None] | None = None
         self.keep_ms = keep_finished_ms(keep_finished)
         self.owner = owner or str(uuid.uuid4())
         self._named = owner is not None
@@ -216,6 +227,12 @@ class Embedded:
         # A process of the same name that stopped: its steps are not running.
         if self._named:
             await self.store.expire_leases(self.owner, self.now())
+        # Its mark, held while it lives (ADR 0086).
+        liveness = getattr(self.store, "liveness", None)
+        live = liveness() if liveness is not None else None
+        if live is not None:
+            await live.hold(self.owner)
+            self._live = live
         listen = getattr(self.store, "listen", None)
         if listen is not None:
             self._unlisten = await listen(self._settled_elsewhere)
@@ -499,6 +516,11 @@ class Embedded:
         it is logged and observed (RUN_STUCK), and put off a lease period, so
         that it does not stay first of what each tick takes up. Raises only
         when the store fails."""
+        # Owners whose mark is gone first: their leases expire now (ADR 0086).
+        try:
+            await self.check_owners()
+        except Exception as e:
+            self.logger.warning("kairo: checking owners: %s", e)
         self._last_sweep = self.now()
         for lease in await self.store.expired_leases(self.now(), 1000):
             if self._closed:
@@ -555,7 +577,31 @@ class Embedded:
         await self.idle()
         if self._unlisten is not None:
             await self._unlisten()
+        if self._live is not None:
+            await self._live.close()
         await self.store.close()
+
+    async def check_owners(self) -> bool:
+        """Takes up the leases of owners whose mark is provably gone, without
+        waiting for them to expire (ADR 0086): whether there were any. A
+        process that lost its own mark is told to stop (on_lost)."""
+        live = self._live
+        owners = getattr(self.store, "lease_owners", None)
+        if live is None or self._closed or owners is None:
+            return False
+        if live.lost():
+            if self.on_lost is not None:
+                self.on_lost()
+            return False
+        took = False
+        for o in await owners(self.now()):
+            if o == self.owner or not await live.gone(o):
+                continue
+            await self.store.expire_leases(o, self.now())
+            took = True
+        if live.lost() and self.on_lost is not None:
+            self.on_lost()
+        return took
 
     # --- internals ---------------------------------------------------------
 

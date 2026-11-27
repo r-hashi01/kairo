@@ -22,6 +22,7 @@ import { randomInt, randomUUID } from 'node:crypto';
 
 import { consoleLogger, observe, stepStatus, type Logger, type Observation, type Observer } from './observe.ts';
 import { isWorkflowRetry, retryingStore, type LeaseRow, type ListFilter, type RunRow, type SharedRateRequest, type SharedRateSettlement, type Store, type TimerRow } from './store.ts';
+import type { Liveness } from './liveness.ts';
 import type { TaskContext } from './worker.ts';
 
 /** Runs the actions of dispatched steps in this process. */
@@ -34,6 +35,13 @@ export interface EmbeddedOptions {
 	now?: () => number;
 	/** How long a step is leased to this process without renewal (ms; default 30 s). */
 	leaseMs?: number;
+	/**
+	 * How often a resident process checks whether the owners of other
+	 * leases are gone (ms; default: a sixth of leaseMs, at least 1 s), to
+	 * take their work up before their leases expire (ADR 0086). Only where
+	 * the store can tell (SQLite files, PostgreSQL).
+	 */
+	ownerCheckMs?: number;
 	/**
 	 * This process's name in the leases (default: random). A process that
 	 * gives the name its earlier self had takes that self's steps as
@@ -120,6 +128,7 @@ export class Embedded {
 	private draining = false;
 	readonly owner: string;
 	private readonly leaseMs: number;
+	readonly ownerCheckMs: number;
 	private readonly keepMs: number;
 	private renewal?: ReturnType<typeof setInterval>;
 	private lastSweep = 0;
@@ -147,6 +156,7 @@ export class Embedded {
 		this.manualTimers = !!opts.manualTimers;
 		this.owner = opts.owner ?? randomUUID();
 		this.leaseMs = opts.leaseMs ?? 30_000;
+		this.ownerCheckMs = opts.ownerCheckMs ?? Math.max(1000, Math.floor(this.leaseMs / 6));
 		this.keepMs = keepFinished(opts.keepFinished);
 		this.logger = opts.logger ?? consoleLogger;
 		this.observer = opts.observe;
@@ -174,6 +184,12 @@ export class Embedded {
 		await e.store.init();
 		// A process of the same name that stopped: its steps are not running.
 		if (opts.owner) await e.store.expireLeases(opts.owner, e.now());
+		// Its mark, held while it lives (ADR 0086).
+		const live = e.store.liveness?.();
+		if (live) {
+			await live.hold(e.owner);
+			e.live = live;
+		}
 		// Runs that settle in other processes wake the waits here.
 		if (e.store.listen) e.unlisten = await e.store.listen((id) => e.settledElsewhere(id));
 		return e;
@@ -440,6 +456,7 @@ export class Embedded {
 	 * store fails.
 	 */
 	async tick(): Promise<void> {
+		await this.checkOwners().catch((e) => this.logger.warn('kairo: checking owners', { err: e }));
 		this.lastSweep = this.now();
 		for (const l of await this.store.expiredLeases(this.now(), 1000)) {
 			if (this.closed) return;
@@ -560,7 +577,35 @@ export class Embedded {
 		this.renew();
 		while (this.busy.size > 0) await Promise.allSettled([...this.busy]);
 		await this.unlisten?.();
+		await this.live?.close();
 		await this.store.close();
+	}
+
+	/** This process's liveness mark (ADR 0086), if the store has one. */
+	private live: Liveness | undefined;
+	/** Told when this process lost its mark: it must stop (ADR 0086). */
+	onLost?: () => void;
+
+	/**
+	 * Takes up the leases of owners whose mark is provably gone, without
+	 * waiting for them to expire (ADR 0086): whether there were any. A
+	 * process that lost its own mark is told to stop (onLost).
+	 */
+	async checkOwners(): Promise<boolean> {
+		const live = this.live;
+		if (!live || this.closed || !this.store.leaseOwners) return false;
+		if (live.lost()) {
+			this.onLost?.();
+			return false;
+		}
+		let took = false;
+		for (const o of await this.store.leaseOwners(this.now())) {
+			if (o === this.owner || !(await live.gone(o))) continue;
+			await this.store.expireLeases(o, this.now());
+			took = true;
+		}
+		if (live.lost()) this.onLost?.();
+		return took;
 	}
 
 	/** Renews this process's leases while it runs steps; one timer for all of them. */

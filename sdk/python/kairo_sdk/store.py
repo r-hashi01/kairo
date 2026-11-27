@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
+from .liveness import PgLiveness, SQLiteLiveness
+
 T = TypeVar("T")
 
 
@@ -174,7 +176,8 @@ class _RetryingStore:
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._store, name)
-        if not callable(value):
+        if not callable(value) or name == "liveness":
+            # Not a store operation: what tells liveness (ADR 0086), as it is.
             return value
 
         async def call(*given: Any, **kw: Any) -> Any:
@@ -639,6 +642,15 @@ class SQLiteStore:
         assert self.db is not None
         self.db.execute(f"UPDATE {self.p}lease SET until = ? WHERE owner = ?", (now - 1, owner))
 
+    def liveness(self) -> SQLiteLiveness | None:
+        """What tells owners' liveness (ADR 0086): a lock file of each owner's."""
+        return None if self.path == ":memory:" else SQLiteLiveness(self.path)
+
+    async def lease_owners(self, now: int) -> list[str]:
+        """Owners of leases not expired at now (ADR 0086)."""
+        assert self.db is not None
+        return [r[0] for r in self.db.execute(f"SELECT DISTINCT owner FROM {self.p}lease WHERE until >= ? AND owner <> ''", (now,))]
+
     async def next_wake(self) -> int | None:
         assert self.db is not None
         t = self.db.execute(f"SELECT MIN(at) FROM {self.p}timer").fetchone()[0]
@@ -950,6 +962,14 @@ class PostgresStore:
 
     async def expire_leases(self, owner: str, now: int) -> None:
         await self._exec(f"UPDATE {self.p}lease SET until = %s WHERE owner = %s", (now - 1, owner))
+
+    def liveness(self) -> PgLiveness:
+        """What tells owners' liveness (ADR 0086): a session advisory lock of each owner's."""
+        return PgLiveness(self.pool)
+
+    async def lease_owners(self, now: int) -> list[str]:
+        """Owners of leases not expired at now (ADR 0086)."""
+        return [r[0] for r in await self._exec(f"SELECT DISTINCT owner FROM {self.p}lease WHERE until >= %s AND owner <> ''", (now,))]
 
     async def next_wake(self) -> int | None:
         t = await self._exec(f"SELECT MIN(at) FROM {self.p}timer")
