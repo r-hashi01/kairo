@@ -282,6 +282,38 @@ describe('driving workflows (ADR 0059)', { skip: !hasGo }, () => {
 		await k1.close();
 	});
 
+	// A process that took a workflow up closes while the workflow waits for
+	// calls stopped for review: close returns, and the workflow is left to
+	// go on where it is driven next (issue #116).
+	test('close returns while a workflow taken up waits for review', async () => {
+		const path = join(dir, 'close-review.db');
+		const start = async (store: Store, hang: boolean) => {
+			const k = await open(path, { store, leaseMs: 200, concurrency: 2 });
+			k.defineAction('write', { effect: 'real', handler: async (n: number, ctx) => {
+				if (hang) await new Promise((resolve) => ctx.signal.addEventListener('abort', resolve, { once: true }));
+				return n;
+			} });
+			k.workflow('w', async (ctx) => Promise.all(Array.from({ length: 4 }, (_, i) => ctx.call<number>('write', i))));
+			await k.start();
+			return k;
+		};
+		const [store, state] = dying(new SQLiteStore(path));
+		const k1 = await start(store, true);
+		await k1.submit('w', null, { id: 'close-1' });
+		await waitUntil(async () => (await query(path, "SELECT 1 FROM kairo_event e JOIN kairo_run r ON e.run = r.id WHERE r.parent = 'close-1' AND json_extract(e.body, '$.kind') = 'intent'")).length === 2);
+		state.dead = true;
+		const k2 = await start(new SQLiteStore(path), false);
+		await waitUntil(async () => (await query(path, "SELECT 1 FROM kairo_run WHERE parent = 'close-1' AND status = 'blocked'")).length === 2);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			k2.close(),
+			new Promise((_, reject) => (timer = setTimeout(() => reject(new Error('close did not return')), 10_000))),
+		]);
+		clearTimeout(timer);
+		assert.equal((await query(path, "SELECT status FROM kairo_run WHERE id = 'close-1'"))[0].status, 'running', 'left to go on');
+		await k1.close();
+	});
+
 	// A resident process that stops without closing: another one takes its
 	// workflow up when its drive lease expires, and the real call it made
 	// is not made again.

@@ -954,6 +954,8 @@ class Kairo:
 
     def _redrive(self, id: str) -> None:
         """Suspend mode: drives workflow id on (again, if it is being driven now)."""
+        if self._closing:
+            return  # nothing more is driven here (issue #116)
         if id in self._redriving:
             self._again.add(id)
             return
@@ -979,7 +981,7 @@ class Kairo:
                         # Suspended again, failed (recorded), cancelled, driven
                         # elsewhere, or of a version not here.
                         pass
-                    if id not in self._again:
+                    if id not in self._again or self._closing:
                         return
             finally:
                 self._redriving.discard(id)
