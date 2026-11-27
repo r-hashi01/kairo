@@ -61,6 +61,10 @@ const (
 // It is a single goroutine that owns all of its state; producers and
 // workers talk to it through a non-blocking queue.
 type Dispatcher struct {
+	// admitted is told of a task held for its intent once it is admitted
+	// (ADR 0085). It must not block: it runs on the dispatcher's goroutine.
+	admitted func(*task.Task)
+
 	q     *mpsc.Queue[dmsg]
 	now   func() time.Time
 	dests map[string]*dest
@@ -108,6 +112,7 @@ const (
 	mAbortAll
 	mWake
 	mRunEnd
+	mDeliver
 )
 
 type dmsg struct {
@@ -132,6 +137,9 @@ type handed struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	at     time.Time // when it was delivered
+	// held: admitted, its credit taken, but not handed to the poller yet:
+	// its intent is becoming durable (ADR 0085).
+	held bool
 }
 
 // Delivery is a task handed to a worker. Ctx is cancelled when the task is
@@ -319,6 +327,15 @@ func newDispatcher(limits func(dest string) DestLimits, now func() time.Time) *D
 
 // Submit queues a task. Never blocks.
 func (d *Dispatcher) Submit(t *task.Task) { d.q.Push(dmsg{kind: mSubmit, task: t}) }
+
+// OnAdmitted sets what is told of a task held for its intent once it is
+// admitted (ADR 0085). Set it before the first Submit; fn must not block.
+func (d *Dispatcher) OnAdmitted(fn func(*task.Task)) { d.admitted = fn }
+
+// Deliver hands a task held for its intent to the worker it was admitted
+// for, now that its intent is durable (ADR 0085). One whose worker went
+// away is queued again. A task no longer held is left as it is.
+func (d *Dispatcher) Deliver(t *task.Task) { d.q.Push(dmsg{kind: mDeliver, task: t}) }
 
 // NewPoller registers a worker for actions with an initial credit.
 func (d *Dispatcher) NewPoller(actions []string, credit int) *Poller {
@@ -525,11 +542,30 @@ func (d *Dispatcher) loop() {
 				// The same task: a reused key may belong to a newer one.
 				var rtt time.Duration
 				h, ok := d.delivered[m.key]
+				unused := false
 				if ok && h.task == m.task {
 					h.cancel() // releases the context
 					delete(d.delivered, m.key)
 					h.poller.inflight--
 					rtt = d.now().Sub(h.at)
+					if h.held {
+						// Held for its intent and never handed over (ADR 0085):
+						// its worker did not use the credit, so it is given back.
+						unused = true
+						if p := h.poller; !p.gone {
+							if p.credit == 0 {
+								for _, a := range p.Actions {
+									d.pollers[a] = append(d.pollers[a], p)
+								}
+							}
+							p.credit++
+							for _, a := range p.Actions {
+								for _, ads := range d.byAction[a] {
+									touched[ads] = struct{}{}
+								}
+							}
+						}
+					}
 				}
 				ds := d.dests[m.dest]
 				if ds == nil {
@@ -539,8 +575,8 @@ func (d *Dispatcher) loop() {
 				// Done is of a delivered task (even when a newer task reused
 				// its key).
 				ds.inflight--
-				if ok && h.task == m.task {
-					ds.observe(d.now(), rtt, m.limited)
+				if ok && h.task == m.task && !unused {
+					ds.observe(d.now(), rtt, m.limited) // not a task that never ran
 				}
 				if tq := ds.tenants[m.tenant]; tq != nil {
 					tq.inflight--
@@ -571,6 +607,21 @@ func (d *Dispatcher) loop() {
 				}
 			case mWake:
 				wakeAll = true
+			case mDeliver:
+				k := m.task.Key()
+				h, ok := d.delivered[k]
+				if !ok || h.task != m.task || !h.held {
+					continue
+				}
+				h.held = false
+				d.delivered[k] = h
+				if h.poller.gone {
+					if d.requeue(m.task) {
+						touched[d.dest(m.task.Destination)] = struct{}{}
+					}
+					continue
+				}
+				h.poller.C <- Delivery{Task: m.task, Ctx: h.ctx} // cannot block: its credit was taken
 			case mRunEnd:
 				if p := d.affine[m.run]; p != nil {
 					delete(d.affine, m.run)
@@ -879,8 +930,15 @@ func (d *Dispatcher) match(ds *dest) time.Duration {
 		}
 		p.credit--
 		p.inflight++
-		d.delivered[k] = handed{t, p, ctx, cancel, now}
-		p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C
+		if t.HoldForIntent && d.admitted != nil {
+			// Admitted: its intent is recorded now, and it is handed over
+			// once that is durable (ADR 0085). Its credit stays taken.
+			d.delivered[k] = handed{t, p, ctx, cancel, now, true}
+			d.admitted(t)
+		} else {
+			d.delivered[k] = handed{t, p, ctx, cancel, now, false}
+			p.C <- Delivery{Task: t, Ctx: ctx} // cannot block: credit <= free capacity of C
+		}
 		if p.credit == 0 {
 			d.removePoller(p)
 		} else if rotate {

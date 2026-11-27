@@ -507,6 +507,11 @@ func New(cfg Config) (*Engine, error) {
 	// Everything below is infallible construction. Start process goroutines
 	// only after every durable resource has opened successfully.
 	e.disp = sched.NewDispatcher(cfg.Limits)
+	// A real step's intent is recorded by its shard once the dispatcher
+	// admits it (ADR 0085).
+	e.disp.OnAdmitted(func(t *task.Task) {
+		e.shardFor(t.RunID).inbox.Push(msg{kind: mAdmitted, runID: t.RunID, task: t})
+	})
 	e.obs = obs.NewStream(cfg.Observe, 1<<16, 512)
 	e.metrics = metrics.NewStream(cfg.Metrics, 4096, 256)
 	if e.metrics != nil {

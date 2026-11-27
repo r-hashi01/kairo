@@ -534,6 +534,90 @@ func TestRecoveryRealStepNeedsReview(t *testing.T) {
 	}
 }
 
+// Real steps that wait in the dispatcher (here for the one executor slot)
+// have no intent yet: after a crash only the step that was running is left
+// for review; the ones that waited run once each (ADR 0085, issue #114).
+func TestRecoveryWaitingRealStepsRunAgain(t *testing.T) {
+	dir := t.TempDir()
+	plan := `{"name":"one","root":{"kind":"step","id":"send","action":"send"}}`
+	block := make(chan struct{})
+	var mu sync.Mutex
+	sent := map[string]int{}
+	hang := ExecutorFunc(func(ctx context.Context, t *task.Task, _ func([]byte)) task.Result {
+		mu.Lock()
+		sent[t.RunID]++
+		mu.Unlock()
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return task.Result{Unknown: true, Err: "shutdown"}
+	})
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(sent)
+	}
+	e1 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true})
+	mustPlan(t, e1, plan)
+	e1.RegisterExecutor([]string{"send"}, 1, hang)
+	e1.Start()
+	var ids []string
+	for range 5 {
+		id, err := submit(e1, SubmitRequest{Plan: "one", Tenant: "t"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	waitFor(t, func() bool { return count() == 1 }) // one runs; four wait for the slot
+	// Simulate a crash: stop without letting results reach the shard.
+	for _, s := range e1.shards {
+		s.inbox.Push(msg{kind: mStop})
+	}
+	e1.wg.Wait()
+	close(block)
+	e1.Close()
+
+	e2 := newEngine(t, Config{Shards: 1, DataDir: dir, NoSync: true})
+	defer e2.Close()
+	mustPlan(t, e2, plan)
+	e2.RegisterExecutor([]string{"send"}, 4, ExecutorFunc(func(_ context.Context, t *task.Task, _ func([]byte)) task.Result {
+		mu.Lock()
+		sent[t.RunID]++
+		mu.Unlock()
+		return task.Result{Output: json.RawMessage(`"sent"`)}
+	}))
+	e2.Start()
+	var blocked, completed int
+	waitFor(t, func() bool {
+		blocked, completed = 0, 0
+		for _, id := range ids {
+			ri, _ := e2.Get(context.Background(), id)
+			switch ri.Status {
+			case "blocked":
+				blocked++
+			case "completed":
+				completed++
+			}
+		}
+		return blocked+completed == len(ids)
+	})
+	if blocked != 1 || completed != 4 {
+		t.Fatalf("blocked %d, completed %d", blocked, completed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for id, n := range sent {
+		if n != 1 {
+			t.Errorf("%s sent %d times", id, n)
+		}
+	}
+	if len(sent) != len(ids) {
+		t.Fatalf("sent %v", sent)
+	}
+}
+
 func TestEvictionAndTimers(t *testing.T) {
 	e := newEngine(t, Config{Shards: 2, EvictAfter: 50 * time.Millisecond})
 	defer e.Close()
