@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/r-hashi01/kairo/blob"
 	"github.com/r-hashi01/kairo/engine"
 	"github.com/r-hashi01/kairo/ir"
 )
@@ -103,6 +104,69 @@ func syncDirectory(path string) error {
 		return err
 	}
 	return d.Close()
+}
+
+// registryCatalogKey names the catalog in API.Catalog.
+const registryCatalogKey = "kairod/registry.json"
+
+// writeCatalog keeps the catalog in Catalog first (ADR 0087), then in Dir:
+// written to the store and not to the file, it is the store's copy that a
+// restart loads (LoadWith).
+func (a *API) writeCatalog(c *registryCatalog) error {
+	if a.Catalog != nil {
+		normalizeCatalog(c)
+		b, err := json.MarshalIndent(c, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := a.Catalog.Put(registryCatalogKey, append(b, '\n')); err != nil {
+			return err
+		}
+	}
+	return writeRegistryCatalog(a.Dir, c, a.fileOps())
+}
+
+// LoadWith is Load, with the catalog kept in store too (API.Catalog, ADR
+// 0087): the store's copy, if there is one, replaces dir's (a kairod on
+// another machine, its data directory new or lost); else dir's goes into
+// the store.
+func LoadWith(e *engine.Engine, dir string, store blob.Store) error {
+	if dir != "" && store != nil {
+		if err := syncCatalog(dir, store); err != nil {
+			return err
+		}
+	}
+	return Load(e, dir)
+}
+
+func syncCatalog(dir string, store blob.Store) error {
+	b, err := store.Get(registryCatalogKey)
+	if errors.Is(err, blob.ErrNotFound) {
+		c, err := loadOrMigrateRegistry(dir, defaultCatalogFileOps())
+		if err != nil {
+			return err
+		}
+		normalizeCatalog(&c)
+		b, err := json.MarshalIndent(&c, "", "  ")
+		if err != nil {
+			return err
+		}
+		return store.Put(registryCatalogKey, append(b, '\n'))
+	}
+	if err != nil {
+		return err
+	}
+	var c registryCatalog
+	if err := json.Unmarshal(b, &c); err != nil {
+		return fmt.Errorf("the store's registry catalog: %w", err)
+	}
+	if c.Version != registryCatalogVersion {
+		return fmt.Errorf("the store's registry catalog: unsupported version %d", c.Version)
+	}
+	if _, err := validateRegistryCatalog(&c); err != nil {
+		return err
+	}
+	return writeRegistryCatalog(dir, &c, defaultCatalogFileOps())
 }
 
 func writeRegistryCatalog(dir string, c *registryCatalog, ops catalogFileOps) error {
