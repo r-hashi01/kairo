@@ -1,5 +1,7 @@
 kairo-data/
 /kairod
+# the binary, not package kairod
+!/kairod/
 *.test
 .claude/settings.local.json
 .claude/.cache/
