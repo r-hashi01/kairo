@@ -23,6 +23,10 @@ suspend モードの `Kairo` は、今進められるところまで進めて返
 
 - **保存先は PostgreSQL にします。** サーバーレスの関数のファイルシステムは呼び出しをまたいで残らないので、SQLite は使えません。
 - **呼び出しのたびに `Kairo` を作り、`start()` します。** 作るたびに WASM の読み込みがかかります（Node で約 20ms、Python で約 240ms。ADR 0051 の計測）。
+  - Python で時間がかかるのは、wasmtime のコンパイルです。そこで Python の SDK は、コンパイルした結果をプロセスの中で使い回し、キャッシュのディレクトリにも保存します。新しいプロセスは、そのキャッシュを読むだけで済みます（手元の計測で、約 370ms が約 50ms になった。#107）。
+  - キャッシュの置き場所は `KAIRO_WASM_CACHE` で決めます。既定は `$XDG_CACHE_HOME/kairo-sdk`（なければ `~/.cache/kairo-sdk`）で、`off` にすると使いません。
+  - サーバーレスの関数では、関数のコードと一緒に配るディレクトリを `KAIRO_WASM_CACHE` にしてください。ビルドの手順の中で、本番と同じ wasmtime・OS・CPU で、`python -c "from kairo_sdk.core import Core; Core()"` を 1 回実行して埋めておきます。そうすると、コールドスタートでもコンパイルが要りません。
+  - 書き込めないディレクトリでは、読むだけで書きません。自分以外も書き込めるディレクトリは、読み込みにも使いません（キャッシュの中身は機械語として実行されるため）。
 - **秘密を 2 つ用意します。** `tickSecret` は `/tick` の Bearer トークン、`secret` は HTTP のアクションとコールバックの署名に使います。HTTP のアクションを使わないなら、`secret` は要りません。
 - **HTTP アクションとコールバックの本文は、要求・応答とも既定で 16 MiB までです。** 配備ごとに `maxBodyBytes`（Python は `max_body_bytes`、Go は `HTTP.MaxBodyBytes`）を 1 byte〜512 MiB で変更できます。大きすぎる要求は handler を動かす前に 413 で拒み、大きすぎる応答や途中で切れた応答は成功として読みません。
 
@@ -170,4 +174,4 @@ Lambda などから直接呼ぶときは、`tick_handler(make)` を使います�
 
 ## 対応していない環境
 
-- **Cloudflare Workers:** 今の埋め込みのランタイムは `node:wasi` と `node:sqlite` を使うので、動きません。
+- **Cloudflare Workers:** 今の埋め込みのランタイムは `node:sqlite` を使うので、動きません。WASM のコアは `node:wasi` を使わず、SDK の中の最小限の WASI で動きます（#108）。
