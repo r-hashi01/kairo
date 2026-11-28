@@ -79,7 +79,35 @@ func (s *SQLStore) q(query string) string {
 
 const doneSQL = `('completed', 'failed', 'cancelled')`
 
+// Init makes the tables, and adds to tables made before them the columns
+// added since. Processes initializing one database at once take turns: on
+// SQLite the look at the columns and the adding of them are one
+// transaction holding the write lock (BEGIN IMMEDIATE); on PostgreSQL one
+// transaction holding an advisory lock of the prefix's, as two sessions
+// making the same table at once can both find it missing.
 func (s *SQLStore) Init(ctx context.Context) error {
+	if s.dialect == SQLite {
+		// busy_timeout first, so every statement after it (WAL included)
+		// waits for another process's lock instead of failing with
+		// "database is locked".
+		for _, q := range []string{`PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`} {
+			if _, err := s.db.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("kairo: %s: %w", q, err)
+			}
+		}
+	}
+	return s.tx(ctx, func(ex execer) error {
+		if s.dialect == Postgres {
+			if _, err := ex.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('kairo.schema:' || $1, 0))`, s.p); err != nil {
+				return err
+			}
+		}
+		return s.schema(ctx, ex)
+	})
+}
+
+// schema makes the tables and adds the columns, in Init's transaction.
+func (s *SQLStore) schema(ctx context.Context, ex execer) error {
 	blob, big := "BLOB", "INTEGER"
 	if s.dialect == Postgres {
 		blob, big = "BYTEA", "BIGINT"
@@ -101,49 +129,32 @@ func (s *SQLStore) Init(ctx context.Context) error {
 		  next_at ` + big + ` NOT NULL, weight REAL NOT NULL, weight_at ` + big + ` NOT NULL, pause_until ` + big + ` NOT NULL, expires_at ` + big + ` NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `rate_expires ON ` + p + `rate (expires_at)`,
 	}
-	if s.dialect == SQLite {
-		ddl = append([]string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`}, ddl...)
-	}
 	for _, q := range ddl {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
+		if _, err := ex.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("kairo: %s: %w", firstLine(q), err)
 		}
 	}
 	// Columns added to tables made before them: parent (ADR 0054),
-	// workflow and meta (ADR 0059).
-	for _, col := range []string{"parent", "workflow", "meta"} {
+	// workflow and meta (ADR 0059), created_order.
+	added := [][2]string{{"parent", "TEXT"}, {"workflow", "TEXT"}, {"meta", "TEXT"}, {"created_order", big + " NOT NULL DEFAULT 0"}}
+	for _, c := range added {
 		if s.dialect == Postgres {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN IF NOT EXISTS `+col+` TEXT`); err != nil {
+			if _, err := ex.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN IF NOT EXISTS `+c[0]+` `+c[1]); err != nil {
 				return err
 			}
 			continue
 		}
-		has, err := s.hasColumn(ctx, p+"run", col)
+		has, err := hasColumn(ctx, ex, p+"run", c[0])
 		if err != nil {
 			return err
 		}
 		if !has {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN `+col+` TEXT`); err != nil {
+			if _, err := ex.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN `+c[0]+` `+c[1]); err != nil {
 				return err
 			}
 		}
 	}
-	if s.dialect == Postgres {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-	} else {
-		has, err := s.hasColumn(ctx, p+"run", "created_order")
-		if err != nil {
-			return err
-		}
-		if !has {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+p+`run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0`); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO `+p+`counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`); err != nil {
+	if _, err := ex.ExecContext(ctx, `INSERT INTO `+p+`counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`); err != nil {
 		return err
 	}
 	for _, q := range []string{
@@ -152,7 +163,7 @@ func (s *SQLStore) Init(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS ` + p + `run_roots ON ` + p + `run (created_at, id) WHERE parent IS NULL`,
 		`CREATE INDEX IF NOT EXISTS ` + p + `run_roots_order ON ` + p + `run (created_order, created_at, id) WHERE parent IS NULL`,
 	} {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
+		if _, err := ex.ExecContext(ctx, q); err != nil {
 			return err
 		}
 	}
@@ -166,8 +177,8 @@ func firstLine(s string) string {
 	return s
 }
 
-func (s *SQLStore) hasColumn(ctx context.Context, table, column string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+func hasColumn(ctx context.Context, ex execer, table, column string) (bool, error) {
+	rows, err := ex.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return false, err
 	}
@@ -285,6 +296,7 @@ func (s *SQLStore) tx(ctx context.Context, fn func(ex execer) error) error {
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
