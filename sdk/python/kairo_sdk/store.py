@@ -477,17 +477,26 @@ class SQLiteStore:
         if self.path != ":memory:":
             self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute(f"PRAGMA synchronous={self.sync}")
-        for q in _ddl(self.p, "BLOB", "INTEGER"):
-            self.db.execute(q)
-        cols = [c[1] for c in self.db.execute(f"PRAGMA table_info({self.p}run)").fetchall()]
-        for col in _ADDED:
-            if col not in cols:
-                self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN {col} TEXT")
-        if "created_order" not in cols:
-            self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0")
-        self.db.execute(f"INSERT INTO {self.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
-        for q in _ddl_removal(self.p):
-            self.db.execute(q)
+        # Processes initializing one file at once take turns: the look at the
+        # columns and the adding of them are one transaction holding the
+        # write lock, so two do not both add a column (duplicate column name).
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for q in _ddl(self.p, "BLOB", "INTEGER"):
+                self.db.execute(q)
+            cols = [c[1] for c in self.db.execute(f"PRAGMA table_info({self.p}run)").fetchall()]
+            for col in _ADDED:
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN {col} TEXT")
+            if "created_order" not in cols:
+                self.db.execute(f"ALTER TABLE {self.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0")
+            self.db.execute(f"INSERT INTO {self.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
+            for q in _ddl_removal(self.p):
+                self.db.execute(q)
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
 
     async def remove_finished(self, cutoff: int, limit: int) -> int:
         db, p = self.db, self.p
@@ -826,14 +835,21 @@ class PostgresStore:
             return await cur.fetchall() if cur.description else []
 
     async def init(self) -> None:
-        for q in _ddl(self.p, "BYTEA", "BIGINT"):
-            await self._exec(q)
-        for col in _ADDED:
-            await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS {col} TEXT")
-        await self._exec(f"ALTER TABLE {self.p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0")
-        await self._exec(f"INSERT INTO {self.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
-        for q in _ddl_removal(self.p):
-            await self._exec(q)
+        p = self.p
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                # Processes initializing one database at once take turns, in
+                # one transaction holding an advisory lock of the prefix's: two
+                # sessions making the same table at once can both find it missing.
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('kairo.schema:' || %s::text, 0))", (p,))
+                for q in _ddl(p, "BYTEA", "BIGINT"):
+                    await conn.execute(q)
+                for col in _ADDED:
+                    await conn.execute(f"ALTER TABLE {p}run ADD COLUMN IF NOT EXISTS {col} TEXT")
+                await conn.execute(f"ALTER TABLE {p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0")
+                await conn.execute(f"INSERT INTO {p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING")
+                for q in _ddl_removal(p):
+                    await conn.execute(q)
 
     async def remove_finished(self, cutoff: int, limit: int) -> int:
         p = self.p

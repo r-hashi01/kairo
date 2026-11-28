@@ -452,12 +452,22 @@ export class SQLiteStore implements Store {
 		this.db.exec('PRAGMA busy_timeout=5000');
 		if (this.path !== ':memory:') this.db.exec('PRAGMA journal_mode=WAL');
 		this.db.exec(`PRAGMA synchronous=${this.sync}`);
-		for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
-		const cols = this.db.prepare(`PRAGMA table_info(${this.p}run)`).all() as { name: string }[];
-		for (const col of ADDED) if (!cols.some((c) => c.name === col)) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN ${col} TEXT`);
-		if (!cols.some((c) => c.name === 'created_order')) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0`);
-		this.db.exec(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
-		for (const q of DDL_REMOVAL(this.p)) this.db.exec(q);
+		// Processes initializing one file at once take turns: the look at the
+		// columns and the adding of them are one transaction holding the
+		// write lock, so two do not both add a column (duplicate column name).
+		this.db.exec('BEGIN IMMEDIATE');
+		try {
+			for (const q of DDL(this.p, 'BLOB', 'INTEGER')) this.db.exec(q);
+			const cols = this.db.prepare(`PRAGMA table_info(${this.p}run)`).all() as { name: string }[];
+			for (const col of ADDED) if (!cols.some((c) => c.name === col)) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN ${col} TEXT`);
+			if (!cols.some((c) => c.name === 'created_order')) this.db.exec(`ALTER TABLE ${this.p}run ADD COLUMN created_order INTEGER NOT NULL DEFAULT 0`);
+			this.db.exec(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
+			for (const q of DDL_REMOVAL(this.p)) this.db.exec(q);
+			this.db.exec('COMMIT');
+		} catch (e) {
+			this.db.exec('ROLLBACK');
+			throw e;
+		}
 		const p = this.p;
 		this.q = {
 			get: this.db.prepare(`SELECT ${RUN_COLS} FROM ${p}run WHERE id = ?`),
@@ -800,11 +810,25 @@ export class PostgresStore implements Store {
 	}
 
 	async init(): Promise<void> {
-		for (const q of DDL(this.p, 'BYTEA', 'BIGINT')) await this.pool.query(q);
-		for (const col of ADDED) await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS ${col} TEXT`);
-		await this.pool.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0`);
-		await this.pool.query(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
-		for (const q of DDL_REMOVAL(this.p)) await this.pool.query(q);
+		// Processes initializing one database at once take turns, in one
+		// transaction holding an advisory lock of the prefix's: two sessions
+		// making the same table at once can both find it missing.
+		const c = await this.pool.connect();
+		try {
+			await c.query('BEGIN');
+			await c.query(`SELECT pg_advisory_xact_lock(hashtextextended('kairo.schema:' || $1::text, 0))`, [this.p]);
+			for (const q of DDL(this.p, 'BYTEA', 'BIGINT')) await c.query(q);
+			for (const col of ADDED) await c.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS ${col} TEXT`);
+			await c.query(`ALTER TABLE ${this.p}run ADD COLUMN IF NOT EXISTS created_order BIGINT NOT NULL DEFAULT 0`);
+			await c.query(`INSERT INTO ${this.p}counter (name, value) VALUES ('run_order', 0) ON CONFLICT (name) DO NOTHING`);
+			for (const q of DDL_REMOVAL(this.p)) await c.query(q);
+			await c.query('COMMIT');
+		} catch (e) {
+			await c.query('ROLLBACK').catch(() => {});
+			throw e;
+		} finally {
+			c.release();
+		}
 	}
 
 	async removeFinished(cutoff: number, limit: number): Promise<number> {
