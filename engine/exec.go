@@ -117,7 +117,12 @@ func (e *Engine) Complete(t *task.Task, res task.Result) {
 		TimedOut: timedOut(res), RetryAfter: retryAfter})
 	ev, err := e.resultEvent(t, res, false)
 	if err != nil {
-		ev = core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "storing output: " + err.Error(), Retryable: true}
+		// The action ran and answered, but its answer cannot be kept: to
+		// the run, its outcome is unknown. Steps that may run again
+		// (unprotected, or real and declared idempotent) are retried; a
+		// real one stops for review, or fails with on_unknown: fail
+		// (ADR 0035). It is never run again blindly.
+		ev = core.Event{Kind: core.EvStepErr, Act: t.Act, Attempt: t.Attempt, Err: "storing output: " + err.Error(), Retryable: true, Unknown: true}
 	}
 	e.shardFor(t.RunID).inbox.Push(msg{kind: mEvent, runID: t.RunID, ev: ev})
 }
