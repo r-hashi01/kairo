@@ -1118,6 +1118,7 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 		l.failed = err
 		s.e.starts.FailRound(sched.StartKey{Shard: s.id, Tier: int(t)}, lsn)
 		log.Printf("kairo: shard %d: %s log write failed: %v", s.id, t, err)
+		s.dropAdmitted(l)
 		return
 	}
 	if lsn > l.durable {
@@ -1148,6 +1149,25 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 	}
 	s.e.starts.ConfirmRound(sched.StartKey{Shard: s.id, Tier: int(t)}, lsn, starts, s.e.cfg.Now())
 	s.maybeCompact(l)
+}
+
+// dropAdmitted gives back the credit of the real steps held on failed log l
+// for their intent (ADR 0085), as admitted does for one admitted after the
+// failure: their intent will never be durable, so they are never handed
+// over, and their workers serve other shards meanwhile. The steps stay
+// dispatched; a restart recovers them. Whatever else is held stays held.
+func (s *shard) dropAdmitted(l *shardLog) {
+	kept := l.held[:0]
+	for _, h := range l.held {
+		if h.kind != hAdmitted {
+			kept = append(kept, h)
+			continue
+		}
+		h.run.holds--
+		s.e.disp.Finish(h.task, sched.Outcome{})
+	}
+	clear(l.held[len(kept):])
+	l.held = kept
 }
 
 func (s *shard) release(h held) {
