@@ -12,6 +12,10 @@ import (
 	"github.com/r-hashi01/kairo/timerwheel"
 )
 
+// errRunHistoryMissing: a run's start record was retired and its snapshot
+// is gone or unreadable, while nothing in its records says it finished.
+var errRunHistoryMissing = errors.New("engine: run history missing")
+
 type lsnEvent struct {
 	lsn uint64
 	ev  *core.Event
@@ -23,6 +27,7 @@ type recovered struct {
 	startLSN uint64 // 0 if the start record was retired
 	cpLSN    uint64 // snapshot LSN of the latest checkpoint record
 	cpRec    uint64 // LSN of that record
+	lastCp   uint64 // LSN of the last checkpoint record of the run, of any snapshot
 	events   []lsnEvent
 }
 
@@ -35,7 +40,11 @@ type recovered struct {
 // any) plus its events after the snapshot's LSN, which retention keeps for
 // every live run (and for finished runs until their snapshot is deleted).
 // A run found without a start record and without a snapshot finished, and
-// is skipped.
+// is skipped, if its records say so: a run that finished logged the event
+// that finished it after its last checkpoint record. Without such a record,
+// or with a snapshot that cannot be read, its history is missing and
+// recovery fails (errRunHistoryMissing) instead of dropping a run that may
+// be waiting.
 func (s *shard) recover() error {
 	runs := map[string]*recovered{}
 	var order []string
@@ -73,6 +82,7 @@ func (s *shard) recover() error {
 				}
 			case recCheckpoint:
 				x := get(Tier(t), r.meta)
+				x.lastCp = lsn
 				if r.snapLSN >= x.cpLSN {
 					x.meta, x.cpLSN, x.cpRec = r.meta, r.snapLSN, lsn
 				}
@@ -123,10 +133,13 @@ func (s *shard) recover() error {
 		st := core.NewState(id)
 		var from uint64
 		haveSnap := false
+		var badSnap error // the snapshot is there but cannot be decoded
 		if x.tier >= TierFile {
 			if data, err := s.e.snaps.Get("snap/" + id); err == nil {
 				if lsn, snap, err := decodeSnapshot(data); err == nil {
 					st, from, haveSnap = snap, lsn, true
+				} else {
+					badSnap = err
 				}
 			} else if err != blob.ErrNotFound {
 				return err
@@ -138,8 +151,23 @@ func (s *shard) recover() error {
 			// state older than the log.
 			return fmt.Errorf("run %s: snapshot covers LSN %d but the log checkpointed LSN %d: %w", id, from, x.cpLSN, seal.ErrTampered)
 		}
+		if x.startLSN == 0 && badSnap != nil {
+			// Snapshots are replaced atomically: one that does not decode
+			// was damaged (or written by a newer version), and without the
+			// start record the run's state is nowhere else.
+			return fmt.Errorf("run %s: %w: its start record was retired and its snapshot cannot be read: %v", id, errRunHistoryMissing, badSnap)
+		}
+		if x.startLSN == 0 && !haveSnap && (len(x.events) == 0 || x.events[len(x.events)-1].lsn < x.lastCp) {
+			// A run that finished logged the event that finished it after
+			// its last checkpoint record (no checkpoint is written once a
+			// run is done), and its snapshot was deleted only after that.
+			// No record after the checkpoint: it had not finished, and its
+			// snapshot was lost. Its blobs are left alone.
+			return fmt.Errorf("run %s: %w: its start record was retired, its snapshot is missing, and the log has none of its records after its checkpoint record at LSN %d (snapshot of LSN %d), so it had not finished", id, errRunHistoryMissing, x.lastCp, x.cpLSN)
+		}
 		if x.startLSN == 0 && !haveSnap {
-			// Its history is gone: it finished and its records were retired.
+			// Its history is gone: it finished, its snapshot was deleted
+			// and its earlier records were retired.
 			log.Printf("kairo: shard %d: run %s has no start record and no snapshot; treating it as finished", s.id, id)
 			if err := s.e.deleteBlobs(id); err != nil {
 				return fmt.Errorf("run %s: deleting leftover blobs: %w", id, err)
