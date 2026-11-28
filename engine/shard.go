@@ -48,8 +48,13 @@ type shard struct {
 	feedOut   []FeedEntry
 	feedBound [tierCount]uint64
 	feedWait  []*run
-	fired     []timerRef
-	now       int64
+	// Per tier: the last LSN of traces handed to the feed, and the LSN up
+	// to which the feed was told the log is durable (it delivers them only
+	// once they are).
+	feedLogged [tierCount]uint64
+	feedTold   [tierCount]uint64
+	fired      []timerRef
+	now        int64
 	// inputWaits: GetInput's replies for evicted runs being loaded for
 	// them (made on first use: no cost to runs nobody asks about).
 	inputWaits map[*run][]chan queryReply
@@ -1122,6 +1127,9 @@ func (s *shard) ack(t Tier, lsn uint64, err error) {
 	}
 	if lsn > l.durable {
 		l.durable = lsn
+	}
+	if s.e.feed != nil && t >= TierFile && l.failed == nil {
+		s.feedDurable(t, l.durable)
 	}
 	i := 0
 	var starts []*sched.StartTicket

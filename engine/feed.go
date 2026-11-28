@@ -25,6 +25,13 @@ import (
 // Traces of the none and memory tiers and live chunks carry no log
 // position: they reach the subscribers that are connected, and are not
 // produced again.
+//
+// A trace with a log position is delivered only once the log is durable up
+// to it, so a subscriber never records an event the log could lose. The
+// shard tells the feed how far its logs are durable when its group commit
+// acknowledges them. Entries of a shard are delivered in order, so what
+// follows such a trace waits with it (a step's chunks must not overtake
+// its start).
 
 // Cursor is a position in the feed: the shard, the tier of its log, the
 // LSN of the event that produced the entry and the entry's number among
@@ -59,6 +66,9 @@ var (
 	// ErrFeedClosed: the subscription was replaced by a newer Subscribe,
 	// or the engine stopped.
 	ErrFeedClosed = errors.New("engine: feed closed")
+	// ErrNotDurable: Ack was given a cursor past what the log has made
+	// durable; no entry there has been delivered.
+	ErrNotDurable = errors.New("engine: feed cursor is past the durable log")
 )
 
 type feedSub struct {
@@ -83,6 +93,10 @@ type feedMsg struct {
 	// barrier, if set, is closed once what was pushed before it is in the
 	// buffers (Subscribe waits for it).
 	barrier chan struct{}
+	// durable, if set: shard's log of tier is durable up to lsn.
+	durable bool
+	tier    Tier
+	lsn     uint64
 }
 
 type feedHub struct {
@@ -94,8 +108,9 @@ type feedHub struct {
 	bufs    []feedBuf
 	changed chan struct{} // closed when entries arrive or subscriptions change
 	bounds  [][tierCount]uint64
-	hold    int  // Config.FeedHold, resolved
-	held    bool // backpressure wanted (ADR 0039)
+	logged  [][tierCount]uint64 // per shard and tier: the log is durable up to this LSN
+	hold    int                 // Config.FeedHold, resolved
+	held    bool                // backpressure wanted (ADR 0039)
 	applyMu sync.Mutex
 	applied bool // backpressure applied to the admission
 	durable int  // buffered entries with a log position (they need acknowledgements)
@@ -106,7 +121,7 @@ type feedHub struct {
 func newFeedHub(e *Engine) *feedHub {
 	h := &feedHub{e: e, limit: e.cfg.FeedLimit, q: mpsc.New[feedMsg](), subs: map[string]*feedSub{},
 		bufs: make([]feedBuf, e.cfg.Shards), changed: make(chan struct{}), bounds: make([][tierCount]uint64, e.cfg.Shards),
-		stop: make(chan struct{}), done: make(chan struct{})}
+		logged: make([][tierCount]uint64, e.cfg.Shards), stop: make(chan struct{}), done: make(chan struct{})}
 	h.hold = e.cfg.FeedHold
 	if h.hold == 0 {
 		h.hold = h.limit / 2
@@ -164,10 +179,13 @@ func (h *feedHub) regenerateFrom(shard int, t Tier) uint64 {
 }
 
 // setStart makes subscriptions without acknowledgements start at the
-// present: everything in the logs now counts as acknowledged.
-func (h *feedHub) setStart(shard int, t Tier, lsn uint64) {
+// present: everything in the logs now counts as acknowledged. The log is
+// durable up to durable (what recovery read; recovery may have appended
+// records after it, which the shard reports once they are durable).
+func (h *feedHub) setStart(shard int, t Tier, lsn, durable uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.logged[shard][t] = max(h.logged[shard][t], durable)
 	for _, s := range h.subs {
 		k := [2]int{shard, int(t)}
 		if _, ok := s.acks[k]; !ok {
@@ -191,6 +209,11 @@ func (h *feedHub) run() {
 		for _, m := range buf {
 			if m.barrier != nil {
 				barriers = append(barriers, m.barrier)
+				continue
+			}
+			if m.durable {
+				l := &h.logged[m.shard][m.tier]
+				*l = max(*l, m.lsn)
 				continue
 			}
 			b := &h.bufs[m.shard]
@@ -469,6 +492,9 @@ func (f *Feed) Next(ctx context.Context, limit int) ([]FeedEntry, error) {
 			for f.sub.read[i] < b.base+len(b.entries) && len(out) < limit {
 				abs := f.sub.read[i]
 				en := b.entries[abs-b.base]
+				if en.Cursor.LSN > h.logged[i][en.Cursor.Tier] {
+					break // not durable yet: neither it nor what follows it
+				}
 				f.sub.read[i]++
 				if en.Cursor.LSN > 0 && h.acked(f.sub, en, abs) {
 					continue // produced again after a restart, already acknowledged
@@ -500,7 +526,8 @@ func (f *Feed) Next(ctx context.Context, limit int) ([]FeedEntry, error) {
 }
 
 // Ack acknowledges every entry of c's shard and tier up to c. It is
-// persisted before it lets the engine snapshot or retire past it.
+// persisted before it lets the engine snapshot or retire past it. A cursor
+// past what the log has made durable is refused (ErrNotDurable).
 func (f *Feed) Ack(c Cursor) error {
 	h := f.h
 	if c.LSN == 0 {
@@ -518,6 +545,12 @@ func (f *Feed) Ack(c Cursor) error {
 	if a, ok := f.sub.acks[k]; ok && !c.after(a) {
 		h.mu.Unlock()
 		return nil
+	}
+	if c.LSN > h.logged[c.Shard][c.Tier] {
+		// Nothing past the durable log was delivered: acknowledging it
+		// would let a subscriber record what a crash could lose.
+		h.mu.Unlock()
+		return ErrNotDurable
 	}
 	// The traces of one event arrive together: if c is the last one of its
 	// event, the event is acknowledged as a whole.
@@ -634,6 +667,7 @@ func (s *shard) feedTraces(r *run, lsn uint64, traces []core.Trace) {
 	c := Cursor{Shard: s.id, Tier: r.tier}
 	if r.tier >= TierFile {
 		c.LSN = lsn
+		s.feedLogged[r.tier] = max(s.feedLogged[r.tier], lsn)
 	}
 	out := make([]FeedEntry, len(traces))
 	for i := range traces {
@@ -642,6 +676,17 @@ func (s *shard) feedTraces(r *run, lsn uint64, traces []core.Trace) {
 		out[i] = FeedEntry{Cursor: c, RunID: r.id, Trace: &t}
 	}
 	s.e.feed.q.Push(feedMsg{shard: s.id, entries: out})
+}
+
+// feedDurable tells the feed that the log of tier t is durable up to lsn,
+// if it holds traces of that log it has not been told are durable. Called
+// on the group commit's acknowledgement: one message per commit at most.
+func (s *shard) feedDurable(t Tier, lsn uint64) {
+	if s.feedLogged[t] <= s.feedTold[t] {
+		return
+	}
+	s.feedTold[t] = lsn
+	s.e.feed.q.Push(feedMsg{shard: s.id, durable: true, tier: t, lsn: lsn})
 }
 
 // feedOK reports whether r's state may be snapshotted (or its records

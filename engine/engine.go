@@ -556,7 +556,7 @@ func (e *Engine) Start() error {
 		for _, s := range e.shards {
 			for t := TierFile; t < tierCount; t++ {
 				if l := s.logs[t]; l != nil {
-					h.setStart(s.id, t, l.lsn)
+					h.setStart(s.id, t, l.lsn, l.durable)
 				}
 			}
 		}
